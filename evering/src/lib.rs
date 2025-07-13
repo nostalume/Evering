@@ -4,6 +4,8 @@
 extern crate alloc;
 
 pub mod driver;
+mod layout;
 pub mod op;
+mod queue;
 pub mod resource;
 pub mod uring;

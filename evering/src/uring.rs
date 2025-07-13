@@ -1,12 +1,9 @@
-use alloc::alloc::Layout;
+use crate::layout::{alloc, alloc_buffer, dealloc, dealloc_buffer};
+use crate::queue::{Drain, Offsets, Queue};
 use core::fmt;
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
-
-mod private {
-    pub trait Sealed {}
-}
 
 #[non_exhaustive]
 pub struct DisposeError {}
@@ -25,7 +22,7 @@ impl fmt::Display for DisposeError {
 
 impl core::error::Error for DisposeError {}
 
-pub trait Uring: private::Sealed {
+pub(crate) trait Uring {
     type A;
     type B;
     type Ext;
@@ -68,12 +65,11 @@ pub trait Uring: private::Sealed {
     }
 }
 
-pub enum UringEither<T, Ext = ()> {
+pub(crate) enum UringEither<T, Ext = ()> {
     A(UringA<T, T, Ext>),
     B(UringB<T, T, Ext>),
 }
 
-impl<T, Ext> private::Sealed for UringEither<T, Ext> {}
 impl<T, Ext> Uring for UringEither<T, Ext> {
     type A = T;
     type B = T;
@@ -104,8 +100,8 @@ impl<T, Ext> Uring for UringEither<T, Ext> {
 pub type Sender<Sqe, Rqe, Ext = ()> = UringA<Sqe, Rqe, Ext>;
 pub type Receiver<Sqe, Rqe, Ext = ()> = UringB<Sqe, Rqe, Ext>;
 
-pub struct UringA<A, B, Ext = ()>(RawUring<A, B, Ext>);
-pub struct UringB<A, B, Ext = ()>(RawUring<A, B, Ext>);
+pub(crate) struct UringA<A, B, Ext = ()>(RawUring<A, B, Ext>);
+pub(crate) struct UringB<A, B, Ext = ()>(RawUring<A, B, Ext>);
 
 unsafe impl<A: Send, B: Send, Ext: Send> Send for UringA<A, B, Ext> {}
 unsafe impl<A: Send, B: Send, Ext: Send> Send for UringB<A, B, Ext> {}
@@ -156,7 +152,6 @@ impl<A, B, Ext> UringB<A, B, Ext> {
     common_methods!(A, B, Ext);
 }
 
-impl<A, B, Ext> private::Sealed for UringA<A, B, Ext> {}
 impl<A, B, Ext> Uring for UringA<A, B, Ext> {
     type A = A;
     type B = B;
@@ -173,7 +168,6 @@ impl<A, B, Ext> Uring for UringA<A, B, Ext> {
     }
 }
 
-impl<A, B, Ext> private::Sealed for UringB<A, B, Ext> {}
 impl<A, B, Ext> Uring for UringB<A, B, Ext> {
     type A = B;
     type B = A;
@@ -216,27 +210,6 @@ impl<Ext> Header<Ext> {
 
     pub fn size_b(&self) -> usize {
         self.off_b.ring_mask as usize + 1
-    }
-}
-
-struct Offsets {
-    head: AtomicU32,
-    tail: AtomicU32,
-    ring_mask: u32,
-}
-
-impl Offsets {
-    fn new(size: u32) -> Self {
-        debug_assert!(size.is_power_of_two());
-        Self {
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
-            ring_mask: size - 1,
-        }
-    }
-
-    fn inc(&self, n: u32) -> u32 {
-        n.wrapping_add(1) & self.ring_mask
     }
 }
 
@@ -304,141 +277,14 @@ impl<A, B, Ext> RawUring<A, B, Ext> {
     }
 }
 
-pub struct Queue<'a, T> {
-    off: &'a Offsets,
-    buf: NonNull<T>,
-}
-
-impl<'a, T> Queue<'a, T> {
-    pub fn len(&self) -> usize {
-        let head = self.off.head.load(Ordering::Relaxed);
-        let tail = self.off.tail.load(Ordering::Relaxed);
-        (tail.wrapping_sub(head) & self.off.ring_mask) as usize
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-
-    unsafe fn enqueue(&mut self, val: T) -> Result<(), T> {
-        let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
-
-        let tail = off.tail.load(Ordering::Relaxed);
-        let head = off.head.load(Ordering::Acquire);
-
-        let next_tail = off.inc(tail);
-        if next_tail == head {
-            return Err(val);
-        }
-
-        unsafe { buf.add(tail as usize).write(val) };
-        off.tail.store(next_tail, Ordering::Release);
-
-        Ok(())
-    }
-
-    unsafe fn enqueue_bulk(&mut self, mut vals: impl Iterator<Item = T>) -> usize {
-        let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
-
-        let mut tail = off.tail.load(Ordering::Relaxed);
-        let head = off.head.load(Ordering::Acquire);
-
-        let mut n = 0;
-        let mut next_tail;
-        loop {
-            next_tail = off.inc(tail);
-            if next_tail == head {
-                break;
-            }
-            let Some(val) = vals.next() else {
-                break;
-            };
-            unsafe { buf.add(tail as usize).write(val) };
-            off.tail.store(next_tail, Ordering::Release);
-            n += 1;
-            tail = next_tail;
-        }
-
-        n
-    }
-
-    unsafe fn dequeue(&mut self) -> Option<T> {
-        let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
-
-        let head = off.head.load(Ordering::Relaxed);
-        let tail = off.tail.load(Ordering::Acquire);
-
-        if head == tail {
-            return None;
-        }
-        let next_head = off.inc(head);
-
-        let val = unsafe { buf.add(head as usize).read() };
-        off.head.store(next_head, Ordering::Release);
-
-        Some(val)
-    }
-
-    unsafe fn dequeue_bulk(&mut self) -> Drain<'a, T> {
-        let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
-
-        let head = off.head.load(Ordering::Relaxed);
-        let tail = off.tail.load(Ordering::Acquire);
-
-        Drain {
-            off,
-            buf: *buf,
-            head,
-            tail,
-        }
-    }
-
-    unsafe fn drop_in_place(&mut self) {
-        debug_assert!((self.off.ring_mask + 1).is_power_of_two());
-        unsafe {
-            let mut head = self.off.head.as_ptr().read();
-            let tail = self.off.tail.as_ptr().read();
-            while head != tail {
-                self.buf.add(head as usize).drop_in_place();
-                head = self.off.inc(head);
-            }
-        }
-    }
-}
-
-pub struct Drain<'a, T> {
-    off: &'a Offsets,
-    buf: NonNull<T>,
-    head: u32,
-    tail: u32,
-}
-
-impl<T> Iterator for Drain<'_, T> {
-    type Item = T;
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.head == self.tail {
-            return None;
-        }
-        let next_head = self.off.inc(self.head);
-        let val = unsafe { self.buf.add(self.head as usize).read() };
-        self.off.head.store(next_head, Ordering::Release);
-        self.head = next_head;
-        Some(val)
-    }
-}
-
-pub struct Builder<A, B, Ext = ()> {
+struct Builder<S: Uring> {
     size_a: usize,
     size_b: usize,
-    ext: Ext,
-    marker: PhantomData<(A, B)>,
+    ext: S::Ext,
+    _marker: PhantomData<(S::A, S::B)>,
 }
 
-impl<A, B, Ext> Builder<A, B, Ext> {
+impl<S:Uring> Builder<S> {
     pub fn new() -> Self
     where
         Ext: Default,
@@ -451,7 +297,7 @@ impl<A, B, Ext> Builder<A, B, Ext> {
             size_a: 32,
             size_b: 32,
             ext,
-            marker: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -510,30 +356,6 @@ impl<A, B, Ext: Default> Default for Builder<A, B, Ext> {
     fn default() -> Self {
         Self::new()
     }
-}
-
-unsafe fn alloc_buffer<T>(size: usize) -> NonNull<T> {
-    let layout = Layout::array::<T>(size).unwrap();
-    NonNull::new(unsafe { alloc::alloc::alloc(layout) })
-        .unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
-        .cast()
-}
-
-unsafe fn alloc<T>() -> NonNull<T> {
-    let layout = Layout::new::<T>();
-    NonNull::new(unsafe { alloc::alloc::alloc(layout) })
-        .unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout))
-        .cast()
-}
-
-unsafe fn dealloc_buffer<T>(ptr: NonNull<T>, size: usize) {
-    let layout = Layout::array::<T>(size).unwrap();
-    unsafe { alloc::alloc::dealloc(ptr.as_ptr().cast(), layout) }
-}
-
-unsafe fn dealloc<T>(ptr: NonNull<T>) {
-    let layout = Layout::new::<T>();
-    unsafe { alloc::alloc::dealloc(ptr.as_ptr().cast(), layout) }
 }
 
 #[cfg(test)]

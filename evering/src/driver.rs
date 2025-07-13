@@ -133,20 +133,20 @@ impl<P, Ext> DriverInner<P, Ext> {
             Lifecycle::Submitted => {
                 op.state = Lifecycle::Waiting(cx.local_waker().clone());
                 Poll::Pending
-            },
+            }
             Lifecycle::Waiting(waker) if !waker.will_wake(cx.local_waker()) => {
                 op.state = Lifecycle::Waiting(cx.local_waker().clone());
                 Poll::Pending
-            },
+            }
             Lifecycle::Waiting(waker) => {
                 op.state = Lifecycle::Waiting(waker);
                 Poll::Pending
-            },
+            }
             Lifecycle::Completed(payload) => {
                 // Remove this operation immediately if completed.
                 let op = self.ops.remove(id.0);
                 Poll::Ready((payload, op.ext))
-            },
+            }
             Lifecycle::Cancelled(_) => unreachable!("invalid operation state"),
         }
     }
@@ -157,17 +157,17 @@ impl<P, Ext> DriverInner<P, Ext> {
             Lifecycle::Submitted => {
                 op.state = Lifecycle::Completed(payload);
                 Ok(())
-            },
+            }
             Lifecycle::Waiting(waker) => {
                 op.state = Lifecycle::Completed(payload);
                 waker.wake();
                 Ok(())
-            },
+            }
             Lifecycle::Completed(_) => unreachable!("invalid operation state"),
             Lifecycle::Cancelled(_) => {
                 let op = self.ops.remove(id.0);
                 Err((payload, op.ext))
-            },
+            }
         }
     }
 
@@ -179,7 +179,7 @@ impl<P, Ext> DriverInner<P, Ext> {
         match mem::replace(&mut op.state, Lifecycle::Submitted) {
             Lifecycle::Submitted | Lifecycle::Waiting(_) => {
                 op.state = Lifecycle::Cancelled(callback());
-            },
+            }
             Lifecycle::Completed(_) => _ = self.ops.remove(id.0),
             Lifecycle::Cancelled(_) => unreachable!("invalid operation state"),
         }
