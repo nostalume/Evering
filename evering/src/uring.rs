@@ -1,5 +1,5 @@
 use crate::layout::{alloc, alloc_buffer, dealloc, dealloc_buffer};
-use crate::queue::{Drain, Offsets, Queue};
+use crate::queue::{Drain, Pow2, Queue, Range};
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
@@ -23,7 +23,7 @@ impl fmt::Display for DisposeError {
 
 impl core::error::Error for DisposeError {}
 
-pub(crate) trait UringSpec {
+pub trait UringSpec {
     type A;
     type B;
     type Ext = ();
@@ -68,6 +68,7 @@ pub(crate) trait Uring<S: UringSpec> {
     }
 }
 
+// [Pause]
 // pub(crate) enum UringEither<S: UringSpec> {
 //     A(UringA<S>),
 //     B(UringB<S>),
@@ -96,60 +97,26 @@ pub(crate) trait Uring<S: UringSpec> {
 //     }
 // }
 
-pub type Sender<S: UringSpec> = UringA<S>;
-pub type Receiver<S: UringSpec> = UringB<S>;
+pub type Sender<S> = UringA<S>;
+pub type Receiver<S> = UringB<S>;
 
-unsafe impl<S:UringSpec> Send for UringA<S> where S::A: Send, S::B:Send, S::Ext: Send{}
-unsafe impl<S:UringSpec> Send for UringB<S> where S::A: Send, S::B:Send, S::Ext: Send{}
+unsafe impl<S: UringSpec> Send for UringA<S>
+where
+    S::A: Send,
+    S::B: Send,
+    S::Ext: Send,
+{
+}
+unsafe impl<S: UringSpec> Send for UringB<S>
+where
+    S::A: Send,
+    S::B: Send,
+    S::Ext: Send,
+{
+}
 
-pub(crate) struct UringA<S: UringSpec>(RawUring<S>);
-pub(crate) struct UringB<S: UringSpec>(RawUring<S>);
-
-// macro_rules! common_methods {
-//     ($A:ident, $B:ident, $Ext:ident) => {
-//         pub fn into_raw(self) -> RawUring<A, B, Ext> {
-//             let inner = RawUring {
-//                 header: self.0.header,
-//                 buf_a: self.0.buf_a,
-//                 buf_b: self.0.buf_b,
-//                 marker: PhantomData,
-//             };
-//             core::mem::forget(self);
-//             inner
-//         }
-
-//         /// Drops this [`Uring`] and all enqueued entries.
-//         ///
-//         /// It does nothing and returns an error if `self` is still connected.
-//         /// Otherwise, the returned [`RawUring`] is safe to deallocate without
-//         /// synchronization.
-//         pub fn dispose_raw(self) -> Result<RawUring<A, B, Ext>, DisposeError> {
-//             let mut raw = self.into_raw();
-//             unsafe {
-//                 match raw.dispose() {
-//                     Ok(_) => Ok(raw),
-//                     Err(e) => Err(e),
-//                 }
-//             }
-//         }
-
-//         /// # Safety
-//         ///
-//         /// The specified [`RawUring`] must be a valid value returned from
-//         /// [`into_raw`](Self::into_raw).
-//         pub unsafe fn from_raw(uring: RawUring<A, B, Ext>) -> Self {
-//             Self(uring)
-//         }
-//     };
-// }
-
-// impl<A, B, Ext> UringA<A, B, Ext> {
-//     common_methods!(A, B, Ext);
-// }
-
-// impl<A, B, Ext> UringB<A, B, Ext> {
-//     common_methods!(A, B, Ext);
-// }
+pub struct UringA<S: UringSpec>(RawUring<S>);
+pub struct UringB<S: UringSpec>(RawUring<S>);
 
 impl<S: UringSpec> Deref for UringB<S> {
     type Target = RawUring<S>;
@@ -188,23 +155,31 @@ impl<S: UringSpec> Drop for UringB<S> {
 }
 
 pub struct Header<Ext = ()> {
-    off_a: Offsets,
-    off_b: Offsets,
+    off_a: Range,
+    off_b: Range,
     rc: AtomicU32,
     ext: Ext,
 }
 
 impl<Ext> Header<Ext> {
     pub fn size_a(&self) -> usize {
-        self.off_a.ring_mask as usize + 1
+        self.off_a.size()
     }
 
     pub fn size_b(&self) -> usize {
-        self.off_b.ring_mask as usize + 1
+        self.off_b.size()
+    }
+
+    pub fn len_a(&self) -> usize {
+        self.off_a.len()
+    }
+
+    pub fn len_b(&self) -> usize {
+        self.off_b.len()
     }
 }
 
-pub(crate) struct RawUring<S: UringSpec> {
+pub struct RawUring<S: UringSpec> {
     pub header: NonNull<Header<S::Ext>>,
     pub buf_a: NonNull<S::A>,
     pub buf_b: NonNull<S::B>,
@@ -226,6 +201,7 @@ impl<S: UringSpec> Uring<S> for RawUring<S> {
 }
 
 impl<S: UringSpec> RawUring<S> {
+    #[inline(always)]
     pub const fn dangling() -> Self {
         Self {
             header: NonNull::dangling(),
@@ -253,9 +229,10 @@ impl<S: UringSpec> RawUring<S> {
         }
     }
 
-    unsafe fn dispose(&mut self) -> Result<(), DisposeError> {
+    unsafe fn drop_queues(&mut self) -> Result<(), DisposeError> {
         let rc = unsafe { &self.header().rc };
         debug_assert!(rc.load(Ordering::Relaxed) >= 1);
+
         // `Release` enforeces any use of the data to happen before here.
         if rc.fetch_sub(1, Ordering::Release) != 1 {
             return Err(DisposeError {});
@@ -264,18 +241,18 @@ impl<S: UringSpec> RawUring<S> {
         core::sync::atomic::fence(Ordering::Acquire);
 
         unsafe {
-            self.queue_a().drop_in_place();
-            self.queue_b().drop_in_place();
+            self.queue_a().drop_elems();
+            self.queue_b().drop_elems();
         }
         Ok(())
     }
 
     unsafe fn drop_in_place(&mut self) {
         unsafe {
-            if self.dispose().is_ok() {
-                let h = self.header.as_ref();
-                dealloc_buffer(self.buf_a, h.off_a.ring_mask as usize + 1);
-                dealloc_buffer(self.buf_b, h.off_b.ring_mask as usize + 1);
+            if self.drop_queues().is_ok() {
+                let h = self.header();
+                dealloc_buffer(self.buf_a, h.size_a());
+                dealloc_buffer(self.buf_b, h.size_b());
                 dealloc(self.header);
             }
         }
@@ -283,14 +260,14 @@ impl<S: UringSpec> RawUring<S> {
 }
 
 struct Builder<S: UringSpec> {
-    size_a: usize,
-    size_b: usize,
+    size_a: Pow2,
+    size_b: Pow2,
     ext: S::Ext,
 }
 
 impl<S: UringSpec> Builder<S> {
-    const SIZE_A: usize = 32;
-    const SIZE_B: usize = 32;
+    const SIZE_A: Pow2 = Pow2::new(5);
+    const SIZE_B: Pow2 = Pow2::new(5);
     pub fn new() -> Self
     where
         S::Ext: Default,
@@ -306,22 +283,10 @@ impl<S: UringSpec> Builder<S> {
         }
     }
 
-    pub fn size_a(&mut self, size: usize) -> &mut Self {
-        assert!(size.is_power_of_two());
-        self.size_a = size;
-        self
-    }
-
-    pub fn size_b(&mut self, size: usize) -> &mut Self {
-        assert!(size.is_power_of_two());
-        self.size_b = size;
-        self
-    }
-
     pub fn build_header(self) -> Header<S::Ext> {
         Header {
-            off_a: Offsets::new(self.size_a as u32),
-            off_b: Offsets::new(self.size_b as u32),
+            off_a: Range::new(self.size_a),
+            off_b: Range::new(self.size_b),
             rc: AtomicU32::new(2),
             ext: self.ext,
         }
@@ -334,8 +299,8 @@ impl<S: UringSpec> Builder<S> {
 
         unsafe {
             header = alloc::<Header<S::Ext>>();
-            buf_a = alloc_buffer(self.size_a);
-            buf_b = alloc_buffer(self.size_b);
+            buf_a = alloc_buffer(self.size_a.as_usize());
+            buf_b = alloc_buffer(self.size_b.as_usize());
 
             header.write(self.build_header());
         }
@@ -377,8 +342,8 @@ mod tests {
         type B = ();
     }
 
-    struct CharRing;
-    impl UringSpec for CharRing {
+    struct CharUring;
+    impl UringSpec for CharUring {
         type A = char;
         type B = char;
     }
@@ -459,7 +424,7 @@ mod tests {
             .take(30)
             .collect::<Vec<_>>();
 
-        let (mut pa, mut pb) = Builder::<CharRing>::new().build();
+        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
         let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
         std::thread::scope(|cx| {
             cx.spawn(|| {
@@ -505,7 +470,7 @@ mod tests {
             .take(30)
             .collect::<Vec<_>>();
 
-        let (mut pa, mut pb) = Builder::<CharRing>::new().build();
+        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
         let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
         std::thread::scope(|cx| {
             cx.spawn(|| {

@@ -1,89 +1,80 @@
 use core::{
+    fmt,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicUsize, Ordering},
 };
 
-pub struct Queue<'a, T> {
-    pub off: &'a Offsets,
+pub(crate) struct Queue<'a, T> {
+    pub off: &'a Range,
     pub buf: NonNull<T>,
 }
 
 impl<'a, T> Queue<'a, T> {
     pub fn len(&self) -> usize {
-        let head = self.off.head.load(Ordering::Relaxed);
-        let tail = self.off.tail.load(Ordering::Relaxed);
-        (tail.wrapping_sub(head) & self.off.ring_mask) as usize
+        self.off.len()
     }
 
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
 
-    pub unsafe fn enqueue(&mut self, val: T) -> Result<(), T> {
+    pub fn enqueue(&mut self, val: T) -> Result<(), T> {
         let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
+        debug_assert!((off.size()).is_power_of_two());
 
-        let tail = off.tail.load(Ordering::Relaxed);
-        let head = off.head.load(Ordering::Acquire);
+        let write_idx = match off.reserve_tail() {
+            Ok(tail) => tail,
+            Err(_) => return Err(val),
+        };
 
-        let next_tail = off.inc(tail);
-        if next_tail == head {
-            return Err(val);
-        }
-
-        unsafe { buf.add(tail as usize).write(val) };
-        off.tail.store(next_tail, Ordering::Release);
-
+        unsafe { buf.add(write_idx).write(val) };
         Ok(())
     }
 
-    pub unsafe fn enqueue_bulk(&mut self, mut vals: impl Iterator<Item = T>) -> usize {
+    pub fn enqueue_bulk(&mut self, vals: impl Iterator<Item = T>) -> usize {
+        let mut vals = vals;
+
         let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
+        debug_assert!((off.size()).is_power_of_two());
 
-        let mut tail = off.tail.load(Ordering::Relaxed);
-        let head = off.head.load(Ordering::Acquire);
-
-        let mut n = 0;
-        let mut next_tail;
-        loop {
-            next_tail = off.inc(tail);
-            if next_tail == head {
-                break;
-            }
-            let Some(val) = vals.next() else {
-                break;
+        let mut suc = 0;
+        let suc = loop {
+            let write_idx = match off.reserve_tail() {
+                Ok(idx) => idx,
+                Err(_) => {
+                    break suc;
+                }
             };
-            unsafe { buf.add(tail as usize).write(val) };
-            off.tail.store(next_tail, Ordering::Release);
-            n += 1;
-            tail = next_tail;
-        }
 
-        n
+            let Some(val) = vals.next() else {
+                break suc;
+            };
+            unsafe {
+                buf.add(write_idx).write(val);
+            }
+
+            suc += 1;
+        };
+
+        suc
     }
 
-    pub unsafe fn dequeue(&mut self) -> Option<T> {
+    pub fn dequeue(&mut self) -> Option<T> {
         let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
+        debug_assert!((off.size()).is_power_of_two());
 
-        let head = off.head.load(Ordering::Relaxed);
-        let tail = off.tail.load(Ordering::Acquire);
+        let read_idx = match off.reserve_head() {
+            Ok(idx) => idx,
+            Err(_) => return None,
+        };
 
-        if head == tail {
-            return None;
-        }
-        let next_head = off.inc(head);
-
-        let val = unsafe { buf.add(head as usize).read() };
-        off.head.store(next_head, Ordering::Release);
-
+        let val = unsafe { buf.add(read_idx).read() };
         Some(val)
     }
 
-    pub unsafe fn dequeue_bulk(&mut self) -> Drain<'a, T> {
+    pub fn dequeue_bulk(&mut self) -> Drain<'a, T> {
         let Self { off, buf } = self;
-        debug_assert!((off.ring_mask + 1).is_power_of_two());
+        debug_assert!((off.size()).is_power_of_two());
 
         let head = off.head.load(Ordering::Relaxed);
         let tail = off.tail.load(Ordering::Acquire);
@@ -96,24 +87,33 @@ impl<'a, T> Queue<'a, T> {
         }
     }
 
-    pub unsafe fn drop_in_place(&mut self) {
-        debug_assert!((self.off.ring_mask + 1).is_power_of_two());
-        unsafe {
-            let mut head = self.off.head.as_ptr().read();
-            let tail = self.off.tail.as_ptr().read();
-            while head != tail {
-                self.buf.add(head as usize).drop_in_place();
-                head = self.off.inc(head);
+    pub fn drop_elems(&mut self) {
+        let Self { off, buf } = self;
+        debug_assert!((off.size()).is_power_of_two());
+
+        loop {
+            let read_idx = match off.reserve_head() {
+                Ok(idx) => idx,
+                Err(RangeError::Empty) => {
+                    break;
+                }
+                Err(_) => unreachable!(
+                    "[Queue]: try to reserve tail should only return Ok(idx) or Err(Empty)"
+                ),
+            };
+
+            unsafe {
+                buf.add(read_idx).drop_in_place();
             }
         }
     }
 }
 
 pub struct Drain<'a, T> {
-    off: &'a Offsets,
+    off: &'a Range,
     buf: NonNull<T>,
-    head: u32,
-    tail: u32,
+    head: usize,
+    tail: usize,
 }
 
 impl<T> Iterator for Drain<'_, T> {
@@ -130,23 +130,118 @@ impl<T> Iterator for Drain<'_, T> {
     }
 }
 
-pub struct Offsets {
-    head: AtomicU32,
-    tail: AtomicU32,
-    pub ring_mask: u32,
+pub(crate) struct Range {
+    head: AtomicUsize,
+    tail: AtomicUsize,
+    pub mask: usize,
 }
 
-impl Offsets {
-    pub fn new(size: u32) -> Self {
-        debug_assert!(size.is_power_of_two());
+#[derive(Debug)]
+pub(crate) enum RangeError {
+    Full,
+    Empty,
+    Contended,
+}
+
+impl fmt::Display for RangeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            RangeError::Full => f.write_str("Full"),
+            RangeError::Empty => f.write_str("Empty"),
+            RangeError::Contended => f.write_str("Contended"),
+        }
+    }
+}
+
+impl core::error::Error for RangeError {}
+
+pub type Head = usize;
+pub type Tail = usize;
+
+impl Range {
+    pub fn new(size: Pow2) -> Self {
+        // Safety: `Pow2` is always a power of 2 and greater than 1.
+        let mask = size.as_usize() - 1;
         Self {
-            head: AtomicU32::new(0),
-            tail: AtomicU32::new(0),
-            ring_mask: size - 1,
+            head: AtomicUsize::new(0),
+            tail: AtomicUsize::new(0),
+            // TODO! handle underflow.
+            mask,
         }
     }
 
-    pub fn inc(&self, n: u32) -> u32 {
-        n.wrapping_add(1) & self.ring_mask
+    #[inline(always)]
+    pub fn size(&self) -> usize {
+        self.mask + 1
+    }
+
+    #[inline(always)]
+    pub fn len(&self) -> usize {
+        let head = self.head.load(Ordering::Relaxed);
+        let tail = self.tail.load(Ordering::Relaxed);
+        tail.wrapping_sub(head) & self.mask
+    }
+
+    pub fn inc(&self, n: usize) -> usize {
+        n.wrapping_add(1) & self.mask
+    }
+
+    pub fn reserve_tail(&self) -> Result<Tail, RangeError> {
+        loop {
+            let tail = self.tail.load(Ordering::Relaxed);
+            let head = self.head.load(Ordering::Acquire);
+
+            let next_tail = self.inc(tail);
+            if next_tail == head {
+                return Err(RangeError::Full);
+            }
+
+            match self.tail.compare_exchange_weak(
+                tail,
+                next_tail,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(tail),
+                Err(_) => continue,
+            }
+        }
+    }
+
+    pub fn reserve_head(&self) -> Result<Head, RangeError> {
+        loop {
+            let head = self.head.load(Ordering::Relaxed);
+            let tail = self.tail.load(Ordering::Acquire);
+
+            let next_head = self.inc(head);
+            if head == tail {
+                return Err(RangeError::Empty);
+            }
+
+            match self.head.compare_exchange_weak(
+                head,
+                next_head,
+                Ordering::Release,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return Ok(head),
+                Err(_) => continue,
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Pow2(usize);
+
+impl Pow2 {
+    pub const fn new(pow: usize) -> Self {
+        // compile time check
+        assert!(pow < usize::BITS as usize, "pow should be less than 64");
+        Self(1 << pow)
+    }
+
+    pub const fn as_usize(self) -> usize {
+        self.0
     }
 }

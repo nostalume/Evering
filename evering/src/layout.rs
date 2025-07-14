@@ -7,6 +7,16 @@ pub(crate) unsafe fn alloc_buffer<T>(size: usize) -> NonNull<T> {
         .cast()
 }
 
+pub(crate) unsafe fn alloc_buffer_2<T>(size: usize) -> NonNull<[T]> {
+    let layout = Layout::array::<T>(size)
+        .ok()
+        .unwrap_or_else(|| alloc::alloc::handle_alloc_error(Layout::array::<T>(size).unwrap()));
+
+    let ptr = NonNull::new(unsafe { alloc::alloc::alloc(layout) } as *mut T)
+        .unwrap_or_else(|| alloc::alloc::handle_alloc_error(layout));
+    return NonNull::slice_from_raw_parts(ptr, size);
+}
+
 pub(crate) unsafe fn alloc<T>() -> NonNull<T> {
     let layout = Layout::new::<T>();
     NonNull::new(unsafe { alloc::alloc::alloc(layout) })

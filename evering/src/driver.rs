@@ -6,6 +6,8 @@ use slab::Slab;
 
 use crate::op::Cancellation;
 
+// TODO: real compile time type state.
+
 #[derive(Clone, Copy, Debug)]
 pub struct OpId(usize);
 
