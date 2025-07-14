@@ -4,7 +4,7 @@
 
 **Evering** is a asynchronous communication frame driven by uring.
 
-It starts at OpenCamp-OS 2025s by Zhang Chao(张超) trainee. Now we want to fully develop it as a independent project in a best wish.
+It starts at OpenCamp-OS 2025s by [Zhang Chao(张超)](https://github.com/loichyan/openoscamp-2025s) trainee. Now we want to fully develop it as a independent project in a best wish.
 
 Now it's only a **primitive** state.
 
