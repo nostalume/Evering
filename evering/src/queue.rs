@@ -23,7 +23,7 @@ impl<'a, T> Queue<'a, T> {
         debug_assert!((off.size()).is_power_of_two());
 
         let write_idx = match off.reserve_tail() {
-            Ok(tail) => tail,
+            Ok(idx) => idx,
             Err(_) => return Err(val),
         };
 
@@ -34,23 +34,16 @@ impl<'a, T> Queue<'a, T> {
     pub fn enqueue_bulk(&mut self, vals: impl Iterator<Item = T>) -> usize {
         let mut vals = vals;
 
-        let Self { off, buf } = self;
-        debug_assert!((off.size()).is_power_of_two());
+        debug_assert!((self.off.size()).is_power_of_two());
 
         let mut suc = 0;
         let suc = loop {
-            let write_idx = match off.reserve_tail() {
-                Ok(idx) => idx,
-                Err(_) => {
-                    break suc;
-                }
-            };
-
             let Some(val) = vals.next() else {
                 break suc;
             };
-            unsafe {
-                buf.add(write_idx).write(val);
+
+            if let Err(_) = self.enqueue(val) {
+                break suc;
             }
 
             suc += 1;
@@ -63,28 +56,16 @@ impl<'a, T> Queue<'a, T> {
         let Self { off, buf } = self;
         debug_assert!((off.size()).is_power_of_two());
 
-        let read_idx = match off.reserve_head() {
-            Ok(idx) => idx,
-            Err(_) => return None,
-        };
-
-        let val = unsafe { buf.add(read_idx).read() };
-        Some(val)
+        off.reserve_head()
+            .ok()
+            .map(|idx| unsafe { buf.add(idx).read() })
     }
 
     pub fn dequeue_bulk(&mut self) -> Drain<'a, T> {
         let Self { off, buf } = self;
         debug_assert!((off.size()).is_power_of_two());
 
-        let head = off.head.load(Ordering::Relaxed);
-        let tail = off.tail.load(Ordering::Acquire);
-
-        Drain {
-            off,
-            buf: *buf,
-            head,
-            tail,
-        }
+        Drain { off, buf: *buf }
     }
 
     pub fn drop_elems(&mut self) {
@@ -109,24 +90,19 @@ impl<'a, T> Queue<'a, T> {
     }
 }
 
+/// A ptr copy of the queue that drains the queue while not dropping the queue.
 pub struct Drain<'a, T> {
     off: &'a Range,
     buf: NonNull<T>,
-    head: usize,
-    tail: usize,
 }
 
 impl<T> Iterator for Drain<'_, T> {
     type Item = T;
     fn next(&mut self) -> Option<Self::Item> {
-        if self.head == self.tail {
-            return None;
-        }
-        let next_head = self.off.inc(self.head);
-        let val = unsafe { self.buf.add(self.head as usize).read() };
-        self.off.head.store(next_head, Ordering::Release);
-        self.head = next_head;
-        Some(val)
+        self.off
+            .reserve_head()
+            .ok()
+            .map(|idx| unsafe { self.buf.add(idx).read() })
     }
 }
 
@@ -165,7 +141,6 @@ impl Range {
         Self {
             head: AtomicUsize::new(0),
             tail: AtomicUsize::new(0),
-            // TODO! handle underflow.
             mask,
         }
     }
@@ -182,6 +157,7 @@ impl Range {
         tail.wrapping_sub(head) & self.mask
     }
 
+    #[inline(always)]
     pub fn inc(&self, n: usize) -> usize {
         n.wrapping_add(1) & self.mask
     }
@@ -213,10 +189,10 @@ impl Range {
             let head = self.head.load(Ordering::Relaxed);
             let tail = self.tail.load(Ordering::Acquire);
 
-            let next_head = self.inc(head);
             if head == tail {
                 return Err(RangeError::Empty);
             }
+            let next_head = self.inc(head);
 
             match self.head.compare_exchange_weak(
                 head,

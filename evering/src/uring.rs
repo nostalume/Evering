@@ -29,45 +29,27 @@ pub trait UringSpec {
     type Ext = ();
 }
 
-pub(crate) trait Uring<S: UringSpec> {
-    fn header(&self) -> &Header<S::Ext>;
-
-    fn sender(&self) -> Queue<S::A>;
-
-    fn receiver(&self) -> Queue<S::B>;
-
-    fn ext(&self) -> &S::Ext
-    where
-        S::Ext: Sync,
-    {
-        &self.header().ext
+pub trait UringSender {
+    type T;
+    fn sender(&mut self) -> Queue<'_, Self::T>;
+    fn send(&mut self, val: Self::T) -> Result<(), Self::T> {
+        self.sender().enqueue(val)
     }
-
-    /// Returns `true` if the remote [`Uring`] is not dropped.
-    fn is_connected(&self) -> bool {
-        self.header().rc.load(Ordering::Relaxed) > 1
-    }
-
-    fn send(&mut self, val: S::A) -> Result<(), S::A> {
-        unsafe { self.sender().enqueue(val) }
-    }
-
-    fn send_bulk<I>(&mut self, vals: I) -> usize
-    where
-        I: Iterator<Item = S::A>,
-    {
-        unsafe { self.sender().enqueue_bulk(vals) }
-    }
-
-    fn recv(&mut self) -> Option<S::B> {
-        unsafe { self.receiver().dequeue() }
-    }
-
-    fn recv_bulk(&mut self) -> Drain<S::B> {
-        unsafe { self.receiver().dequeue_bulk() }
+    fn send_bulk(&mut self, val: impl Iterator<Item = Self::T>) -> usize {
+        self.sender().enqueue_bulk(val)
     }
 }
 
+pub trait UringReceiver {
+    type T;
+    fn receiver(&mut self) -> Queue<'_, Self::T>;
+    fn recv(&mut self) -> Option<Self::T> {
+        self.receiver().dequeue()
+    }
+    fn recv_bulk(&mut self) -> Drain<'_, Self::T> {
+        self.receiver().dequeue_bulk()
+    }
+}
 // [Pause]
 // pub(crate) enum UringEither<S: UringSpec> {
 //     A(UringA<S>),
@@ -97,8 +79,8 @@ pub(crate) trait Uring<S: UringSpec> {
 //     }
 // }
 
-pub type Sender<S> = UringA<S>;
-pub type Receiver<S> = UringB<S>;
+pub struct UringA<S: UringSpec>(RawUring<S>);
+pub struct UringB<S: UringSpec>(RawUring<S>);
 
 unsafe impl<S: UringSpec> Send for UringA<S>
 where
@@ -115,8 +97,37 @@ where
 {
 }
 
-pub struct UringA<S: UringSpec>(RawUring<S>);
-pub struct UringB<S: UringSpec>(RawUring<S>);
+impl<S: UringSpec> UringSender for UringA<S> {
+    type T = S::A;
+
+    fn sender(&mut self) -> Queue<'_, Self::T> {
+        self.queue_a()
+    }
+}
+
+impl<S: UringSpec> UringSender for UringB<S> {
+    type T = S::B;
+
+    fn sender(&mut self) -> Queue<'_, Self::T> {
+        self.queue_b()
+    }
+}
+
+impl<S: UringSpec> UringReceiver for UringA<S> {
+    type T = S::B;
+
+    fn receiver(&mut self) -> Queue<'_, Self::T> {
+        self.queue_b()
+    }
+}
+
+impl<S: UringSpec> UringReceiver for UringB<S> {
+    type T = S::A;
+
+    fn receiver(&mut self) -> Queue<'_, Self::T> {
+        self.queue_a()
+    }
+}
 
 impl<S: UringSpec> Deref for UringB<S> {
     type Target = RawUring<S>;
@@ -177,6 +188,11 @@ impl<Ext> Header<Ext> {
     pub fn len_b(&self) -> usize {
         self.off_b.len()
     }
+
+    /// Returns `true` if the remote [`Uring`] is not dropped.
+    pub fn is_connected(&self) -> bool {
+        self.rc.load(Ordering::Relaxed) > 1
+    }
 }
 
 pub struct RawUring<S: UringSpec> {
@@ -186,43 +202,29 @@ pub struct RawUring<S: UringSpec> {
     _marker: PhantomData<fn(S)>,
 }
 
-impl<S: UringSpec> Uring<S> for RawUring<S> {
-    fn header(&self) -> &Header<S::Ext> {
-        unsafe { self.header() }
-    }
-
-    fn sender(&self) -> Queue<S::A> {
-        unsafe { self.queue_a() }
-    }
-
-    fn receiver(&self) -> Queue<S::B> {
-        unsafe { self.queue_b() }
-    }
-}
-
 impl<S: UringSpec> RawUring<S> {
-    #[inline(always)]
-    pub const fn dangling() -> Self {
-        Self {
-            header: NonNull::dangling(),
-            buf_a: NonNull::dangling(),
-            buf_b: NonNull::dangling(),
-            _marker: PhantomData,
-        }
-    }
+    // #[inline(always)]
+    // pub const fn dangling() -> Self {
+    //     Self {
+    //         header: NonNull::dangling(),
+    //         buf_a: NonNull::dangling(),
+    //         buf_b: NonNull::dangling(),
+    //         _marker: PhantomData,
+    //     }
+    // }
 
-    unsafe fn header(&self) -> &Header<S::Ext> {
+    fn header(&self) -> &Header<S::Ext> {
         unsafe { self.header.as_ref() }
     }
 
-    unsafe fn queue_a(&self) -> Queue<'_, S::A> {
+    fn queue_a(&self) -> Queue<'_, S::A> {
         Queue {
             off: unsafe { &self.header().off_a },
             buf: self.buf_a,
         }
     }
 
-    unsafe fn queue_b(&self) -> Queue<'_, S::B> {
+    fn queue_b(&self) -> Queue<'_, S::B> {
         Queue {
             off: unsafe { &self.header().off_b },
             buf: self.buf_b,
@@ -336,11 +338,6 @@ mod tests {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     use super::*;
-    struct VoidUring;
-    impl UringSpec for VoidUring {
-        type A = ();
-        type B = ();
-    }
 
     struct CharUring;
     impl UringSpec for CharUring {
@@ -349,16 +346,27 @@ mod tests {
     }
 
     #[test]
-    fn queue_len() {
+    fn queue_inspect() {
         let mut len_a = 0;
         let mut len_b = 0;
-        let (mut pa, mut pb) = Builder::<VoidUring>::new().build();
+        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
         for _ in 0..32 {
+            let ch = fastrand::alphabetic();
             match fastrand::u8(0..4) {
-                0 => len_a += pa.send(()).map_or(0, |_| 1),
-                1 => len_b += pb.send(()).map_or(0, |_| 1),
-                2 => len_a -= pb.recv().map_or(0, |_| 1),
-                3 => len_b -= pa.recv().map_or(0, |_| 1),
+                0 => len_a += pa.send(ch).map_or(0, |_| 1),
+                1 => len_b += pb.send(ch).map_or(0, |_| 1),
+                2 => {
+                    if let Some(ch) = pa.recv() {
+                        dbg!(format!("A recv: {}", ch));
+                        len_b -= 1;
+                    }
+                }
+                3 => {
+                    if let Some(ch) = pb.recv() {
+                        dbg!(format!("B recv: {}", ch));
+                        len_a -= 1;
+                    }
+                }
                 _ => unreachable!(),
             }
             assert_eq!(pa.sender().len(), pb.receiver().len());
