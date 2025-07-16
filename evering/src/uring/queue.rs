@@ -4,7 +4,7 @@ use core::{
     sync::atomic::{AtomicUsize, Ordering},
 };
 
-pub(crate) struct Queue<'a, T> {
+pub struct Queue<'a, T> {
     pub off: &'a Range,
     pub buf: NonNull<T>,
 }
@@ -106,7 +106,7 @@ impl<T> Iterator for Drain<'_, T> {
     }
 }
 
-pub(crate) struct Range {
+pub struct Range {
     head: AtomicUsize,
     tail: AtomicUsize,
     pub mask: usize,

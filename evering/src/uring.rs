@@ -1,32 +1,34 @@
-use crate::layout::{alloc, alloc_buffer, dealloc, dealloc_buffer};
-use crate::queue::{Drain, Pow2, Queue, Range};
+use core::alloc::{Layout, LayoutError};
 use core::fmt;
 use core::marker::PhantomData;
 use core::ops::{Deref, DerefMut};
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicU32, Ordering};
 
-#[non_exhaustive]
-pub struct DisposeError {}
+mod queue;
+mod tests;
 
-impl fmt::Debug for DisposeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DisposeError").finish_non_exhaustive()
-    }
-}
+use queue::{Drain, Queue};
 
-impl fmt::Display for DisposeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Uring is still connected")
-    }
-}
-
-impl core::error::Error for DisposeError {}
+use crate::uring::queue::{Pow2, Range};
 
 pub trait UringSpec {
     type A;
     type B;
     type Ext = ();
+
+    fn layout(size_a: usize, size_b: usize) -> Result<(Layout, usize, usize), LayoutError> {
+        let layout_header = Layout::new::<Header<Self::Ext>>();
+        let layout_a = Layout::array::<Self::A>(size_a)?;
+        let layout_b = Layout::array::<Self::B>(size_b)?;
+
+        let (comb_ha, off_a) = layout_header.extend(layout_a)?;
+        let (comb_hab, off_b) = comb_ha.extend(layout_b)?;
+
+        let comb_hab = comb_hab.pad_to_align();
+
+        Ok((comb_hab, off_a, off_b))
+    }
 }
 
 pub trait UringSender {
@@ -50,34 +52,6 @@ pub trait UringReceiver {
         self.receiver().dequeue_bulk()
     }
 }
-// [Pause]
-// pub(crate) enum UringEither<S: UringSpec> {
-//     A(UringA<S>),
-//     B(UringB<S>),
-// }
-
-// impl<S: UringSpec> Uring for UringEither<S> {
-//     fn header(&self) -> &Header<S::Ext> {
-//         match self {
-//             UringEither::A(a) => a.header(),
-//             UringEither::B(b) => b.header(),
-//         }
-//     }
-
-//     fn sender(&self) -> Queue<S::T> {
-//         match self {
-//             UringEither::A(a) => a.sender(),
-//             UringEither::B(b) => b.sender(),
-//         }
-//     }
-
-//     fn receiver(&self) -> Queue<T> {
-//         match self {
-//             UringEither::A(a) => a.receiver(),
-//             UringEither::B(b) => b.receiver(),
-//         }
-//     }
-// }
 
 pub struct UringA<S: UringSpec>(RawUring<S>);
 pub struct UringB<S: UringSpec>(RawUring<S>);
@@ -166,73 +140,92 @@ impl<S: UringSpec> Drop for UringB<S> {
 }
 
 pub struct Header<Ext = ()> {
-    off_a: Range,
-    off_b: Range,
+    range_a: Range,
+    range_b: Range,
     rc: AtomicU32,
     ext: Ext,
 }
 
 impl<Ext> Header<Ext> {
+    #[inline(always)]
     pub fn size_a(&self) -> usize {
-        self.off_a.size()
+        self.range_a.size()
     }
 
+    #[inline(always)]
     pub fn size_b(&self) -> usize {
-        self.off_b.size()
+        self.range_b.size()
     }
 
+    #[inline(always)]
     pub fn len_a(&self) -> usize {
-        self.off_a.len()
+        self.range_a.len()
     }
 
+    #[inline(always)]
     pub fn len_b(&self) -> usize {
-        self.off_b.len()
+        self.range_b.len()
     }
 
     /// Returns `true` if the remote [`Uring`] is not dropped.
+    #[inline(always)]
     pub fn is_connected(&self) -> bool {
         self.rc.load(Ordering::Relaxed) > 1
     }
 }
 
+#[derive(Debug)]
 pub struct RawUring<S: UringSpec> {
-    pub header: NonNull<Header<S::Ext>>,
-    pub buf_a: NonNull<S::A>,
-    pub buf_b: NonNull<S::B>,
-    _marker: PhantomData<fn(S)>,
+    header: NonNull<Header<S::Ext>>,
+    buf_a: NonNull<S::A>,
+    buf_b: NonNull<S::B>,
 }
 
-impl<S: UringSpec> RawUring<S> {
-    // #[inline(always)]
-    // pub const fn dangling() -> Self {
-    //     Self {
-    //         header: NonNull::dangling(),
-    //         buf_a: NonNull::dangling(),
-    //         buf_b: NonNull::dangling(),
-    //         _marker: PhantomData,
-    //     }
-    // }
+#[non_exhaustive]
+pub struct DisposeError {}
 
-    fn header(&self) -> &Header<S::Ext> {
+impl fmt::Debug for DisposeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DisposeError").finish_non_exhaustive()
+    }
+}
+
+impl fmt::Display for DisposeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Uring is still connected")
+    }
+}
+
+impl core::error::Error for DisposeError {}
+
+impl<S: UringSpec> RawUring<S> {
+    #[inline(always)]
+    pub fn header(&self) -> &Header<S::Ext> {
+        // Safety: The header is always initiated.
         unsafe { self.header.as_ref() }
     }
 
-    fn queue_a(&self) -> Queue<'_, S::A> {
+    #[inline(always)]
+    pub fn is_connected(&self) -> bool {
+        self.header().is_connected()
+    }
+
+    pub fn queue_a(&self) -> Queue<'_, S::A> {
         Queue {
-            off: unsafe { &self.header().off_a },
+            off: &self.header().range_a,
             buf: self.buf_a,
         }
     }
 
-    fn queue_b(&self) -> Queue<'_, S::B> {
+    pub fn queue_b(&self) -> Queue<'_, S::B> {
         Queue {
-            off: unsafe { &self.header().off_b },
+            off: &self.header().range_b,
             buf: self.buf_b,
         }
     }
 
-    unsafe fn drop_queues(&mut self) -> Result<(), DisposeError> {
-        let rc = unsafe { &self.header().rc };
+    fn drop_queues(&mut self) -> Result<(), DisposeError> {
+        let rc = &self.header().rc;
         debug_assert!(rc.load(Ordering::Relaxed) >= 1);
 
         // `Release` enforeces any use of the data to happen before here.
@@ -242,267 +235,132 @@ impl<S: UringSpec> RawUring<S> {
         // `Acquire` enforces the deletion of the data to happen after here.
         core::sync::atomic::fence(Ordering::Acquire);
 
-        unsafe {
-            self.queue_a().drop_elems();
-            self.queue_b().drop_elems();
-        }
+        self.queue_a().drop_elems();
+        self.queue_b().drop_elems();
         Ok(())
     }
 
+    #[inline(always)]
     unsafe fn drop_in_place(&mut self) {
         unsafe {
             if self.drop_queues().is_ok() {
-                let h = self.header();
-                dealloc_buffer(self.buf_a, h.size_a());
-                dealloc_buffer(self.buf_b, h.size_b());
-                dealloc(self.header);
+                // Safety: the initiated data indicates the layout never overflows.
+                let (ly, _, _) = S::layout(self.header().size_a(), self.header().size_b()).unwrap();
+                alloc::alloc::dealloc(self.header.as_ptr().cast(), ly);
             }
         }
+    }
+}
+
+impl<S: UringSpec> Clone for RawUring<S> {
+    fn clone(&self) -> Self {
+        let hd = self.header();
+        hd.rc.fetch_add(1, Ordering::Release);
+
+        Self {
+            header: self.header.clone(),
+            buf_a: self.buf_a.clone(),
+            buf_b: self.buf_b.clone(),
+        }
+    }
+}
+
+impl<S: UringSpec> Default for RawUring<S>
+where
+    S::Ext: Default,
+{
+    fn default() -> Self {
+        let builder = Builder::default();
+        builder
+            .init(S::Ext::default())
+            .expect("[Uring]: Initiation of RawUring failed.")
     }
 }
 
 struct Builder<S: UringSpec> {
     size_a: Pow2,
     size_b: Pow2,
-    ext: S::Ext,
+    _marker: PhantomData<S>,
 }
 
 impl<S: UringSpec> Builder<S> {
     const SIZE_A: Pow2 = Pow2::new(5);
     const SIZE_B: Pow2 = Pow2::new(5);
-    pub fn new() -> Self
-    where
-        S::Ext: Default,
-    {
-        Self::new_ext(S::Ext::default())
+
+    pub fn new(size_a: Pow2, size_b: Pow2) -> Self {
+        Self {
+            size_a,
+            size_b,
+            _marker: PhantomData,
+        }
     }
 
-    pub fn new_ext(ext: S::Ext) -> Self {
-        Self {
-            size_a: Self::SIZE_A,
-            size_b: Self::SIZE_B,
+    pub fn init_header(self, ext: S::Ext) -> Header<S::Ext> {
+        Header {
+            range_a: Range::new(self.size_a),
+            range_b: Range::new(self.size_b),
+            rc: AtomicU32::new(1),
             ext,
         }
     }
 
-    pub fn build_header(self) -> Header<S::Ext> {
-        Header {
-            off_a: Range::new(self.size_a),
-            off_b: Range::new(self.size_b),
-            rc: AtomicU32::new(2),
-            ext: self.ext,
-        }
+    fn init(self, ext: S::Ext) -> Result<RawUring<S>, LayoutError> {
+        // Safety: the layout is ensured by `Pow2` to avoid overflow.
+        let (comb_hab, off_a, off_b) = S::layout(self.size_a.as_usize(), self.size_b.as_usize())?;
+        // Safety: the alloc memory is obviously non-null
+        // unless it is out of memory as shut down.
+        let ptr = unsafe {
+            NonNull::new(alloc::alloc::alloc(comb_hab))
+                .unwrap_or_else(|| alloc::alloc::handle_alloc_error(comb_hab))
+        };
+
+        let header = ptr.cast::<Header<S::Ext>>();
+        // Safety: the new alloc memory with perscribed offset.
+        unsafe { header.write(self.init_header(ext)) };
+        let buf_a = unsafe { ptr.add(off_a).cast::<S::A>() };
+        let buf_b = unsafe { ptr.add(off_b).cast::<S::B>() };
+
+        Ok(RawUring {
+            header,
+            buf_a,
+            buf_b,
+        })
     }
 
-    pub fn build(self) -> (UringA<S>, UringB<S>) {
-        let header;
-        let buf_a;
-        let buf_b;
+    pub fn try_build_ext(self, ext: S::Ext) -> Result<(UringA<S>, UringB<S>), LayoutError> {
+        let ru = self.init(ext)?;
+        let ra = UringA(ru.clone());
+        let rb = UringB(ru);
 
-        unsafe {
-            header = alloc::<Header<S::Ext>>();
-            buf_a = alloc_buffer(self.size_a.as_usize());
-            buf_b = alloc_buffer(self.size_b.as_usize());
+        Ok((ra, rb))
+    }
 
-            header.write(self.build_header());
-        }
+    pub fn build_ext(self, ext: S::Ext) -> (UringA<S>, UringB<S>) {
+        let ru = self
+            .init(ext)
+            .expect("[Uring]: Initiation of Uring failed.");
+        let ra = UringA(ru.clone());
+        let rb = UringB(ru);
 
-        let ring_a = UringA(RawUring {
-            header,
-            buf_a,
-            buf_b,
-            _marker: PhantomData,
-        });
-        let ring_b = UringB(RawUring {
-            header,
-            buf_a,
-            buf_b,
-            _marker: PhantomData,
-        });
+        (ra, rb)
+    }
 
-        (ring_a, ring_b)
+    pub fn build(self) -> (UringA<S>, UringB<S>)
+    where
+        S::Ext: Default,
+    {
+        let ru = self
+            .init(S::Ext::default())
+            .expect("[Uring]: Initiation of Uring failed.");
+        let ra = UringA(ru.clone());
+        let rb = UringB(ru);
+
+        (ra, rb)
     }
 }
 
-impl<S: UringSpec> Default for Builder<S>
-where
-    S::Ext: Default,
-{
+impl<S: UringSpec> Default for Builder<S> {
     fn default() -> Self {
-        Self::new()
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-    use super::*;
-
-    struct CharUring;
-    impl UringSpec for CharUring {
-        type A = char;
-        type B = char;
-    }
-
-    #[test]
-    fn queue_inspect() {
-        let mut len_a = 0;
-        let mut len_b = 0;
-        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
-        for _ in 0..32 {
-            let ch = fastrand::alphabetic();
-            match fastrand::u8(0..4) {
-                0 => len_a += pa.send(ch).map_or(0, |_| 1),
-                1 => len_b += pb.send(ch).map_or(0, |_| 1),
-                2 => {
-                    if let Some(ch) = pa.recv() {
-                        dbg!(format!("A recv: {}", ch));
-                        len_b -= 1;
-                    }
-                }
-                3 => {
-                    if let Some(ch) = pb.recv() {
-                        dbg!(format!("B recv: {}", ch));
-                        len_a -= 1;
-                    }
-                }
-                _ => unreachable!(),
-            }
-            assert_eq!(pa.sender().len(), pb.receiver().len());
-            assert_eq!(pa.receiver().len(), pb.sender().len());
-            assert_eq!(pa.sender().len(), len_a);
-            assert_eq!(pb.sender().len(), len_b);
-        }
-    }
-
-    #[test]
-    fn uring_drop() {
-        static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
-
-        #[derive(Debug)]
-        struct DropCounter(char);
-        impl Drop for DropCounter {
-            fn drop(&mut self) {
-                DROP_COUNT.fetch_add(1, Ordering::Relaxed);
-            }
-        }
-
-        struct CounterRing;
-
-        impl UringSpec for CounterRing {
-            type A = DropCounter;
-            type B = DropCounter;
-        }
-
-        let input = std::iter::repeat_with(fastrand::alphabetic)
-            .take(30)
-            .collect::<Vec<_>>();
-
-        let (mut pa, mut pb) = Builder::<CounterRing>::new().build();
-        std::thread::scope(|cx| {
-            cx.spawn(|| {
-                for i in input.iter().copied().map(DropCounter) {
-                    if i.0.is_uppercase() {
-                        pa.send(i).unwrap();
-                    } else {
-                        _ = pa.recv();
-                    }
-                }
-                drop(pa);
-            });
-            cx.spawn(|| {
-                for i in input.iter().copied().map(DropCounter) {
-                    if i.0.is_lowercase() {
-                        pb.send(i).unwrap();
-                    } else {
-                        _ = pb.recv();
-                    }
-                }
-                drop(pb);
-            });
-        });
-
-        assert_eq!(DROP_COUNT.load(Ordering::Relaxed), input.len() * 2);
-    }
-
-    #[test]
-    fn uring_threaded() {
-        let input = std::iter::repeat_with(fastrand::alphabetic)
-            .take(30)
-            .collect::<Vec<_>>();
-
-        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
-        let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
-        std::thread::scope(|cx| {
-            cx.spawn(|| {
-                let mut r = vec![];
-                for i in input.iter().copied() {
-                    pa.send(i).unwrap();
-                    while let Some(i) = pa.recv() {
-                        r.push(i);
-                    }
-                }
-                pa_finished.store(true, Ordering::Release);
-                while !pb_finished.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                while let Some(i) = pa.recv() {
-                    r.push(i);
-                }
-                assert_eq!(r, input);
-            });
-            cx.spawn(|| {
-                let mut r = vec![];
-                for i in input.iter().copied() {
-                    pb.send(i).unwrap();
-                    while let Some(i) = pb.recv() {
-                        r.push(i);
-                    }
-                }
-                pb_finished.store(true, Ordering::Release);
-                while !pa_finished.load(Ordering::Acquire) {
-                    std::thread::yield_now();
-                }
-                while let Some(i) = pb.recv() {
-                    r.push(i);
-                }
-                assert_eq!(r, input);
-            });
-        });
-    }
-
-    #[test]
-    fn uring_threaded_bulk() {
-        let input = std::iter::repeat_with(fastrand::alphabetic)
-            .take(30)
-            .collect::<Vec<_>>();
-
-        let (mut pa, mut pb) = Builder::<CharUring>::new().build();
-        let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
-        std::thread::scope(|cx| {
-            cx.spawn(|| {
-                let mut r = vec![];
-                pa.send_bulk(input.iter().copied());
-                pa_finished.store(true, Ordering::Release);
-                while !pb_finished.load(Ordering::Acquire) {
-                    r.extend(pa.recv_bulk());
-                    std::thread::yield_now();
-                }
-                r.extend(pa.recv_bulk());
-                assert_eq!(r, input);
-            });
-            cx.spawn(|| {
-                let mut r = vec![];
-                pb.send_bulk(input.iter().copied());
-                pb_finished.store(true, Ordering::Release);
-                while !pa_finished.load(Ordering::Acquire) {
-                    r.extend(pb.recv_bulk());
-                    std::thread::yield_now();
-                }
-                r.extend(pb.recv_bulk());
-                assert_eq!(r, input);
-            });
-        });
+        Self::new(Self::SIZE_A, Self::SIZE_B)
     }
 }
