@@ -213,7 +213,7 @@ pub struct Pow2(usize);
 impl Pow2 {
     pub const fn new(pow: usize) -> Self {
         // compile time check
-        assert!(pow < usize::BITS as usize, "pow should be less than 64");
+        assert!(pow < 32, "pow should be less than 64");
         Self(1 << pow)
     }
 
