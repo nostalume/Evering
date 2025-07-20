@@ -1,366 +1,204 @@
-use core::alloc::{Layout, LayoutError};
-use core::fmt;
-use core::marker::PhantomData;
-use core::ops::{Deref, DerefMut};
-use core::ptr::NonNull;
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::{
+    ops::Deref,
+    pin,
+    task::{self, Poll},
+};
 
-mod queue;
-mod tests;
-
-use queue::{Drain, Queue};
-
-use crate::uring::queue::{Pow2, Range};
+use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError};
+use futures::{Sink, Stream};
 
 pub trait UringSpec {
-    type A;
-    type B;
-    type Ext = ();
-
-    fn layout(size_a: usize, size_b: usize) -> Result<(Layout, usize, usize), LayoutError> {
-        let layout_header = Layout::new::<Header<Self::Ext>>();
-        let layout_a = Layout::array::<Self::A>(size_a)?;
-        let layout_b = Layout::array::<Self::B>(size_b)?;
-
-        let (comb_ha, off_a) = layout_header.extend(layout_a)?;
-        let (comb_hab, off_b) = comb_ha.extend(layout_b)?;
-
-        let comb_hab = comb_hab.pad_to_align();
-
-        Ok((comb_hab, off_a, off_b))
-    }
+    type SQE;
+    type CQE;
 }
-
-pub trait UringSender {
+pub trait WithSend {
     type T;
-    fn sender(&mut self) -> Queue<'_, Self::T>;
-    fn send(&mut self, val: Self::T) -> Result<(), Self::T> {
-        self.sender().enqueue(val)
+    fn sink_sender(&self) -> &SinkSender<Self::T>;
+    fn sender(&self) -> &Sender<Self::T> {
+        &self.sink_sender()
     }
-    fn send_bulk(&mut self, val: impl Iterator<Item = Self::T>) -> usize {
-        self.sender().enqueue_bulk(val)
-    }
-}
+    fn send_bulk(&self, vals: impl Iterator<Item = Self::T>) -> usize {
+        let mut vals = vals;
+        let mut count = 0;
+        loop {
+            let Some(val) = vals.next() else { break count };
 
-pub trait UringReceiver {
-    type T;
-    fn receiver(&mut self) -> Queue<'_, Self::T>;
-    fn recv(&mut self) -> Option<Self::T> {
-        self.receiver().dequeue()
-    }
-    fn recv_bulk(&mut self) -> Drain<'_, Self::T> {
-        self.receiver().dequeue_bulk()
-    }
-}
-
-pub struct UringA<S: UringSpec>(RawUring<S>);
-pub struct UringB<S: UringSpec>(RawUring<S>);
-
-unsafe impl<S: UringSpec> Send for UringA<S>
-where
-    S::A: Send,
-    S::B: Send,
-    S::Ext: Send,
-{
-}
-unsafe impl<S: UringSpec> Send for UringB<S>
-where
-    S::A: Send,
-    S::B: Send,
-    S::Ext: Send,
-{
-}
-
-impl<S: UringSpec> UringSender for UringA<S> {
-    type T = S::A;
-
-    fn sender(&mut self) -> Queue<'_, Self::T> {
-        self.queue_a()
-    }
-}
-
-impl<S: UringSpec> UringSender for UringB<S> {
-    type T = S::B;
-
-    fn sender(&mut self) -> Queue<'_, Self::T> {
-        self.queue_b()
-    }
-}
-
-impl<S: UringSpec> UringReceiver for UringA<S> {
-    type T = S::B;
-
-    fn receiver(&mut self) -> Queue<'_, Self::T> {
-        self.queue_b()
-    }
-}
-
-impl<S: UringSpec> UringReceiver for UringB<S> {
-    type T = S::A;
-
-    fn receiver(&mut self) -> Queue<'_, Self::T> {
-        self.queue_a()
-    }
-}
-
-impl<S: UringSpec> Deref for UringB<S> {
-    type Target = RawUring<S>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl<S: UringSpec> DerefMut for UringB<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<S: UringSpec> Deref for UringA<S> {
-    type Target = RawUring<S>;
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-impl<S: UringSpec> DerefMut for UringA<S> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
-
-impl<S: UringSpec> Drop for UringA<S> {
-    fn drop(&mut self) {
-        unsafe { self.0.drop_in_place() }
-    }
-}
-
-impl<S: UringSpec> Drop for UringB<S> {
-    fn drop(&mut self) {
-        unsafe { self.0.drop_in_place() }
-    }
-}
-
-pub struct Header<Ext = ()> {
-    range_a: Range,
-    range_b: Range,
-    rc: AtomicU32,
-    ext: Ext,
-}
-
-impl<Ext> Header<Ext> {
-    #[inline(always)]
-    pub fn size_a(&self) -> usize {
-        self.range_a.size()
-    }
-
-    #[inline(always)]
-    pub fn size_b(&self) -> usize {
-        self.range_b.size()
-    }
-
-    #[inline(always)]
-    pub fn len_a(&self) -> usize {
-        self.range_a.len()
-    }
-
-    #[inline(always)]
-    pub fn len_b(&self) -> usize {
-        self.range_b.len()
-    }
-
-    /// Returns `true` if the remote [`Uring`] is not dropped.
-    #[inline(always)]
-    pub fn is_connected(&self) -> bool {
-        self.rc.load(Ordering::Relaxed) > 1
-    }
-}
-
-#[derive(Debug)]
-pub struct RawUring<S: UringSpec> {
-    header: NonNull<Header<S::Ext>>,
-    buf_a: NonNull<S::A>,
-    buf_b: NonNull<S::B>,
-}
-
-#[non_exhaustive]
-pub struct DisposeError {}
-
-impl fmt::Debug for DisposeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("DisposeError").finish_non_exhaustive()
-    }
-}
-
-impl fmt::Display for DisposeError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Uring is still connected")
-    }
-}
-
-impl core::error::Error for DisposeError {}
-
-impl<S: UringSpec> RawUring<S> {
-    #[inline(always)]
-    pub fn header(&self) -> &Header<S::Ext> {
-        // Safety: The header is always initiated.
-        unsafe { self.header.as_ref() }
-    }
-
-    #[inline(always)]
-    pub fn is_connected(&self) -> bool {
-        self.header().is_connected()
-    }
-
-    pub fn queue_a(&self) -> Queue<'_, S::A> {
-        Queue {
-            off: &self.header().range_a,
-            buf: self.buf_a,
-        }
-    }
-
-    pub fn queue_b(&self) -> Queue<'_, S::B> {
-        Queue {
-            off: &self.header().range_b,
-            buf: self.buf_b,
-        }
-    }
-
-    fn drop_queues(&mut self) -> Result<(), DisposeError> {
-        let rc = &self.header().rc;
-        debug_assert!(rc.load(Ordering::Relaxed) >= 1);
-
-        // `Release` enforeces any use of the data to happen before here.
-        if rc.fetch_sub(1, Ordering::Release) != 1 {
-            return Err(DisposeError {});
-        }
-        // `Acquire` enforces the deletion of the data to happen after here.
-        core::sync::atomic::fence(Ordering::Acquire);
-
-        self.queue_a().drop_elems();
-        self.queue_b().drop_elems();
-        Ok(())
-    }
-
-    #[inline(always)]
-    unsafe fn drop_in_place(&mut self) {
-        unsafe {
-            if self.drop_queues().is_ok() {
-                // Safety: the initiated data indicates the layout never overflows.
-                let (ly, _, _) = S::layout(self.header().size_a(), self.header().size_b()).unwrap();
-                alloc::alloc::dealloc(self.header.as_ptr().cast(), ly);
+            if let Err(_) = self.sender().send(val) {
+                break count;
             }
+
+            count += 1;
         }
     }
 }
 
-impl<S: UringSpec> Clone for RawUring<S> {
-    fn clone(&self) -> Self {
-        let hd = self.header();
-        hd.rc.fetch_add(1, Ordering::Release);
+#[derive(Debug, Clone)]
+pub struct SinkSender<T>(Sender<T>);
 
-        Self {
-            header: self.header.clone(),
-            buf_a: self.buf_a.clone(),
-            buf_b: self.buf_b.clone(),
+impl<T> From<Sender<T>> for SinkSender<T> {
+    fn from(sender: Sender<T>) -> Self {
+        Self(sender)
+    }
+}
+
+impl<T> AsRef<Sender<T>> for SinkSender<T> {
+    fn as_ref(&self) -> &Sender<T> {
+        &self.0
+    }
+}
+
+impl<T> Deref for SinkSender<T> {
+    type Target = Sender<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T> Sink<T> for SinkSender<T> {
+    type Error = TrySendError<T>;
+
+    fn poll_ready(
+        self: pin::Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if this.is_full() {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn start_send(self: pin::Pin<&mut Self>, item: T) -> Result<(), Self::Error> {
+        self.0.try_send(item)
+    }
+
+    fn poll_flush(
+        self: pin::Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        if this.is_full() {
+            return Poll::Pending;
+        }
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(
+        self: pin::Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+}
+
+pub trait WithRecv {
+    type T;
+    fn stream_receiver(&self) -> &StreamReceiver<Self::T>;
+    fn receiver(&self) -> &Receiver<Self::T> {
+        self.stream_receiver()
+    }
+    fn recv_bulk(&self) -> impl Iterator<Item = Self::T> {
+        core::iter::from_fn(|| self.receiver().recv().ok())
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct StreamReceiver<T>(Receiver<T>);
+
+impl<T> From<Receiver<T>> for StreamReceiver<T> {
+    fn from(receiver: Receiver<T>) -> Self {
+        Self(receiver)
+    }
+}
+
+impl<T> AsRef<Receiver<T>> for StreamReceiver<T> {
+    fn as_ref(&self) -> &Receiver<T> {
+        &self.0
+    }
+}
+
+impl<T> Deref for StreamReceiver<T> {
+    type Target = Receiver<T>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<T: Unpin> Stream for StreamReceiver<T> {
+    type Item = T;
+
+    fn poll_next(
+        self: pin::Pin<&mut Self>,
+        cx: &mut task::Context<'_>,
+    ) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        match this.try_recv() {
+            Ok(msg) => Poll::Ready(Some(msg)),
+            Err(TryRecvError::Empty) => Poll::Pending,
+            Err(TryRecvError::Disconnected) => Poll::Ready(None),
         }
     }
 }
 
-impl<S: UringSpec> Default for RawUring<S>
-where
-    S::Ext: Default,
-{
-    fn default() -> Self {
-        let builder = Builder::default();
-        builder
-            .init(S::Ext::default())
-            .expect("[Uring]: Initiation of RawUring failed.")
+pub type Uring<S> = (Completer<S>, Submitter<S>);
+
+#[derive(Debug, Clone)]
+pub struct Submitter<S: UringSpec> {
+    sqs: SinkSender<S::SQE>,
+    sqr: StreamReceiver<S::CQE>,
+}
+#[derive(Debug, Clone)]
+pub struct Completer<S: UringSpec> {
+    cqs: SinkSender<S::CQE>,
+    cqr: StreamReceiver<S::SQE>,
+}
+
+impl<S: UringSpec> WithSend for Submitter<S> {
+    type T = S::SQE;
+    fn sink_sender(&self) -> &SinkSender<Self::T> {
+        &self.sqs
     }
 }
 
-struct Builder<S: UringSpec> {
-    size_a: Pow2,
-    size_b: Pow2,
-    _marker: PhantomData<S>,
-}
-
-impl<S: UringSpec> Builder<S> {
-    const SIZE_A: Pow2 = Pow2::new(5);
-    const SIZE_B: Pow2 = Pow2::new(5);
-
-    pub fn new(size_a: Pow2, size_b: Pow2) -> Self {
-        Self {
-            size_a,
-            size_b,
-            _marker: PhantomData,
-        }
-    }
-
-    pub fn init_header(self, ext: S::Ext) -> Header<S::Ext> {
-        Header {
-            range_a: Range::new(self.size_a),
-            range_b: Range::new(self.size_b),
-            rc: AtomicU32::new(1),
-            ext,
-        }
-    }
-
-    fn init(self, ext: S::Ext) -> Result<RawUring<S>, LayoutError> {
-        // Safety: the layout is ensured by `Pow2` to avoid overflow.
-        let (comb_hab, off_a, off_b) = S::layout(self.size_a.as_usize(), self.size_b.as_usize())?;
-        // Safety: the alloc memory is obviously non-null
-        // unless it is out of memory as shut down.
-        let ptr = unsafe {
-            NonNull::new(alloc::alloc::alloc(comb_hab))
-                .unwrap_or_else(|| alloc::alloc::handle_alloc_error(comb_hab))
-        };
-
-        let header = ptr.cast::<Header<S::Ext>>();
-        // Safety: the new alloc memory with perscribed offset.
-        unsafe { header.write(self.init_header(ext)) };
-        let buf_a = unsafe { ptr.add(off_a).cast::<S::A>() };
-        let buf_b = unsafe { ptr.add(off_b).cast::<S::B>() };
-
-        Ok(RawUring {
-            header,
-            buf_a,
-            buf_b,
-        })
-    }
-
-    pub fn try_build_ext(self, ext: S::Ext) -> Result<(UringA<S>, UringB<S>), LayoutError> {
-        let ru = self.init(ext)?;
-        let ra = UringA(ru.clone());
-        let rb = UringB(ru);
-
-        Ok((ra, rb))
-    }
-
-    pub fn build_ext(self, ext: S::Ext) -> (UringA<S>, UringB<S>) {
-        let ru = self
-            .init(ext)
-            .expect("[Uring]: Initiation of Uring failed.");
-        let ra = UringA(ru.clone());
-        let rb = UringB(ru);
-
-        (ra, rb)
-    }
-
-    pub fn build(self) -> (UringA<S>, UringB<S>)
-    where
-        S::Ext: Default,
-    {
-        let ru = self
-            .init(S::Ext::default())
-            .expect("[Uring]: Initiation of Uring failed.");
-        let ra = UringA(ru.clone());
-        let rb = UringB(ru);
-
-        (ra, rb)
+impl<S: UringSpec> WithRecv for Submitter<S> {
+    type T = S::CQE;
+    fn stream_receiver(&self) -> &StreamReceiver<Self::T> {
+        &self.sqr
     }
 }
 
-impl<S: UringSpec> Default for Builder<S> {
-    fn default() -> Self {
-        Self::new(Self::SIZE_A, Self::SIZE_B)
+impl<S: UringSpec> WithSend for Completer<S> {
+    type T = S::CQE;
+    fn sink_sender(&self) -> &SinkSender<Self::T> {
+        &self.cqs
     }
+}
+
+impl<S: UringSpec> WithRecv for Completer<S> {
+    type T = S::SQE;
+    fn stream_receiver(&self) -> &StreamReceiver<Self::T> {
+        &self.cqr
+    }
+}
+
+pub fn channel<S: UringSpec>(cap: usize) -> Uring<S> {
+    let (cqs, sqr) = crossbeam_channel::bounded(cap);
+    let (sqs, cqr) = crossbeam_channel::bounded(cap);
+    (
+        Completer {
+            cqs: cqs.into(),
+            cqr: cqr.into(),
+        },
+        Submitter {
+            sqs: sqs.into(),
+            sqr: sqr.into(),
+        },
+    )
+}
+
+pub fn default<S: UringSpec>() -> Uring<S> {
+    let cap = 1 << 5;
+    channel(cap)
 }

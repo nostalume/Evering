@@ -9,15 +9,21 @@ use core::pin::Pin;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::task::{Context, LocalWaker, Poll};
 
-use crate::uring::{RawUring, UringA, UringB, UringReceiver, UringSender, UringSpec};
+use crate::uring::{Submitter, Uring, UringSpec, WithRecv, WithSend};
 
-pub struct Op<S: DriverSpec> {
-    id: OpId,
-    driver: Driver<S>,
+struct SpinDriver;
+
+impl DriverSpec for SpinDriver {
+    type Lock = spin::Mutex<()>;
 }
 
-impl<S: DriverSpec> Future for Op<S> {
-    type Output = S::B;
+pub struct Op<S: UringSpec, D: DriverSpec> {
+    id: OpId,
+    driver: Driver<S, D>,
+}
+
+impl<S: UringSpec, D: DriverSpec> Future for Op<S, D> {
+    type Output = S::CQE;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut core = self.driver.lock();
@@ -44,7 +50,7 @@ impl<S: DriverSpec> Future for Op<S> {
     }
 }
 
-impl<S: DriverSpec> Drop for Op<S> {
+impl<S: UringSpec, D: DriverSpec> Drop for Op<S, D> {
     fn drop(&mut self) {
         let core = self.driver.lock();
         if let Some(op_sign) = core.ops.get(self.id.into()) {
@@ -73,14 +79,14 @@ impl<T> OpSign<T> {
             cancelled: AtomicBool::new(false),
         }
     }
-    
+
     fn complete(&mut self, completed: T) {
         match mem::replace(&mut self.state, OpSignState::Completed(completed)) {
             OpSignState::Waiting(waker) => waker.wake(),
             OpSignState::Completed(_) => (),
         }
     }
-    
+
     fn cancel(&self) {
         self.cancelled.store(true, Ordering::Release);
     }
@@ -90,8 +96,7 @@ impl<T> OpSign<T> {
     }
 }
 
-
-pub trait DriverSpec : UringSpec {
+pub trait DriverSpec {
     type Lock: RawMutex;
 }
 
@@ -100,52 +105,51 @@ struct DriverUring<S: UringSpec> {
 }
 
 impl<S: UringSpec> UringSpec for DriverUring<S> {
-    type A = (OpId, S::A);
-    type B = (OpId, S::B);
-    type Ext = S::Ext;
+    type SQE = (OpId, S::SQE);
+    type CQE = (OpId, S::CQE);
 }
-
 
 struct DriverCore<S: UringSpec> {
-    ops: OpSigns<S::B>,
+    ops: OpSigns<S::CQE>,
 }
 
-struct Driver<S: DriverSpec> {
-    inner: Arc<Mutex<S::Lock, DriverCore<DriverUring<S>>>>,
+struct Driver<S: UringSpec, D: DriverSpec> {
+    inner: Arc<Mutex<D::Lock, DriverCore<DriverUring<S>>>>,
 }
 
-impl<S:DriverSpec> Deref for Driver<S> {
-    type Target = Arc<Mutex<S::Lock, DriverCore<DriverUring<S>>>>;
+impl<S: UringSpec, D: DriverSpec> Deref for Driver<S, D> {
+    type Target = Arc<Mutex<D::Lock, DriverCore<DriverUring<S>>>>;
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-impl<S:DriverSpec> Clone for Driver<S> {
+impl<S: UringSpec, D: DriverSpec> Clone for Driver<S, D> {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
-struct Bridge<S: DriverSpec, R: Role> {
-    driver: Driver<S>,
-    sq: UringA<DriverUring<S>>,
+struct Bridge<S: UringSpec, D: DriverSpec, R: Role> {
+    driver: Driver<S, D>,
+    sq: Submitter<DriverUring<S>>,
     _marker: PhantomData<R>,
 }
 
 trait Role {}
 
-struct Submitter;
-impl Role for Submitter {}
-struct Receiver;
-impl Role for Receiver {}
+struct Submit;
+impl Role for Submit {}
+struct Receive;
+impl Role for Receive {}
 
-pub type SubmitterBridge<S> = Bridge<S, Submitter>;
-pub type ReceiverBridge<S> = Bridge<S, Receiver>;
+pub type SubmitterBridge<S, D> = Bridge<S, D, Submit>;
+pub type ReceiverBridge<S, D> = Bridge<S, D, Receive>;
 
-
-impl<S: DriverSpec> Bridge<S, Submitter> {
-    pub fn submit(&mut self, data: <S as UringSpec>::A) -> Op<S> {
+impl<S: UringSpec, D: DriverSpec> Bridge<S, D, Submit> {
+    pub fn submit(&mut self, data: <S as UringSpec>::SQE) -> Op<S, D> {
         let mut core = self.driver.inner.lock();
 
         let id = core.ops.insert(OpSign::init());
@@ -155,16 +159,15 @@ impl<S: DriverSpec> Bridge<S, Submitter> {
         };
 
         let sqe = (id, data);
-        self.sq.send(sqe).ok().unwrap();
+        self.sq.sender().send(sqe).ok().unwrap();
 
         op
     }
 }
 
-impl<S: DriverSpec> Bridge<S, Receiver> {
+impl<S: UringSpec, D: DriverSpec> Bridge<S, D, Receive> {
     pub fn recv_op(&mut self) {
         for (id, payload) in self.sq.recv_bulk() {
-            
             let mut core = self.driver.inner.lock();
             if let Some(op_sign) = core.ops.get_mut(id.into()) {
                 if op_sign.cancelled() {

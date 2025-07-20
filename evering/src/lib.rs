@@ -5,6 +5,7 @@
 extern crate alloc;
 
 pub mod driver;
-mod layout;
 pub mod resource;
 pub mod uring;
+mod uring_array;
+mod uring_depr;

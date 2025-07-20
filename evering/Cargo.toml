@@ -8,6 +8,10 @@ edition.workspace = true
 slab = "0.4.10"
 spin = { version = "0.10.0", features = ["lock_api"] }
 lock_api = "0.4.13"
+crossbeam-utils = "0.8"
+crossbeam-queue = "0.3"
+crossbeam-channel = "0.5"
+futures = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 fastrand.workspace = true
