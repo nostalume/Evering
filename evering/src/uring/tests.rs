@@ -1,32 +1,33 @@
+use super::UringSpec;
 #[cfg(test)]
-use std::sync::atomic::{AtomicBool, AtomicUsize};
-
-use super::*;
-
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct CharUring;
 impl UringSpec for CharUring {
-    type A = char;
-    type B = char;
+    type SQE = char;
+    type CQE = char;
 }
 
 #[test]
-fn queue_inspect() {
+fn uring_inspect() {
+    use super::sync::{WithRecv, WithSend, default_channel};
+
     let mut len_a = 0;
     let mut len_b = 0;
-    let (mut pa, mut pb) = Builder::<CharUring>::default().build();
+    let (pa, pb) = default_channel::<CharUring>();
+
     for _ in 0..32 {
         let ch = fastrand::alphabetic();
         match fastrand::u8(0..4) {
-            0 => len_a += pa.send(ch).map_or(0, |_| 1),
-            1 => len_b += pb.send(ch).map_or(0, |_| 1),
+            0 => len_a += pa.sender().send(ch).map_or(0, |_| 1),
+            1 => len_b += pb.sender().send(ch).map_or(0, |_| 1),
             2 => {
-                if let Some(ch) = pa.recv() {
+                if let Ok(ch) = pa.receiver().try_recv() {
                     dbg!(format!("A recv: {}", ch));
                     len_b -= 1;
                 }
             }
             3 => {
-                if let Some(ch) = pb.recv() {
+                if let Ok(ch) = pb.receiver().try_recv() {
                     dbg!(format!("B recv: {}", ch));
                     len_a -= 1;
                 }
@@ -42,6 +43,7 @@ fn queue_inspect() {
 
 #[test]
 fn uring_drop() {
+    use super::sync::{WithRecv, WithSend, default_channel};
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug)]
@@ -55,33 +57,35 @@ fn uring_drop() {
     struct CounterRing;
 
     impl UringSpec for CounterRing {
-        type A = DropCounter;
-        type B = DropCounter;
+        type SQE = DropCounter;
+        type CQE = DropCounter;
     }
 
     let input = std::iter::repeat_with(fastrand::alphabetic)
         .take(30)
         .collect::<Vec<_>>();
+    let (pa, pb) = default_channel::<CounterRing>();
 
-    let (mut pa, mut pb) = Builder::<CounterRing>::default().build();
     std::thread::scope(|cx| {
         cx.spawn(|| {
             for i in input.iter().copied().map(DropCounter) {
                 if i.0.is_uppercase() {
-                    pa.send(i).unwrap();
+                    _ = pa.sender().try_send(i);
                 } else {
-                    _ = pa.recv();
+                    _ = pa.receiver().try_recv();
                 }
+                std::thread::yield_now();
             }
             drop(pa);
         });
         cx.spawn(|| {
             for i in input.iter().copied().map(DropCounter) {
                 if i.0.is_lowercase() {
-                    pb.send(i).unwrap();
+                    _ = pb.sender().try_send(i);
                 } else {
-                    _ = pb.recv();
+                    _ = pb.receiver().try_recv();
                 }
+                std::thread::yield_now();
             }
             drop(pb);
         });
@@ -92,18 +96,19 @@ fn uring_drop() {
 
 #[test]
 fn uring_threaded() {
+    use super::sync::{WithRecv, WithSend, default_channel};
     let input = std::iter::repeat_with(fastrand::alphabetic)
         .take(30)
         .collect::<Vec<_>>();
 
-    let (mut pa, mut pb) = Builder::<CharUring>::default().build();
+    let (pa, pb) = default_channel::<CharUring>();
     let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
     std::thread::scope(|cx| {
         cx.spawn(|| {
             let mut r = vec![];
             for i in input.iter().copied() {
-                pa.send(i).unwrap();
-                while let Some(i) = pa.recv() {
+                pa.sender().send(i).unwrap();
+                while let Ok(i) = pa.receiver().try_recv() {
                     r.push(i);
                 }
             }
@@ -111,7 +116,7 @@ fn uring_threaded() {
             while !pb_finished.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            while let Some(i) = pa.recv() {
+            while let Ok(i) = pa.receiver().try_recv() {
                 r.push(i);
             }
             assert_eq!(r, input);
@@ -119,8 +124,8 @@ fn uring_threaded() {
         cx.spawn(|| {
             let mut r = vec![];
             for i in input.iter().copied() {
-                pb.send(i).unwrap();
-                while let Some(i) = pb.recv() {
+                pb.sender().send(i).unwrap();
+                while let Ok(i) = pb.receiver().try_recv() {
                     r.push(i);
                 }
             }
@@ -128,43 +133,9 @@ fn uring_threaded() {
             while !pa_finished.load(Ordering::Acquire) {
                 std::thread::yield_now();
             }
-            while let Some(i) = pb.recv() {
+            while let Ok(i) = pb.receiver().try_recv() {
                 r.push(i);
             }
-            assert_eq!(r, input);
-        });
-    });
-}
-
-#[test]
-fn uring_threaded_bulk() {
-    let input = std::iter::repeat_with(fastrand::alphabetic)
-        .take(30)
-        .collect::<Vec<_>>();
-
-    let (mut pa, mut pb) = Builder::<CharUring>::default().build();
-    let (pa_finished, pb_finished) = (AtomicBool::new(false), AtomicBool::new(false));
-    std::thread::scope(|cx| {
-        cx.spawn(|| {
-            let mut r = vec![];
-            pa.send_bulk(input.iter().copied());
-            pa_finished.store(true, Ordering::Release);
-            while !pb_finished.load(Ordering::Acquire) {
-                r.extend(pa.recv_bulk());
-                std::thread::yield_now();
-            }
-            r.extend(pa.recv_bulk());
-            assert_eq!(r, input);
-        });
-        cx.spawn(|| {
-            let mut r = vec![];
-            pb.send_bulk(input.iter().copied());
-            pb_finished.store(true, Ordering::Release);
-            while !pa_finished.load(Ordering::Acquire) {
-                r.extend(pb.recv_bulk());
-                std::thread::yield_now();
-            }
-            r.extend(pb.recv_bulk());
             assert_eq!(r, input);
         });
     });
