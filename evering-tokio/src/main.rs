@@ -1,29 +1,29 @@
-use tokio::task::yield_now;
 use evering::driver::SQEHandle;
+use tokio::task::yield_now;
 
 mod op;
 
-use op::{ADriver, CharUring};
+use op::{MyDriver, MyHandle};
 
-#[tokio::main]
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    let (sb, cb, cq) = evering::driver::new::<CharUring, ADriver>();
+    let (sb, cb, cq) = evering::driver::new::<MyDriver>();
 
     tokio::spawn(async move {
         loop {
             cb.try_complete();
-            CharUring::try_handle_ref(&cq);
+            MyHandle::try_handle_ref(&cq);
             yield_now().await;
         }
     });
 
-    let sb_1 = sb.clone();
     tokio::spawn(async move {
         for i in 0..100 {
             let ch = fastrand::alphabetic();
             println!("[submit]: send {}", ch);
-            let res = sb_1.try_submit(ch).unwrap().await;
+            let res = sb.try_submit(ch).unwrap().await;
             println!("[submit]: recv {}: {}", i, res);
+            yield_now().await;
         }
     });
 

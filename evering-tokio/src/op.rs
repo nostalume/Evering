@@ -1,4 +1,5 @@
-use evering::driver::{Completer, DriverSpec, SQEHandle, WithSink, WithStream, lock::SpinMutex};
+use evering::driver::locked::{LockDriverSpec, Op, SlabDriver};
+use evering::driver::{Completer, Driver, SQEHandle, WithSink, WithStream};
 use evering::uring::UringSpec;
 
 pub struct CharUring;
@@ -7,8 +8,16 @@ impl UringSpec for CharUring {
     type CQE = char;
 }
 
-impl SQEHandle<CharUring> for CharUring {
-    fn try_handle_ref(cq: &Completer<CharUring>) -> Self::HandleOutput {
+pub struct SpinDriver;
+impl LockDriverSpec for SpinDriver {
+    type Lock = evering::driver::locked::lock::StdMutex;
+}
+
+pub type MyDriver = SlabDriver<CharUring, SpinDriver>;
+pub struct MyHandle;
+
+impl SQEHandle<MyDriver> for MyHandle {
+    fn try_handle_ref(cq: &Completer<MyDriver>) -> Self::Output {
         // use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
@@ -21,7 +30,7 @@ impl SQEHandle<CharUring> for CharUring {
         }
     }
 
-    async fn handle(cq: Completer<CharUring>) ->  Self::HandleOutput {
+    async fn handle(cq: Completer<MyDriver>) -> Self::Output {
         use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
@@ -33,11 +42,6 @@ impl SQEHandle<CharUring> for CharUring {
             println!("[handle]: send: {}", res);
         }
     }
-}
-
-pub struct ADriver;
-impl DriverSpec for ADriver {
-    type Lock = SpinMutex;
 }
 
 #[cfg(test)]

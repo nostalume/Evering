@@ -122,6 +122,8 @@ dependencies = [
  "fastrand",
  "futures",
  "lock_api",
+ "orx-concurrent-option",
+ "parking_lot",
  "slab",
  "spin",
 ]
@@ -269,6 +271,12 @@ checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "orx-concurrent-option"
+version = "1.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "842a5c05d6f02368d1cdfebec87ae6e2277ca0cf544ab3778e6f2e6c5c947da3"
 
 [[package]]
 name = "parking"

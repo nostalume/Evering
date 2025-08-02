@@ -4,7 +4,7 @@ members = ["evering", "evering-tokio"]
 
 [workspace.package]
 version = "0.1.0"
-authors = ["Loi Chyan <loichyan@foxmail.com>", "Nostalgia <Nostalume@outlook.com>"]
+authors = ["Nostalgia <Nostalume@outlook.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
 

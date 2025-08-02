@@ -1,9 +1,17 @@
 [package]
 name = "evering"
 license.workspace = true
-authors.workspace = true
+authors = [
+	"Loi Chyan <loichyan@foxmail.com>",
+	"Nostalgia <Nostalume@outlook.com>",
+]
 version.workspace = true
 edition.workspace = true
+
+[features]
+default = ["std"]
+
+std = ["dep:parking_lot"]
 
 [dependencies]
 async-channel = "2.5.0"
@@ -11,7 +19,9 @@ slab = "0.4.10"
 spin = { version = "0.10.0", features = ["lock_api"] }
 lock_api = "0.4.13"
 crossbeam-channel = "0.5"
+orx-concurrent-option = "1.5.0"
 futures = { version = "0.3", default-features = false }
+parking_lot = { version = "0.12", optional = true }
 
 [dev-dependencies]
 fastrand.workspace = true
