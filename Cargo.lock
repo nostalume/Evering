@@ -87,6 +87,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-queue"
+version = "0.3.12"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0f58bbc28f91df819d0aa2a2c00cd19754769c2fad90579b3592b1c9ba7a3115"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-utils"
 version = "0.8.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -122,6 +131,7 @@ dependencies = [
  "fastrand",
  "futures",
  "lock_api",
+ "objectpool",
  "orx-concurrent-option",
  "parking_lot",
  "slab",
@@ -270,6 +280,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "62948e14d923ea95ea2c7c86c71013138b66525b86bdc08d2dcc262bdb497b87"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "objectpool"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4a96bbaa568606ac0159ca3b36c920a34f88607d2847b692ad9366905b84bc2"
+dependencies = [
+ "crossbeam-queue",
 ]
 
 [[package]]

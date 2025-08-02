@@ -15,13 +15,17 @@ std = ["dep:parking_lot"]
 
 [dependencies]
 async-channel = "2.5.0"
-slab = "0.4.10"
-spin = { version = "0.10.0", features = ["lock_api"] }
-lock_api = "0.4.13"
 crossbeam-channel = "0.5"
-orx-concurrent-option = "1.5.0"
-futures = { version = "0.3", default-features = false }
+
+lock_api = "0.4.13"
+spin = { version = "0.10.0", features = ["lock_api"] }
 parking_lot = { version = "0.12", optional = true }
+
+slab = "0.4.10"
+objectpool = { version = "0.1", default-features = false, features = ["alloc"] }
+orx-concurrent-option = "1.5.0"
+
+futures = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 fastrand.workspace = true

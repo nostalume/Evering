@@ -10,16 +10,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::{
-    driver::Driver,
-    driver::op_cache::{OpCache, OpCacheState},
-    uring::UringSpec,
-};
-
-pub trait LockDriverSpec {
-    type Lock: RawMutex;
-    // ...
-}
+use crate::{driver::Driver, driver::op_cache::OpCacheState, uring::UringSpec};
 
 pub mod lock {
     pub type SpinMutex = spin::Mutex<()>;
@@ -28,7 +19,13 @@ pub mod lock {
     pub type StdMutex = parking_lot::RawMutex;
 }
 
+pub trait LockDriverSpec {
+    type Lock: RawMutex;
+    // ...
+}
+
 type OpId = usize;
+type OpCache<T> = OpCacheState<T>;
 type OpSigns<T> = Slab<OpCache<T>>;
 
 #[derive(Debug)]
@@ -63,6 +60,7 @@ impl<T> Deref for SlabDriverCore<T> {
         &self.ops
     }
 }
+
 impl<T> DerefMut for SlabDriverCore<T> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.ops
@@ -72,7 +70,7 @@ impl<T> DerefMut for SlabDriverCore<T> {
 impl<T> Drop for SlabDriverCore<T> {
     fn drop(&mut self) {
         for op_sign in self.drain() {
-            match op_sign.state {
+            match op_sign {
                 OpCacheState::Completed(_) => {}
                 OpCacheState::Waiting(_) => {
                     panic!("[driver]: unhandled waiting op");
@@ -82,11 +80,11 @@ impl<T> Drop for SlabDriverCore<T> {
     }
 }
 
-pub struct SlabDriver<S: UringSpec, D: LockDriverSpec> {
-    inner: Arc<Mutex<D::Lock, SlabDriverCore<S::CQE>>>,
+pub struct SlabDriver<U: UringSpec, D: LockDriverSpec> {
+    inner: Arc<Mutex<D::Lock, SlabDriverCore<U::CQE>>>,
 }
 
-impl<S: UringSpec, D: LockDriverSpec> Default for SlabDriver<S, D> {
+impl<U: UringSpec, D: LockDriverSpec> Default for SlabDriver<U, D> {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SlabDriverCore::default())),
@@ -94,21 +92,21 @@ impl<S: UringSpec, D: LockDriverSpec> Default for SlabDriver<S, D> {
     }
 }
 
-impl<S: UringSpec, D: LockDriverSpec> Clone for SlabDriver<S, D> {
+impl<U: UringSpec, D: LockDriverSpec> Clone for SlabDriver<U, D> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
         Self { inner }
     }
 }
 
-impl<S:UringSpec, D: LockDriverSpec> UringSpec for SlabDriver<S, D> {
-    type SQE = S::SQE;
-    type CQE = S::CQE;
+impl<U: UringSpec, D: LockDriverSpec> UringSpec for SlabDriver<U, D> {
+    type SQE = U::SQE;
+    type CQE = U::CQE;
 }
 
-impl<S: UringSpec, D: LockDriverSpec> Driver for SlabDriver<S, D> {
+impl<U: UringSpec, D: LockDriverSpec> Driver for SlabDriver<U, D> {
     type Id = OpId;
-    type Op = Op<S, D>;
+    type Op = Op<U, D>;
     type Config = usize;
 
     fn new(cap: usize) -> Self {
@@ -130,45 +128,37 @@ impl<S: UringSpec, D: LockDriverSpec> Driver for SlabDriver<S, D> {
     fn complete(&self, id: Self::Id, payload: <Self::Op as Future>::Output) {
         let mut core = self.inner.lock();
         // if the op is dropped, `op_sign` won't exist.
-        if let Some(op_sign) = core.get_mut(id) {
-            op_sign.complete(payload);
+        if let Some(op_cache) = core.get_mut(id) {
+            op_cache.try_complete(payload);
         }
     }
 }
 
-pub struct Op<S: UringSpec, D: LockDriverSpec> {
+pub struct Op<U: UringSpec, D: LockDriverSpec> {
     id: OpId,
-    driver: SlabDriver<S, D>,
+    driver: SlabDriver<U, D>,
 }
 
-impl<S: UringSpec, D: LockDriverSpec> Future for Op<S, D> {
-    type Output = S::CQE;
+impl<U: UringSpec, D: LockDriverSpec> Future for Op<U, D> {
+    type Output = U::CQE;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut core = self.driver.inner.lock();
         let Some(op_sign) = core.ops.get_mut(self.id) else {
             return Poll::Pending;
         };
-
-        match &mut op_sign.state {
-            OpCacheState::Completed(_) => {
-                let OpCacheState::Completed(payload) = mem::take(&mut op_sign.state) else {
-                    unreachable!()
-                };
+        
+        match op_sign.try_poll(cx) {
+            Poll::Ready(payload) => {
                 core.remove(self.id);
                 Poll::Ready(payload)
             }
-            OpCacheState::Waiting(waker) => {
-                if !waker.will_wake(cx.waker()) {
-                    *waker = cx.waker().clone();
-                }
-                Poll::Pending
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
-impl<S: UringSpec, D: LockDriverSpec> Drop for Op<S, D> {
+impl<U: UringSpec, D: LockDriverSpec> Drop for Op<U, D> {
     fn drop(&mut self) {
         let mut core = self.driver.inner.lock();
         core.ops.try_remove(self.id);

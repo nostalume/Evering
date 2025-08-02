@@ -1,9 +1,7 @@
-use core::{mem, task::Waker};
-
-#[derive(Debug, Default)]
-pub struct OpCache<T> {
-    pub state: OpCacheState<T>,
-}
+use core::{
+    mem,
+    task::{Context, Poll, Waker},
+};
 
 #[derive(Debug)]
 pub enum OpCacheState<T> {
@@ -17,17 +15,39 @@ impl<T> Default for OpCacheState<T> {
     }
 }
 
-impl<T> OpCache<T> {
+impl<T> OpCacheState<T> {
     pub fn init() -> Self {
-        OpCache {
-            state: OpCacheState::Waiting(Waker::noop().clone()),
+        OpCacheState::Waiting(Waker::noop().clone())
+    }
+
+    pub fn try_complete(&mut self, completed: T) -> bool {
+        match mem::replace(self, OpCacheState::Completed(completed)) {
+            OpCacheState::Waiting(waker) => {
+                waker.wake();
+                true
+            }
+            OpCacheState::Completed(_) => false,
         }
     }
 
-    pub fn complete(&mut self, completed: T) {
-        match mem::replace(&mut self.state, OpCacheState::Completed(completed)) {
-            OpCacheState::Waiting(waker) => waker.wake(),
-            OpCacheState::Completed(_) => (),
+    pub fn try_poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
+        match self {
+            OpCacheState::Completed(_) => {
+                let OpCacheState::Completed(payload) = mem::take(self) else {
+                    unreachable!()
+                };
+                Poll::Ready(payload)
+            }
+            OpCacheState::Waiting(waker) => {
+                if !waker.will_wake(cx.waker()) {
+                    *waker = cx.waker().clone();
+                }
+                Poll::Pending
+            }
         }
+    }
+
+    pub fn clean(&mut self) {
+        mem::take(self);
     }
 }

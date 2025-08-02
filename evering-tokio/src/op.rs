@@ -1,5 +1,6 @@
-use evering::driver::locked::{LockDriverSpec, Op, SlabDriver};
-use evering::driver::{Completer, Driver, SQEHandle, WithSink, WithStream};
+use evering::driver::locked::{LockDriverSpec, SlabDriver};
+use evering::driver::unlocked::PoolDriver;
+use evering::driver::{Completer, SQEHandle, WithSink, WithStream};
 use evering::uring::UringSpec;
 
 pub struct CharUring;
@@ -8,16 +9,17 @@ impl UringSpec for CharUring {
     type CQE = char;
 }
 
-pub struct SpinDriver;
-impl LockDriverSpec for SpinDriver {
+pub struct Spin;
+impl LockDriverSpec for Spin {
     type Lock = evering::driver::locked::lock::StdMutex;
 }
 
-pub type MyDriver = SlabDriver<CharUring, SpinDriver>;
+pub type MySlabDriver = SlabDriver<CharUring, Spin>;
+pub type MyPoolDriver = PoolDriver<CharUring>;
 pub struct MyHandle;
 
-impl SQEHandle<MyDriver> for MyHandle {
-    fn try_handle_ref(cq: &Completer<MyDriver>) -> Self::Output {
+impl SQEHandle<MySlabDriver> for MyHandle {
+    fn try_handle_ref(cq: &Completer<MySlabDriver>) -> Self::Output {
         // use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
@@ -30,7 +32,35 @@ impl SQEHandle<MyDriver> for MyHandle {
         }
     }
 
-    async fn handle(cq: Completer<MyDriver>) -> Self::Output {
+    async fn handle(cq: Completer<MySlabDriver>) -> Self::Output {
+        use tokio::time::{self, Duration};
+        while let Ok((id, ch)) = cq.receiver().recv().await {
+            println!("[handle]: recv: {}", ch);
+            time::sleep(Duration::from_millis(50)).await;
+            let res = fastrand::alphabetic();
+            if let Err(e) = cq.sender().send((id, res)).await {
+                println!("[handle]: send err: {}", e);
+            }
+            println!("[handle]: send: {}", res);
+        }
+    }
+}
+
+impl SQEHandle<MyPoolDriver> for MyHandle {
+    fn try_handle_ref(cq: &Completer<MyPoolDriver>) -> Self::Output {
+        // use tokio::time::{self, Duration};
+        while let Ok((id, ch)) = cq.receiver().try_recv() {
+            println!("[handle]: recv: {}", ch);
+            // time::sleep(Duration::from_millis(50)).await;
+            let res = fastrand::alphabetic();
+            if let Err(e) = cq.sender().try_send((id, res)) {
+                println!("[handle]: send err: {}", e);
+            }
+            println!("[handle]: send: {}", res);
+        }
+    }
+
+    async fn handle(cq: Completer<MyPoolDriver>) -> Self::Output {
         use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);

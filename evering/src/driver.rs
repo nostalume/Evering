@@ -11,11 +11,11 @@ pub use crate::uring::asynch::{WithSink, WithStream};
 
 pub mod locked;
 mod op_cache;
-mod unlocked;
+pub mod unlocked;
 
 pub trait Driver: UringSpec + Clone + Default {
     type Id;
-    type Config: Default;
+    type Config;
     type Op: Future<Output = Self::CQE>;
     fn register(&self) -> (Self::Id, Self::Op);
     fn complete(&self, id: Self::Id, payload: <Self::Op as Future>::Output);
@@ -113,11 +113,7 @@ pub type CompleteBridge<D> = Bridge<D, Receive>;
 
 type UringBridge<D> = (SubmitBridge<D>, CompleteBridge<D>, Completer<D>);
 
-const URING_CAP: usize = 1 << 5;
-pub fn new_with_cap<D: Driver>(
-    uring_cap: usize,
-    driver_cfg: D::Config,
-) -> UringBridge< D> {
+pub fn new_with<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBridge<D> {
     let (cq, sq) = channel(uring_cap);
     let d = D::new(driver_cfg);
     let sb = Bridge {
@@ -133,9 +129,9 @@ pub fn new_with_cap<D: Driver>(
     (sb, cb, cq)
 }
 
-pub fn new< D: Driver>() -> UringBridge<D> {
+pub fn new<D: Driver>() -> UringBridge<D> {
     let (cq, sq) = default_channel();
-    let d = D::new(D::Config::default());
+    let d = D::default();
     let sb = Bridge {
         driver: d.clone(),
         sq: sq.clone(),
