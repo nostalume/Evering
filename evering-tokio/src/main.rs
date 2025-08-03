@@ -15,12 +15,19 @@ async fn main() {
     for _ in 0..5 {
         let cq = cq.clone();
         let cb = cb.clone();
+        // tokio::spawn(async move {
+        //     loop {
+        //         cb.try_complete();
+        //         MyHandle::try_handle_ref(&cq);
+        //         yield_now().await;
+        //     }
+        // });
+        tokio::spawn(async move  {
+            cb.complete().await
+        });
+
         tokio::spawn(async move {
-            loop {
-                cb.try_complete();
-                MyHandle::try_handle_ref(&cq);
-                yield_now().await;
-            }
+            MyHandle::handle(cq).await
         });
     }
 

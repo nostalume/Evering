@@ -8,11 +8,11 @@ use objectpool::{Pool, ReusableObject};
 use spin::Mutex;
 
 use crate::{
-    driver::{Driver, op_cache::OpCacheState},
+    driver::{Driver, op_cache::unlocked::CacheState},
     uring::UringSpec,
 };
 
-type OpCache<T> = Mutex<OpCacheState<T>>;
+type OpCache<T> = CacheState<T>;
 type OpId<T> = Arc<ReusableObject<OpCache<T>>>;
 type OpPool<T> = Pool<OpCache<T>>;
 
@@ -35,8 +35,8 @@ where
     fn default() -> Self {
         Self {
             pool: Pool::unbounded(Default::default, |op_cache: &mut OpCache<U::CQE>| {
-                let mut inner = op_cache.lock();
-                inner.clean()
+                // let mut inner = op_cache.lock();
+                op_cache.clean()
             }),
         }
     }
@@ -57,8 +57,8 @@ where
     fn new(cap: usize) -> Self {
         Self {
             pool: Pool::bounded(cap, Default::default, |op_cache: &mut OpCache<U::CQE>| {
-                let mut inner = op_cache.lock();
-                inner.clean()
+                // let mut inner = op_cache.lock();
+                op_cache.clean()
             }),
         }
     }
@@ -70,8 +70,7 @@ where
     }
 
     fn complete(&self, id: Self::Id, payload: <Self::Op as Future>::Output) {
-        let mut inner = id.lock();
-        inner.try_complete(payload);
+        id.try_complete(payload);
     }
 }
 
@@ -83,7 +82,6 @@ impl<U: UringSpec> Future for Op<U> {
     type Output = U::CQE;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let mut inner = self.id.lock();
-        inner.try_poll(cx)
+        self.id.try_poll(cx)
     }
 }

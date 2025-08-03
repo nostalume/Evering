@@ -10,7 +10,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::{driver::Driver, driver::op_cache::OpCacheState, uring::UringSpec};
+use crate::{driver::Driver, driver::op_cache::locked::Cachestate, uring::UringSpec};
 
 pub mod lock {
     pub type SpinMutex = spin::Mutex<()>;
@@ -25,7 +25,7 @@ pub trait LockDriverSpec {
 }
 
 type OpId = usize;
-type OpCache<T> = OpCacheState<T>;
+type OpCache<T> = Cachestate<T>;
 type OpSigns<T> = Slab<OpCache<T>>;
 
 #[derive(Debug)]
@@ -71,8 +71,8 @@ impl<T> Drop for SlabDriverCore<T> {
     fn drop(&mut self) {
         for op_sign in self.drain() {
             match op_sign {
-                OpCacheState::Completed(_) => {}
-                OpCacheState::Waiting(_) => {
+                Cachestate::Completed(_) => {}
+                Cachestate::Waiting(_) => {
                     panic!("[driver]: unhandled waiting op");
                 }
             }
@@ -147,7 +147,7 @@ impl<U: UringSpec, D: LockDriverSpec> Future for Op<U, D> {
         let Some(op_sign) = core.ops.get_mut(self.id) else {
             return Poll::Pending;
         };
-        
+
         match op_sign.try_poll(cx) {
             Poll::Ready(payload) => {
                 core.remove(self.id);

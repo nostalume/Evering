@@ -36,7 +36,7 @@ impl SQEHandle<MySlabDriver> for MyHandle {
         use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
-            time::sleep(Duration::from_millis(50)).await;
+            // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
             if let Err(e) = cq.sender().send((id, res)).await {
                 println!("[handle]: send err: {}", e);
@@ -64,7 +64,7 @@ impl SQEHandle<MyPoolDriver> for MyHandle {
         use tokio::time::{self, Duration};
         while let Ok((id, ch)) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
-            time::sleep(Duration::from_millis(50)).await;
+            // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
             if let Err(e) = cq.sender().send((id, res)).await {
                 println!("[handle]: send err: {}", e);
