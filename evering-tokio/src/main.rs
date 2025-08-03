@@ -22,13 +22,9 @@ async fn main() {
         //         yield_now().await;
         //     }
         // });
-        tokio::spawn(async move  {
-            cb.complete().await
-        });
+        tokio::spawn(async move { cb.complete().await });
 
-        tokio::spawn(async move {
-            MyHandle::handle(cq).await
-        });
+        tokio::spawn(async move { MyHandle::handle(cq).await });
     }
 
     for th in 0..5 {

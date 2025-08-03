@@ -6,4 +6,3 @@ pub trait UringSpec {
     type SQE;
     type CQE;
 }
-

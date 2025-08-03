@@ -5,41 +5,41 @@ pub mod locked {
     };
 
     #[derive(Debug)]
-    pub enum Cachestate<T> {
+    pub enum CacheState<T> {
         Waiting(Waker),
         Completed(T),
     }
 
-    impl<T> Default for Cachestate<T> {
+    impl<T> Default for CacheState<T> {
         fn default() -> Self {
             Self::init()
         }
     }
 
-    impl<T> Cachestate<T> {
+    impl<T> CacheState<T> {
         pub fn init() -> Self {
-            Cachestate::Waiting(Waker::noop().clone())
+            CacheState::Waiting(Waker::noop().clone())
         }
 
         pub fn try_complete(&mut self, completed: T) -> bool {
-            match mem::replace(self, Cachestate::Completed(completed)) {
-                Cachestate::Waiting(waker) => {
+            match mem::replace(self, CacheState::Completed(completed)) {
+                CacheState::Waiting(waker) => {
                     waker.wake();
                     true
                 }
-                Cachestate::Completed(_) => false,
+                CacheState::Completed(_) => false,
             }
         }
 
         pub fn try_poll(&mut self, cx: &mut Context<'_>) -> Poll<T> {
             match self {
-                Cachestate::Completed(_) => {
-                    let Cachestate::Completed(payload) = mem::take(self) else {
+                CacheState::Completed(_) => {
+                    let CacheState::Completed(payload) = mem::take(self) else {
                         unreachable!()
                     };
                     Poll::Ready(payload)
                 }
-                Cachestate::Waiting(waker) => {
+                CacheState::Waiting(waker) => {
                     if !waker.will_wake(cx.waker()) {
                         *waker = cx.waker().clone();
                     }
@@ -123,12 +123,12 @@ pub mod unlocked {
                 match self.state.load(core::sync::atomic::Ordering::Acquire) {
                     INIT => {
                         unsafe { (*self.waker.get()).write(cx.waker().clone()) };
-                        if let Ok(_) = self.state.compare_exchange(
+                        if self.state.compare_exchange(
                             INIT,
                             WAITING,
                             core::sync::atomic::Ordering::AcqRel,
                             core::sync::atomic::Ordering::Acquire,
-                        ) {
+                        ).is_ok() {
                             return Poll::Pending;
                         }
                     }
@@ -137,12 +137,12 @@ pub mod unlocked {
                         if !waker.will_wake(cx.waker()) {
                             unsafe { (*self.waker.get()).write(cx.waker().clone()) };
                         }
-                        if let Ok(_) = self.state.compare_exchange(
+                        if self.state.compare_exchange(
                             WAITING,
                             WAITING,
                             core::sync::atomic::Ordering::AcqRel,
                             core::sync::atomic::Ordering::Acquire,
-                        ) {
+                        ).is_ok() {
                             return Poll::Pending;
                         }
                     }

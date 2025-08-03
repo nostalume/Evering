@@ -5,7 +5,6 @@ use core::{
 
 use alloc::sync::Arc;
 use objectpool::{Pool, ReusableObject};
-use spin::Mutex;
 
 use crate::{
     driver::{Driver, op_cache::unlocked::CacheState},

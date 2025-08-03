@@ -21,11 +21,11 @@ pub struct MyHandle;
 impl SQEHandle<MySlabDriver> for MyHandle {
     fn try_handle_ref(cq: &Completer<MySlabDriver>) -> Self::Output {
         // use tokio::time::{self, Duration};
-        while let Ok((id, ch)) = cq.receiver().try_recv() {
+        while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().try_send((id, res)) {
+            if let Err(e) = cq.sender().try_send(ch.store(res)) {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
@@ -33,12 +33,11 @@ impl SQEHandle<MySlabDriver> for MyHandle {
     }
 
     async fn handle(cq: Completer<MySlabDriver>) -> Self::Output {
-        use tokio::time::{self, Duration};
-        while let Ok((id, ch)) = cq.receiver().recv().await {
+        while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().send((id, res)).await {
+            if let Err(e) = cq.sender().send(ch.store(res)).await {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
@@ -49,11 +48,11 @@ impl SQEHandle<MySlabDriver> for MyHandle {
 impl SQEHandle<MyPoolDriver> for MyHandle {
     fn try_handle_ref(cq: &Completer<MyPoolDriver>) -> Self::Output {
         // use tokio::time::{self, Duration};
-        while let Ok((id, ch)) = cq.receiver().try_recv() {
+        while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().try_send((id, res)) {
+            if let Err(e) = cq.sender().try_send(ch.store(res)) {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
@@ -61,12 +60,11 @@ impl SQEHandle<MyPoolDriver> for MyHandle {
     }
 
     async fn handle(cq: Completer<MyPoolDriver>) -> Self::Output {
-        use tokio::time::{self, Duration};
-        while let Ok((id, ch)) = cq.receiver().recv().await {
+        while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().send((id, res)).await {
+            if let Err(e) = cq.sender().send(ch.store(res)).await {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);

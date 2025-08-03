@@ -9,6 +9,7 @@ use crate::uring::asynch::{
 
 pub use crate::uring::asynch::{WithSink, WithStream};
 
+mod cell;
 pub mod locked;
 mod op_cache;
 pub mod unlocked;
@@ -30,8 +31,8 @@ pub struct DriverUring<D: Driver> {
 }
 
 impl<D: Driver> UringSpec for DriverUring<D> {
-    type SQE = (D::Id, D::SQE);
-    type CQE = (D::Id, D::CQE);
+    type SQE = cell::IdCell<D::Id, D::SQE>;
+    type CQE = cell::IdCell<D::Id, D::CQE>;
 }
 /// The dispatched methods to handle submitted requests.
 ///
@@ -154,7 +155,8 @@ impl<D: Driver> Bridge<D, Submit> {
         data: D::SQE,
     ) -> Result<D::Op, SendError<<DriverUring<D> as UringSpec>::SQE>> {
         let (id, op) = self.driver.register();
-        self.sq.sender().send((id, data)).await?;
+        let req = cell::IdCell::new(id, data);
+        self.sq.sender().send(req).await?;
 
         Ok(op)
     }
@@ -167,7 +169,8 @@ impl<D: Driver> Bridge<D, Submit> {
         data: D::SQE,
     ) -> Result<D::Op, TrySendError<<DriverUring<D> as UringSpec>::SQE>> {
         let (id, op) = self.driver.register();
-        self.sq.sender().try_send((id, data))?;
+        let req = cell::IdCell::new(id, data);
+        self.sq.sender().try_send(req)?;
 
         Ok(op)
     }
@@ -178,7 +181,8 @@ impl<D: Driver> Bridge<D, Receive> {
     ///
     /// If the channel is empty or closed, it will block in pending.
     pub async fn complete(&self) {
-        while let Ok((id, payload)) = self.sq.receiver().recv().await {
+        while let Ok(data) = self.sq.receiver().recv().await {
+            let (id, payload) = data.into_inner();
             self.driver.complete(id, payload);
         }
     }
@@ -187,7 +191,8 @@ impl<D: Driver> Bridge<D, Receive> {
     ///
     /// If the channel is empty or closed, it will return immediately.
     pub fn try_complete(&self) {
-        while let Ok((id, payload)) = self.sq.receiver().try_recv() {
+        while let Ok(data) = self.sq.receiver().try_recv() {
+            let (id, payload) = data.into_inner();
             self.driver.complete(id, payload);
         }
     }

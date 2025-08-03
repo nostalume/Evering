@@ -4,13 +4,12 @@ use lock_api::RawMutex;
 use slab::Slab;
 
 use core::{
-    mem,
     ops::{Deref, DerefMut},
     pin::Pin,
     task::{Context, Poll},
 };
 
-use crate::{driver::Driver, driver::op_cache::locked::Cachestate, uring::UringSpec};
+use crate::{driver::Driver, driver::op_cache::locked::CacheState, uring::UringSpec};
 
 pub mod lock {
     pub type SpinMutex = spin::Mutex<()>;
@@ -25,36 +24,35 @@ pub trait LockDriverSpec {
 }
 
 type OpId = usize;
-type OpCache<T> = Cachestate<T>;
-type OpSigns<T> = Slab<OpCache<T>>;
+type OpCaches<T> = Slab<CacheState<T>>;
 
 #[derive(Debug)]
 struct SlabDriverCore<T> {
-    ops: OpSigns<T>,
+    ops: OpCaches<T>,
 }
 
 impl<T> SlabDriverCore<T> {
     pub fn new_with_cap(cap: usize) -> Self {
         SlabDriverCore {
-            ops: OpSigns::with_capacity(cap),
+            ops: OpCaches::with_capacity(cap),
         }
     }
 
     pub fn insert(&mut self) -> OpId {
-        self.ops.insert(OpCache::init())
+        self.ops.insert(CacheState::init())
     }
 }
 
 impl<T> Default for SlabDriverCore<T> {
     fn default() -> Self {
         SlabDriverCore {
-            ops: OpSigns::new(),
+            ops: OpCaches::new(),
         }
     }
 }
 
 impl<T> Deref for SlabDriverCore<T> {
-    type Target = OpSigns<T>;
+    type Target = OpCaches<T>;
 
     fn deref(&self) -> &Self::Target {
         &self.ops
@@ -71,8 +69,8 @@ impl<T> Drop for SlabDriverCore<T> {
     fn drop(&mut self) {
         for op_sign in self.drain() {
             match op_sign {
-                Cachestate::Completed(_) => {}
-                Cachestate::Waiting(_) => {
+                CacheState::Completed(_) => {}
+                CacheState::Waiting(_) => {
                     panic!("[driver]: unhandled waiting op");
                 }
             }
