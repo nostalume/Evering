@@ -9,7 +9,7 @@ impl UringSpec for CharUring {
 
 #[test]
 fn uring_inspect() {
-    use super::sync::{WithRecv, WithSend, default_channel};
+    use super::sync::default_channel;
 
     let mut len_a = 0;
     let mut len_b = 0;
@@ -43,7 +43,7 @@ fn uring_inspect() {
 
 #[test]
 fn uring_drop() {
-    use super::sync::{WithRecv, WithSend, default_channel};
+    use super::sync::default_channel;
     static DROP_COUNT: AtomicUsize = AtomicUsize::new(0);
 
     #[derive(Debug)]
@@ -96,7 +96,7 @@ fn uring_drop() {
 
 #[test]
 fn uring_threaded() {
-    use super::sync::{WithRecv, WithSend, default_channel};
+    use super::sync::default_channel;
     let input = std::iter::repeat_with(fastrand::alphabetic)
         .take(30)
         .collect::<Vec<_>>();

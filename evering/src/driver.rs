@@ -7,8 +7,6 @@ use crate::uring::asynch::{
     Completer as UringCompleter, Submitter as UringSubbmiter, channel, default_channel,
 };
 
-pub use crate::uring::asynch::{WithSink, WithStream};
-
 mod cell;
 pub mod locked;
 mod op_cache;
@@ -41,47 +39,27 @@ impl<D: Driver> UringSpec for DriverUring<D> {
 ///     - server
 ///     - ...
 pub trait SQEHandle<D: Driver> {
-    /// The output type for all handle methods. Defaults to `()`.
-    type Output = ();
-
     // --- Blocking Handlers ---
 
-    /// Dispatches and handles a submitted request in non-blocking.
-    ///
-    /// This method is called by the completer to process a submitted request synchronously.
-    ///
-    /// Users **must** implement this for their specific driver.
-    fn try_handle(cq: Completer<D>) -> Self::Output {
+    /// Dispatches and handles requests synchronously in non-blocking.
+    fn try_handle(cq: Completer<D>) {
         unimplemented!()
     }
 
-    /// Dispatches and handles a submitted request in non-blocking,
-    /// taking a reference to the completer.
-    ///
-    /// This method allows synchronous processing of a submitted request
-    /// without consuming the completer.
-    /// Users **must** implement this for their specific driver.
-    fn try_handle_ref(cq: &Completer<D>) -> Self::Output {
+    /// Dispatches and handles requests synchronously in non-blocking.
+    fn try_handle_ref(cq: &Completer<D>) {
         unimplemented!()
     }
 
     // --- Non-Blocking (Async) Handlers ---
 
-    /// Dispatches and handles a submitted request in blocking pending.
-    ///
-    /// This method is called by the completer to process a submitted request asynchronously.
-    /// Users **must** implement this for their specific driver.
-    fn handle(cq: Completer<D>) -> impl Future<Output = Self::Output> {
+    /// Dispatches and handles requests asychronously in blocking pending
+    fn handle(cq: Completer<D>) -> impl Future<Output = ()> {
         async { unimplemented!() }
     }
 
-    /// Dispatches and handles a submitted request in blocking pending,
-    /// taking a reference to the completer.
-    ///
-    /// This method allows asynchronous processing of a submitted request
-    /// without consuming the completer.
-    /// Users **must** implement this for their specific driver.
-    fn handle_ref(cq: &Completer<D>) -> impl Future<Output = Self::Output> {
+    /// Dispatches and handles requests asychronously in blocking pending
+    fn handle_ref(cq: &Completer<D>) -> impl Future<Output = ()> {
         async { unimplemented!() }
     }
 }

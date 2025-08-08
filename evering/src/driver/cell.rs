@@ -1,7 +1,6 @@
 use alloc::fmt::Debug;
 use core::{
     fmt::Display,
-    mem,
     ops::{Deref, DerefMut},
 };
 
@@ -19,14 +18,15 @@ impl<Id, T> IdCell<Id, T> {
         (self.id, self.data)
     }
 
-    pub fn store(self, data: T) -> Self {
-        let mut s = self;
-        let _ = mem::replace(&mut s.data, data);
-        s
-    }
+    pub fn store<U>(self, data: U) -> (IdCell<Id,U>, T) {
+        let IdCell { id, data: old} = self;
 
-    pub fn replace(&mut self, data: T) -> T {
-        mem::replace(&mut self.data, data)
+        (IdCell::new(id, data), old)
+    }
+    
+    pub fn replace<U>(self, data:U) -> IdCell<Id,U> {
+        let (res, _) = self.store(data);
+        res
     }
 
     pub fn update(&mut self, f: impl FnOnce(&mut T)) {
@@ -34,8 +34,6 @@ impl<Id, T> IdCell<Id, T> {
     }
 
     pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IdCell<Id, U>
-    where
-        U: Unpin,
     {
         IdCell {
             id: self.id,

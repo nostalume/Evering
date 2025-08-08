@@ -1,15 +1,6 @@
 use crossbeam_channel::{Receiver, Sender};
 
-use crate::uring::UringSpec;
-
-pub trait WithSend {
-    type T;
-    fn sender(&self) -> &Sender<Self::T>;
-}
-pub trait WithRecv {
-    type T;
-    fn receiver(&self) -> &Receiver<Self::T>;
-}
+use crate::uring::{UringSpec, with_recv, with_send};
 
 pub type Uring<S> = (Completer<S>, Submitter<S>);
 
@@ -42,33 +33,10 @@ impl<S: UringSpec> Clone for Completer<S> {
     }
 }
 
-impl<S: UringSpec> WithSend for Submitter<S> {
-    type T = S::SQE;
-    fn sender(&self) -> &Sender<Self::T> {
-        &self.sqs
-    }
-}
-
-impl<S: UringSpec> WithRecv for Submitter<S> {
-    type T = S::CQE;
-    fn receiver(&self) -> &Receiver<Self::T> {
-        &self.sqr
-    }
-}
-
-impl<S: UringSpec> WithSend for Completer<S> {
-    type T = S::CQE;
-    fn sender(&self) -> &Sender<Self::T> {
-        &self.cqs
-    }
-}
-
-impl<S: UringSpec> WithRecv for Completer<S> {
-    type T = S::SQE;
-    fn receiver(&self) -> &Receiver<Self::T> {
-        &self.cqr
-    }
-}
+with_send!(Submitter, sqs, Sender, SQE);
+with_recv!(Submitter, sqr, Receiver, CQE);
+with_send!(Completer, cqs, Sender, CQE);
+with_recv!(Completer, cqr, Receiver, SQE);
 
 pub fn channel<S: UringSpec>(cap: usize) -> Uring<S> {
     let (cqs, sqr) = crossbeam_channel::bounded(cap);

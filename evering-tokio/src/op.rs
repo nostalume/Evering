@@ -1,6 +1,6 @@
 use evering::driver::locked::{LockDriverSpec, SlabDriver};
 use evering::driver::unlocked::PoolDriver;
-use evering::driver::{Completer, SQEHandle, WithSink, WithStream};
+use evering::driver::{Completer, SQEHandle};
 use evering::uring::UringSpec;
 
 pub struct CharUring;
@@ -19,25 +19,25 @@ pub type MyPoolDriver = PoolDriver<CharUring>;
 pub struct MyHandle;
 
 impl SQEHandle<MySlabDriver> for MyHandle {
-    fn try_handle_ref(cq: &Completer<MySlabDriver>) -> Self::Output {
+    fn try_handle_ref(cq: &Completer<MySlabDriver>) {
         // use tokio::time::{self, Duration};
         while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().try_send(ch.store(res)) {
+            if let Err(e) = cq.sender().try_send(ch.replace(res)) {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
         }
     }
 
-    async fn handle(cq: Completer<MySlabDriver>) -> Self::Output {
+    async fn handle(cq: Completer<MySlabDriver>) {
         while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().send(ch.store(res)).await {
+            if let Err(e) = cq.sender().send(ch.replace(res)).await {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
@@ -46,25 +46,25 @@ impl SQEHandle<MySlabDriver> for MyHandle {
 }
 
 impl SQEHandle<MyPoolDriver> for MyHandle {
-    fn try_handle_ref(cq: &Completer<MyPoolDriver>) -> Self::Output {
+    fn try_handle_ref(cq: &Completer<MyPoolDriver>) {
         // use tokio::time::{self, Duration};
         while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().try_send(ch.store(res)) {
+            if let Err(e) = cq.sender().try_send(ch.replace(res)) {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
         }
     }
 
-    async fn handle(cq: Completer<MyPoolDriver>) -> Self::Output {
+    async fn handle(cq: Completer<MyPoolDriver>) {
         while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
             let res = fastrand::alphabetic();
-            if let Err(e) = cq.sender().send(ch.store(res)).await {
+            if let Err(e) = cq.sender().send(ch.replace(res)).await {
                 println!("[handle]: send err: {}", e);
             }
             println!("[handle]: send: {}", res);
@@ -74,7 +74,7 @@ impl SQEHandle<MyPoolDriver> for MyHandle {
 
 #[cfg(test)]
 mod tests {
-    use evering::uring::asynch::{WithSink, WithStream, default_channel};
+    use evering::uring::asynch::default_channel;
     use tokio::task::yield_now;
 
     use crate::op::CharUring;
