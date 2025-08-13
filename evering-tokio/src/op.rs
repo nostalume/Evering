@@ -1,6 +1,8 @@
+use std::marker::PhantomData;
+
 use evering::driver::locked::{LockDriverSpec, SlabDriver};
 use evering::driver::unlocked::PoolDriver;
-use evering::driver::{Completer, SQEHandle};
+use evering::driver::{Completer, Driver};
 use evering::uring::UringSpec;
 
 pub struct CharUring;
@@ -16,10 +18,10 @@ impl LockDriverSpec for Spin {
 
 pub type MySlabDriver = SlabDriver<CharUring, Spin>;
 pub type MyPoolDriver = PoolDriver<CharUring>;
-pub struct MyHandle;
+pub struct MyHandle<D: Driver>(PhantomData<D>);
 
-impl SQEHandle<MySlabDriver> for MyHandle {
-    fn try_handle_ref(cq: &Completer<MySlabDriver>) {
+impl MyHandle<MySlabDriver> {
+    pub fn try_handle_ref(cq: &Completer<MySlabDriver>) {
         // use tokio::time::{self, Duration};
         while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
@@ -32,7 +34,7 @@ impl SQEHandle<MySlabDriver> for MyHandle {
         }
     }
 
-    async fn handle(cq: Completer<MySlabDriver>) {
+    pub async fn handle(cq: Completer<MySlabDriver>) {
         while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;
@@ -45,8 +47,8 @@ impl SQEHandle<MySlabDriver> for MyHandle {
     }
 }
 
-impl SQEHandle<MyPoolDriver> for MyHandle {
-    fn try_handle_ref(cq: &Completer<MyPoolDriver>) {
+impl MyHandle<MyPoolDriver> {
+    pub fn try_handle_ref(cq: &Completer<MyPoolDriver>) {
         // use tokio::time::{self, Duration};
         while let Ok(ch) = cq.receiver().try_recv() {
             println!("[handle]: recv: {}", ch);
@@ -59,7 +61,7 @@ impl SQEHandle<MyPoolDriver> for MyHandle {
         }
     }
 
-    async fn handle(cq: Completer<MyPoolDriver>) {
+    pub async fn handle(cq: Completer<MyPoolDriver>) {
         while let Ok(ch) = cq.receiver().recv().await {
             println!("[handle]: recv: {}", ch);
             // time::sleep(Duration::from_millis(50)).await;

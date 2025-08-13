@@ -1,0 +1,17 @@
+[package]
+name = "evering-shm"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[features]
+default = []
+
+std = []
+
+[dependencies]
+spin = { version = "0.10.0", features = ["lock_api"] }
+blink-alloc = { version = "0.3.1", features = ["nightly", "sync"] }
+good_memory_allocator = { version = "0.1.7", features = ["allocator"] }
+rlsf = "0.2.1"

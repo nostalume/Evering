@@ -32,37 +32,6 @@ impl<D: Driver> UringSpec for DriverUring<D> {
     type SQE = cell::IdCell<D::Id, D::SQE>;
     type CQE = cell::IdCell<D::Id, D::CQE>;
 }
-/// The dispatched methods to handle submitted requests.
-///
-/// General case:
-///     - kernel
-///     - server
-///     - ...
-pub trait SQEHandle<D: Driver> {
-    // --- Blocking Handlers ---
-
-    /// Dispatches and handles requests synchronously in non-blocking.
-    fn try_handle(cq: Completer<D>) {
-        unimplemented!()
-    }
-
-    /// Dispatches and handles requests synchronously in non-blocking.
-    fn try_handle_ref(cq: &Completer<D>) {
-        unimplemented!()
-    }
-
-    // --- Non-Blocking (Async) Handlers ---
-
-    /// Dispatches and handles requests asychronously in blocking pending
-    fn handle(cq: Completer<D>) -> impl Future<Output = ()> {
-        async { unimplemented!() }
-    }
-
-    /// Dispatches and handles requests asychronously in blocking pending
-    fn handle_ref(cq: &Completer<D>) -> impl Future<Output = ()> {
-        async { unimplemented!() }
-    }
-}
 
 pub struct Bridge<D: Driver, R: Role> {
     driver: D,

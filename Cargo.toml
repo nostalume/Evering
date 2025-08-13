@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["evering", "evering-tokio"]
+members = ["evering", "evering-shm", "evering-tokio"]
 
 [workspace.package]
 version = "0.1.0"

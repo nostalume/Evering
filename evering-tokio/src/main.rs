@@ -1,4 +1,3 @@
-use evering::driver::SQEHandle;
 use tokio::task::yield_now;
 
 mod op;
@@ -23,8 +22,7 @@ async fn main() {
         //     }
         // });
         tokio::spawn(async move { cb.complete().await });
-
-        tokio::spawn(async move { MyHandle::handle(cq).await });
+        tokio::spawn(async move { MyHandle::<MyPoolDriver>::handle(cq).await });
     }
 
     for th in 0..5 {
