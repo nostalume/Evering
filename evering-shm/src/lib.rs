@@ -5,7 +5,5 @@
 extern crate alloc;
 
 pub mod shm_alloc;
-mod align;
 pub mod shm_box;
-
-
+mod tests;

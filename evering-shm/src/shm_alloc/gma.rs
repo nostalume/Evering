@@ -3,23 +3,19 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
-use crate::align::align_up;
-use crate::shm_alloc::ShmAllocator;
 use crate::shm_alloc::ShmInit;
 
-pub struct ShmGma(GmaSpinAllocator, usize);
+pub struct SpinGma(GmaSpinAllocator);
 
-impl ShmGma {
+impl SpinGma {
     pub unsafe fn raw_new(start: usize, size: usize) -> Self {
-        let aligned_heap_start_addr = align_up(start, Self::MIN_ALIGNMENT);
-
         let alloc = GmaSpinAllocator::empty();
         unsafe { alloc.init(start, size) };
-        Self(alloc, aligned_heap_start_addr)
+        Self(alloc)
     }
 }
 
-unsafe impl Allocator for ShmGma {
+unsafe impl Allocator for SpinGma {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, alloc::alloc::AllocError> {
         self.0.allocate(layout)
     }
@@ -53,13 +49,7 @@ unsafe impl Allocator for ShmGma {
     }
 }
 
-unsafe impl ShmAllocator for ShmGma {
-    fn start_ptr(&self) -> *const u8 {
-        self.1 as *const u8
-    }
-}
-
-unsafe impl ShmInit for ShmGma {
+unsafe impl ShmInit for SpinGma {
     unsafe fn init_addr(start: usize, size: usize) -> Self {
         unsafe { Self::raw_new(start, size) }
     }

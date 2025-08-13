@@ -5,28 +5,23 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
-use crate::align::align_up;
-use crate::shm_alloc::gma::ShmGma;
-use crate::shm_alloc::ShmAllocator;
 use crate::shm_alloc::ShmInit;
 
-type GmaBlink = SyncBlinkAlloc<GmaSpinAllocator>;
+type GmaBlinkIn = SyncBlinkAlloc<GmaSpinAllocator>;
 
-pub struct ShmGmaBlink(GmaBlink, usize, usize);
+pub struct BlinkGma(GmaBlinkIn);
 
-impl ShmGmaBlink {
+impl BlinkGma {
     pub unsafe fn raw_new(start: usize, size: usize) -> Self {
-        let aligned_start = align_up(start, ShmGma::MIN_ALIGNMENT);
         let gma = GmaSpinAllocator::empty();
-        unsafe { gma.init(aligned_start, size) };
+        unsafe { gma.init(start, size) };
 
         let blink = SyncBlinkAlloc::new_in(gma);
-        
-        Self(blink, aligned_start, size)
+        Self(blink)
     }
 }
 
-unsafe impl Allocator for ShmGmaBlink {
+unsafe impl Allocator for BlinkGma {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.0.allocate(layout)
     }
@@ -68,14 +63,8 @@ unsafe impl Allocator for ShmGmaBlink {
     }
 }
 
-unsafe impl ShmAllocator for ShmGmaBlink {
-    fn start_ptr(&self) -> *const u8 {
-        self.1 as *const u8
-    }
-}
-
-unsafe impl ShmInit for ShmGmaBlink {
+unsafe impl ShmInit for BlinkGma {
     unsafe fn init_addr(start: usize, size: usize) -> Self {
-        unsafe { ShmGmaBlink::raw_new(start, size) }
+        unsafe { BlinkGma::raw_new(start, size) }
     }
 }
