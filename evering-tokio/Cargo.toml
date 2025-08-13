@@ -7,5 +7,5 @@ edition.workspace = true
 
 [dependencies]
 evering = { path = "../evering", features = ["std"] }
-tokio = { version = "1.47.0", features = ["full"] }
+tokio = { version = "1.47.1", features = ["full"] }
 fastrand.workspace = true

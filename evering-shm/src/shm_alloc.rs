@@ -1,8 +1,11 @@
 use core::ops::Deref;
 use core::ptr::NonNull;
 
-use alloc::alloc::AllocError;
-use alloc::alloc::Allocator;
+#[cfg(feature = "nightly")]
+use alloc::alloc::{AllocError, Allocator};
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::alloc::{AllocError, Allocator};
+
 use memory_addr::MemoryAddr;
 use memory_set::MappingBackend;
 use memory_set::MemoryArea;
@@ -32,7 +35,7 @@ impl<A: ShmInit, B: MappingBackend> ShmAlloc<A, B> {
     pub fn from_map(start: B::Addr, size: usize, flags: B::Flags, bk: B) -> Self {
         let align_start = start.align_up(A::MIN_ALIGNMENT);
         let end = align_start.add(size);
-        let align_end =  end.align_down(A::MIN_ALIGNMENT);
+        let align_end = end.align_down(A::MIN_ALIGNMENT);
         let align_size = align_end.sub_addr(align_start);
 
         let area = MemoryArea::new(align_start, align_size, flags, bk);
@@ -154,7 +157,7 @@ pub unsafe trait ShmAllocator: Allocator {
     fn start_ptr(&self) -> *const u8;
 
     /// Returns the start pointer of the main memory of the allocator.
-    /// 
+    ///
     /// ## Safety
     /// The `ptr` should be correctly modified.
     #[inline]

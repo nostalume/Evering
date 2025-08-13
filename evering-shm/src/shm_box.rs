@@ -4,8 +4,10 @@ use core::ops::Deref;
 use core::ops::DerefMut;
 use core::pin::Pin;
 
-use alloc::alloc::AllocError;
-use alloc::boxed::Box;
+#[cfg(feature = "nightly")]
+use alloc::{alloc::AllocError, boxed::Box};
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::{alloc::AllocError, boxed::Box};
 
 use crate::shm_alloc::ShmAllocator;
 

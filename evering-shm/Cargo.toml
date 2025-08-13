@@ -6,16 +6,22 @@ license.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["nightly", "unix"]
+
+nightly = []
 
 std = []
-unix = ["std"]
+unix = ["std", "dep:nix"]
 
 [dependencies]
-spin = { version = "0.10.0", features = ["lock_api"] }
+allocator-api2 = "0.3.0"
+
+spin.workspace = true
 blink-alloc = { version = "0.3.1", features = ["nightly", "sync"] }
 good_memory_allocator = { version = "0.1.7", features = ["allocator"] }
 rlsf = "0.2.1"
 
 memory_addr = "0.4.0"
 memory_set = "0.4.0"
+
+nix = { workspace = true, optional = true, features = ["fs", "mman"] }

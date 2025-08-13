@@ -17,11 +17,11 @@ std = ["dep:parking_lot"]
 async-channel = "2.5.0"
 crossbeam-channel = "0.5"
 
-lock_api = "0.4.13"
-spin = { version = "0.10.0", features = ["lock_api"] }
+lock_api.workspace = true
+spin.workspace = true
 parking_lot = { version = "0.12", optional = true }
 
-slab = "0.4.10"
+slab = "0.4.11"
 objectpool = { version = "0.1", default-features = false, features = ["alloc"] }
 orx-concurrent-option = "1.5.0"
 

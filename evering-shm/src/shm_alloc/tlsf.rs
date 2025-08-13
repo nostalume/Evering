@@ -1,5 +1,8 @@
-use alloc::alloc::AllocError;
-use alloc::alloc::Allocator;
+#[cfg(feature = "nightly")]
+use alloc::alloc::{AllocError, Allocator};
+#[cfg(not(feature = "nightly"))]
+use allocator_api2::alloc::{AllocError, Allocator};
+
 use core::alloc::Layout;
 use core::mem::MaybeUninit;
 use core::ptr;

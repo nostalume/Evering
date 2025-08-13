@@ -1,5 +1,7 @@
-use alloc::alloc::AllocError;
-use alloc::alloc::Allocator;
+#![cfg(feature = "nightly")]
+
+use alloc::alloc::{AllocError, Allocator};
+
 use blink_alloc::SyncBlinkAlloc;
 use core::alloc::Layout;
 use core::ptr::NonNull;
