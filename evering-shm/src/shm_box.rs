@@ -7,7 +7,7 @@ use core::pin::Pin;
 use alloc::alloc::AllocError;
 use alloc::boxed::Box;
 
-use crate::ShmAllocator;
+use crate::shm_alloc::ShmAllocator;
 
 #[repr(transparent)]
 struct ShmBox<T: ?Sized, A: ShmAllocator>(Box<T, A>);
@@ -164,15 +164,17 @@ impl<T, A: ShmAllocator> From<ShmToken<T, A>> for ShmBox<T, A> {
 mod tests {
     use core::ops::AddAssign;
 
-    use crate::{
-        shm_box::{ShmBox, ShmToken}, ShmAllocator, ShmHeap, ShmInit, SpinTlsf
-    };
+    use crate::shm_alloc::blink::ShmGmaBlink;
+    use crate::shm_alloc::gma::ShmGma;
+    use crate::shm_alloc::tlsf::SpinTlsf;
+    use crate::shm_box::{ShmBox, ShmToken};
+    use crate::shm_alloc::*;
 
     const TEST_HEAP_SIZE: usize = 4096;
 
     #[repr(align(4096))]
     struct PageAlignedBytes<const N: usize>([u8; N]);
-    
+
     fn box_test(allocator: &impl ShmAllocator) {
         let mut bb = ShmBox::new_in(1u8, allocator);
         dbg!(format!("box: {:?}", bb.as_ptr()));
@@ -189,16 +191,19 @@ mod tests {
         let token = ShmToken::from(bb);
         let bb = ShmBox::from(token);
         dbg!(format!("translated box: {:?}", bb.as_ptr()));
-        dbg!(format!("translated start: {:?}", bb.allocator().start_ptr()));
+        dbg!(format!(
+            "translated start: {:?}",
+            bb.allocator().start_ptr()
+        ));
         assert_eq!(*bb, 1);
     }
 
     #[test]
-    fn heap() {
-        let data= PageAlignedBytes([0; TEST_HEAP_SIZE]);
+    fn gma() {
+        let data = PageAlignedBytes([0; TEST_HEAP_SIZE]);
         let start = data.0.as_ptr().addr();
 
-        let shm_heap = unsafe { ShmHeap::init_addr(start, TEST_HEAP_SIZE) };
+        let shm_heap = unsafe { ShmGma::init_addr(start, TEST_HEAP_SIZE) };
         box_test(&shm_heap);
         token_test(&shm_heap);
     }
@@ -207,9 +212,19 @@ mod tests {
     fn tlsf() {
         let data = PageAlignedBytes::<TEST_HEAP_SIZE>([0; TEST_HEAP_SIZE]);
         let start = data.0.as_ptr().addr();
-        
+
         let tlsf = unsafe { SpinTlsf::init_addr(start, TEST_HEAP_SIZE) };
         box_test(&tlsf);
         token_test(&tlsf);
+    }
+
+    #[test]
+    fn blink() {
+        let data = PageAlignedBytes::<TEST_HEAP_SIZE>([0; TEST_HEAP_SIZE]);
+        let start = data.0.as_ptr().addr();
+
+        let blink = unsafe { ShmGmaBlink::init_addr(start, TEST_HEAP_SIZE) };
+        box_test(&blink);
+        token_test(&blink);
     }
 }
