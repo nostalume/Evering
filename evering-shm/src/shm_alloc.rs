@@ -7,7 +7,6 @@ use alloc::alloc::{AllocError, Allocator};
 use allocator_api2::alloc::{AllocError, Allocator};
 
 use memory_addr::MemoryAddr;
-use memory_set::MappingBackend;
 
 use crate::shm_area::ShmArea;
 use crate::shm_area::ShmBackend;
@@ -21,55 +20,92 @@ pub type ShmSpinTlsf<'a, S, M> = ShmAlloc<tlsf::SpinTlsf<'a>, S, M>;
 pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
 pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 
+pub enum ShmAllocError<S: ShmSpec, M: ShmBackend<S>> {
+    UnenoughSpace,
+    MapError(M::Error),
+}
+
+impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnenoughSpace => write!(f, "UnenoughSpace"),
+            Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
+        }
+    }
+}
+
 pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
-    alloc: A,
     area: ShmArea<S, M>,
+    phantom: core::marker::PhantomData<A>,
 }
 
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
     type Target = A;
 
     fn deref(&self) -> &Self::Target {
-        &self.alloc
+        let ptr = self.area.start().into() as *mut A;
+        unsafe { &*ptr }
     }
 }
 
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
+    pub fn allocator(&self) -> &A {
+        self
+    }
+
     pub fn map(
         state: M,
         start: S::Addr,
         size: usize,
         flags: S::Flags,
         cfg: M::Config,
-    ) -> Result<Self, M::Error> {
+    ) -> Result<Self, ShmAllocError<S, M>> {
         let align_start = start.align_up(A::MIN_ALIGNMENT);
         let end = align_start.add(size);
         let align_end = end.align_down(A::MIN_ALIGNMENT);
         let align_size = align_end.sub_addr(align_start);
 
-        let area = state.map(align_start, align_size, flags, cfg)?;
-        Ok(Self::from_area(area))
+        let area = state
+            .map(align_start, align_size, flags, cfg)
+            .map_err(ShmAllocError::MapError)?;
+        Ok(Self::from_area(area)?)
     }
 
-    pub fn from_area(area: ShmArea<S, M>) -> Self {
-        Self {
-            alloc: A::init_area(&area),
-            area,
+    pub fn from_area(area: ShmArea<S, M>) -> Result<Self, ShmAllocError<S, M>> {
+        let start = area.start();
+        // calculate size of allocator
+        let alloc_start = start
+            .add(A::ALLOCATOR_SIZE)
+            .align_up(A::MIN_ALIGNMENT)
+            .into();
+        let alloc_size = match area.size().checked_sub(A::ALLOCATOR_SIZE) {
+            Some(size) => size,
+            _ => return Err(ShmAllocError::UnenoughSpace),
+        };
+        // Safety: The area must be valid to access and store the allocator.
+        unsafe {
+            let ptr = start.into() as *mut A;
+            let a = A::init_addr(alloc_start, alloc_size);
+            ptr.write(a);
         }
+        Ok(Self {
+            area,
+            phantom: core::marker::PhantomData,
+        })
     }
 }
 
 unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, S, M> {
     fn allocate(&self, layout: core::alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.alloc.allocate(layout)
+        self.allocator().allocate(layout)
     }
 
     fn allocate_zeroed(&self, layout: core::alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.alloc.allocate_zeroed(layout)
+        self.allocator().allocate_zeroed(layout)
     }
 
     unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: core::alloc::Layout) {
-        unsafe { self.alloc.deallocate(ptr, layout) }
+        unsafe { self.allocator().deallocate(ptr, layout) }
     }
 
     unsafe fn grow(
@@ -78,7 +114,7 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, 
         old_layout: core::alloc::Layout,
         new_layout: core::alloc::Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        unsafe { self.alloc.grow(ptr, old_layout, new_layout) }
+        unsafe { self.allocator().grow(ptr, old_layout, new_layout) }
     }
 
     unsafe fn grow_zeroed(
@@ -87,7 +123,7 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, 
         old_layout: core::alloc::Layout,
         new_layout: core::alloc::Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        unsafe { self.alloc.grow_zeroed(ptr, old_layout, new_layout) }
+        unsafe { self.allocator().grow_zeroed(ptr, old_layout, new_layout) }
     }
 
     unsafe fn shrink(
@@ -96,7 +132,7 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, 
         old_layout: core::alloc::Layout,
         new_layout: core::alloc::Layout,
     ) -> Result<NonNull<[u8]>, AllocError> {
-        unsafe { self.alloc.shrink(ptr, old_layout, new_layout) }
+        unsafe { self.allocator().shrink(ptr, old_layout, new_layout) }
     }
 }
 
@@ -106,9 +142,10 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAllocator for ShmAlloc<
     }
 }
 
-pub unsafe trait ShmInit: Allocator {
+pub unsafe trait ShmInit: Allocator + Sized {
     const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
     const USIZE_SIZE: usize = core::mem::size_of::<usize>();
+    const ALLOCATOR_SIZE: usize = core::mem::size_of::<Self>();
 
     // IMPORTANT:
     // `MIN_ALIGNMENT` must be larger than 4, so that storing the size as a
@@ -132,14 +169,6 @@ pub unsafe trait ShmInit: Allocator {
         Self: Sized,
     {
         unsafe { Self::init_addr(blk.as_ptr().addr(), blk.len()) }
-    }
-
-    #[inline]
-    fn init_area<S: ShmSpec, M: ShmBackend<S>>(area: &ShmArea<S, M>) -> Self
-    where
-        Self: Sized,
-    {
-        unsafe { Self::init_addr(area.start().into(), area.size()) }
     }
 }
 

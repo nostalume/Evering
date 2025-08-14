@@ -5,9 +5,9 @@ use nix::{
     libc::off_t,
     sys::mman::{MapFlags, ProtFlags},
 };
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, OwnedFd};
 
-use crate::shm_area::{ShmArea, ShmBackend, ShmSpec, ShmProtect};
+use crate::shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
 
 #[repr(transparent)]
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
@@ -53,19 +53,38 @@ impl<T> From<UnixAddr> for NonNull<T> {
 
 pub struct FdConfig<F: AsFd> {
     f: F,
-    mflag: MapFlags,
+    mflags: MapFlags,
     offset: off_t,
 }
 
-impl<F:AsFd> FdConfig<F> {
-	pub const fn new(f: F, mflag: MapFlags, offset: off_t) -> Self {
-		Self { f, mflag, offset }
-	}
+impl FdConfig<OwnedFd> {
+    pub fn default_from_mem_fd<P: nix::NixPath + ?Sized>(
+        name: &P,
+        mfd_flags: nix::sys::memfd::MFdFlags,
+    ) -> Result<Self, nix::Error> {
+        Self::from_mem_fd(name, mfd_flags, MapFlags::MAP_SHARED, 0)
+    }
+
+    pub fn from_mem_fd<P: nix::NixPath + ?Sized>(
+        name: &P,
+        mfd_flags: nix::sys::memfd::MFdFlags,
+        mflags: MapFlags,
+        offset: off_t,
+    ) -> Result<Self, nix::Error> {
+        let f = nix::sys::memfd::memfd_create(name, mfd_flags)?;
+        Ok(Self::new(f, mflags, offset))
+    }
 }
 
-struct FdShmSpec<F:AsFd>(core::marker::PhantomData<F>);
+impl<F: AsFd> FdConfig<F> {
+    pub const fn new(f: F, mflags: MapFlags, offset: off_t) -> Self {
+        Self { f, mflags, offset }
+    }
+}
 
-impl<F:AsFd> ShmSpec for FdShmSpec<F> {
+struct FdShmSpec<F: AsFd>(core::marker::PhantomData<F>);
+
+impl<F: AsFd> ShmSpec for FdShmSpec<F> {
     type Addr = UnixAddr;
     type Flags = ProtFlags;
 }
@@ -81,14 +100,18 @@ impl<F: AsFd> ShmBackend<FdShmSpec<F>> for FdBackend {
         start: <FdShmSpec<F> as ShmSpec>::Addr,
         size: usize,
         flags: <FdShmSpec<F> as ShmSpec>::Flags,
-		cfg: FdConfig<F>,
+        cfg: FdConfig<F>,
     ) -> Result<ShmArea<FdShmSpec<F>, Self>, Self::Error> {
         let size = match NonZeroUsize::new(size) {
             Some(size) => size,
             _ => return Err(nix::Error::EINVAL),
         };
 
-        let FdConfig { f, mflag, offset } = cfg;
+        let FdConfig {
+            f,
+            mflags: mflag,
+            offset,
+        } = cfg;
 
         unsafe {
             nix::sys::mman::mmap(start.0, size, flags, mflag, f.as_fd(), offset).map(|ptr| {

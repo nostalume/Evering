@@ -7,7 +7,7 @@ pub trait ShmSpec {
 
 pub trait ShmBackend<S: ShmSpec>: Sized {
     type Config;
-    type Error;
+    type Error : core::fmt::Debug;
 
     fn map(
         self,

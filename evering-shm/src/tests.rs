@@ -116,7 +116,7 @@ macro_rules! alloc_test {
         for start in (0..MAX_ADDR).step_by(0x2000) {
             let bk = MockBackend(&mut pt);
             let area = bk.map(start.into(), 0x2000, 0, ()).unwrap();
-            let alloc = <$alloc>::from_area(area);
+            let alloc = <$alloc>::from_area(area).unwrap();
             box_test(&alloc);
             token_test(&alloc);
         }
@@ -125,7 +125,7 @@ macro_rules! alloc_test {
 
 #[test]
 fn area_alloc() {
-    alloc_test!(shm_alloc::ShmSpinGma<MockSpec, MockBackend>); // 8 bits offset
-    alloc_test!(shm_alloc::ShmSpinTlsf<MockSpec,MockBackend>); // 16 bits offset
-    alloc_test!(shm_alloc::ShmBlinkGma<MockSpec,MockBackend>); // 41 bits offset
+    alloc_test!(shm_alloc::ShmSpinGma<MockSpec, MockBackend>); // 8/1480 bits offset
+    alloc_test!(shm_alloc::ShmSpinTlsf<MockSpec,MockBackend>); // 16/1680 bits offset
+    alloc_test!(shm_alloc::ShmBlinkGma<MockSpec,MockBackend>); // 41/1545 bits offset
 }
