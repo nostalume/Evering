@@ -4,7 +4,8 @@
 
 extern crate alloc;
 
-pub mod shm_alloc;
-pub mod shm_box;
 pub mod os;
+pub mod shm_alloc;
+pub mod shm_area;
+pub mod shm_box;
 mod tests;

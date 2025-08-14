@@ -8,22 +8,25 @@ use allocator_api2::alloc::{AllocError, Allocator};
 
 use memory_addr::MemoryAddr;
 use memory_set::MappingBackend;
-use memory_set::MemoryArea;
+
+use crate::shm_area::ShmArea;
+use crate::shm_area::ShmBackend;
+use crate::shm_area::ShmSpec;
 
 pub mod blink;
 pub mod gma;
 pub mod tlsf;
 
-pub type ShmSpinTlsf<'a, B> = ShmAlloc<tlsf::SpinTlsf<'a>, B>;
-pub type ShmSpinGma<B> = ShmAlloc<gma::SpinGma, B>;
-pub type ShmBlinkGma<B> = ShmAlloc<blink::BlinkGma, B>;
+pub type ShmSpinTlsf<'a, S, M> = ShmAlloc<tlsf::SpinTlsf<'a>, S, M>;
+pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
+pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 
-pub struct ShmAlloc<A: ShmInit, B: MappingBackend> {
+pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
     alloc: A,
-    area: MemoryArea<B>,
+    area: ShmArea<S, M>,
 }
 
-impl<A: ShmInit, B: MappingBackend> Deref for ShmAlloc<A, B> {
+impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
     type Target = A;
 
     fn deref(&self) -> &Self::Target {
@@ -31,18 +34,24 @@ impl<A: ShmInit, B: MappingBackend> Deref for ShmAlloc<A, B> {
     }
 }
 
-impl<A: ShmInit, B: MappingBackend> ShmAlloc<A, B> {
-    pub fn from_map(start: B::Addr, size: usize, flags: B::Flags, bk: B) -> Self {
+impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
+    pub fn map(
+        state: M,
+        start: S::Addr,
+        size: usize,
+        flags: S::Flags,
+        cfg: M::Config,
+    ) -> Result<Self, M::Error> {
         let align_start = start.align_up(A::MIN_ALIGNMENT);
         let end = align_start.add(size);
         let align_end = end.align_down(A::MIN_ALIGNMENT);
         let align_size = align_end.sub_addr(align_start);
 
-        let area = MemoryArea::new(align_start, align_size, flags, bk);
-        Self::from_area(area)
+        let area = state.map(align_start, align_size, flags, cfg)?;
+        Ok(Self::from_area(area))
     }
 
-    pub fn from_area(area: MemoryArea<B>) -> Self {
+    pub fn from_area(area: ShmArea<S, M>) -> Self {
         Self {
             alloc: A::init_area(&area),
             area,
@@ -50,7 +59,7 @@ impl<A: ShmInit, B: MappingBackend> ShmAlloc<A, B> {
     }
 }
 
-unsafe impl<A: ShmInit, B: MappingBackend> Allocator for ShmAlloc<A, B> {
+unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, S, M> {
     fn allocate(&self, layout: core::alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.alloc.allocate(layout)
     }
@@ -91,7 +100,7 @@ unsafe impl<A: ShmInit, B: MappingBackend> Allocator for ShmAlloc<A, B> {
     }
 }
 
-unsafe impl<A: ShmInit, B: MappingBackend> ShmAllocator for ShmAlloc<A, B> {
+unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAllocator for ShmAlloc<A, S, M> {
     fn start_ptr(&self) -> *const u8 {
         self.area.start().into() as *const u8
     }
@@ -126,7 +135,7 @@ pub unsafe trait ShmInit: Allocator {
     }
 
     #[inline]
-    fn init_area<B: MappingBackend>(area: &MemoryArea<B>) -> Self
+    fn init_area<S: ShmSpec, M: ShmBackend<S>>(area: &ShmArea<S, M>) -> Self
     where
         Self: Sized,
     {
