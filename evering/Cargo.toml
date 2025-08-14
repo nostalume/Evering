@@ -9,12 +9,13 @@ version.workspace = true
 edition.workspace = true
 
 [features]
-default = ["std"]
+default = ["nightly"]
 
 std = ["dep:parking_lot"]
+nightly = []
 
 [dependencies]
-async-channel = "2.5.0"
+async-channel = { path = "async-channel" }
 crossbeam-channel = "0.5"
 
 lock_api.workspace = true
