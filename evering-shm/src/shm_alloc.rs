@@ -11,6 +11,7 @@ use memory_addr::MemoryAddr;
 use crate::shm_area::ShmArea;
 use crate::shm_area::ShmBackend;
 use crate::shm_area::ShmSpec;
+use crate::shm_header::ShmHeader;
 
 pub mod blink;
 pub mod gma;
@@ -22,13 +23,17 @@ pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 
 pub enum ShmAllocError<S: ShmSpec, M: ShmBackend<S>> {
     UnenoughSpace,
+    InvalidHeader,
+    Dbg,
     MapError(M::Error),
 }
 
 impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::Dbg => write!(f, "Dbg"),
             Self::UnenoughSpace => write!(f, "UnenoughSpace"),
+            Self::InvalidHeader => write!(f, "InvalidHeader"),
             Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
         }
     }
@@ -36,14 +41,20 @@ impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
 
 pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
     area: ShmArea<S, M>,
-    phantom: core::marker::PhantomData<A>,
+    phantom: core::marker::PhantomData<(A, ShmHeader)>,
 }
 
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
     type Target = A;
 
     fn deref(&self) -> &Self::Target {
-        let ptr = self.area.start().into() as *mut A;
+        // TODO! better layout check
+        let ptr = self
+            .area
+            .start()
+            .add(ShmHeader::HEADER_SIZE)
+            .align_up(ShmHeader::HEADER_ALIGN)
+            .into() as *mut A;
         unsafe { &*ptr }
     }
 }
@@ -53,7 +64,7 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
         self
     }
 
-    pub fn map(
+    pub fn init_or_load(
         state: M,
         start: S::Addr,
         size: usize,
@@ -73,21 +84,44 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
 
     pub fn from_area(area: ShmArea<S, M>) -> Result<Self, ShmAllocError<S, M>> {
         let start = area.start();
-        // calculate size of allocator
-        let alloc_start = start
-            .add(A::ALLOCATOR_SIZE)
-            .align_up(A::MIN_ALIGNMENT)
-            .into();
-        let alloc_size = match area.size().checked_sub(A::ALLOCATOR_SIZE) {
-            Some(size) => size,
-            _ => return Err(ShmAllocError::UnenoughSpace),
-        };
-        // Safety: The area must be valid to access and store the allocator.
+
         unsafe {
-            let ptr = start.into() as *mut A;
-            let a = A::init_addr(alloc_start, alloc_size);
-            ptr.write(a);
+            let (header, h_start, _) = area
+                .acquire::<ShmHeader>(start)
+                .ok_or(ShmAllocError::UnenoughSpace)?;
+
+            let header_ref = &mut *header;
+            let mut header_write = header_ref.write();
+
+            // TODO!
+            use crate::shm_header::ShmStatus;
+            if !header_write.valid_magic() {
+                header_write.intializing();
+                let (a_ptr, a_start, a_size) = area
+                    .acquire_raw::<A>(h_start, A::ALLOCATOR_SIZE, A::MIN_ALIGNMENT)
+                    .ok_or(ShmAllocError::UnenoughSpace)?;
+                let a = A::init_addr(a_start.into(), a_size);
+                a_ptr.write(a);
+                header_write.with_status(ShmStatus::Initialized);
+            } else {
+                match header_write.status() {
+                    ShmStatus::Initializing => {
+                        drop(header_write);
+                        loop {
+                            // repeat acquire header until initialized
+                            let header_read = header_ref.read();
+                            if header_read.status() == ShmStatus::Initialized {
+                                break;
+                            } else {
+                                core::hint::spin_loop();
+                            }
+                        }
+                    }
+                    _ => return Err(ShmAllocError::InvalidHeader),
+                }
+            }
         }
+
         Ok(Self {
             area,
             phantom: core::marker::PhantomData,

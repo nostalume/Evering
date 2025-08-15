@@ -7,7 +7,7 @@ pub trait ShmSpec {
 
 pub trait ShmBackend<S: ShmSpec>: Sized {
     type Config;
-    type Error : core::fmt::Debug;
+    type Error: core::fmt::Debug;
 
     fn map(
         self,
@@ -43,6 +43,86 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
             flags,
             bk,
         }
+    }
+
+    /// Given a start address, acquire a new start address by skipping
+    /// instance `T`.
+    /// 
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    /// 
+    /// ## Returns
+    /// `next_start`: `start + size_of<T>()
+    #[inline]
+    pub(crate) unsafe fn with_offset<T: Sized>(&self, start: S::Addr) -> Option<S::Addr> {
+        let t_size = core::mem::size_of::<T>();
+        let t_align = core::mem::align_of::<T>();
+        let t_start = start.add(t_size).align_up(t_align);
+        let _ = self.end().checked_sub_addr(t_start);
+        Some(t_start)
+    }
+
+    /// Given a start address, acquire the `Sized` instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut T`, `next_start`)
+    /// - `*mut T`: the pointer to the instance.
+    /// - `next_start`: `start + size_of<T>()`
+    /// - `free_size`: `end - next_start`
+    #[inline]
+    pub(crate) unsafe fn acquire<T: Sized>(
+        &self,
+        start: S::Addr,
+    ) -> Option<(*mut T, S::Addr, usize)> {
+        // including padding
+        let t_size = core::mem::size_of::<T>();
+        let t_align = core::mem::align_of::<T>();
+        let t_start = start.add(t_size).align_up(t_align);
+        let free = self.end().checked_sub_addr(t_start)?.align_down(t_align);
+        let ptr = start.into() as *mut T;
+        Some((ptr, t_start, free))
+    }
+
+    /// Given a start address, acquire the `Sized` instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut T`, `next_start`)
+    /// - `*mut T`: the pointer to the instance.
+    /// - `next_start`: `start + size_of<T>()`
+    /// - `free_size`: `end - next_start`
+    #[inline]
+    pub(crate) unsafe fn acquire_raw<T: Sized>(
+        &self,
+        start: S::Addr,
+        t_size: usize,
+        t_align: usize,
+    ) -> Option<(*mut T, S::Addr, usize)> {
+        // including padding
+        let t_start = start.add(t_size).align_up(t_align);
+        let free = self
+            .end()
+            .checked_sub_addr(t_start)?
+            .align_down(t_align)
+            .into();
+        let ptr = start.into() as *mut T;
+        Some((ptr, t_start, free))
     }
 }
 

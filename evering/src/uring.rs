@@ -1,4 +1,3 @@
-pub mod asynch_alloc;
 pub mod asynch;
 pub mod sync;
 mod tests;

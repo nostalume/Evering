@@ -9,7 +9,7 @@ use crate::op::MyPoolDriver;
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     // let (sb, cb, cq) = evering::driver::new::<MySlabDriver>();
-    let (sb, cb, cq) = evering::driver::new::<MyPoolDriver>();
+    let (sb, cb, cq) = evering::driver::default::<MyPoolDriver>();
 
     for _ in 0..5 {
         let cq = cq.clone();

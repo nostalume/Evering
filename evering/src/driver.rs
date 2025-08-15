@@ -1,10 +1,12 @@
+use alloc::alloc::{Allocator, Global};
 use core::marker::PhantomData;
 
 use async_channel::{SendError, TrySendError};
 
 use crate::uring::UringSpec;
 use crate::uring::asynch::{
-    Completer as UringCompleter, Submitter as UringSubbmiter, channel, default_channel,
+    Completer as UringCompleter, Submitter as UringSubbmiter, channel, channel_in, default_channel,
+    default_channel_in,
 };
 
 mod cell;
@@ -21,8 +23,8 @@ pub trait Driver: UringSpec + Clone + Default {
     fn new(cfg: Self::Config) -> Self;
 }
 
-pub type Submitter<D> = UringSubbmiter<DriverUring<D>>;
-pub type Completer<D> = UringCompleter<DriverUring<D>>;
+pub type Submitter<D, A: Allocator = Global> = UringSubbmiter<DriverUring<D>, A>;
+pub type Completer<D, A: Allocator = Global> = UringCompleter<DriverUring<D>, A>;
 
 pub struct DriverUring<D: Driver> {
     _marker: PhantomData<D>,
@@ -33,13 +35,13 @@ impl<D: Driver> UringSpec for DriverUring<D> {
     type CQE = cell::IdCell<D::Id, D::CQE>;
 }
 
-pub struct Bridge<D: Driver, R: Role> {
+pub struct Bridge<D: Driver, R: Role, A: Allocator = Global> {
     driver: D,
-    sq: Submitter<D>,
+    sq: Submitter<D, A>,
     _marker: PhantomData<R>,
 }
 
-impl<D: Driver, R: Role> Clone for Bridge<D, R> {
+impl<D: Driver, R: Role, A: Allocator> Clone for Bridge<D, R, A> {
     fn clone(&self) -> Self {
         Self {
             driver: self.driver.clone(),
@@ -56,12 +58,49 @@ impl Role for Submit {}
 pub struct Receive;
 impl Role for Receive {}
 
-pub type SubmitBridge<D> = Bridge<D, Submit>;
-pub type CompleteBridge<D> = Bridge<D, Receive>;
+pub type SubmitBridge<D, A> = Bridge<D, Submit, A>;
+pub type CompleteBridge<D, A> = Bridge<D, Receive, A>;
 
-type UringBridge<D> = (SubmitBridge<D>, CompleteBridge<D>, Completer<D>);
+type UringBridge<D, A: Allocator = Global> =
+    (SubmitBridge<D, A>, CompleteBridge<D, A>, Completer<D, A>);
 
-pub fn new_with<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBridge<D> {
+pub fn new_in<D: Driver, A: Allocator>(
+    uring_cap: usize,
+    alloc: &A,
+    driver_cfg: D::Config,
+) -> UringBridge<D, &A> {
+    let (cq, sq) = channel_in(uring_cap, alloc);
+    let d = D::new(driver_cfg);
+    let sb = Bridge {
+        driver: d.clone(),
+        sq: sq.clone(),
+        _marker: PhantomData,
+    };
+    let cb = Bridge {
+        driver: d,
+        sq,
+        _marker: PhantomData,
+    };
+    (sb, cb, cq)
+}
+
+pub fn default_in<D: Driver, A: Allocator>(alloc: &A) -> UringBridge<D, &A> {
+    let (cq, sq) = default_channel_in(alloc);
+    let d = D::default();
+    let sb = Bridge {
+        driver: d.clone(),
+        sq: sq.clone(),
+        _marker: PhantomData,
+    };
+    let cb = Bridge {
+        driver: d,
+        sq,
+        _marker: PhantomData,
+    };
+    (sb, cb, cq)
+}
+
+pub fn new<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBridge<D> {
     let (cq, sq) = channel(uring_cap);
     let d = D::new(driver_cfg);
     let sb = Bridge {
@@ -77,7 +116,7 @@ pub fn new_with<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBrid
     (sb, cb, cq)
 }
 
-pub fn new<D: Driver>() -> UringBridge<D> {
+pub fn default<D: Driver>() -> UringBridge<D> {
     let (cq, sq) = default_channel();
     let d = D::default();
     let sb = Bridge {
