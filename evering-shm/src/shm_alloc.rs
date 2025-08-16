@@ -11,7 +11,9 @@ use memory_addr::MemoryAddr;
 use crate::shm_area::ShmArea;
 use crate::shm_area::ShmBackend;
 use crate::shm_area::ShmSpec;
-use crate::shm_header::ShmHeader;
+use crate::shm_box::ShmBox;
+use crate::shm_box::ShmToken;
+use crate::shm_header::Header;
 
 pub mod blink;
 pub mod gma;
@@ -24,14 +26,12 @@ pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 pub enum ShmAllocError<S: ShmSpec, M: ShmBackend<S>> {
     UnenoughSpace,
     InvalidHeader,
-    Dbg,
     MapError(M::Error),
 }
 
 impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Dbg => write!(f, "Dbg"),
             Self::UnenoughSpace => write!(f, "UnenoughSpace"),
             Self::InvalidHeader => write!(f, "InvalidHeader"),
             Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
@@ -41,7 +41,7 @@ impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
 
 pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
     area: ShmArea<S, M>,
-    phantom: core::marker::PhantomData<(A, ShmHeader)>,
+    phantom: core::marker::PhantomData<A>,
 }
 
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
@@ -52,8 +52,8 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
         let ptr = self
             .area
             .start()
-            .add(ShmHeader::HEADER_SIZE)
-            .align_up(ShmHeader::HEADER_ALIGN)
+            .add(Header::HEADER_SIZE)
+            .align_up(Header::HEADER_ALIGN)
             .into() as *mut A;
         unsafe { &*ptr }
     }
@@ -66,30 +66,23 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
 
     pub fn init_or_load(
         state: M,
-        start: S::Addr,
+        start: Option<S::Addr>,
         size: usize,
         flags: S::Flags,
         cfg: M::Config,
     ) -> Result<Self, ShmAllocError<S, M>> {
-        let align_start = start.align_up(A::MIN_ALIGNMENT);
-        let end = align_start.add(size);
-        let align_end = end.align_down(A::MIN_ALIGNMENT);
-        let align_size = align_end.sub_addr(align_start);
-
         let area = state
-            .map(align_start, align_size, flags, cfg)
+            .map(start, size, flags, cfg)
             .map_err(ShmAllocError::MapError)?;
-        Ok(Self::from_area(area)?)
+        Self::from_area(area)
     }
 
     pub fn from_area(area: ShmArea<S, M>) -> Result<Self, ShmAllocError<S, M>> {
         let start = area.start();
-
         unsafe {
             let (header, h_start, _) = area
-                .acquire::<ShmHeader>(start)
+                .acquire::<Header>(start)
                 .ok_or(ShmAllocError::UnenoughSpace)?;
-
             let header_ref = &mut *header;
             let mut header_write = header_ref.write();
 
@@ -176,6 +169,31 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAllocator for ShmAlloc<
     }
 }
 
+unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmHeader for ShmAlloc<A, S, M> {
+    /// preload spec
+    fn spec_raw<T>(&self) -> Option<NonNull<T>> {
+        let header = self.header();
+        let offset = header.read().spec();
+
+        offset.map(|offset| {
+            let token = ShmToken::from_raw(offset, self);
+            token.acquire()
+        })
+    }
+
+    unsafe fn init_spec_raw<T>(&self, spec: &T) -> bool {
+        let header = self.header();
+        let mut header = header.write();
+        let offset = unsafe { self.offset(spec) };
+        header.with_spec(offset)
+    }
+
+    fn header(&self) -> &Header {
+        let ptr = self.area.start().into() as *mut Header;
+        unsafe { &*ptr }
+    }
+}
+
 pub unsafe trait ShmInit: Allocator + Sized {
     const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
     const USIZE_SIZE: usize = core::mem::size_of::<usize>();
@@ -251,9 +269,6 @@ pub unsafe trait ShmAllocator: Allocator {
     #[inline]
     fn get_ptr(&self, offset: isize) -> *const u8 {
         unsafe {
-            if offset == 0 {
-                return self.start_ptr();
-            }
             if offset < 0 {
                 return self.start_ptr().sub(-offset as usize);
             }
@@ -265,9 +280,6 @@ pub unsafe trait ShmAllocator: Allocator {
     #[inline]
     fn get_ptr_mut(&self, offset: isize) -> *mut u8 {
         unsafe {
-            if offset == 0 {
-                return self.start_mut_ptr();
-            }
             if offset < 0 {
                 return self.start_mut_ptr().sub(-offset as usize);
             }
@@ -289,8 +301,8 @@ pub unsafe trait ShmAllocator: Allocator {
     #[inline]
     unsafe fn get_aligned_ptr_mut<T>(&self, offset: isize) -> NonNull<T> {
         unsafe {
-            if offset == 0 {
-                return NonNull::dangling();
+            if offset < 0 {
+                return NonNull::new_unchecked(self.start_mut_ptr().sub(-offset as usize).cast());
             }
 
             let ptr = self.get_ptr_mut(offset).cast();
@@ -303,5 +315,17 @@ unsafe impl<A: ShmAllocator> ShmAllocator for &A {
     #[inline]
     fn start_ptr(&self) -> *const u8 {
         (**self).start_ptr()
+    }
+}
+
+pub unsafe trait ShmHeader {
+    fn header(&self) -> &Header;
+    fn spec_raw<T>(&self) -> Option<NonNull<T>>;
+    unsafe fn init_spec_raw<T>(&self, spec: &T) -> bool;
+    fn init_spec<T,A:ShmAllocator>(&self, spec: ShmBox<T, A>) -> bool
+    where
+        Self: ShmAllocator + Sized,
+    {
+        unsafe { self.init_spec_raw(spec.as_ref()) }
     }
 }

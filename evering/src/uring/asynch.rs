@@ -3,7 +3,7 @@ use async_channel::{Receiver, Sender};
 
 use crate::uring::{UringSpec, with_recv_alloc, with_send_alloc};
 
-pub type Uring<S, A: Allocator = Global> = (Completer<S, A>, Submitter<S, A>);
+pub type Uring<S, A = Global> = (Completer<S, A>, Submitter<S, A>);
 
 #[derive(Debug)]
 pub struct Submitter<S: UringSpec, A: Allocator = Global> {

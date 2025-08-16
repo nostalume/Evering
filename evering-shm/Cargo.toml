@@ -6,7 +6,7 @@ license.workspace = true
 edition.workspace = true
 
 [features]
-default = ["nightly", "unix"]
+default = ["nightly"]
 
 nightly = []
 

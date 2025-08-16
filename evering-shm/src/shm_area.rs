@@ -1,3 +1,4 @@
+
 use memory_addr::{AddrRange, MemoryAddr};
 
 pub trait ShmSpec {
@@ -11,7 +12,7 @@ pub trait ShmBackend<S: ShmSpec>: Sized {
 
     fn map(
         self,
-        start: S::Addr,
+        start: Option<S::Addr>,
         size: usize,
         flags: S::Flags,
         cfg: Self::Config,
@@ -47,13 +48,13 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
 
     /// Given a start address, acquire a new start address by skipping
     /// instance `T`.
-    /// 
+    ///
     /// ## Panics
     /// `start.add(size_of<T>())` overflows.
     ///
     /// ## Safety
     /// User should ensure the validity of memory area and instance.
-    /// 
+    ///
     /// ## Returns
     /// `next_start`: `start + size_of<T>()
     #[inline]
@@ -88,7 +89,7 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
         let t_size = core::mem::size_of::<T>();
         let t_align = core::mem::align_of::<T>();
         let t_start = start.add(t_size).align_up(t_align);
-        let free = self.end().checked_sub_addr(t_start)?.align_down(t_align);
+        let free = self.end().checked_sub_addr(t_start)?;
         let ptr = start.into() as *mut T;
         Some((ptr, t_start, free))
     }
@@ -118,9 +119,7 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
         let t_start = start.add(t_size).align_up(t_align);
         let free = self
             .end()
-            .checked_sub_addr(t_start)?
-            .align_down(t_align)
-            .into();
+            .checked_sub_addr(t_start)?;
         let ptr = start.into() as *mut T;
         Some((ptr, t_start, free))
     }

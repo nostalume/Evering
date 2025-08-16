@@ -23,8 +23,8 @@ pub trait Driver: UringSpec + Clone + Default {
     fn new(cfg: Self::Config) -> Self;
 }
 
-pub type Submitter<D, A: Allocator = Global> = UringSubbmiter<DriverUring<D>, A>;
-pub type Completer<D, A: Allocator = Global> = UringCompleter<DriverUring<D>, A>;
+pub type Submitter<D, A = Global> = UringSubbmiter<DriverUring<D>, A>;
+pub type Completer<D, A = Global> = UringCompleter<DriverUring<D>, A>;
 
 pub struct DriverUring<D: Driver> {
     _marker: PhantomData<D>,
@@ -61,7 +61,7 @@ impl Role for Receive {}
 pub type SubmitBridge<D, A> = Bridge<D, Submit, A>;
 pub type CompleteBridge<D, A> = Bridge<D, Receive, A>;
 
-type UringBridge<D, A: Allocator = Global> =
+type UringBridge<D, A = Global> =
     (SubmitBridge<D, A>, CompleteBridge<D, A>, Completer<D, A>);
 
 pub fn new_in<D: Driver, A: Allocator>(

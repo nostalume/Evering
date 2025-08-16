@@ -18,13 +18,13 @@ impl<Id, T> IdCell<Id, T> {
         (self.id, self.data)
     }
 
-    pub fn store<U>(self, data: U) -> (IdCell<Id,U>, T) {
-        let IdCell { id, data: old} = self;
+    pub fn store<U>(self, data: U) -> (IdCell<Id, U>, T) {
+        let IdCell { id, data: old } = self;
 
         (IdCell::new(id, data), old)
     }
-    
-    pub fn replace<U>(self, data:U) -> IdCell<Id,U> {
+
+    pub fn replace<U>(self, data: U) -> IdCell<Id, U> {
         let (res, _) = self.store(data);
         res
     }
@@ -33,8 +33,7 @@ impl<Id, T> IdCell<Id, T> {
         f(&mut self.data);
     }
 
-    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IdCell<Id, U>
-    {
+    pub fn map<U>(self, f: impl FnOnce(T) -> U) -> IdCell<Id, U> {
         IdCell {
             id: self.id,
             data: f(self.data),
@@ -119,6 +118,7 @@ impl<Id, T> Eq for IdCell<Id, T> where T: Eq {}
 
 #[cfg(feature = "std")]
 use std::hash::{Hash, Hasher};
+#[cfg(feature = "std")]
 impl<Id, T> Hash for IdCell<Id, T>
 where
     T: Hash,

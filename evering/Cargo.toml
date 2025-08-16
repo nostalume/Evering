@@ -15,6 +15,8 @@ std = ["dep:parking_lot"]
 nightly = []
 
 [dependencies]
+evering-shm = { path = "../evering-shm" }
+
 async-channel = { path = "async-channel" }
 crossbeam-channel = "0.5"
 
@@ -24,7 +26,6 @@ parking_lot = { version = "0.12", optional = true }
 
 slab = "0.4.11"
 objectpool = { version = "0.1", default-features = false, features = ["alloc"] }
-orx-concurrent-option = "1.5.0"
 
 futures = { version = "0.3", default-features = false }
 

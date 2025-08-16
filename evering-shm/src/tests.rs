@@ -1,9 +1,10 @@
 #![cfg(test)]
+use core::marker::PhantomData;
 use core::ops::AddAssign;
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::shm_alloc::{self, ShmAllocator};
+use crate::shm_alloc::{self, ShmAlloc, ShmAllocator, ShmHeader, ShmSpinGma, ShmSpinTlsf};
 use crate::shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
 use crate::shm_box::{ShmBox, ShmToken};
 
@@ -38,11 +39,14 @@ impl<'a> ShmBackend<MockSpec> for MockBackend<'a> {
 
     fn map(
         self,
-        start: <MockSpec as ShmSpec>::Addr,
+        start: Option<<MockSpec as ShmSpec>::Addr>,
         size: usize,
         flags: <MockSpec as ShmSpec>::Flags,
         _cfg: (),
     ) -> Result<ShmArea<MockSpec, Self>, Self::Error> {
+        let Some(start) = start else {
+            return Err(());
+        };
         for entry in self.0.iter_mut().skip(start.as_usize()).take(size) {
             if *entry != 0 {
                 return Err(());
@@ -85,6 +89,10 @@ impl<'a> ShmProtect<MockSpec> for MockBackend<'a> {
     }
 }
 
+type MySpinGma<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
+type MyTlsf<'a> = ShmSpinTlsf<'a, MockSpec, MockBackend<'a>>;
+type MyBlink<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
+
 fn box_test(allocator: &impl ShmAllocator) {
     let mut bb = ShmBox::new_in(1u8, allocator);
     dbg!(format!("box: {:?}", bb.as_ptr()));
@@ -110,22 +118,46 @@ fn token_test(allocator: &impl ShmAllocator) {
     assert_eq!(*bb, 1);
 }
 
+macro_rules! header_spec_test {
+    ($name:ident, $alloc:ty) => {
+        fn $name<'a>(allocator: &'a $alloc) {
+            let bb = ShmBox::new_in(32u16, allocator);
+            allocator.init_spec(bb);
+            match allocator.spec_raw::<u16>() {
+                Some(spec) => {
+                    let spec = unsafe { spec.as_ref() };
+                    dbg!(format!("spec address: {:?}", spec));
+                    assert_eq!(*spec, 32);
+                }
+                None => {
+                    panic!("spec not initialized");
+                }
+            }
+        }
+    };
+}
+
+header_spec_test!(header_spec_test_gma, MySpinGma);
+header_spec_test!(header_spec_test_blink, MyBlink);
+header_spec_test!(header_spec_test_tlsf, MyTlsf);
+
 macro_rules! alloc_test {
-    ($alloc:ty) => {{
+    ($alloc:ty, $spec_fn:ident) => {{
         let mut pt = [0; MAX_ADDR];
         for start in (0..MAX_ADDR).step_by(0x2000) {
             let bk = MockBackend(&mut pt);
-            let area = bk.map(start.into(), 0x2000, 0, ()).unwrap();
+            let area = bk.map(Some(start.into()), 0x2000, 0, ()).unwrap();
             let alloc = <$alloc>::from_area(area).unwrap();
             box_test(&alloc);
             token_test(&alloc);
+            $spec_fn(&alloc);
         }
     }};
 }
 
 #[test]
 fn area_alloc() {
-    alloc_test!(shm_alloc::ShmSpinGma<MockSpec, MockBackend>); // 8/1480 bits offset
-    alloc_test!(shm_alloc::ShmSpinTlsf<MockSpec,MockBackend>); // 16/1680 bits offset
-    alloc_test!(shm_alloc::ShmBlinkGma<MockSpec,MockBackend>); // 41/1545 bits offset
+    alloc_test!(MySpinGma, header_spec_test_gma); // 8/1512 bits offset
+    alloc_test!(MyTlsf, header_spec_test_tlsf); // 16/1712 bits offset
+    alloc_test!(MyBlink, header_spec_test_blink); // 41/1512 bits offset
 }
