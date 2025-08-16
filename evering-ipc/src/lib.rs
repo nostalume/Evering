@@ -33,15 +33,13 @@ impl<U: UringSpec, S: ShmSpec, M: ShmBackend<S>, A: ShmInit> IpcHandle<A, S, M, 
         }
     }
 
-    pub fn u(&self) -> NonNull<concurrent_queue::ConcurrentQueue<char>> {
+    pub fn u(&self) -> NonNull<lfqueue::ConstBoundedQueue<char,16>> {
         loop {
             match self.0.spec_raw::<_>() {
                 Some(u) => break u,
                 None => {
-                    let u = concurrent_queue::ConcurrentQueue::<char, _>::bounded_in(20, &self.0);
-                    unsafe {
-                        self.0.init_spec_raw(&u);
-                    }
+                    let u = ShmBox::new_in(lfqueue::ConstBoundedQueue::<char,16>::new_const(), &self.0);
+                    self.0.init_spec(u);
                 }
             }
         }
@@ -52,6 +50,7 @@ impl<U: UringSpec, S: ShmSpec, M: ShmBackend<S>, A: ShmInit> IpcHandle<A, S, M, 
 mod tests {
     use core::marker::PhantomData;
     use std::os::fd::OwnedFd;
+    use std::sync::Arc;
 
     use evering::uring::UringSpec;
     use evering_shm::os::unix::{FdBackend, FdConfig, FdShmSpec, MFdFlags, ProtFlags};
@@ -101,9 +100,11 @@ mod tests {
         let mut u = h.u();
         unsafe {
             let l = u.as_mut();
-            let w = l.capacity();
+            
+            let ar = Arc::new(l);
+            let w = ar.capacity();
             dbg!("{}", w);
-            let _ = l.push('a');
+            let _ = ar.enqueue('a');
         }
     }
 }

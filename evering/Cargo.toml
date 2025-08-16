@@ -17,6 +17,7 @@ nightly = []
 [dependencies]
 evering-shm = { path = "../evering-shm" }
 
+lfqueue = { version = "0.8.1", default-features = false }
 async-channel = { path = "async-channel" }
 crossbeam-channel = "0.5"
 

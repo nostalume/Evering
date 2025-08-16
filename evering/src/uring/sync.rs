@@ -45,6 +45,5 @@ pub fn channel<S: UringSpec>(cap: usize) -> Uring<S> {
 }
 
 pub fn default_channel<S: UringSpec>() -> Uring<S> {
-    let cap = 1 << 5;
-    channel(cap)
+    channel(crate::uring::DEFAULT_CAP)
 }

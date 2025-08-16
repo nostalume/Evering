@@ -9,6 +9,7 @@ edition.workspace = true
 evering = { path = "../evering" }
 evering-shm = { path = "../evering-shm" }
 concurrent-queue = "2.5.0"
+lfqueue = "0.8.1"
 
 [dev-dependencies]
 evering-shm = { path = "../evering-shm", features = ["unix"] }
