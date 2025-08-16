@@ -321,8 +321,15 @@ unsafe impl<A: ShmAllocator> ShmAllocator for &A {
 pub unsafe trait ShmHeader {
     fn header(&self) -> &Header;
     fn spec_raw<T>(&self) -> Option<NonNull<T>>;
+    unsafe fn spec<T>(&self) -> Option<ShmBox<T, &Self>>
+    where
+        Self: ShmAllocator + Sized,
+    {
+        self.spec_raw()
+            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
+    }
     unsafe fn init_spec_raw<T>(&self, spec: &T) -> bool;
-    fn init_spec<T,A:ShmAllocator>(&self, spec: ShmBox<T, A>) -> bool
+    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>) -> bool
     where
         Self: ShmAllocator + Sized,
     {

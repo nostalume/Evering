@@ -2,7 +2,7 @@ use std::marker::PhantomData;
 
 use evering::driver::locked::{LockDriverSpec, SlabDriver};
 use evering::driver::unlocked::PoolDriver;
-use evering::driver::{Completer, Driver};
+use evering::driver::{asynch::Completer, Driver};
 use evering::uring::UringSpec;
 
 pub struct CharUring;

@@ -9,7 +9,6 @@ use evering_shm::shm_box::{ShmBox, ShmToken};
 use core::marker::PhantomData;
 use core::ptr::NonNull;
 use evering::uring::UringSpec;
-use evering::uring::asynch::{Uring, default_channel_in};
 use evering_shm::shm_alloc::{ShmAlloc, ShmHeader, ShmInit};
 use evering_shm::shm_area::{ShmBackend, ShmSpec};
 
@@ -33,12 +32,15 @@ impl<U: UringSpec, S: ShmSpec, M: ShmBackend<S>, A: ShmInit> IpcHandle<A, S, M, 
         }
     }
 
-    pub fn u(&self) -> NonNull<lfqueue::ConstBoundedQueue<char,16>> {
+    pub fn u(&self) -> NonNull<lfqueue::ConstBoundedQueue<char, 16>> {
         loop {
             match self.0.spec_raw::<_>() {
                 Some(u) => break u,
                 None => {
-                    let u = ShmBox::new_in(lfqueue::ConstBoundedQueue::<char,16>::new_const(), &self.0);
+                    let u = ShmBox::new_in(
+                        lfqueue::ConstBoundedQueue::<char, 16>::new_const(),
+                        &self.0,
+                    );
                     self.0.init_spec(u);
                 }
             }
@@ -92,7 +94,7 @@ mod tests {
             }
         }
     }
-    
+
     #[test]
     fn u() {
         let m = create(0x2000);
@@ -100,11 +102,13 @@ mod tests {
         let mut u = h.u();
         unsafe {
             let l = u.as_mut();
-            
+
             let ar = Arc::new(l);
             let w = ar.capacity();
             dbg!("{}", w);
             let _ = ar.enqueue('a');
+            let a = ar.dequeue().unwrap();
+            assert_eq!(a, 'a')
         }
     }
 }
