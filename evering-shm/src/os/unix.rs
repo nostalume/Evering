@@ -12,10 +12,6 @@ use crate::shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
 
 type UnixAddr = usize;
 
-fn c_void_as_usize(ptr: *const c_void) -> UnixAddr {
-    ptr as UnixAddr
-}
-
 unsafe fn usize_as_c_void(ptr: UnixAddr) -> NonNull<c_void> {
     let ptr = ptr as *mut c_void;
     unsafe { NonNull::new_unchecked(ptr) }
@@ -52,26 +48,33 @@ impl<F: AsFd> FdConfig<F> {
     }
 }
 
-pub struct FdShmSpec<F: AsFd>(core::marker::PhantomData<F>);
+pub struct UnixShm;
 
-impl<F: AsFd> ShmSpec for FdShmSpec<F> {
+impl ShmSpec for UnixShm {
     type Addr = UnixAddr;
     type Flags = ProtFlags;
 }
 
-pub struct FdBackend;
+pub struct FdBackend<F: AsFd>(core::marker::PhantomData<F>);
 
-impl<F: AsFd> ShmBackend<FdShmSpec<F>> for FdBackend {
+impl<F: AsFd> FdBackend<F> {
+    #[inline]
+    pub const fn new() -> Self {
+        Self(core::marker::PhantomData)
+    }
+}
+
+impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
     type Config = FdConfig<F>;
     type Error = nix::Error;
 
     fn map(
         self,
-        start: Option<<FdShmSpec<F> as ShmSpec>::Addr>,
+        start: Option<<UnixShm as ShmSpec>::Addr>,
         size: usize,
-        flags: <FdShmSpec<F> as ShmSpec>::Flags,
+        flags: <UnixShm as ShmSpec>::Flags,
         cfg: FdConfig<F>,
-    ) -> Result<ShmArea<FdShmSpec<F>, Self>, Self::Error> {
+    ) -> Result<ShmArea<UnixShm, Self>, Self::Error> {
         let start = start.and_then(NonZeroUsize::new);
         let len = size as i64;
         let size = match NonZeroUsize::new(size) {
@@ -98,17 +101,17 @@ impl<F: AsFd> ShmBackend<FdShmSpec<F>> for FdBackend {
         }
     }
 
-    fn unmap(area: &mut ShmArea<FdShmSpec<F>, Self>) -> Result<(), Self::Error> {
+    fn unmap(area: &mut ShmArea<UnixShm, Self>) -> Result<(), Self::Error> {
         let addr = unsafe { usize_as_c_void(area.start().into()) };
         let size = area.size();
         unsafe { nix::sys::mman::munmap(addr, size) }
     }
 }
 
-impl<F: AsFd> ShmProtect<FdShmSpec<F>> for FdBackend {
+impl<F: AsFd> ShmProtect<UnixShm> for FdBackend<F> {
     fn protect(
-        area: &mut ShmArea<FdShmSpec<F>, Self>,
-        new_flags: <FdShmSpec<F> as ShmSpec>::Flags,
+        area: &mut ShmArea<UnixShm, Self>,
+        new_flags: <UnixShm as ShmSpec>::Flags,
     ) -> Result<(), Self::Error> {
         let start = unsafe { usize_as_c_void(area.start().into()) };
         let size = area.size();

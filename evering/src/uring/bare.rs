@@ -4,7 +4,7 @@ use alloc::sync::Arc;
 use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
 use lfqueue::ConstBoundedQueue;
 
-use crate::{uring::UringSpec, seal::Sealed};
+use crate::{seal::Sealed, uring::UringSpec};
 
 pub trait QueuePair<S: UringSpec, const N: usize>: Sealed {
     type SubQueue: Ref<T = ConstBoundedQueue<S::SQE, N>> + Clone;
@@ -32,6 +32,12 @@ impl<A: ShmAllocator> Sealed for Boxed<A> {}
 impl<S: UringSpec, A: ShmAllocator, const N: usize> QueuePair<S, N> for Boxed<A> {
     type SubQueue = BoxQueue<S::SQE, A, N>;
     type CompQueue = BoxQueue<S::CQE, A, N>;
+}
+
+impl<A: ShmAllocator> Boxed<A> {
+    pub fn new<T, const N: usize>(alloc: &A) -> BoxedQueue<T, &A, N> {
+        ShmBox::new_in(ConstBoundedQueue::new_const(), alloc)
+    }
 }
 
 pub trait Ref {
@@ -86,7 +92,7 @@ pub type Queue<T, const N: usize> = Arc<ConstBoundedQueue<T, N>>;
 pub type Submitter<S, P, const N: usize> = Channel<S, P, N, Submit>;
 pub type Completer<S, P, const N: usize> = Channel<S, P, N, Complete>;
 
-trait Role {}
+pub trait Role {}
 pub struct Submit;
 impl Role for Submit {}
 pub struct Complete;

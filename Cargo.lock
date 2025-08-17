@@ -243,7 +243,9 @@ dependencies = [
  "concurrent-queue",
  "evering",
  "evering-shm",
+ "fastrand",
  "lfqueue",
+ "tokio",
 ]
 
 [[package]]

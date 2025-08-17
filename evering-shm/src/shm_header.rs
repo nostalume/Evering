@@ -6,7 +6,7 @@ use spin::RwLock;
 pub struct HeaderIn {
     magic: u16,
     status: ShmStatus,
-    spec: Option<isize>,
+    spec: [Option<isize>; 5],
 }
 
 #[repr(transparent)]
@@ -29,7 +29,7 @@ impl HeaderIn {
     pub const fn intializing(&mut self) {
         self.with_magic();
         self.with_status(ShmStatus::Initializing);
-        self.spec = None;
+        self.spec = [None; 5];
     }
 
     #[inline]
@@ -53,16 +53,25 @@ impl HeaderIn {
     }
 
     #[inline]
-    pub const fn spec(&self) -> Option<isize> {
-        self.spec
+    pub const fn spec(&self, idx: usize) -> Option<isize> {
+        assert!(
+            idx < self.spec.len(),
+            "idx must smaller than length of spec",
+        );
+        // Safety: assert!()
+        *self.spec.get(idx).unwrap()
     }
 
     #[inline]
-    pub fn with_spec(&mut self, offset: isize) -> bool {
-        if self.spec.is_some() {
+    pub const fn with_spec(&mut self, offset: isize, idx: usize) -> bool {
+        assert!(
+            idx < self.spec.len(),
+            "idx must smaller than length of spec"
+        );
+        if self.spec.get(idx).unwrap().is_some() {
             false
         } else {
-            self.spec = Some(offset);
+            self.spec[idx] = Some(offset);
             true
         }
     }

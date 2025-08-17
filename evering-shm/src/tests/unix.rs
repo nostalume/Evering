@@ -3,20 +3,20 @@
 
 use std::os::fd::OwnedFd;
 
-use crate::os::unix::{FdBackend, FdConfig, FdShmSpec, MFdFlags, ProtFlags};
+use crate::os::unix::{FdBackend, FdConfig, MFdFlags, ProtFlags, UnixShm};
 use crate::shm_alloc::{ShmAllocError, ShmHeader, ShmSpinTlsf};
 use crate::shm_box::ShmBox;
 
-type TestShm<'a> = ShmSpinTlsf<'a, FdShmSpec<OwnedFd>, FdBackend>;
+type TestShm = ShmSpinTlsf<UnixShm, FdBackend<OwnedFd>>;
 
 fn create<P: nix::NixPath + ?Sized>(
     name: &P,
     size: usize,
-) -> Result<TestShm<'_>, ShmAllocError<FdShmSpec<OwnedFd>, FdBackend>> {
+) -> Result<TestShm, ShmAllocError<UnixShm, FdBackend<OwnedFd>>> {
     let cfg =
         FdConfig::default_from_mem_fd(name, MFdFlags::empty()).map_err(ShmAllocError::MapError)?;
     let m = TestShm::init_or_load(
-        FdBackend,
+        FdBackend::new(),
         None,
         size,
         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
@@ -25,13 +25,13 @@ fn create<P: nix::NixPath + ?Sized>(
     Ok(m)
 }
 
-fn load_spec<'a>(m: &'a TestShm<'a>) -> ShmBox<[u8; 100], &'a TestShm<'a>> {
+fn load_spec(m: &TestShm) -> ShmBox<[u8; 100], &TestShm> {
     loop {
-        match unsafe { m.spec::<_>() } {
+        match unsafe { m.spec::<_>(0) } {
             Some(u) => break u,
             None => {
                 let u = ShmBox::new_in([1u8; 100], &m);
-                m.init_spec(u);
+                m.init_spec(u, 0);
             }
         }
     }
@@ -41,5 +41,5 @@ fn load_spec<'a>(m: &'a TestShm<'a>) -> ShmBox<[u8; 100], &'a TestShm<'a>> {
 fn spec_test() {
     let m = create("test", 0x1000).unwrap();
     let u = load_spec(&m);
-    assert_eq!(u[0], 1);
+    assert_eq!(u[42], 1);
 }

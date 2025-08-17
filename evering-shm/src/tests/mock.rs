@@ -90,7 +90,7 @@ impl<'a> ShmProtect<MockSpec> for MockBackend<'a> {
 }
 
 type MySpinGma<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
-type MyTlsf<'a> = ShmSpinTlsf<'a, MockSpec, MockBackend<'a>>;
+type MyTlsf<'a> = ShmSpinTlsf<MockSpec, MockBackend<'a>>;
 type MyBlink<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
 
 fn box_test(allocator: &impl ShmAllocator) {
@@ -122,8 +122,8 @@ macro_rules! header_spec_test {
     ($name:ident, $alloc:ty) => {
         fn $name<'a>(allocator: &'a $alloc) {
             let bb = ShmBox::new_in(32u16, allocator);
-            allocator.init_spec(bb);
-            match allocator.spec_raw::<u16>() {
+            allocator.init_spec(bb,0);
+            match allocator.spec_raw::<u16>(0) {
                 Some(spec) => {
                     let spec = unsafe { spec.as_ref() };
                     dbg!(format!("spec address: {:?}", spec));

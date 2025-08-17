@@ -162,10 +162,11 @@ pub mod bare {
 
     use evering_shm::shm_alloc::ShmAllocator;
 
-    use crate::driver::{BridgeTmpl, Driver, DriverUring, Receive, Submit};
+    use crate::driver::{BridgeTmpl, Driver, DriverUring, Receive, Submit, cell};
     use crate::uring::UringSpec;
     use crate::uring::bare::{
-        box_channel, channel, Boxed, BoxedQueue, Completer as UringCompleter, Submitter as UringSubbmiter
+        Boxed, BoxedQueue, Completer as UringCompleter, QueuePair, Submitter as UringSubbmiter,
+        box_channel, channel,
     };
 
     pub type Submitter<D, P, const N: usize> = UringSubbmiter<DriverUring<D>, P, N>;
@@ -227,5 +228,54 @@ pub mod bare {
             _marker: PhantomData,
         };
         (sb, cb, cq)
+    }
+
+    pub fn box_default<D: Driver, A: ShmAllocator, const N: usize>(
+        q: (
+            BoxedQueue<<DriverUring<D> as UringSpec>::SQE, A, N>,
+            BoxedQueue<<DriverUring<D> as UringSpec>::CQE, A, N>,
+        ),
+    ) -> BoxUringBridge<D, A, N> {
+        let (sq, cq) = box_channel(q.0, q.1);
+        let d = D::default();
+        let sb = BridgeTmpl {
+            driver: d.clone(),
+            sq: sq.clone(),
+            _marker: PhantomData,
+        };
+        let cb = BridgeTmpl {
+            driver: d,
+            sq,
+            _marker: PhantomData,
+        };
+        (sb, cb, cq)
+    }
+
+    impl<D: Driver, P: QueuePair<DriverUring<D>, N>, const N: usize> SubmitBridge<D, P, N> {
+        /// submits a request in non-blocking.
+        ///
+        /// If the channel is closed or full, it will return an error immediately.
+        pub fn try_submit(
+            &self,
+            data: D::SQE,
+        ) -> Result<D::Op, <DriverUring<D> as UringSpec>::SQE> {
+            let (id, op) = self.driver.register();
+            let req = cell::IdCell::new(id, data);
+            self.sq.try_send(req)?;
+
+            Ok(op)
+        }
+    }
+
+    impl<D: Driver, P: QueuePair<DriverUring<D>, N>, const N: usize> ReceiveBridge<D, P, N> {
+        /// Receives completed msgs in non-blocking.
+        ///
+        /// If the channel is empty or closed, it will return immediately.
+        pub fn try_complete(&self) {
+            while let Some(data) = self.sq.try_recv() {
+                let (id, payload) = data.into_inner();
+                self.driver.complete(id, payload);
+            }
+        }
     }
 }

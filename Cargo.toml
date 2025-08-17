@@ -9,6 +9,7 @@ license = "MIT OR Apache-2.0"
 edition = "2024"
 
 [workspace.dependencies]
+tokio = { version = "1.47.1", features = ["full"] }
 fastrand = "2.3.0"
 lock_api = "0.4.13"
 spin = { version = "0.10.0", features = ["lock_api"] }
@@ -17,4 +18,3 @@ nix = "0.30.1"
 [patch.crates-io]
 concurrent-queue = { path = "evering/concurrent-queue" }
 async-channel = { path = "evering/async-channel" }
-

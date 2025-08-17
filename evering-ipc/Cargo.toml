@@ -13,3 +13,5 @@ lfqueue = "0.8.1"
 
 [dev-dependencies]
 evering-shm = { path = "../evering-shm", features = ["unix"] }
+tokio.workspace = true
+fastrand.workspace = true

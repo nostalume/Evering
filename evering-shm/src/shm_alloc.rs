@@ -12,14 +12,13 @@ use crate::shm_area::ShmArea;
 use crate::shm_area::ShmBackend;
 use crate::shm_area::ShmSpec;
 use crate::shm_box::ShmBox;
-use crate::shm_box::ShmToken;
 use crate::shm_header::Header;
 
 pub mod blink;
 pub mod gma;
 pub mod tlsf;
 
-pub type ShmSpinTlsf<'a, S, M> = ShmAlloc<tlsf::SpinTlsf<'a>, S, M>;
+pub type ShmSpinTlsf<S, M> = ShmAlloc<tlsf::SSpinTlsf, S, M>;
 pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
 pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 
@@ -183,21 +182,18 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAllocator for ShmAlloc<
 
 unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmHeader for ShmAlloc<A, S, M> {
     /// preload spec
-    fn spec_raw<T>(&self) -> Option<NonNull<T>> {
+    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
         let header = self.header();
-        let offset = header.read().spec();
+        let offset = header.read().spec(idx);
 
-        offset.map(|offset| {
-            let token = ShmToken::from_raw(offset, self);
-            token.acquire()
-        })
+        offset.map(|offset| unsafe { self.get_aligned_ptr_mut::<T>(offset) })
     }
 
-    unsafe fn init_spec_raw<T>(&self, spec: &T) -> bool {
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
         let header = self.header();
         let mut header = header.write();
         let offset = unsafe { self.offset(spec) };
-        header.with_spec(offset)
+        header.with_spec(offset, idx)
     }
 
     fn header(&self) -> &Header {
@@ -332,19 +328,19 @@ unsafe impl<A: ShmAllocator> ShmAllocator for &A {
 
 pub unsafe trait ShmHeader {
     fn header(&self) -> &Header;
-    fn spec_raw<T>(&self) -> Option<NonNull<T>>;
-    unsafe fn spec<T>(&self) -> Option<ShmBox<T, &Self>>
+    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>>;
+    unsafe fn spec<T>(&self, idx: usize) -> Option<ShmBox<T, &Self>>
     where
         Self: ShmAllocator + Sized,
     {
-        self.spec_raw()
+        self.spec_raw(idx)
             .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
     }
-    unsafe fn init_spec_raw<T>(&self, spec: &T) -> bool;
-    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>) -> bool
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool;
+    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize) -> bool
     where
         Self: ShmAllocator + Sized,
     {
-        unsafe { self.init_spec_raw(spec.as_ref()) }
+        unsafe { self.init_spec_raw(spec.as_ref(), idx) }
     }
 }

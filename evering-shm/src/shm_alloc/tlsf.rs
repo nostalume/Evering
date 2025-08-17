@@ -11,6 +11,7 @@ use rlsf::Tlsf;
 
 use crate::shm_alloc::ShmInit;
 
+pub type SSpinTlsf = SpinTlsf<'static>;
 type MyTlsf<'a> = Tlsf<'a, u32, u32, 24, 8>;
 pub struct SpinTlsf<'a>(spin::Mutex<MyTlsf<'a>>);
 

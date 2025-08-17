@@ -4,7 +4,6 @@ use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use core::pin::Pin;
-use core::ptr::NonNull;
 
 #[cfg(feature = "nightly")]
 use alloc::{alloc::AllocError, boxed::Box};
@@ -162,13 +161,6 @@ impl<T, A: ShmAllocator> ShmToken<T, A> {
 
     pub fn from_raw(offset: isize, alloc: A) -> Self {
         ShmToken(offset, alloc, PhantomData)
-    }
-
-    /// Acquire the ptr of `T` based on allocator offset.
-    pub fn acquire(self) -> NonNull<T> {
-        let Self(offset, alloc, _) = self;
-
-        unsafe { alloc.get_aligned_ptr_mut::<T>(offset) }
     }
 }
 
