@@ -4,12 +4,11 @@ use alloc::sync::Arc;
 use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
 use lfqueue::ConstBoundedQueue;
 
-use crate::uring::UringSpec;
-trait Sealed {}
+use crate::{uring::UringSpec, seal::Sealed};
 
-trait QueuePair<S: UringSpec, const N: usize>: Sealed {
-    type SubQueue: Ref<T = ConstBoundedQueue<S::SQE, N>>;
-    type CompQueue: Ref<T = ConstBoundedQueue<S::CQE, N>>;
+pub trait QueuePair<S: UringSpec, const N: usize>: Sealed {
+    type SubQueue: Ref<T = ConstBoundedQueue<S::SQE, N>> + Clone;
+    type CompQueue: Ref<T = ConstBoundedQueue<S::CQE, N>> + Clone;
 }
 
 impl Sealed for () {}
@@ -18,7 +17,7 @@ impl<S: UringSpec, const N: usize> QueuePair<S, N> for () {
     type CompQueue = Queue<S::CQE, N>;
 }
 
-impl<'a> Sealed for &'a () {}
+impl Sealed for &() {}
 impl<'a, S: UringSpec, const N: usize> QueuePair<S, N> for &'a ()
 where
     S::SQE: 'a,
@@ -35,7 +34,7 @@ impl<S: UringSpec, A: ShmAllocator, const N: usize> QueuePair<S, N> for Boxed<A>
     type CompQueue = BoxQueue<S::CQE, A, N>;
 }
 
-trait Ref {
+pub trait Ref {
     type T;
     fn as_ref(&self) -> &Self::T;
 }
@@ -108,7 +107,7 @@ where
         Self {
             s: self.s.clone(),
             r: self.r.clone(),
-            phantom: self.phantom.clone(),
+            phantom: self.phantom,
         }
     }
 }

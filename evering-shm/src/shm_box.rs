@@ -60,7 +60,7 @@ impl<T, A: ShmAllocator> ShmBox<T, A> {
     }
 
     pub fn as_ref(&self) -> &T {
-        &**self
+        self
     }
 
     pub fn as_ptr(&self) -> *const T {

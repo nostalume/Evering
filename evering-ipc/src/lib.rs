@@ -3,8 +3,7 @@
 
 extern crate alloc;
 
-use alloc::alloc::Allocator;
-use evering_shm::shm_box::{ShmBox, ShmToken};
+use evering_shm::shm_box::ShmBox;
 
 use core::marker::PhantomData;
 use core::ptr::NonNull;
@@ -12,12 +11,18 @@ use evering::uring::UringSpec;
 use evering_shm::shm_alloc::{ShmAlloc, ShmHeader, ShmInit};
 use evering_shm::shm_area::{ShmBackend, ShmSpec};
 
-struct IpcHandle<A: ShmInit, S: ShmSpec, M: ShmBackend<S>, U: UringSpec>(
-    ShmAlloc<A, S, M>,
+pub trait IpcSepc {
+    type A: ShmInit;
+    type S: ShmSpec;
+    type M: ShmBackend<Self::S>;
+}
+
+struct IpcHandle<I:IpcSepc, U: UringSpec>(
+    ShmAlloc<I::A, I::S, I::M>,
     PhantomData<U>,
 );
 
-impl<U: UringSpec, S: ShmSpec, M: ShmBackend<S>, A: ShmInit> IpcHandle<A, S, M, U> {
+impl<I:IpcSepc,U:UringSpec> IpcHandle<I,U> {
     pub fn init_or_load(&self) -> NonNull<[u8; 100]> {
         loop {
             match self.0.spec_raw::<_>() {
@@ -56,7 +61,7 @@ mod tests {
 
     use evering::uring::UringSpec;
     use evering_shm::os::unix::{FdBackend, FdConfig, FdShmSpec, MFdFlags, ProtFlags};
-    use evering_shm::shm_alloc::ShmSpinGma;
+    use evering_shm::shm_alloc::{ShmAllocError, ShmSpinGma};
 
     use crate::IpcHandle;
 

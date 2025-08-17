@@ -1,6 +1,6 @@
 pub mod asynch;
 pub mod sync;
-mod bare;
+pub mod bare;
 mod tests;
 
 pub trait UringSpec {

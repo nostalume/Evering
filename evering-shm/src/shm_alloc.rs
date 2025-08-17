@@ -29,6 +29,18 @@ pub enum ShmAllocError<S: ShmSpec, M: ShmBackend<S>> {
     MapError(M::Error),
 }
 
+impl<S: ShmSpec, M: ShmBackend<S>> core::error::Error for ShmAllocError<S, M> {}
+
+impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Display for ShmAllocError<S, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnenoughSpace => write!(f, "UnenoughSpace"),
+            Self::InvalidHeader => write!(f, "InvalidHeader"),
+            Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
+        }
+    }
+}
+
 impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {

@@ -8,3 +8,7 @@ extern crate std;
 
 pub mod driver;
 pub mod uring;
+
+mod seal {
+    pub trait Sealed {}
+}
