@@ -2,23 +2,23 @@ use core::{marker::PhantomData, ops::Deref};
 
 use alloc::sync::Arc;
 use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
-use lfqueue::ConstBoundedQueue;
+use lfqueue::ConstBoundedQueue as CBQueue;
 
 use crate::{seal::Sealed, uring::UringSpec};
 
-pub trait QueuePair<S: UringSpec, const N: usize>: Sealed {
-    type SubQueue: Ref<T = ConstBoundedQueue<S::SQE, N>> + Clone;
-    type CompQueue: Ref<T = ConstBoundedQueue<S::CQE, N>> + Clone;
+pub trait QPair<S: UringSpec, const N: usize>: Sealed {
+    type SubQueue: Ref<T = CBQueue<S::SQE, N>> + Clone;
+    type CompQueue: Ref<T = CBQueue<S::CQE, N>> + Clone;
 }
 
 impl Sealed for () {}
-impl<S: UringSpec, const N: usize> QueuePair<S, N> for () {
-    type SubQueue = Queue<S::SQE, N>;
-    type CompQueue = Queue<S::CQE, N>;
+impl<S: UringSpec, const N: usize> QPair<S, N> for () {
+    type SubQueue = ArcQueue<S::SQE, N>;
+    type CompQueue = ArcQueue<S::CQE, N>;
 }
 
 impl Sealed for &() {}
-impl<'a, S: UringSpec, const N: usize> QueuePair<S, N> for &'a ()
+impl<'a, S: UringSpec, const N: usize> QPair<S, N> for &'a ()
 where
     S::SQE: 'a,
     S::CQE: 'a,
@@ -29,14 +29,14 @@ where
 
 pub struct Boxed<A: ShmAllocator>(PhantomData<A>);
 impl<A: ShmAllocator> Sealed for Boxed<A> {}
-impl<S: UringSpec, A: ShmAllocator, const N: usize> QueuePair<S, N> for Boxed<A> {
-    type SubQueue = BoxQueue<S::SQE, A, N>;
-    type CompQueue = BoxQueue<S::CQE, A, N>;
+impl<S: UringSpec, A: ShmAllocator, const N: usize> QPair<S, N> for Boxed<A> {
+    type SubQueue = ABoxQueue<S::SQE, A, N>;
+    type CompQueue = ABoxQueue<S::CQE, A, N>;
 }
 
 impl<A: ShmAllocator> Boxed<A> {
-    pub fn new<T, const N: usize>(alloc: &A) -> BoxedQueue<T, &A, N> {
-        ShmBox::new_in(ConstBoundedQueue::new_const(), alloc)
+    pub fn new<T, const N: usize>(alloc: &A) -> BoxQueue<T, &A, N> {
+        ShmBox::new_in(CBQueue::new_const(), alloc)
     }
 }
 
@@ -46,32 +46,32 @@ pub trait Ref {
 }
 
 impl<'a, T, const N: usize> Ref for RefQueue<'a, T, N> {
-    type T = ConstBoundedQueue<T, N>;
+    type T = CBQueue<T, N>;
 
     fn as_ref(&self) -> &Self::T {
         self.deref()
     }
 }
 
-impl<T, const N: usize> Ref for Queue<T, N> {
-    type T = ConstBoundedQueue<T, N>;
+impl<T, const N: usize> Ref for ArcQueue<T, N> {
+    type T = CBQueue<T, N>;
 
     fn as_ref(&self) -> &Self::T {
         self
     }
 }
 
-impl<T, A: ShmAllocator, const N: usize> Ref for BoxQueue<T, A, N> {
-    type T = ConstBoundedQueue<T, N>;
+impl<T, A: ShmAllocator, const N: usize> Ref for ABoxQueue<T, A, N> {
+    type T = CBQueue<T, N>;
 
     fn as_ref(&self) -> &Self::T {
         self.deref().as_ref()
     }
 }
 
-pub type BoxUring<S, A, const N: usize> = (BoxSubmitter<S, A, N>, BoxCompleter<S, A, N>);
-pub type BoxSubmitter<S, A, const N: usize> = Submitter<S, Boxed<A>, N>;
-pub type BoxCompleter<S, A, const N: usize> = Completer<S, Boxed<A>, N>;
+pub type ABoxUring<S, A, const N: usize> = (ABoxSubmitter<S, A, N>, ABoxCompleter<S, A, N>);
+pub type ABoxSubmitter<S, A, const N: usize> = Submitter<S, Boxed<A>, N>;
+pub type ABoxCompleter<S, A, const N: usize> = Completer<S, Boxed<A>, N>;
 
 pub type OwnUring<S, const N: usize> = (OwnSubmitter<S, N>, OwnCompleter<S, N>);
 pub type OwnSubmitter<S, const N: usize> = Submitter<S, (), N>;
@@ -81,13 +81,13 @@ pub type RefUring<'a, S, const N: usize> = (RefSubmitter<'a, S, N>, RefCompleter
 pub type RefSubmitter<'a, S, const N: usize> = Submitter<S, &'a (), N>;
 pub type RefCompleter<'a, S, const N: usize> = Completer<S, &'a (), N>;
 
-pub type BoxQueue<T, A, const N: usize> = Arc<BoxedQueue<T, A, N>>;
-pub type BoxedQueue<T, A, const N: usize> = ShmBox<ConstBoundedQueue<T, N>, A>;
+pub type ABoxQueue<T, A, const N: usize> = Arc<BoxQueue<T, A, N>>;
+pub type BoxQueue<T, A, const N: usize> = ShmBox<CBQueue<T, N>, A>;
 
 pub type RefQueue<'a, T, const N: usize> = Arc<BorrowQueue<'a, T, N>>;
-pub type BorrowQueue<'a, T, const N: usize> = &'a ConstBoundedQueue<T, N>;
+pub type BorrowQueue<'a, T, const N: usize> = &'a CBQueue<T, N>;
 
-pub type Queue<T, const N: usize> = Arc<ConstBoundedQueue<T, N>>;
+pub type ArcQueue<T, const N: usize> = Arc<CBQueue<T, N>>;
 
 pub type Submitter<S, P, const N: usize> = Channel<S, P, N, Submit>;
 pub type Completer<S, P, const N: usize> = Channel<S, P, N, Complete>;
@@ -98,13 +98,13 @@ impl Role for Submit {}
 pub struct Complete;
 impl Role for Complete {}
 
-pub struct Channel<S: UringSpec, P: QueuePair<S, N>, const N: usize, R: Role> {
+pub struct Channel<S: UringSpec, P: QPair<S, N>, const N: usize, R: Role> {
     s: P::SubQueue,
     r: P::CompQueue,
     phantom: PhantomData<(S, R)>,
 }
 
-impl<S: UringSpec, P: QueuePair<S, N>, const N: usize, R: Role> Clone for Channel<S, P, N, R>
+impl<S: UringSpec, P: QPair<S, N>, const N: usize, R: Role> Clone for Channel<S, P, N, R>
 where
     P::SubQueue: Clone,
     P::CompQueue: Clone,
@@ -118,7 +118,7 @@ where
     }
 }
 
-impl<S: UringSpec, P: QueuePair<S, N>, const N: usize> Submitter<S, P, N> {
+impl<S: UringSpec, P: QPair<S, N>, const N: usize> Submitter<S, P, N> {
     // block
     pub fn send(&self, data: S::SQE) {
         let mut d = Some(data);
@@ -151,7 +151,7 @@ impl<S: UringSpec, P: QueuePair<S, N>, const N: usize> Submitter<S, P, N> {
     }
 }
 
-impl<S: UringSpec, P: QueuePair<S, N>, const N: usize> Completer<S, P, N> {
+impl<S: UringSpec, P: QPair<S, N>, const N: usize> Completer<S, P, N> {
     // block
     pub fn send(&self, data: S::CQE) {
         let mut d = Some(data);
@@ -184,24 +184,29 @@ impl<S: UringSpec, P: QueuePair<S, N>, const N: usize> Completer<S, P, N> {
     }
 }
 
-pub fn channel<S: UringSpec, const N: usize>() -> OwnUring<S, N> {
-    let s = ConstBoundedQueue::<S::SQE, N>::new_const();
-    let r = ConstBoundedQueue::<S::CQE, N>::new_const();
-    let s = Arc::new(s);
-    let r = Arc::new(r);
+macro_rules! build_qpair {
+    ($q1:expr, $q2:expr, $submitter:ident, $completer:ident) => {{
+        let s = Arc::new($q1);
+        let r = Arc::new($q2);
+        (
+            $submitter {
+                s: s.clone(),
+                r: r.clone(),
+                phantom: PhantomData,
+            },
+            $completer {
+                s,
+                r,
+                phantom: PhantomData,
+            },
+        )
+    }};
+}
 
-    (
-        OwnSubmitter {
-            s: s.clone(),
-            r: r.clone(),
-            phantom: PhantomData,
-        },
-        OwnCompleter {
-            s,
-            r,
-            phantom: PhantomData,
-        },
-    )
+pub fn channel<S: UringSpec, const N: usize>() -> OwnUring<S, N> {
+    let s = CBQueue::<S::SQE, N>::new_const();
+    let r = CBQueue::<S::CQE, N>::new_const();
+    build_qpair!(s, r, OwnSubmitter, OwnCompleter)
 }
 
 pub fn default_channel<S: UringSpec>() -> OwnUring<S, { crate::uring::DEFAULT_CAP }> {
@@ -212,40 +217,12 @@ pub fn entrap_channel<'a, S: UringSpec, const N: usize>(
     q1: BorrowQueue<'a, S::SQE, N>,
     q2: BorrowQueue<'a, S::CQE, N>,
 ) -> RefUring<'a, S, N> {
-    let s = Arc::new(q1);
-    let r = Arc::new(q2);
-
-    (
-        RefSubmitter {
-            s: s.clone(),
-            r: r.clone(),
-            phantom: PhantomData,
-        },
-        RefCompleter {
-            s,
-            r,
-            phantom: PhantomData,
-        },
-    )
+    build_qpair!(q1, q2, RefSubmitter, RefCompleter)
 }
 
 pub fn box_channel<S: UringSpec, A: ShmAllocator, const N: usize>(
-    q1: BoxedQueue<S::SQE, A, N>,
-    q2: BoxedQueue<S::CQE, A, N>,
-) -> BoxUring<S, A, N> {
-    let s = Arc::new(q1);
-    let r = Arc::new(q2);
-
-    (
-        BoxSubmitter {
-            s: s.clone(),
-            r: r.clone(),
-            phantom: PhantomData,
-        },
-        BoxCompleter {
-            s,
-            r,
-            phantom: PhantomData,
-        },
-    )
+    q1: BoxQueue<S::SQE, A, N>,
+    q2: BoxQueue<S::CQE, A, N>,
+) -> ABoxUring<S, A, N> {
+    build_qpair!(q1, q2, ABoxSubmitter, ABoxCompleter)
 }

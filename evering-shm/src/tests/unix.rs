@@ -8,11 +8,12 @@ use crate::shm_alloc::{ShmAllocError, ShmHeader, ShmSpinTlsf};
 use crate::shm_box::ShmBox;
 
 type TestShm = ShmSpinTlsf<UnixShm, FdBackend<OwnedFd>>;
+type Error = ShmAllocError<UnixShm, FdBackend<OwnedFd>>;
 
 fn create<P: nix::NixPath + ?Sized>(
     name: &P,
     size: usize,
-) -> Result<TestShm, ShmAllocError<UnixShm, FdBackend<OwnedFd>>> {
+) -> Result<TestShm, Error> {
     let cfg =
         FdConfig::default_from_mem_fd(name, MFdFlags::empty()).map_err(ShmAllocError::MapError)?;
     let m = TestShm::init_or_load(

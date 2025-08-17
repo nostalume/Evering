@@ -93,8 +93,8 @@ type MySpinGma<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
 type MyTlsf<'a> = ShmSpinTlsf<MockSpec, MockBackend<'a>>;
 type MyBlink<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
 
-fn box_test(allocator: &impl ShmAllocator) {
-    let mut bb = ShmBox::new_in(1u8, allocator);
+fn box_test(alloc: &impl ShmAllocator) {
+    let mut bb = ShmBox::new_in(1u8, alloc);
     dbg!(format!("box: {:?}", bb.as_ptr()));
     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
     assert_eq!(*bb, 1);
@@ -102,9 +102,9 @@ fn box_test(allocator: &impl ShmAllocator) {
     assert_eq!(*bb, 3);
 }
 
-fn token_test(allocator: &impl ShmAllocator) {
+fn token_test(alloc: &impl ShmAllocator) {
     // 8 bits offset
-    let bb = ShmBox::new_in(1u8, allocator);
+    let bb = ShmBox::new_in(1u8, alloc);
     dbg!(format!("box: {:?}", bb.as_ptr()));
     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
     let token = ShmToken::from(bb);
@@ -118,31 +118,22 @@ fn token_test(allocator: &impl ShmAllocator) {
     assert_eq!(*bb, 1);
 }
 
-macro_rules! header_spec_test {
-    ($name:ident, $alloc:ty) => {
-        fn $name<'a>(allocator: &'a $alloc) {
-            let bb = ShmBox::new_in(32u16, allocator);
-            allocator.init_spec(bb,0);
-            match allocator.spec_raw::<u16>(0) {
-                Some(spec) => {
-                    let spec = unsafe { spec.as_ref() };
-                    dbg!(format!("spec address: {:?}", spec));
-                    assert_eq!(*spec, 32);
-                }
-                None => {
-                    panic!("spec not initialized");
-                }
-            }
+fn spec_test(alloc: &(impl ShmAllocator + ShmHeader)) {
+    let bb = ShmBox::new_in(32u16, &alloc);
+    alloc.init_spec(bb, 0);
+    match unsafe { alloc.spec::<u16>(0) } {
+        Some(spec) => {
+            dbg!(format!("spec address: {:?}", spec.as_ptr()));
+            assert_eq!(*spec, 32);
         }
-    };
+        None => {
+            panic!("spec is not initialized");
+        }
+    }
 }
 
-header_spec_test!(header_spec_test_gma, MySpinGma);
-header_spec_test!(header_spec_test_blink, MyBlink);
-header_spec_test!(header_spec_test_tlsf, MyTlsf);
-
 macro_rules! alloc_test {
-    ($alloc:ty, $spec_fn:ident) => {{
+    ($alloc:ty) => {{
         let mut pt = [0; MAX_ADDR];
         for start in (0..MAX_ADDR).step_by(0x2000) {
             let bk = MockBackend(&mut pt);
@@ -150,14 +141,14 @@ macro_rules! alloc_test {
             let alloc = <$alloc>::from_area(area).unwrap();
             box_test(&alloc);
             token_test(&alloc);
-            $spec_fn(&alloc);
+            spec_test(&alloc);
         }
     }};
 }
 
 #[test]
 fn area_alloc() {
-    alloc_test!(MySpinGma, header_spec_test_gma); // 8/1512 bits offset
-    alloc_test!(MyTlsf, header_spec_test_tlsf); // 16/1712 bits offset
-    alloc_test!(MyBlink, header_spec_test_blink); // 41/1512 bits offset
+    alloc_test!(MySpinGma); // 8/1512 bits offset
+    alloc_test!(MyTlsf); // 16/1712 bits offset
+    alloc_test!(MyBlink); // 41/1512 bits offset
 }

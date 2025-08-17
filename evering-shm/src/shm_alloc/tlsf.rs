@@ -11,11 +11,11 @@ use rlsf::Tlsf;
 
 use crate::shm_alloc::ShmInit;
 
-pub type SSpinTlsf = SpinTlsf<'static>;
+pub type SpinTlsf = SpinTlsfIn<'static>;
 type MyTlsf<'a> = Tlsf<'a, u32, u32, 24, 8>;
-pub struct SpinTlsf<'a>(spin::Mutex<MyTlsf<'a>>);
+pub struct SpinTlsfIn<'a>(spin::Mutex<MyTlsf<'a>>);
 
-impl<'a> SpinTlsf<'a> {
+impl<'a> SpinTlsfIn<'a> {
     pub unsafe fn raw_new(start: usize, size: usize) -> Self {
         let s = Self(spin::Mutex::new(MyTlsf::new()));
         let blk = unsafe {
@@ -37,7 +37,7 @@ impl<'a> SpinTlsf<'a> {
     }
 }
 
-unsafe impl<'a> Allocator for SpinTlsf<'a> {
+unsafe impl<'a> Allocator for SpinTlsfIn<'a> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if let Some(alloc) = self.0.lock().allocate(layout).map(|p| unsafe {
             NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(p.as_ptr(), layout.size()))
@@ -54,7 +54,7 @@ unsafe impl<'a> Allocator for SpinTlsf<'a> {
     }
 }
 
-unsafe impl<'a> ShmInit for SpinTlsf<'a> {
+unsafe impl<'a> ShmInit for SpinTlsfIn<'a> {
     unsafe fn init_addr(start: usize, size: usize) -> Self {
         unsafe { Self::raw_new(start, size) }
     }

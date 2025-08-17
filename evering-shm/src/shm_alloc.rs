@@ -18,7 +18,7 @@ pub mod blink;
 pub mod gma;
 pub mod tlsf;
 
-pub type ShmSpinTlsf<S, M> = ShmAlloc<tlsf::SSpinTlsf, S, M>;
+pub type ShmSpinTlsf<S, M> = ShmAlloc<tlsf::SpinTlsf, S, M>;
 pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
 pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
 

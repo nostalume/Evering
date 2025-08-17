@@ -2,6 +2,7 @@ use super::UringSpec;
 #[cfg(test)]
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 struct CharUring;
+
 impl UringSpec for CharUring {
     type SQE = char;
     type CQE = char;

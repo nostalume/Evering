@@ -5,14 +5,11 @@ extern crate alloc;
 
 use core::marker::PhantomData;
 
+use evering::driver::Driver;
 use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_default};
-use evering::driver::{Driver, DriverUring};
-use evering::uring::UringSpec;
-use evering::uring::bare::{Boxed, BoxedQueue};
-use evering_shm::shm_alloc::{ShmAlloc, ShmHeader, ShmInit};
+use evering::uring::bare::{BoxQueue, Boxed};
+use evering_shm::shm_alloc::{ShmAlloc, ShmAllocError, ShmHeader, ShmInit};
 use evering_shm::shm_area::{ShmBackend, ShmSpec};
-use evering_shm::shm_box::ShmBox;
-use lfqueue::ConstBoundedQueue;
 
 pub trait IpcSpec {
     type A: ShmInit;
@@ -21,24 +18,27 @@ pub trait IpcSpec {
 }
 
 type IpcAlloc<I: IpcSpec> = ShmAlloc<I::A, I::S, I::M>;
+type IpcError<I: IpcSpec> = ShmAllocError<I::S, I::M>;
+type IpcQueue<'a, T, I, const N: usize> = BoxQueue<T, &'a IpcAlloc<I>, N>;
+type IpcSubmitter<'a, D, I, const N: usize> = SubmitBridge<D, Boxed<&'a IpcAlloc<I>>, N>;
+type IpcReceiver<'a, D, I, const N: usize> = ReceiveBridge<D, Boxed<&'a IpcAlloc<I>>, N>;
+type IpcCompleter<'a, D, I, const N: usize> = Completer<D, Boxed<&'a IpcAlloc<I>>, N>;
 
 struct IpcHandle<I: IpcSpec, D: Driver, const N: usize>(ShmAlloc<I::A, I::S, I::M>, PhantomData<D>);
 
 impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
-    unsafe fn back<T>(&self, idx: usize) -> BoxedQueue<T, &IpcAlloc<I>, N> {
-        assert!(idx <= 2);
-        loop {
-            match unsafe { self.0.spec::<_>(idx) } {
-                Some(u) => break u,
-                None => {
-                    let q = ShmBox::new_in(ConstBoundedQueue::<T, N>::new_const(), &self.0);
-                    // let q2 = Boxed::new(&self.0);
-                    self.0.init_spec(q, 0);
-                }
-            }
-        }
+    pub fn init_or_load(
+        state: I::M,
+        start: Option<<I::S as ShmSpec>::Addr>,
+        size: usize,
+        flags: <I::S as ShmSpec>::Flags,
+        cfg: <I::M as ShmBackend<I::S>>::Config,
+    ) -> Result<Self, IpcError<I>> {
+        let area = ShmAlloc::init_or_load(state, start, size, flags, cfg)?;
+        Ok(IpcHandle(area, PhantomData))
     }
-    unsafe fn queue<T>(&self, idx: usize) -> BoxedQueue<T, &IpcAlloc<I>, N> {
+
+    unsafe fn queue<T>(&self, idx: usize) -> BoxQueue<T, &IpcAlloc<I>, N> {
         assert!(idx <= 2);
         loop {
             match unsafe { self.0.spec::<_>(idx) } {
@@ -52,30 +52,20 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
         }
     }
 
-    pub unsafe fn queue_pair<T, U>(
-        &self,
-    ) -> (
-        BoxedQueue<T, &IpcAlloc<I>, N>,
-        BoxedQueue<U, &IpcAlloc<I>, N>,
-    ) {
+    pub unsafe fn queue_pair<T, U>(&self) -> (IpcQueue<'_, T, I, N>, IpcQueue<'_, U, I, N>) {
         let q1 = unsafe { self.queue::<T>(0) };
         let q2 = unsafe { self.queue::<U>(1) };
 
         (q1, q2)
     }
 
-    pub fn client(
-        &self,
-    ) -> (
-        SubmitBridge<D, Boxed<&IpcAlloc<I>>, N>,
-        ReceiveBridge<D, Boxed<&IpcAlloc<I>>, N>,
-    ) {
+    pub fn client(&self) -> (IpcSubmitter<'_, D, I, N>, IpcReceiver<'_, D, I, N>) {
         let q_pair = unsafe { self.queue_pair() };
         let (sb, cb, _) = box_default(q_pair);
         (sb, cb)
     }
 
-    pub fn server(&self) -> Completer<D, Boxed<&IpcAlloc<I>>, N> {
+    pub fn server(&self) -> IpcCompleter<'_, D, I, N> {
         let q_pair = unsafe { self.queue_pair() };
         let (_, _, cq) = box_default(q_pair);
         cq
@@ -84,49 +74,41 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
 
 #[cfg(test)]
 mod tests {
-    use core::marker::PhantomData;
     use core::time::Duration;
     use std::io::{self, Write};
     use std::os::fd::OwnedFd;
 
-    use evering::driver::bare::Completer;
     use evering::driver::unlocked::PoolDriver;
     use evering::uring::UringSpec;
-    use evering::uring::bare::Boxed;
     use evering_shm::os::unix::{FdBackend, FdConfig, MFdFlags, ProtFlags, UnixShm};
-    use evering_shm::shm_alloc::tlsf::SSpinTlsf;
-    use evering_shm::shm_alloc::{ShmAlloc, ShmAllocError, ShmSpinGma};
+    use evering_shm::shm_alloc::tlsf::SpinTlsf;
     use tokio::task::yield_now;
     use tokio::time;
 
-    use crate::{IpcAlloc, IpcHandle, IpcSpec};
+    use crate::{IpcCompleter, IpcHandle, IpcSpec};
 
     const SIZE: usize = 0x50000;
 
     struct CharUring;
-
     impl UringSpec for CharUring {
         type SQE = char;
         type CQE = char;
     }
+    type MyPoolDriver = PoolDriver<CharUring>;
 
     struct MyIpcSpec;
     impl IpcSpec for MyIpcSpec {
-        type A = SSpinTlsf;
+        type A = SpinTlsf;
         type S = UnixShm;
         type M = FdBackend<OwnedFd>;
     }
-
-    type MyPoolDriver = PoolDriver<CharUring>;
 
     type MyIpc = IpcHandle<MyIpcSpec, MyPoolDriver, { 1 << 5 }>;
 
     struct MyHandle;
 
     impl MyHandle {
-        async fn try_handle_ref<const N: usize>(
-            cq: &Completer<MyPoolDriver, Boxed<&IpcAlloc<MyIpcSpec>>, N>,
-        ) {
+        async fn try_handle_ref<const N: usize>(cq: &IpcCompleter<'_, MyPoolDriver, MyIpcSpec, N>) {
             // use tokio::time::{self, Duration};
             loop {
                 let mut f = false;
@@ -148,24 +130,19 @@ mod tests {
     }
 
     fn create(size: usize) -> MyIpc {
-        let cfg = FdConfig::default_from_mem_fd("awda", MFdFlags::empty()).unwrap();
-        let m = ShmAlloc::<
-            <MyIpcSpec as IpcSpec>::A,
-            <MyIpcSpec as IpcSpec>::S,
-            <MyIpcSpec as IpcSpec>::M,
-        >::init_or_load(
+        let cfg = FdConfig::default_from_mem_fd("test", MFdFlags::empty()).unwrap();
+        IpcHandle::init_or_load(
             FdBackend::new(),
             None,
             size,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             cfg,
         )
-        .unwrap();
-        IpcHandle(m, PhantomData)
+        .unwrap()
     }
 
     #[test]
-    fn queue() {
+    fn queue_test() {
         let handle = create(SIZE);
         let (pa, pb) = unsafe { handle.queue_pair::<char, char>() };
         let mut len_a = 0;
@@ -194,8 +171,9 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
-    async fn test() {
+    async fn ipc_test() {
         let handle = create(SIZE);
+        // leak to acquire 'static lifetime.
         let leak = Box::leak(Box::new(handle));
         let (sb, rb) = leak.client();
         let cq = leak.server();
