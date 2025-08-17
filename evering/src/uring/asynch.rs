@@ -1,50 +1,66 @@
-use async_channel::{Receiver, Sender};
+use async_channel::{Receiver, RecvError, SendError, Sender, TryRecvError, TrySendError};
 
-use crate::uring::{UringSpec, with_recv, with_send};
+use crate::{
+    seal::Sealed,
+    uring::{IReceiver, ISender, UringSpec},
+};
 
-pub type Uring<S> = (Completer<S>, Submitter<S>);
+pub type Uring<S> = (Submitter<S>, Completer<S>);
 
 #[derive(Debug)]
-pub struct Submitter<S: UringSpec> {
-    sqs: Sender<S::SQE>,
-    sqr: Receiver<S::CQE>,
-}
-#[derive(Debug)]
-pub struct Completer<S: UringSpec> {
-    cqs: Sender<S::CQE>,
-    cqr: Receiver<S::SQE>,
+pub struct Channel<T, U> {
+    s: Sender<T>,
+    r: Receiver<U>,
 }
 
-impl<S: UringSpec> Clone for Submitter<S> {
+pub type Submitter<S: UringSpec> = Channel<S::SQE, S::CQE>;
+pub type Completer<S: UringSpec> = Channel<S::CQE, S::SQE>;
+
+impl<T, U> Clone for Channel<T, U> {
     fn clone(&self) -> Self {
         Self {
-            sqs: self.sqs.clone(),
-            sqr: self.sqr.clone(),
+            s: self.s.clone(),
+            r: self.r.clone(),
         }
     }
 }
 
-impl<S: UringSpec> Clone for Completer<S> {
-    fn clone(&self) -> Self {
-        Self {
-            cqs: self.cqs.clone(),
-            cqr: self.cqr.clone(),
-        }
+impl<T, U> Sealed for Channel<T, U> {}
+
+impl<T, U> ISender for Channel<T, U> {
+    type Item = T;
+    type Error = SendError<T>;
+    type TryError = TrySendError<T>;
+
+    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError> {
+        self.s.try_send(item)
+    }
+
+    async fn send(&self, item: Self::Item) -> Result<(), Self::Error> {
+        self.s.send(item).await
     }
 }
 
-with_send!(Submitter, sqs, Sender, SQE);
-with_recv!(Submitter, sqr, Receiver, CQE);
-with_send!(Completer, cqs, Sender, CQE);
-with_recv!(Completer, cqr, Receiver, SQE);
+impl<T, U> IReceiver for Channel<T, U> {
+    type Item = U;
+    type Error = RecvError;
+    type TryError = TryRecvError;
+
+    fn try_recv(&self) -> Result<Self::Item, Self::TryError> {
+        self.r.try_recv()
+    }
+
+    async fn recv(&self) -> Result<Self::Item, Self::Error> {
+        self.r.recv().await
+    }
+}
 
 pub fn channel<S: UringSpec>(cap: usize) -> Uring<S> {
-    let (cqs, sqr) = async_channel::bounded(cap);
     let (sqs, cqr) = async_channel::bounded(cap);
-    (Completer { cqs, cqr }, Submitter { sqs, sqr })
+    let (cqs, sqr) = async_channel::bounded(cap);
+    (Channel { s: sqs, r: sqr }, Channel { s: cqs, r: cqr })
 }
 
-
 pub fn default_channel<S: UringSpec>() -> Uring<S> {
-    channel(crate::uring::DEFAULT_CAP)
+    channel::<S>(crate::uring::DEFAULT_CAP)
 }

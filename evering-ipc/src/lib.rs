@@ -6,7 +6,7 @@ extern crate alloc;
 use core::marker::PhantomData;
 
 use evering::driver::Driver;
-use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_default};
+use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_client, box_server};
 use evering::uring::bare::{BoxQueue, Boxed};
 use evering_shm::shm_alloc::{ShmAlloc, ShmAllocError, ShmHeader, ShmInit};
 use evering_shm::shm_area::{ShmBackend, ShmSpec};
@@ -61,14 +61,12 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
 
     pub fn client(&self) -> (IpcSubmitter<'_, D, I, N>, IpcReceiver<'_, D, I, N>) {
         let q_pair = unsafe { self.queue_pair() };
-        let (sb, cb, _) = box_default(q_pair);
-        (sb, cb)
+        box_client(q_pair)
     }
 
     pub fn server(&self) -> IpcCompleter<'_, D, I, N> {
         let q_pair = unsafe { self.queue_pair() };
-        let (_, _, cq) = box_default(q_pair);
-        cq
+        box_server::<D, _, N>(q_pair)
     }
 }
 
@@ -79,7 +77,7 @@ mod tests {
     use std::os::fd::OwnedFd;
 
     use evering::driver::unlocked::PoolDriver;
-    use evering::uring::UringSpec;
+    use evering::uring::{IReceiver, ISender, UringSpec};
     use evering_shm::os::unix::{FdBackend, FdConfig, MFdFlags, ProtFlags, UnixShm};
     use evering_shm::shm_alloc::tlsf::SpinTlsf;
     use tokio::task::yield_now;
@@ -112,7 +110,7 @@ mod tests {
             // use tokio::time::{self, Duration};
             loop {
                 let mut f = false;
-                while let Some(ch) = cq.try_recv() {
+                while let Ok(ch) = cq.try_recv() {
                     f = true;
                     println!("[handle]: recv: {}", ch);
                     // time::sleep(Duration::from_millis(50)).await;
@@ -195,12 +193,11 @@ mod tests {
             });
 
             tokio::spawn(async move {
-                for i in 0..1000 {
+                for i in 0..10000 {
                     let ch = fastrand::alphabetic();
                     println!("[submit {}]: send {}", th, ch);
                     io::stdout().flush().unwrap();
                     let res = sb.try_submit(ch).unwrap().await;
-                    time::sleep(Duration::from_micros(50)).await;
                     println!("[submit {}]: recv {}: {}", th, i, res);
                     yield_now().await
                 }
@@ -208,6 +205,6 @@ mod tests {
         }
 
         use tokio::time::{self, Duration};
-        time::sleep(Duration::from_secs(15)).await;
+        time::sleep(Duration::from_secs(5)).await;
     }
 }

@@ -1,6 +1,9 @@
 use core::marker::PhantomData;
 
-use crate::{seal::Sealed, uring::UringSpec};
+use crate::{
+    seal::Sealed,
+    uring::{IReceiver, ISender, UringSpec},
+};
 
 mod cell;
 pub mod locked;
@@ -34,18 +37,76 @@ pub struct Receive;
 impl Sealed for Receive {}
 impl Role for Receive {}
 
-pub struct BridgeTmpl<D: Driver, T: Clone, R: Role> {
+pub struct BridgeTmpl<D: Driver, T: ISender + IReceiver + Clone, R: Role> {
     driver: D,
     sq: T,
     _marker: PhantomData<R>,
 }
 
-impl<D: Driver, T: Clone, R: Role> Clone for BridgeTmpl<D, T, R> {
+impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Clone for BridgeTmpl<D, T, R> {
     fn clone(&self) -> Self {
         Self {
             driver: self.driver.clone(),
             sq: self.sq.clone(),
             _marker: PhantomData,
+        }
+    }
+}
+
+impl<
+    D: Driver,
+    T: ISender<Item = <DUring<D> as UringSpec>::SQE>
+        + IReceiver<Item = <DUring<D> as UringSpec>::CQE>
+        + Clone,
+> BridgeTmpl<D, T, Submit>
+{
+    /// submits a request in pending blocking.
+    ///
+    /// If the channel is closed, it will return an error.
+    pub async fn submit(&self, data: D::SQE) -> Result<D::Op, <T as ISender>::Error> {
+        let (id, op) = self.driver.register();
+        let req = cell::IdCell::new(id, data);
+        self.sq.send(req).await?;
+
+        Ok(op)
+    }
+
+    /// submits a request in non-blocking.
+    ///
+    /// If the channel is closed or full, it will return an error immediately.
+    pub fn try_submit(&self, data: D::SQE) -> Result<D::Op, <T as ISender>::TryError> {
+        let (id, op) = self.driver.register();
+        let req = cell::IdCell::new(id, data);
+        self.sq.try_send(req)?;
+
+        Ok(op)
+    }
+}
+
+impl<
+    D: Driver,
+    T: ISender<Item = <DUring<D> as UringSpec>::SQE>
+        + IReceiver<Item = <DUring<D> as UringSpec>::CQE>
+        + Clone,
+> BridgeTmpl<D, T, Receive>
+{
+    /// Receives completed msgs by blocking in pending.
+    ///
+    /// If the channel is empty or closed, it will block in pending.
+    pub async fn complete(&self) {
+        while let Ok(data) = self.sq.recv().await {
+            let (id, payload) = data.into_inner();
+            self.driver.complete(id, payload);
+        }
+    }
+
+    /// Receives completed msgs in non-blocking.
+    ///
+    /// If the channel is empty or closed, it will return immediately.
+    pub fn try_complete(&self) {
+        while let Ok(data) = self.sq.try_recv() {
+            let (id, payload) = data.into_inner();
+            self.driver.complete(id, payload);
         }
     }
 }
@@ -81,14 +142,12 @@ pub mod asynch {
     use core::marker::PhantomData;
 
     use crate::driver::{BridgeTmpl, Receive, Submit};
-    use crate::uring::UringSpec;
     use crate::{
-        driver::{DUring, Driver, cell},
+        driver::{DUring, Driver},
         uring::asynch::{
             Completer as UCompleter, Submitter as USubmitter, channel, default_channel,
         },
     };
-    use async_channel::{SendError, TrySendError};
 
     pub type Submitter<D> = USubmitter<DUring<D>>;
     pub type Completer<D> = UCompleter<DUring<D>>;
@@ -100,67 +159,15 @@ pub mod asynch {
     type UringBridge<D> = (SubmitBridge<D>, ReceiveBridge<D>, Completer<D>);
 
     pub fn new<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBridge<D> {
-        let (cq, sq) = channel(uring_cap);
+        let (sq, cq) = channel::<DUring<D>>(uring_cap);
         let (sb, cb) = build_bridge!(sq, driver_cfg);
         (sb, cb, cq)
     }
 
     pub fn default<D: Driver>() -> UringBridge<D> {
-        let (cq, sq) = default_channel();
+        let (sq, cq) = default_channel::<DUring<D>>();
         let (sb, cb) = build_bridge!(sq);
         (sb, cb, cq)
-    }
-
-    impl<D: Driver> Bridge<D, Submit> {
-        /// submits a request in pending blocking.
-        ///
-        /// If the channel is closed, it will return an error.
-        pub async fn submit(
-            &self,
-            data: D::SQE,
-        ) -> Result<D::Op, SendError<<DUring<D> as UringSpec>::SQE>> {
-            let (id, op) = self.driver.register();
-            let req = cell::IdCell::new(id, data);
-            self.sq.sender().send(req).await?;
-
-            Ok(op)
-        }
-
-        /// submits a request in non-blocking.
-        ///
-        /// If the channel is closed or full, it will return an error immediately.
-        pub fn try_submit(
-            &self,
-            data: D::SQE,
-        ) -> Result<D::Op, TrySendError<<DUring<D> as UringSpec>::SQE>> {
-            let (id, op) = self.driver.register();
-            let req = cell::IdCell::new(id, data);
-            self.sq.sender().try_send(req)?;
-
-            Ok(op)
-        }
-    }
-
-    impl<D: Driver> Bridge<D, Receive> {
-        /// Receives completed msgs by blocking in pending.
-        ///
-        /// If the channel is empty or closed, it will block in pending.
-        pub async fn complete(&self) {
-            while let Ok(data) = self.sq.receiver().recv().await {
-                let (id, payload) = data.into_inner();
-                self.driver.complete(id, payload);
-            }
-        }
-
-        /// Receives completed msgs in non-blocking.
-        ///
-        /// If the channel is empty or closed, it will return immediately.
-        pub fn try_complete(&self) {
-            while let Ok(data) = self.sq.receiver().try_recv() {
-                let (id, payload) = data.into_inner();
-                self.driver.complete(id, payload);
-            }
-        }
     }
 }
 
@@ -169,10 +176,10 @@ pub mod bare {
 
     use evering_shm::shm_alloc::ShmAllocator;
 
-    use crate::driver::{BridgeTmpl, DUring, Driver, Receive, Submit, cell};
+    use crate::driver::{BridgeTmpl, DUring, Driver, Receive, Submit};
     use crate::uring::UringSpec;
     use crate::uring::bare::{
-        BoxQueue, Boxed, Completer as UringCompleter, QPair, Submitter as UringSubbmiter,
+        BoxQueue, Boxed, Completer as UringCompleter, Submitter as UringSubbmiter,
         box_channel, channel,
     };
 
@@ -188,16 +195,8 @@ pub mod bare {
         ReceiveBridge<D, P, N>,
         Completer<D, P, N>,
     );
-    pub type OwnUringBridge<D, const N: usize> = (
-        SubmitBridge<D, (), N>,
-        ReceiveBridge<D, (), N>,
-        Completer<D, (), N>,
-    );
-    pub type BoxUringBridge<D, A, const N: usize> = (
-        SubmitBridge<D, Boxed<A>, N>,
-        ReceiveBridge<D, Boxed<A>, N>,
-        Completer<D, Boxed<A>, N>,
-    );
+    pub type OwnUringBridge<D, const N: usize> = UringBridge<D, (), N>;
+    pub type BoxUringBridge<D, A, const N: usize> = UringBridge<D, Boxed<A>, N>;
 
     pub fn own_new<D: Driver, const N: usize>(driver_cfg: D::Config) -> OwnUringBridge<D, N> {
         let (sq, cq) = channel::<DUring<D>, N>();
@@ -211,51 +210,35 @@ pub mod bare {
         (sb, cb, cq)
     }
 
-    pub fn box_new<D: Driver, A: ShmAllocator, const N: usize>(
-        q: (
-            BoxQueue<<DUring<D> as UringSpec>::SQE, A, N>,
-            BoxQueue<<DUring<D> as UringSpec>::CQE, A, N>,
-        ),
-        driver_cfg: D::Config,
-    ) -> BoxUringBridge<D, A, N> {
-        let (sq, cq) = box_channel(q.0, q.1);
-        let (sb, cb) = build_bridge!(sq, driver_cfg);
-        (sb, cb, cq)
-    }
-
     pub fn box_default<D: Driver, A: ShmAllocator, const N: usize>(
         q: (
             BoxQueue<<DUring<D> as UringSpec>::SQE, A, N>,
             BoxQueue<<DUring<D> as UringSpec>::CQE, A, N>,
         ),
     ) -> BoxUringBridge<D, A, N> {
-        let (sq, cq) = box_channel(q.0, q.1);
+        let (sq, cq) = box_channel::<DUring<D>, A, N>(q.0, q.1);
         let (sb, cb) = build_bridge!(sq);
         (sb, cb, cq)
     }
 
-    impl<D: Driver, P: QPair<DUring<D>, N>, const N: usize> SubmitBridge<D, P, N> {
-        /// submits a request in non-blocking.
-        ///
-        /// If the channel is closed or full, it will return an error immediately.
-        pub fn try_submit(&self, data: D::SQE) -> Result<D::Op, <DUring<D> as UringSpec>::SQE> {
-            let (id, op) = self.driver.register();
-            let req = cell::IdCell::new(id, data);
-            self.sq.try_send(req)?;
-
-            Ok(op)
-        }
+    pub fn box_client<D: Driver, A: ShmAllocator, const N: usize>(
+        q: (
+            BoxQueue<<DUring<D> as UringSpec>::SQE, A, N>,
+            BoxQueue<<DUring<D> as UringSpec>::CQE, A, N>,
+        ),
+    ) -> (SubmitBridge<D, Boxed<A>, N>, ReceiveBridge<D, Boxed<A>, N>) {
+        let (sq, _) = box_channel::<DUring<D>, A, N>(q.0, q.1);
+        let (sb, cb) = build_bridge!(sq);
+        (sb, cb)
     }
 
-    impl<D: Driver, P: QPair<DUring<D>, N>, const N: usize> ReceiveBridge<D, P, N> {
-        /// Receives completed msgs in non-blocking.
-        ///
-        /// If the channel is empty or closed, it will return immediately.
-        pub fn try_complete(&self) {
-            while let Some(data) = self.sq.try_recv() {
-                let (id, payload) = data.into_inner();
-                self.driver.complete(id, payload);
-            }
-        }
+    pub fn box_server<D: Driver, A: ShmAllocator, const N: usize>(
+        q: (
+            BoxQueue<<DUring<D> as UringSpec>::SQE, A, N>,
+            BoxQueue<<DUring<D> as UringSpec>::CQE, A, N>,
+        ),
+    ) -> Completer<D, Boxed<A>, N> {
+        let (_, cq) = box_channel::<DUring<D>, A, N>(q.0, q.1);
+        cq
     }
 }

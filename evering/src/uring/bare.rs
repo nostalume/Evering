@@ -4,34 +4,37 @@ use alloc::sync::Arc;
 use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
 use lfqueue::ConstBoundedQueue as CBQueue;
 
-use crate::{seal::Sealed, uring::UringSpec};
+use crate::{
+    seal::Sealed,
+    uring::{IReceiver, ISender, UringSpec},
+};
 
-pub trait QPair<S: UringSpec, const N: usize>: Sealed {
-    type SubQueue: Ref<T = CBQueue<S::SQE, N>> + Clone;
-    type CompQueue: Ref<T = CBQueue<S::CQE, N>> + Clone;
+pub trait QPair<T, U, const N: usize>: Sealed {
+    type Sender: Ref<Target = CBQueue<T, N>> + Clone;
+    type Receiver: Ref<Target = CBQueue<U, N>> + Clone;
 }
 
 impl Sealed for () {}
-impl<S: UringSpec, const N: usize> QPair<S, N> for () {
-    type SubQueue = ArcQueue<S::SQE, N>;
-    type CompQueue = ArcQueue<S::CQE, N>;
+impl<T, U, const N: usize> QPair<T, U, N> for () {
+    type Sender = ArcQueue<T, N>;
+    type Receiver = ArcQueue<U, N>;
 }
 
 impl Sealed for &() {}
-impl<'a, S: UringSpec, const N: usize> QPair<S, N> for &'a ()
+impl<'a, T, U, const N: usize> QPair<T, U, N> for &'a ()
 where
-    S::SQE: 'a,
-    S::CQE: 'a,
+    T: 'a,
+    U: 'a,
 {
-    type SubQueue = RefQueue<'a, S::SQE, N>;
-    type CompQueue = RefQueue<'a, S::CQE, N>;
+    type Sender = RefQueue<'a, T, N>;
+    type Receiver = RefQueue<'a, U, N>;
 }
 
 pub struct Boxed<A: ShmAllocator>(PhantomData<A>);
 impl<A: ShmAllocator> Sealed for Boxed<A> {}
-impl<S: UringSpec, A: ShmAllocator, const N: usize> QPair<S, N> for Boxed<A> {
-    type SubQueue = ABoxQueue<S::SQE, A, N>;
-    type CompQueue = ABoxQueue<S::CQE, A, N>;
+impl<T, U, A: ShmAllocator, const N: usize> QPair<T, U, N> for Boxed<A> {
+    type Sender = ABoxQueue<T, A, N>;
+    type Receiver = ABoxQueue<U, A, N>;
 }
 
 impl<A: ShmAllocator> Boxed<A> {
@@ -41,33 +44,43 @@ impl<A: ShmAllocator> Boxed<A> {
 }
 
 pub trait Ref {
-    type T;
-    fn as_ref(&self) -> &Self::T;
+    type Target;
+    fn as_ref(&self) -> &Self::Target;
 }
 
 impl<'a, T, const N: usize> Ref for RefQueue<'a, T, N> {
-    type T = CBQueue<T, N>;
+    type Target = CBQueue<T, N>;
 
-    fn as_ref(&self) -> &Self::T {
+    fn as_ref(&self) -> &Self::Target {
         self.deref()
     }
 }
 
 impl<T, const N: usize> Ref for ArcQueue<T, N> {
-    type T = CBQueue<T, N>;
+    type Target = CBQueue<T, N>;
 
-    fn as_ref(&self) -> &Self::T {
+    fn as_ref(&self) -> &Self::Target {
         self
     }
 }
 
 impl<T, A: ShmAllocator, const N: usize> Ref for ABoxQueue<T, A, N> {
-    type T = CBQueue<T, N>;
+    type Target = CBQueue<T, N>;
 
-    fn as_ref(&self) -> &Self::T {
+    fn as_ref(&self) -> &Self::Target {
         self.deref().as_ref()
     }
 }
+
+pub type ABoxQueue<T, A, const N: usize> = Arc<BoxQueue<T, A, N>>;
+pub type BoxQueue<T, A, const N: usize> = ShmBox<CBQueue<T, N>, A>;
+
+pub type RefQueue<'a, T, const N: usize> = Arc<BorrowQueue<'a, T, N>>;
+pub type BorrowQueue<'a, T, const N: usize> = &'a CBQueue<T, N>;
+
+pub type ArcQueue<T, const N: usize> = Arc<CBQueue<T, N>>;
+
+// ---
 
 pub type ABoxUring<S, A, const N: usize> = (ABoxSubmitter<S, A, N>, ABoxCompleter<S, A, N>);
 pub type ABoxSubmitter<S, A, const N: usize> = Submitter<S, Boxed<A>, N>;
@@ -81,132 +94,88 @@ pub type RefUring<'a, S, const N: usize> = (RefSubmitter<'a, S, N>, RefCompleter
 pub type RefSubmitter<'a, S, const N: usize> = Submitter<S, &'a (), N>;
 pub type RefCompleter<'a, S, const N: usize> = Completer<S, &'a (), N>;
 
-pub type ABoxQueue<T, A, const N: usize> = Arc<BoxQueue<T, A, N>>;
-pub type BoxQueue<T, A, const N: usize> = ShmBox<CBQueue<T, N>, A>;
+pub type Submitter<S: UringSpec, P, const N: usize> = Channel<S::SQE, S::CQE, P, N>;
+pub type Completer<S: UringSpec, P, const N: usize> = Channel<S::CQE, S::SQE, P, N>;
 
-pub type RefQueue<'a, T, const N: usize> = Arc<BorrowQueue<'a, T, N>>;
-pub type BorrowQueue<'a, T, const N: usize> = &'a CBQueue<T, N>;
-
-pub type ArcQueue<T, const N: usize> = Arc<CBQueue<T, N>>;
-
-pub type Submitter<S, P, const N: usize> = Channel<S, P, N, Submit>;
-pub type Completer<S, P, const N: usize> = Channel<S, P, N, Complete>;
-
-pub trait Role {}
-pub struct Submit;
-impl Role for Submit {}
-pub struct Complete;
-impl Role for Complete {}
-
-pub struct Channel<S: UringSpec, P: QPair<S, N>, const N: usize, R: Role> {
-    s: P::SubQueue,
-    r: P::CompQueue,
-    phantom: PhantomData<(S, R)>,
+pub struct Channel<T, U, P: QPair<T, U, N>, const N: usize> {
+    s: P::Sender,
+    r: P::Receiver,
 }
 
-impl<S: UringSpec, P: QPair<S, N>, const N: usize, R: Role> Clone for Channel<S, P, N, R>
+impl<T, U, P: QPair<T, U, N>, const N: usize> Clone for Channel<T, U, P, N>
 where
-    P::SubQueue: Clone,
-    P::CompQueue: Clone,
+    P::Sender: Clone,
+    P::Receiver: Clone,
 {
     fn clone(&self) -> Self {
         Self {
             s: self.s.clone(),
             r: self.r.clone(),
-            phantom: self.phantom,
         }
     }
 }
 
-impl<S: UringSpec, P: QPair<S, N>, const N: usize> Submitter<S, P, N> {
-    // block
-    pub fn send(&self, data: S::SQE) {
-        let mut d = Some(data);
+impl<T, U, P: QPair<T, U, N>, const N: usize> Sealed for Channel<T, U, P, N> {}
+
+impl<T, U, P: QPair<T, U, N>, const N: usize> ISender for Channel<T, U, P, N> {
+    type Item = T;
+    type Error = T;
+    type TryError = T;
+
+    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError> {
+        self.s.as_ref().enqueue(item)
+    }
+    async fn send(&self, item: Self::Item) -> Result<(), Self::Error> {
+        let mut i = Some(item);
         loop {
-            let cur = d.take().unwrap();
+            let cur = i.take().unwrap();
             match self.s.as_ref().enqueue(cur) {
-                Ok(_) => break,
-                Err(cur) => {
-                    d = Some(cur);
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    i.replace(e);
                     core::hint::spin_loop();
                 }
             }
         }
-    }
-
-    pub fn try_send(&self, data: S::SQE) -> Result<(), S::SQE> {
-        self.s.as_ref().enqueue(data)
-    }
-
-    pub fn recv(&self) -> S::CQE {
-        loop {
-            if let Some(d) = self.r.as_ref().dequeue() {
-                return d;
-            }
-        }
-    }
-
-    pub fn try_recv(&self) -> Option<S::CQE> {
-        self.r.as_ref().dequeue()
     }
 }
 
-impl<S: UringSpec, P: QPair<S, N>, const N: usize> Completer<S, P, N> {
-    // block
-    pub fn send(&self, data: S::CQE) {
-        let mut d = Some(data);
+impl<T, U, P: QPair<T, U, N>, const N: usize> IReceiver for Channel<T, U, P, N> {
+    type Item = U;
+    type Error = ();
+    type TryError = ();
+    fn try_recv(&self) -> Result<U, Self::TryError> {
+        self.r.as_ref().dequeue().ok_or(())
+    }
+
+    async fn recv(&self) -> Result<Self::Item, Self::Error> {
         loop {
-            let cur = d.take().unwrap();
-            match self.r.as_ref().enqueue(cur) {
-                Ok(_) => break,
-                Err(cur) => {
-                    d = Some(cur);
-                    core::hint::spin_loop();
-                }
+            match self.r.as_ref().dequeue() {
+                Some(item) => return Ok(item),
+                None => core::hint::spin_loop(),
             }
         }
-    }
-
-    pub fn try_send(&self, data: S::CQE) -> Result<(), S::CQE> {
-        self.r.as_ref().enqueue(data)
-    }
-
-    pub fn recv(&self) -> S::SQE {
-        loop {
-            if let Some(d) = self.s.as_ref().dequeue() {
-                return d;
-            }
-        }
-    }
-
-    pub fn try_recv(&self) -> Option<S::SQE> {
-        self.s.as_ref().dequeue()
     }
 }
 
 macro_rules! build_qpair {
-    ($q1:expr, $q2:expr, $submitter:ident, $completer:ident) => {{
-        let s = Arc::new($q1);
-        let r = Arc::new($q2);
+    ($q1:expr, $q2:expr) => {{
+        let q1 = Arc::new($q1);
+        let q2 = Arc::new($q2);
         (
-            $submitter {
-                s: s.clone(),
-                r: r.clone(),
-                phantom: PhantomData,
+            Channel {
+                s: q1.clone(),
+                r: q2.clone(),
             },
-            $completer {
-                s,
-                r,
-                phantom: PhantomData,
-            },
+            Channel { s: q2, r: q1 },
         )
     }};
 }
 
 pub fn channel<S: UringSpec, const N: usize>() -> OwnUring<S, N> {
-    let s = CBQueue::<S::SQE, N>::new_const();
-    let r = CBQueue::<S::CQE, N>::new_const();
-    build_qpair!(s, r, OwnSubmitter, OwnCompleter)
+    let q1 = CBQueue::<S::SQE, N>::new_const();
+    let q2 = CBQueue::<S::CQE, N>::new_const();
+    build_qpair!(q1, q2)
 }
 
 pub fn default_channel<S: UringSpec>() -> OwnUring<S, { crate::uring::DEFAULT_CAP }> {
@@ -217,12 +186,12 @@ pub fn entrap_channel<'a, S: UringSpec, const N: usize>(
     q1: BorrowQueue<'a, S::SQE, N>,
     q2: BorrowQueue<'a, S::CQE, N>,
 ) -> RefUring<'a, S, N> {
-    build_qpair!(q1, q2, RefSubmitter, RefCompleter)
+    build_qpair!(q1, q2)
 }
 
 pub fn box_channel<S: UringSpec, A: ShmAllocator, const N: usize>(
     q1: BoxQueue<S::SQE, A, N>,
     q2: BoxQueue<S::CQE, A, N>,
 ) -> ABoxUring<S, A, N> {
-    build_qpair!(q1, q2, ABoxSubmitter, ABoxCompleter)
+    build_qpair!(q1, q2)
 }
