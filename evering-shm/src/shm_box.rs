@@ -1,59 +1,81 @@
+use core::alloc::Layout;
 use core::marker::PhantomData;
-use core::mem::ManuallyDrop;
+use core::mem;
 use core::mem::MaybeUninit;
+use core::mem::SizedTypeProperties;
 use core::ops::Deref;
 use core::ops::DerefMut;
 use core::pin::Pin;
+use core::ptr;
+use core::ptr::NonNull;
 
 #[cfg(feature = "nightly")]
-use alloc::{alloc::AllocError, boxed::Box};
+use alloc::alloc::{AllocError, handle_alloc_error};
 #[cfg(not(feature = "nightly"))]
-use allocator_api2::{alloc::AllocError, boxed::Box};
+use allocator_api2::alloc::{AllocError, handle_alloc_error};
 
 use crate::shm_alloc::ShmAllocator;
 
-#[repr(transparent)]
-pub struct ShmBox<T: ?Sized, A: ShmAllocator>(ManuallyDrop<Box<T, A>>);
+#[repr(C)]
+pub struct ShmBox<T: ?Sized, A: ShmAllocator>(NonNull<T>, A);
 
 impl<T, A: ShmAllocator> ShmBox<T, A> {
     pub fn new_in(x: T, alloc: A) -> ShmBox<T, A> {
-        let mut boxed = Box::new_uninit_in(alloc);
-        boxed.write(x);
-        let boxed = ManuallyDrop::new(unsafe { boxed.assume_init() });
-        ShmBox(boxed)
+        let boxed = Self::new_uninit_in(alloc);
+        boxed.write(x)
     }
 
     pub fn try_new_in(x: T, alloc: A) -> Result<ShmBox<T, A>, AllocError> {
-        let mut boxed = Box::try_new_uninit_in(alloc)?;
-        boxed.write(x);
-        let boxed = ManuallyDrop::new(unsafe { boxed.assume_init() });
-        Ok(ShmBox(boxed))
+        let boxed = Self::try_new_uninit_in(alloc)?;
+        Ok(boxed.write(x))
     }
 
     pub fn new_uninit_in(alloc: A) -> ShmBox<MaybeUninit<T>, A> {
-        ShmBox(ManuallyDrop::new(Box::new_uninit_in(alloc)))
+        let layout = Layout::new::<mem::MaybeUninit<T>>();
+        // NOTE: Prefer match over unwrap_or_else since closure sometimes not inlineable.
+        // That would make code size bigger.
+        match ShmBox::try_new_uninit_in(alloc) {
+            Ok(m) => m,
+            Err(_) => handle_alloc_error(layout),
+        }
     }
 
     pub fn try_new_uninit_in(alloc: A) -> Result<ShmBox<MaybeUninit<T>, A>, AllocError> {
-        Ok(ShmBox(ManuallyDrop::new(Box::try_new_uninit_in(alloc)?)))
+        let ptr = if T::IS_ZST {
+            NonNull::dangling()
+        } else {
+            let layout = Layout::new::<MaybeUninit<T>>();
+            alloc.allocate(layout)?.cast()
+        };
+        unsafe { Ok(ShmBox::from_raw_in(ptr.as_ptr(), alloc)) }
     }
 
     pub fn new_zeroed_in(alloc: A) -> ShmBox<MaybeUninit<T>, A> {
-        ShmBox(ManuallyDrop::new(Box::new_zeroed_in(alloc)))
+        let layout = Layout::new::<mem::MaybeUninit<T>>();
+        // NOTE: Prefer match over unwrap_or_else since closure sometimes not inlineable.
+        // That would make code size bigger.
+        match ShmBox::try_new_zeroed_in(alloc) {
+            Ok(m) => m,
+            Err(_) => handle_alloc_error(layout),
+        }
     }
 
     pub fn try_new_zeroed_in(alloc: A) -> Result<ShmBox<MaybeUninit<T>, A>, AllocError> {
-        Ok(ShmBox(ManuallyDrop::new(Box::try_new_zeroed_in(alloc)?)))
-    }
-
-    pub unsafe fn from_raw_in(raw: *mut T, alloc: A) -> Self {
-        ShmBox(ManuallyDrop::new(unsafe { Box::from_raw_in(raw, alloc) }))
+        let ptr = if T::IS_ZST {
+            NonNull::dangling()
+        } else {
+            let layout = Layout::new::<mem::MaybeUninit<T>>();
+            alloc.allocate_zeroed(layout)?.cast()
+        };
+        unsafe { Ok(ShmBox::from_raw_in(ptr.as_ptr(), alloc)) }
     }
 
     pub fn pin_in(x: T, alloc: A) -> Pin<ShmBox<T, A>> {
         ShmBox::into_pin(ShmBox::new_in(x, alloc))
     }
+}
 
+impl<T: ?Sized, A: ShmAllocator> ShmBox<T, A> {
     pub fn into_pin(self) -> Pin<ShmBox<T, A>> {
         unsafe { Pin::new_unchecked(self) }
     }
@@ -71,42 +93,76 @@ impl<T, A: ShmAllocator> ShmBox<T, A> {
     }
 
     pub fn allocator(&self) -> &A {
-        Box::allocator(&self.0)
+        &self.1
+    }
+
+    pub unsafe fn from_raw_in(raw: *mut T, alloc: A) -> Self {
+        ShmBox(unsafe { NonNull::new_unchecked(raw) }, alloc)
+    }
+
+    pub fn into_raw_with_allocator(b: Self) -> (*mut T, A) {
+        let mut b = mem::ManuallyDrop::new(b);
+        // We carefully get the raw pointer out in a way that Miri's aliasing model understands what
+        // is happening: using the primitive "deref" of `Box`. In case `A` is *not* `Global`, we
+        // want *no* aliasing requirements here!
+        // In case `A` *is* `Global`, this does not quite have the right behavior; `into_raw`
+        // works around that.
+        let ptr = &raw mut **b;
+        let alloc = unsafe { ptr::read(&b.1) };
+        (ptr, alloc)
     }
 }
 
 impl<T, A: ShmAllocator> ShmBox<[T], A> {
     pub fn new_uninit_slice_in(len: usize, alloc: A) -> ShmBox<[MaybeUninit<T>], A> {
-        ShmBox(ManuallyDrop::new(Box::new_uninit_slice_in(len, alloc)))
+        let m = ShmBox::try_new_uninit_slice_in(len, alloc);
+        m.unwrap()
     }
 
     pub fn new_zeroed_slice_in(len: usize, alloc: A) -> ShmBox<[MaybeUninit<T>], A> {
-        ShmBox(ManuallyDrop::new(Box::new_zeroed_slice_in(len, alloc)))
+        let m = ShmBox::try_new_zeroed_slice_in(len, alloc);
+        m.unwrap()
     }
 
     pub fn try_new_uninit_slice_in(
         len: usize,
         alloc: A,
     ) -> Result<ShmBox<[MaybeUninit<T>], A>, AllocError> {
-        Ok(ShmBox(ManuallyDrop::new(Box::try_new_uninit_slice_in(
-            len, alloc,
-        )?)))
+        let ptr = if T::IS_ZST || len == 0 {
+            NonNull::dangling()
+        } else {
+            let layout = match Layout::array::<mem::MaybeUninit<T>>(len) {
+                Ok(l) => l,
+                Err(_) => return Err(AllocError),
+            };
+            alloc.allocate(layout)?.cast()
+        };
+        let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, len);
+        unsafe { Ok(ShmBox::from_raw_in(slice, alloc)) }
     }
 
     pub fn try_new_zeroed_slice_in(
         len: usize,
         alloc: A,
     ) -> Result<ShmBox<[MaybeUninit<T>], A>, AllocError> {
-        Ok(ShmBox(ManuallyDrop::new(Box::try_new_zeroed_slice_in(
-            len, alloc,
-        )?)))
+        let ptr = if T::IS_ZST || len == 0 {
+            NonNull::dangling()
+        } else {
+            let layout = match Layout::array::<mem::MaybeUninit<T>>(len) {
+                Ok(l) => l,
+                Err(_) => return Err(AllocError),
+            };
+            alloc.allocate_zeroed(layout)?.cast()
+        };
+        let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, len);
+        unsafe { Ok(ShmBox::from_raw_in(slice, alloc)) }
     }
 }
 
 impl<T, A: ShmAllocator> ShmBox<MaybeUninit<T>, A> {
     pub unsafe fn assume_init(self) -> ShmBox<T, A> {
-        let inner = ManuallyDrop::into_inner(self.0);
-        ShmBox(ManuallyDrop::new(unsafe { inner.assume_init() }))
+        let (raw, alloc) = ShmBox::into_raw_with_allocator(self);
+        unsafe { ShmBox::from_raw_in(raw as *mut T, alloc) }
     }
 
     pub fn write(self, value: T) -> ShmBox<T, A> {
@@ -120,35 +176,26 @@ impl<T, A: ShmAllocator> ShmBox<MaybeUninit<T>, A> {
 
 impl<T, A: ShmAllocator> ShmBox<[MaybeUninit<T>], A> {
     pub unsafe fn assume_init(self) -> ShmBox<[T], A> {
-        let inner = ManuallyDrop::into_inner(self.0);
-        ShmBox(ManuallyDrop::new(unsafe { inner.assume_init() }))
+        let (raw, alloc) = ShmBox::into_raw_with_allocator(self);
+        unsafe { ShmBox::from_raw_in(raw as *mut [T], alloc) }
     }
 }
 
-impl<T, A: ShmAllocator> Deref for ShmBox<T, A> {
+impl<T: ?Sized, A: ShmAllocator> Deref for ShmBox<T, A> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
-        &self.0
+        unsafe { self.0.as_ref() }
     }
 }
 
-impl<T, A: ShmAllocator> DerefMut for ShmBox<T, A> {
+impl<T: ?Sized, A: ShmAllocator> DerefMut for ShmBox<T, A> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
+        unsafe { self.0.as_mut() }
     }
 }
 
-impl<T, A: ShmAllocator> AsRef<Box<T, A>> for ShmBox<T, A> {
-    fn as_ref(&self) -> &Box<T, A> {
-        &self.0
-    }
-}
-
-impl<T, A: ShmAllocator> From<Box<T, A>> for ShmBox<T, A> {
-    fn from(value: Box<T, A>) -> Self {
-        Self(ManuallyDrop::new(value))
-    }
-}
+unsafe impl<T: Send, A: ShmAllocator> Send for ShmBox<T, A> {}
+unsafe impl<T: Sync, A: ShmAllocator> Sync for ShmBox<T, A> {}
 
 /// A token that can be transferred between processes.
 pub struct ShmToken<T, A: ShmAllocator>(isize, A, PhantomData<T>);
@@ -170,11 +217,10 @@ unsafe impl<T: Sync, A: ShmAllocator> Sync for ShmToken<T, A> {}
 
 impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A> {
     fn from(value: ShmBox<T, A>) -> Self {
-        let (ptr, allocator) =
-            Box::<T, A>::into_non_null_with_allocator(ManuallyDrop::into_inner(value.0));
+        let (ptr, allocator) = ShmBox::into_raw_with_allocator(value);
 
         // Safety: the ptr is allocated by the allocator
-        let offset = unsafe { allocator.offset(ptr.as_ptr()) };
+        let offset = unsafe { allocator.offset(ptr) };
 
         ShmToken(offset, allocator, PhantomData)
     }
@@ -182,11 +228,9 @@ impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A> {
 
 impl<T, A: ShmAllocator> From<ShmToken<T, A>> for ShmBox<T, A> {
     fn from(value: ShmToken<T, A>) -> Self {
-        let ShmToken(offset, allocator, _) = value;
+        let ShmToken(offset, alloc, _) = value;
 
-        let ptr = unsafe { allocator.get_aligned_ptr_mut::<T>(offset) };
-        ShmBox(ManuallyDrop::new(unsafe {
-            Box::from_non_null_in(ptr, allocator)
-        }))
+        let ptr = unsafe { alloc.get_aligned_ptr_mut::<T>(offset) };
+        unsafe { ShmBox::from_raw_in(ptr.as_ptr(), alloc) }
     }
 }

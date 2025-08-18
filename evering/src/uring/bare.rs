@@ -38,7 +38,7 @@ impl<T, U, A: ShmAllocator, const N: usize> QPair<T, U, N> for Boxed<A> {
 }
 
 impl<A: ShmAllocator> Boxed<A> {
-    pub fn new<T, const N: usize>(alloc: &A) -> BoxQueue<T, &A, N> {
+    pub fn new<T, const N: usize>(alloc: A) -> BoxQueue<T, A, N> {
         ShmBox::new_in(CBQueue::new_const(), alloc)
     }
 }

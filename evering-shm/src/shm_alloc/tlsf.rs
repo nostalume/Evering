@@ -1,19 +1,18 @@
-#[cfg(feature = "nightly")]
-use alloc::alloc::{AllocError, Allocator};
-#[cfg(not(feature = "nightly"))]
-use allocator_api2::alloc::{AllocError, Allocator};
-
 use core::alloc::Layout;
 use core::mem::MaybeUninit;
 use core::ptr;
 use core::ptr::NonNull;
 use rlsf::Tlsf;
 
+use crate::seal::Sealed;
 use crate::shm_alloc::ShmInit;
+use crate::{AllocError, IAllocator};
 
 pub type SpinTlsf = SpinTlsfIn<'static>;
 type MyTlsf<'a> = Tlsf<'a, u32, u32, 24, 8>;
 pub struct SpinTlsfIn<'a>(spin::Mutex<MyTlsf<'a>>);
+
+impl<'a> Sealed for SpinTlsfIn<'a> {}
 
 impl<'a> SpinTlsfIn<'a> {
     pub unsafe fn raw_new(start: usize, size: usize) -> Self {
@@ -37,7 +36,7 @@ impl<'a> SpinTlsfIn<'a> {
     }
 }
 
-unsafe impl<'a> Allocator for SpinTlsfIn<'a> {
+unsafe impl<'a> IAllocator for SpinTlsfIn<'a> {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         if let Some(alloc) = self.0.lock().allocate(layout).map(|p| unsafe {
             NonNull::new_unchecked(ptr::slice_from_raw_parts_mut(p.as_ptr(), layout.size()))

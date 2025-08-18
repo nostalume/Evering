@@ -3,6 +3,7 @@
 
 extern crate alloc;
 
+use alloc::sync::Arc;
 use core::marker::PhantomData;
 
 use evering::driver::Driver;
@@ -17,14 +18,14 @@ pub trait IpcSpec {
     type M: ShmBackend<Self::S>;
 }
 
-type IpcAlloc<I: IpcSpec> = ShmAlloc<I::A, I::S, I::M>;
+type IpcAlloc<I: IpcSpec> = Arc<ShmAlloc<I::A, I::S, I::M>>;
 type IpcError<I: IpcSpec> = ShmAllocError<I::S, I::M>;
-type IpcQueue<'a, T, I, const N: usize> = BoxQueue<T, &'a IpcAlloc<I>, N>;
-type IpcSubmitter<'a, D, I, const N: usize> = SubmitBridge<D, Boxed<&'a IpcAlloc<I>>, N>;
-type IpcReceiver<'a, D, I, const N: usize> = ReceiveBridge<D, Boxed<&'a IpcAlloc<I>>, N>;
-type IpcCompleter<'a, D, I, const N: usize> = Completer<D, Boxed<&'a IpcAlloc<I>>, N>;
+type IpcQueue<T, I, const N: usize> = BoxQueue<T, IpcAlloc<I>, N>;
+type IpcSubmitter<D, I, const N: usize> = SubmitBridge<D, Boxed<IpcAlloc<I>>, N>;
+type IpcReceiver<D, I, const N: usize> = ReceiveBridge<D, Boxed<IpcAlloc<I>>, N>;
+type IpcCompleter<D, I, const N: usize> = Completer<D, Boxed<IpcAlloc<I>>, N>;
 
-struct IpcHandle<I: IpcSpec, D: Driver, const N: usize>(ShmAlloc<I::A, I::S, I::M>, PhantomData<D>);
+struct IpcHandle<I: IpcSpec, D: Driver, const N: usize>(IpcAlloc<I>, PhantomData<D>);
 
 impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
     pub fn init_or_load(
@@ -35,16 +36,18 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
         cfg: <I::M as ShmBackend<I::S>>::Config,
     ) -> Result<Self, IpcError<I>> {
         let area = ShmAlloc::init_or_load(state, start, size, flags, cfg)?;
+        let area = Arc::new(area);
         Ok(IpcHandle(area, PhantomData))
     }
 
-    unsafe fn queue<T>(&self, idx: usize) -> BoxQueue<T, &IpcAlloc<I>, N> {
+    unsafe fn queue<T>(&self, idx: usize) -> IpcQueue<T, I, N> {
         assert!(idx <= 2);
         loop {
-            match unsafe { self.0.spec::<_>(idx) } {
+            let arc = self.0.clone();
+            match unsafe { arc.spec_in(idx) } {
                 Some(u) => break u,
                 None => {
-                    let q = Boxed::new::<T, N>(&self.0);
+                    let q = Boxed::new::<T, N>(self.0.clone());
                     // let q2 = Boxed::new(&self.0);
                     self.0.init_spec(q, idx);
                 }
@@ -52,19 +55,19 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
         }
     }
 
-    pub unsafe fn queue_pair<T, U>(&self) -> (IpcQueue<'_, T, I, N>, IpcQueue<'_, U, I, N>) {
+    pub unsafe fn queue_pair<T, U>(&self) -> (IpcQueue<T, I, N>, IpcQueue<U, I, N>) {
         let q1 = unsafe { self.queue::<T>(0) };
         let q2 = unsafe { self.queue::<U>(1) };
 
         (q1, q2)
     }
 
-    pub fn client(&self) -> (IpcSubmitter<'_, D, I, N>, IpcReceiver<'_, D, I, N>) {
+    pub fn client(&self) -> (IpcSubmitter<D, I, N>, IpcReceiver<D, I, N>) {
         let q_pair = unsafe { self.queue_pair() };
         box_client(q_pair)
     }
 
-    pub fn server(&self) -> IpcCompleter<'_, D, I, N> {
+    pub fn server(&self) -> IpcCompleter<D, I, N> {
         let q_pair = unsafe { self.queue_pair() };
         box_server::<D, _, N>(q_pair)
     }
@@ -72,13 +75,15 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
 
 #[cfg(test)]
 mod tests {
+    use core::marker::PhantomData;
     use core::time::Duration;
-    use std::io::{self, Write};
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::sync::Arc;
 
     use evering::driver::unlocked::PoolDriver;
     use evering::uring::{IReceiver, ISender, UringSpec};
-    use evering_shm::os::unix::{FdBackend, FdConfig, MFdFlags, ProtFlags, UnixShm};
+    use evering_shm::os::FdBackend;
+    use evering_shm::os::unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm};
     use evering_shm::shm_alloc::tlsf::SpinTlsf;
     use tokio::task::yield_now;
     use tokio::time;
@@ -86,6 +91,7 @@ mod tests {
     use crate::{IpcCompleter, IpcHandle, IpcSpec};
 
     const SIZE: usize = 0x50000;
+    const CAP: usize = 1 << 5;
 
     struct CharUring;
     impl UringSpec for CharUring {
@@ -94,19 +100,19 @@ mod tests {
     }
     type MyPoolDriver = PoolDriver<CharUring>;
 
-    struct MyIpcSpec;
-    impl IpcSpec for MyIpcSpec {
+    struct MyIpcSpec<F>(PhantomData<F>);
+    impl<F:AsFd> IpcSpec for MyIpcSpec<F> {
         type A = SpinTlsf;
         type S = UnixShm;
-        type M = FdBackend<OwnedFd>;
+        type M = FdBackend<F>;
     }
 
-    type MyIpc = IpcHandle<MyIpcSpec, MyPoolDriver, { 1 << 5 }>;
+    type MyIpc<F> = IpcHandle<MyIpcSpec<F>, MyPoolDriver, CAP>;
 
     struct MyHandle;
 
     impl MyHandle {
-        async fn try_handle_ref<const N: usize>(cq: &IpcCompleter<'_, MyPoolDriver, MyIpcSpec, N>) {
+        async fn try_handle_ref<F:AsFd,const N: usize>(cq: &IpcCompleter<MyPoolDriver, MyIpcSpec<F>, N>) {
             // use tokio::time::{self, Duration};
             loop {
                 let mut f = false;
@@ -127,21 +133,22 @@ mod tests {
         }
     }
 
-    fn create(size: usize) -> MyIpc {
-        let cfg = FdConfig::default_from_mem_fd("test", MFdFlags::empty()).unwrap();
-        IpcHandle::init_or_load(
+    fn init_or_load<F:AsFd>(size: usize, cfg:UnixFdConf<F>) -> Arc<MyIpc<F>> {
+        let h = IpcHandle::init_or_load(
             FdBackend::new(),
             None,
             size,
             ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
             cfg,
         )
-        .unwrap()
+        .unwrap();
+        Arc::new(h)
     }
 
     #[test]
     fn queue_test() {
-        let handle = create(SIZE);
+        let cfg = UnixFdConf::default_from_mem_fd("test", MFdFlags::empty()).unwrap();
+        let handle = init_or_load(SIZE,cfg);
         let (pa, pb) = unsafe { handle.queue_pair::<char, char>() };
         let mut len_a = 0;
         let mut len_b = 0;
@@ -170,39 +177,49 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn ipc_test() {
-        let handle = create(SIZE);
-        // leak to acquire 'static lifetime.
-        let leak = Box::leak(Box::new(handle));
-        let (sb, rb) = leak.client();
-        let cq = leak.server();
-        for _ in 0..5 {
-            let cq = cq.clone();
-            tokio::spawn(async move {
-                MyHandle::try_handle_ref(&cq).await;
-            });
-        }
+        let cfg = Box::leak(Box::new(UnixFdConf::default_from_mem_fd("test", MFdFlags::empty()).unwrap()));
+        let b1cfg = cfg.borrow();
+        let b2cfg = cfg.borrow();
 
-        for th in 0..5 {
-            let sb = sb.clone();
-            let rb = rb.clone();
-            tokio::spawn(async move {
-                loop {
-                    rb.try_complete();
-                    yield_now().await;
-                }
-            });
+        tokio::spawn(async move {
+            let handle = init_or_load(SIZE,b1cfg);
+            let cq = handle.server();
+            for _ in 0..5 {
+                let cq = cq.clone();
+                tokio::spawn(async move {
+                    MyHandle::try_handle_ref(&cq).await;
+                });
+            }
+        });
+        tokio::spawn(async move {
+            let handle = init_or_load(SIZE,b2cfg);
+            let (sb, rb) = handle.client();
+            let mut clients = Vec::new();
+            for th in 0..5 {
+                let sb = sb.clone();
+                let rb = rb.clone();
+                tokio::spawn(async move {
+                    loop {
+                        rb.try_complete();
+                        yield_now().await;
+                    }
+                });
 
-            tokio::spawn(async move {
-                for i in 0..10000 {
-                    let ch = fastrand::alphabetic();
-                    println!("[submit {}]: send {}", th, ch);
-                    io::stdout().flush().unwrap();
-                    let res = sb.try_submit(ch).unwrap().await;
-                    println!("[submit {}]: recv {}: {}", th, i, res);
-                    yield_now().await
-                }
-            });
-        }
+                let t = tokio::spawn(async move {
+                    for i in 0..1000 {
+                        let ch = fastrand::alphabetic();
+                        println!("[submit {}]: send {}", th, ch);
+                        let res = sb.try_submit(ch).unwrap().await;
+                        println!("[submit {}]: recv {}: {}", th, i, res);
+                        yield_now().await
+                    }
+                });
+                clients.push(t);
+            }
+            for t in clients {
+                t.await.unwrap();
+            }
+        });
 
         use tokio::time::{self, Duration};
         time::sleep(Duration::from_secs(5)).await;

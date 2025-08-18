@@ -3,7 +3,8 @@
 
 use std::os::fd::OwnedFd;
 
-use crate::os::unix::{FdBackend, FdConfig, MFdFlags, ProtFlags, UnixShm};
+use crate::os::FdBackend;
+use crate::os::unix::{UnixFdConf, MFdFlags, ProtFlags, UnixShm};
 use crate::shm_alloc::{ShmAllocError, ShmHeader, ShmSpinTlsf};
 use crate::shm_box::ShmBox;
 
@@ -15,7 +16,7 @@ fn create<P: nix::NixPath + ?Sized>(
     size: usize,
 ) -> Result<TestShm, Error> {
     let cfg =
-        FdConfig::default_from_mem_fd(name, MFdFlags::empty()).map_err(ShmAllocError::MapError)?;
+        UnixFdConf::default_from_mem_fd(name, MFdFlags::empty()).map_err(ShmAllocError::MapError)?;
     let m = TestShm::init_or_load(
         FdBackend::new(),
         None,

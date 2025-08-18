@@ -15,7 +15,6 @@ pub struct Header(RwLock<HeaderIn>);
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShmStatus {
-    Uninitialized = 0,
     Initializing = 1,
     Initialized = 2,
     Corrupted = 3, // optional

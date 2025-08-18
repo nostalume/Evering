@@ -1,12 +1,15 @@
 #![cfg(feature = "nightly")]
 
-use alloc::alloc::{AllocError, Allocator};
+use alloc::alloc::Allocator;
 
 use blink_alloc::SyncBlinkAlloc;
 use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
+use crate::AllocError;
+use crate::seal::Sealed;
+use crate::IAllocator;
 use crate::shm_alloc::ShmInit;
 
 type GmaBlinkIn = SyncBlinkAlloc<GmaSpinAllocator>;
@@ -23,7 +26,9 @@ impl BlinkGma {
     }
 }
 
-unsafe impl Allocator for BlinkGma {
+impl Sealed for BlinkGma {}
+
+unsafe impl IAllocator for BlinkGma {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.0.allocate(layout)
     }

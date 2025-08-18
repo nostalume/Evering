@@ -1,12 +1,14 @@
 #![cfg(feature = "nightly")]
 
-use alloc::alloc::{AllocError, Allocator};
+use alloc::alloc::Allocator;
 
 use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
+use crate::seal::Sealed;
 use crate::shm_alloc::ShmInit;
+use crate::{IAllocator,AllocError};
 
 pub struct SpinGma(GmaSpinAllocator);
 
@@ -18,7 +20,9 @@ impl SpinGma {
     }
 }
 
-unsafe impl Allocator for SpinGma {
+impl Sealed for SpinGma {}
+
+unsafe impl IAllocator for SpinGma {
     fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.0.allocate(layout)
     }

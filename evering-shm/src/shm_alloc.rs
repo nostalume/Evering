@@ -6,8 +6,11 @@ use alloc::alloc::{AllocError, Allocator};
 #[cfg(not(feature = "nightly"))]
 use allocator_api2::alloc::{AllocError, Allocator};
 
+use alloc::sync::Arc;
 use memory_addr::MemoryAddr;
 
+use crate::IAllocator;
+use crate::seal::Sealed;
 use crate::shm_area::ShmArea;
 use crate::shm_area::ShmBackend;
 use crate::shm_area::ShmSpec;
@@ -121,6 +124,7 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
                             }
                         }
                     }
+                    ShmStatus::Initialized => {}
                     _ => return Err(ShmAllocError::InvalidHeader),
                 }
             }
@@ -133,7 +137,9 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
     }
 }
 
-unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Allocator for ShmAlloc<A, S, M> {
+impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Sealed for ShmAlloc<A, S, M> {}
+
+unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> IAllocator for ShmAlloc<A, S, M> {
     fn allocate(&self, layout: core::alloc::Layout) -> Result<NonNull<[u8]>, AllocError> {
         self.allocator().allocate(layout)
     }
@@ -202,7 +208,7 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmHeader for ShmAlloc<A, 
     }
 }
 
-pub unsafe trait ShmInit: Allocator + Sized {
+pub unsafe trait ShmInit: IAllocator + Sized {
     const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
     const USIZE_SIZE: usize = core::mem::size_of::<usize>();
     const ALLOCATOR_SIZE: usize = core::mem::size_of::<Self>();
@@ -232,7 +238,7 @@ pub unsafe trait ShmInit: Allocator + Sized {
     }
 }
 
-pub unsafe trait ShmAllocator: Allocator {
+pub unsafe trait ShmAllocator: IAllocator {
     // Returns the number of bytes that are reserved by the allocator.
     // fn reserved(&self) -> usize;
     // /// Returns the data offset of the allocator. The offset is the end of the reserved bytes of the allocator.
@@ -326,10 +332,23 @@ unsafe impl<A: ShmAllocator> ShmAllocator for &A {
     }
 }
 
+unsafe impl<A:ShmAllocator> ShmAllocator for Arc<A> {
+    fn start_ptr(&self) -> *const u8 {
+        (**self).start_ptr()
+    }
+}
+
 pub unsafe trait ShmHeader {
     fn header(&self) -> &Header;
     fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>>;
     unsafe fn spec<T>(&self, idx: usize) -> Option<ShmBox<T, &Self>>
+    where
+        Self: ShmAllocator + Sized,
+    {
+        self.spec_raw(idx)
+            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
+    }
+    unsafe fn spec_in<T>(self, idx: usize) -> Option<ShmBox<T, Self>>
     where
         Self: ShmAllocator + Sized,
     {
@@ -342,5 +361,33 @@ pub unsafe trait ShmHeader {
         Self: ShmAllocator + Sized,
     {
         unsafe { self.init_spec_raw(spec.as_ref(), idx) }
+    }
+}
+
+unsafe impl<A:ShmHeader> ShmHeader for &A {
+    fn header(&self) -> &Header {
+        (**self).header()
+    }
+
+    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
+        (**self).spec_raw(idx)
+    }
+
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
+        unsafe { (**self).init_spec_raw(spec, idx) }
+    }
+}
+
+unsafe impl<A:ShmHeader> ShmHeader for Arc<A> {
+    fn header(&self) -> &Header {
+        (**self).header()
+    }
+    
+    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
+        (**self).spec_raw(idx)
+    }
+    
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
+        unsafe { (**self).init_spec_raw(spec, idx) }
     }
 }

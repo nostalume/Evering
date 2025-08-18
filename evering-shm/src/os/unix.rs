@@ -6,9 +6,9 @@ pub use nix::{
     sys::memfd::MFdFlags,
     sys::mman::{MapFlags, ProtFlags},
 };
-use std::os::fd::{AsFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
-use crate::shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
+use crate::{os::FdBackend, shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec}};
 
 type UnixAddr = usize;
 
@@ -17,13 +17,13 @@ unsafe fn usize_as_c_void(ptr: UnixAddr) -> NonNull<c_void> {
     unsafe { NonNull::new_unchecked(ptr) }
 }
 
-pub struct FdConfig<F: AsFd> {
+pub struct UnixFdConf<F: AsFd> {
     f: F,
     mflags: MapFlags,
     offset: off_t,
 }
 
-impl FdConfig<OwnedFd> {
+impl UnixFdConf<OwnedFd> {
     pub fn default_from_mem_fd<P: nix::NixPath + ?Sized>(
         name: &P,
         mfd_flags: nix::sys::memfd::MFdFlags,
@@ -40,9 +40,13 @@ impl FdConfig<OwnedFd> {
         let f = nix::sys::memfd::memfd_create(name, mfd_flags)?;
         Ok(Self::new(f, mflags, offset))
     }
+    
+    pub fn borrow<'f>(&'f self) -> UnixFdConf<BorrowedFd<'f>> {
+        UnixFdConf::new(self.f.as_fd(), self.mflags, self.offset)
+    }
 }
 
-impl<F: AsFd> FdConfig<F> {
+impl<F: AsFd> UnixFdConf<F> {
     pub const fn new(f: F, mflags: MapFlags, offset: off_t) -> Self {
         Self { f, mflags, offset }
     }
@@ -55,17 +59,8 @@ impl ShmSpec for UnixShm {
     type Flags = ProtFlags;
 }
 
-pub struct FdBackend<F: AsFd>(core::marker::PhantomData<F>);
-
-impl<F: AsFd> FdBackend<F> {
-    #[inline]
-    pub const fn new() -> Self {
-        Self(core::marker::PhantomData)
-    }
-}
-
 impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
-    type Config = FdConfig<F>;
+    type Config = UnixFdConf<F>;
     type Error = nix::Error;
 
     fn map(
@@ -73,7 +68,7 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
         start: Option<<UnixShm as ShmSpec>::Addr>,
         size: usize,
         flags: <UnixShm as ShmSpec>::Flags,
-        cfg: FdConfig<F>,
+        cfg: UnixFdConf<F>,
     ) -> Result<ShmArea<UnixShm, Self>, Self::Error> {
         let start = start.and_then(NonZeroUsize::new);
         let len = size as i64;
@@ -82,7 +77,7 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
             _ => return Err(nix::Error::EINVAL),
         };
 
-        let FdConfig {
+        let UnixFdConf {
             f,
             mflags: mflag,
             offset,
