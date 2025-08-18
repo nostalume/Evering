@@ -6,9 +6,12 @@ pub use nix::{
     sys::memfd::MFdFlags,
     sys::mman::{MapFlags, ProtFlags},
 };
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
 
-use crate::{os::FdBackend, shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec}};
+use crate::{
+    os::FdBackend,
+    shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec},
+};
 
 type UnixAddr = usize;
 
@@ -26,23 +29,43 @@ pub struct UnixFdConf<F: AsFd> {
 impl UnixFdConf<OwnedFd> {
     pub fn default_from_mem_fd<P: nix::NixPath + ?Sized>(
         name: &P,
+        size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
     ) -> Result<Self, nix::Error> {
-        Self::from_mem_fd(name, mfd_flags, MapFlags::MAP_SHARED, 0)
+        Self::from_mem_fd(name, size, mfd_flags, MapFlags::MAP_SHARED, 0)
     }
 
     pub fn from_mem_fd<P: nix::NixPath + ?Sized>(
         name: &P,
+        size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
         mflags: MapFlags,
         offset: off_t,
     ) -> Result<Self, nix::Error> {
         let f = nix::sys::memfd::memfd_create(name, mfd_flags)?;
+        nix::unistd::ftruncate(f.as_fd(), size as i64)?;
         Ok(Self::new(f, mflags, offset))
     }
-    
-    pub fn borrow<'f>(&'f self) -> UnixFdConf<BorrowedFd<'f>> {
+
+    pub fn as_ref<'f>(&'f self) -> UnixFdConf<BorrowedFd<'f>> {
         UnixFdConf::new(self.f.as_fd(), self.mflags, self.offset)
+    }
+
+    pub fn dup(&self) -> Result<UnixFdConf<OwnedFd>, nix::Error> {
+        let owned = nix::unistd::dup(self.f.as_fd())?;
+        Ok(UnixFdConf::new(owned, self.mflags, self.offset))
+    }
+
+    pub fn close(self) -> Result<(), nix::Error> {
+        let raw = self.f.as_fd().as_raw_fd();
+        core::mem::forget(self);
+        nix::unistd::close(raw)
+    }
+}
+
+impl Clone for UnixFdConf<OwnedFd> {
+    fn clone(&self) -> Self {
+        self.dup().unwrap()
     }
 }
 
@@ -51,6 +74,13 @@ impl<F: AsFd> UnixFdConf<F> {
         Self { f, mflags, offset }
     }
 }
+
+// impl<F: AsFd> Drop for UnixFdConf<F> {
+//     fn drop(&mut self) {
+//         let Self { f, .. } = self;
+//         nix::unistd::close(f.as_fd().as_raw_fd()).unwrap();
+//     }
+// }
 
 pub struct UnixShm;
 
@@ -78,7 +108,7 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
         };
 
         let UnixFdConf {
-            f,
+            ref f,
             mflags: mflag,
             offset,
         } = cfg;

@@ -274,7 +274,7 @@ pub unsafe trait ShmAllocator: IAllocator {
     /// ## Safety
     /// - `ptr` must be allocated by this allocator.
     #[inline]
-    unsafe fn offset<T>(&self, ptr: *const T) -> isize {
+    unsafe fn offset<T:?Sized>(&self, ptr: *const T) -> isize {
         // Safety: `ptr` must has address greater than `self.raw_ptr()`.
         unsafe { ptr.byte_offset_from(self.start_ptr()) }
     }
@@ -315,12 +315,16 @@ pub unsafe trait ShmAllocator: IAllocator {
     #[inline]
     unsafe fn get_aligned_ptr_mut<T>(&self, offset: isize) -> NonNull<T> {
         unsafe {
-            if offset < 0 {
-                return NonNull::new_unchecked(self.start_mut_ptr().sub(-offset as usize).cast());
-            }
-
             let ptr = self.get_ptr_mut(offset).cast();
             NonNull::new_unchecked(ptr)
+        }
+    }
+
+    #[inline]
+    unsafe fn get_aligned_slice_mut<T>(&self, offset: isize, len: usize) -> NonNull<[T]> {
+        unsafe {
+            let ptr = self.get_ptr_mut(offset).cast();
+            NonNull::new_unchecked(core::slice::from_raw_parts_mut(ptr, len))
         }
     }
 }

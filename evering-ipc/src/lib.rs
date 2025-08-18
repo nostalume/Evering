@@ -1,10 +1,33 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(not(any(test, feature = "unix")), no_std)]
 #![feature(allocator_api)]
 
 extern crate alloc;
 
 use alloc::sync::Arc;
 use core::marker::PhantomData;
+
+pub mod driver {
+    pub use evering::driver::*;
+}
+
+pub mod uring {
+    pub use evering::uring::bare::*;
+    pub use evering::uring::{IReceiver, ISender, UringSpec};
+}
+
+pub mod shm {
+    pub use evering_shm::shm_alloc::*;
+    pub use evering_shm::shm_area::{ShmBackend, ShmSpec};
+    pub mod boxed {
+        pub use evering_shm::shm_box::*;
+    }
+    pub mod os {
+        pub use evering_shm::os::FdBackend;
+
+        #[cfg(feature = "unix")]
+        pub use evering_shm::os::unix::*;
+    }
+}
 
 use evering::driver::Driver;
 use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_client, box_server};
@@ -18,14 +41,14 @@ pub trait IpcSpec {
     type M: ShmBackend<Self::S>;
 }
 
-type IpcAlloc<I: IpcSpec> = Arc<ShmAlloc<I::A, I::S, I::M>>;
-type IpcError<I: IpcSpec> = ShmAllocError<I::S, I::M>;
-type IpcQueue<T, I, const N: usize> = BoxQueue<T, IpcAlloc<I>, N>;
-type IpcSubmitter<D, I, const N: usize> = SubmitBridge<D, Boxed<IpcAlloc<I>>, N>;
-type IpcReceiver<D, I, const N: usize> = ReceiveBridge<D, Boxed<IpcAlloc<I>>, N>;
-type IpcCompleter<D, I, const N: usize> = Completer<D, Boxed<IpcAlloc<I>>, N>;
+pub type IpcAlloc<I: IpcSpec> = Arc<ShmAlloc<I::A, I::S, I::M>>;
+pub type IpcError<I: IpcSpec> = ShmAllocError<I::S, I::M>;
+pub type IpcQueue<T, I, const N: usize> = BoxQueue<T, IpcAlloc<I>, N>;
+pub type IpcSubmitter<D, I, const N: usize> = SubmitBridge<D, Boxed<IpcAlloc<I>>, N>;
+pub type IpcReceiver<D, I, const N: usize> = ReceiveBridge<D, Boxed<IpcAlloc<I>>, N>;
+pub type IpcCompleter<D, I, const N: usize> = Completer<D, Boxed<IpcAlloc<I>>, N>;
 
-struct IpcHandle<I: IpcSpec, D: Driver, const N: usize>(IpcAlloc<I>, PhantomData<D>);
+pub struct IpcHandle<I: IpcSpec, D: Driver, const N: usize>(IpcAlloc<I>, PhantomData<D>);
 
 impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
     pub fn init_or_load(
@@ -101,7 +124,7 @@ mod tests {
     type MyPoolDriver = PoolDriver<CharUring>;
 
     struct MyIpcSpec<F>(PhantomData<F>);
-    impl<F:AsFd> IpcSpec for MyIpcSpec<F> {
+    impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
         type A = SpinTlsf;
         type S = UnixShm;
         type M = FdBackend<F>;
@@ -112,7 +135,9 @@ mod tests {
     struct MyHandle;
 
     impl MyHandle {
-        async fn try_handle_ref<F:AsFd,const N: usize>(cq: &IpcCompleter<MyPoolDriver, MyIpcSpec<F>, N>) {
+        async fn try_handle_ref<F: AsFd, const N: usize>(
+            cq: &IpcCompleter<MyPoolDriver, MyIpcSpec<F>, N>,
+        ) {
             // use tokio::time::{self, Duration};
             loop {
                 let mut f = false;
@@ -133,7 +158,7 @@ mod tests {
         }
     }
 
-    fn init_or_load<F:AsFd>(size: usize, cfg:UnixFdConf<F>) -> Arc<MyIpc<F>> {
+    fn init_or_load<F: AsFd>(size: usize, cfg: UnixFdConf<F>) -> Arc<MyIpc<F>> {
         let h = IpcHandle::init_or_load(
             FdBackend::new(),
             None,
@@ -147,8 +172,8 @@ mod tests {
 
     #[test]
     fn queue_test() {
-        let cfg = UnixFdConf::default_from_mem_fd("test", MFdFlags::empty()).unwrap();
-        let handle = init_or_load(SIZE,cfg);
+        let cfg = UnixFdConf::default_from_mem_fd("test", SIZE, MFdFlags::empty()).unwrap();
+        let handle = init_or_load(SIZE, cfg);
         let (pa, pb) = unsafe { handle.queue_pair::<char, char>() };
         let mut len_a = 0;
         let mut len_b = 0;
@@ -177,12 +202,11 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 5)]
     async fn ipc_test() {
-        let cfg = Box::leak(Box::new(UnixFdConf::default_from_mem_fd("test", MFdFlags::empty()).unwrap()));
-        let b1cfg = cfg.borrow();
-        let b2cfg = cfg.borrow();
+        let s_cfg = UnixFdConf::default_from_mem_fd("test", SIZE, MFdFlags::empty()).unwrap();
+        let c_cfg = s_cfg.clone();
 
         tokio::spawn(async move {
-            let handle = init_or_load(SIZE,b1cfg);
+            let handle = init_or_load(SIZE, s_cfg);
             let cq = handle.server();
             for _ in 0..5 {
                 let cq = cq.clone();
@@ -192,7 +216,7 @@ mod tests {
             }
         });
         tokio::spawn(async move {
-            let handle = init_or_load(SIZE,b2cfg);
+            let handle = init_or_load(SIZE, c_cfg);
             let (sb, rb) = handle.client();
             let mut clients = Vec::new();
             for th in 0..5 {

@@ -1,0 +1,27 @@
+[package]
+name = "ipc-bench"
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+edition.workspace = true
+
+[dependencies]
+nix.workspace = true
+fastrand.workspace = true
+bytes = "1.10.1"
+bytesize = "2.0.1"
+
+evering-ipc = { workspace = true, features = ["unix"] }
+tokio.workspace = true
+monoio = { version = "0.2.4", features = ["sync"] }
+
+criterion = "0.7.0"
+
+[dependencies.shmipc]
+git = "https://github.com/cloudwego/shmipc-rs"
+rev = "de966a6ca2d76d574b943f6fd4d3abfa6ff2df5f"
+
+[[bench]]
+name = "ipc-bench"
+path = "src/bench.rs"
+harness = false

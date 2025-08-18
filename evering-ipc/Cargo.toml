@@ -5,9 +5,14 @@ authors.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+
+unix = ["evering-shm/unix"]
+
 [dependencies]
-evering = { path = "../evering" }
-evering-shm = { path = "../evering-shm" }
+evering.workspace = true
+evering-shm = { workspace = true, features = ["unix"] }
 concurrent-queue = "2.5.0"
 lfqueue = "0.8.1"
 

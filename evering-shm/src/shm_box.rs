@@ -14,6 +14,7 @@ use alloc::alloc::{AllocError, handle_alloc_error};
 #[cfg(not(feature = "nightly"))]
 use allocator_api2::alloc::{AllocError, handle_alloc_error};
 
+use crate::seal::Sealed;
 use crate::shm_alloc::ShmAllocator;
 
 #[repr(C)]
@@ -114,6 +115,17 @@ impl<T: ?Sized, A: ShmAllocator> ShmBox<T, A> {
 }
 
 impl<T, A: ShmAllocator> ShmBox<[T], A> {
+    pub fn copy_from_slice(src: &[T], alloc: A) -> ShmBox<[T], A> {
+        let len = src.len();
+        let mut m = ShmBox::new_uninit_slice_in(len, alloc);
+        unsafe {
+            let dst = m.as_mut_ptr().as_mut_ptr();
+            let src_ = src.as_ptr().cast();
+            dst.copy_from_nonoverlapping(src_, len);
+            m.assume_init()
+        }
+    }
+
     pub fn new_uninit_slice_in(len: usize, alloc: A) -> ShmBox<[MaybeUninit<T>], A> {
         let m = ShmBox::try_new_uninit_slice_in(len, alloc);
         m.unwrap()
@@ -197,40 +209,71 @@ impl<T: ?Sized, A: ShmAllocator> DerefMut for ShmBox<T, A> {
 unsafe impl<T: Send, A: ShmAllocator> Send for ShmBox<T, A> {}
 unsafe impl<T: Sync, A: ShmAllocator> Sync for ShmBox<T, A> {}
 
-/// A token that can be transferred between processes.
-pub struct ShmToken<T, A: ShmAllocator>(isize, A, PhantomData<T>);
+pub trait AsShmToken: Sealed {}
 
-impl<T, A: ShmAllocator> ShmToken<T, A> {
+pub struct ShmSized<T: ?Sized>(PhantomData<T>);
+impl<T: ?Sized> Sealed for ShmSized<T> {}
+impl<T: ?Sized> AsShmToken for ShmSized<T> {}
+pub struct ShmSlice<T: ?Sized>(usize, PhantomData<T>);
+impl<T: ?Sized> Sealed for ShmSlice<T> {}
+impl<T: ?Sized> AsShmToken for ShmSlice<T> {}
+
+/// A token that can be transferred between processes.
+pub struct ShmToken<T: ?Sized, A: ShmAllocator, S: AsShmToken>(isize, A, S, PhantomData<T>);
+
+impl<T: ?Sized, A: ShmAllocator> ShmToken<T, A, ShmSized<T>> {
     /// Returns the offset to the start memory region of the allocator.
     pub fn offset(&self) -> isize {
         self.0
     }
+}
 
-    pub fn from_raw(offset: isize, alloc: A) -> Self {
-        ShmToken(offset, alloc, PhantomData)
+impl<T, A: ShmAllocator> ShmToken<[T], A, ShmSlice<T>> {
+    pub fn len(&self) -> usize {
+        self.2.0
     }
 }
 
 /// Safety: ShmToken is invariant across process.
-unsafe impl<T, A: ShmAllocator> Send for ShmToken<T, A> {}
-unsafe impl<T: Sync, A: ShmAllocator> Sync for ShmToken<T, A> {}
+unsafe impl<T, A: ShmAllocator, S: AsShmToken> Send for ShmToken<T, A, S> {}
+unsafe impl<T: Sync, A: ShmAllocator, S: AsShmToken> Sync for ShmToken<T, A, S> {}
 
-impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A> {
+impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A, ShmSized<T>> {
     fn from(value: ShmBox<T, A>) -> Self {
         let (ptr, allocator) = ShmBox::into_raw_with_allocator(value);
 
         // Safety: the ptr is allocated by the allocator
         let offset = unsafe { allocator.offset(ptr) };
 
-        ShmToken(offset, allocator, PhantomData)
+        ShmToken(offset, allocator, ShmSized(PhantomData), PhantomData)
     }
 }
 
-impl<T, A: ShmAllocator> From<ShmToken<T, A>> for ShmBox<T, A> {
-    fn from(value: ShmToken<T, A>) -> Self {
-        let ShmToken(offset, alloc, _) = value;
+impl<T, A: ShmAllocator> From<ShmToken<T, A, ShmSized<T>>> for ShmBox<T, A> {
+    fn from(value: ShmToken<T, A, ShmSized<T>>) -> Self {
+        let ShmToken(offset, alloc, _, _) = value;
 
         let ptr = unsafe { alloc.get_aligned_ptr_mut::<T>(offset) };
+        unsafe { ShmBox::from_raw_in(ptr.as_ptr(), alloc) }
+    }
+}
+
+impl<T, A: ShmAllocator> From<ShmBox<[T], A>> for ShmToken<[T], A, ShmSlice<T>> {
+    fn from(value: ShmBox<[T], A>) -> Self {
+        let len = value.len();
+        let (ptr, allocator) = ShmBox::into_raw_with_allocator(value);
+
+        let offset = unsafe { allocator.offset(ptr) };
+        ShmToken(offset, allocator, ShmSlice(len, PhantomData), PhantomData)
+    }
+}
+
+impl<T, A: ShmAllocator> From<ShmToken<[T], A, ShmSlice<T>>> for ShmBox<[T], A> {
+    fn from(value: ShmToken<[T], A, ShmSlice<T>>) -> Self {
+        let ShmToken(offset, alloc, l, _) = value;
+        let len = l.0;
+
+        let ptr = unsafe { alloc.get_aligned_slice_mut(offset, len) };
         unsafe { ShmBox::from_raw_in(ptr.as_ptr(), alloc) }
     }
 }
