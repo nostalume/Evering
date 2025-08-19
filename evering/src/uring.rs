@@ -10,7 +10,7 @@ pub trait UringSpec {
 
 pub const DEFAULT_CAP: usize = 1 << 5;
 
-pub trait ISender : Sealed {
+pub trait ISender: Sealed {
     type Item;
     type Error;
     type TryError;
@@ -20,35 +20,18 @@ pub trait ISender : Sealed {
     fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError>;
 }
 
-pub trait IReceiver : Sealed {
+pub trait IReceiver: Sealed {
     type Item;
     type Error;
     type TryError;
     fn recv(&self) -> impl Future<Output = Result<Self::Item, Self::Error>> {
         async { unimplemented!() }
     }
-    fn try_recv(&self) -> Result<Self::Item, Self::TryError>;    
+    fn try_recv(&self) -> Result<Self::Item, Self::TryError>;
 }
 
-macro_rules! with_send {
-    ($self:ident, $field:ident, $sender:ident,$data:ident) => {
-        impl<S: UringSpec> $self<S> {
-            pub fn sender(&self) -> &$sender<S::$data> {
-                &self.$field
-            }
-        }
-    };
+pub trait Closable: Sealed + ISender {
+    fn close(&self);
 }
-
-macro_rules! with_recv {
-    ($self:ident, $field:ident, $receiver:ident,$data:ident) => {
-        impl<S: UringSpec> $self<S> {
-            pub fn receiver(&self) -> &$receiver<S::$data> {
-                &self.$field
-            }
-        }
-    };
-}
-
 
 use crate::seal::Sealed;

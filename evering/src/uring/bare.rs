@@ -1,4 +1,4 @@
-use core::{marker::PhantomData, ops::Deref};
+use core::{marker::PhantomData, ops::Deref, task::Poll};
 
 use alloc::sync::Arc;
 use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
@@ -6,7 +6,7 @@ use lfqueue::ConstBoundedQueue as CBQueue;
 
 use crate::{
     seal::Sealed,
-    uring::{IReceiver, ISender, UringSpec},
+    uring::{Closable, IReceiver, ISender, UringSpec},
 };
 
 pub trait QPair<T, U, const N: usize>: Sealed {
@@ -129,17 +129,25 @@ impl<T, U, P: QPair<T, U, N>, const N: usize> ISender for Channel<T, U, P, N> {
         self.s.as_ref().enqueue(item)
     }
     async fn send(&self, item: Self::Item) -> Result<(), Self::Error> {
-        let mut i = Some(item);
-        loop {
-            let cur = i.take().unwrap();
-            match self.s.as_ref().enqueue(cur) {
-                Ok(()) => return Ok(()),
-                Err(e) => {
-                    i.replace(e);
-                    core::hint::spin_loop();
+        let mut item = Some(item);
+        core::future::poll_fn(|cx| {
+            loop {
+                let cur = match item.take() {
+                    Some(i) => i,
+                    None => return Poll::Ready(Ok(())),
+                };
+                match self.s.as_ref().enqueue(cur) {
+                    Ok(()) => return Poll::Ready(Ok(())),
+                    Err(e) => {
+                        item.replace(e);
+                        core::hint::spin_loop();
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
                 }
             }
-        }
+        })
+        .await
     }
 }
 
@@ -147,17 +155,26 @@ impl<T, U, P: QPair<T, U, N>, const N: usize> IReceiver for Channel<T, U, P, N> 
     type Item = U;
     type Error = ();
     type TryError = ();
-    fn try_recv(&self) -> Result<U, Self::TryError> {
+    fn try_recv(&self) -> Result<Self::Item, Self::TryError> {
         self.r.as_ref().dequeue().ok_or(())
     }
 
     async fn recv(&self) -> Result<Self::Item, Self::Error> {
-        loop {
-            match self.r.as_ref().dequeue() {
-                Some(item) => return Ok(item),
-                None => core::hint::spin_loop(),
+        core::future::poll_fn(|cx| {
+            loop {
+                match self.r.as_ref().dequeue() {
+                    Some(item) => {
+                        return Poll::Ready(Ok(item));
+                    }
+                    None => {
+                        core::hint::spin_loop();
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
             }
-        }
+        })
+        .await
     }
 }
 

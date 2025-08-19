@@ -26,7 +26,3 @@ bytesize = "2.0.1"
 evering = { path = "evering" }
 evering-shm = { path = "evering-shm" }
 evering-ipc = { path = "evering-ipc" }
-
-[patch.crates-io]
-concurrent-queue = { path = "evering/concurrent-queue" }
-async-channel = { path = "evering/async-channel" }

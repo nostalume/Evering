@@ -106,11 +106,13 @@ impl<
     /// Receives completed msgs in non-blocking.
     ///
     /// If the channel is empty or closed, it will return immediately.
-    pub fn try_complete(&self) {
-        while let Ok(data) = self.sq.try_recv() {
+    pub fn try_complete(&self) -> bool {
+        if let Ok(data) = self.sq.try_recv() {
             let (id, payload) = data.into_inner();
             self.driver.complete(id, payload);
+            return true
         }
+        false
     }
 }
 
@@ -182,8 +184,8 @@ pub mod bare {
     use crate::driver::{BridgeTmpl, DUring, Driver, Receive, Submit};
     use crate::uring::UringSpec;
     use crate::uring::bare::{
-        BoxQueue, Boxed, Completer as UringCompleter, Submitter as UringSubbmiter,
-        box_channel, channel,
+        BoxQueue, Boxed, Completer as UringCompleter, Submitter as UringSubbmiter, box_channel,
+        channel,
     };
 
     pub type Submitter<D, P, const N: usize> = UringSubbmiter<DUring<D>, P, N>;

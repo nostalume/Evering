@@ -4,8 +4,8 @@ use core::{hint::black_box, time::Duration};
 
 use bytes::Bytes;
 
-mod char_ipc;
-mod box_ipc;
+mod multi_ipc;
+mod single_ipc;
 
 const CONCURRENCY: usize = 200;
 

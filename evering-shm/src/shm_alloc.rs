@@ -59,8 +59,6 @@ pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
     phantom: core::marker::PhantomData<A>,
 }
 
-unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Send for ShmAlloc<A, S, M> {}
-
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
     type Target = A;
 
@@ -73,6 +71,28 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
             .align_up(Header::HEADER_ALIGN)
             .into() as *mut A;
         unsafe { &*ptr }
+    }
+}
+
+impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Clone for ShmAlloc<A, S, M>
+where
+    M: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            area: self.area.clone(),
+            phantom: self.phantom,
+        }
+    }
+}
+
+impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Drop for ShmAlloc<A, S, M> {
+    fn drop(&mut self) {
+        let header_write = self.header().write();
+        if header_write.decre_rc() == 1 {
+            drop(header_write);
+            let _ = M::unmap(&mut self.area);
+        }
     }
 }
 
@@ -130,6 +150,7 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
                     ShmStatus::Initialized => {}
                     _ => return Err(ShmAllocError::InvalidHeader),
                 }
+                header_ref.write().incre_rc();
             }
         }
 

@@ -1,4 +1,4 @@
-use core::ops::Deref;
+use core::{ops::Deref, sync::atomic::AtomicU32};
 
 use spin::RwLock;
 
@@ -6,6 +6,7 @@ use spin::RwLock;
 pub struct HeaderIn {
     magic: u16,
     status: ShmStatus,
+    rc: AtomicU32,
     spec: [Option<isize>; 5],
 }
 
@@ -28,6 +29,7 @@ impl HeaderIn {
     pub const fn intializing(&mut self) {
         self.with_magic();
         self.with_status(ShmStatus::Initializing);
+        self.rc = AtomicU32::new(1);
         self.spec = [None; 5];
     }
 
@@ -49,6 +51,16 @@ impl HeaderIn {
     #[inline]
     pub const fn with_status(&mut self, status: ShmStatus) {
         self.status = status;
+    }
+
+    #[inline]
+    pub fn incre_rc(&self) -> u32 {
+        self.rc.fetch_add(1, core::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[inline]
+    pub fn decre_rc(&self) -> u32 {
+        self.rc.fetch_sub(1, core::sync::atomic::Ordering::SeqCst)
     }
 
     #[inline]

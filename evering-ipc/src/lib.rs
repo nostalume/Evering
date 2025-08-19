@@ -73,7 +73,7 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
         Ok(IpcHandle(area, PhantomData))
     }
 
-    unsafe fn queue_ref<T>(&self, idx: usize) -> BoxQueue<T, IpcAllocRef<I>, N> {
+    unsafe fn queue_ref<T>(&self, idx: usize) -> BoxQueue<T, IpcAllocRef<'_, I>, N> {
         assert!(idx <= 2);
         loop {
             match unsafe { self.0.as_ref().spec(idx) } {

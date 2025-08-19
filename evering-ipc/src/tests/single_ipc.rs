@@ -1,4 +1,5 @@
-extern crate evering_ipc;
+#![cfg(test)]
+#![cfg(feature = "unix")]
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -6,20 +7,19 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Instant;
 
-use evering_ipc::driver::cell::IdCell;
-use evering_ipc::driver::unlocked::PoolDriver;
-use evering_ipc::shm::boxed::{ShmBox, ShmSlice, ShmToken};
-use evering_ipc::shm::os::{
+use crate::driver::cell::IdCell;
+use crate::driver::unlocked::PoolDriver;
+use crate::shm::boxed::{ShmBox, ShmSlice, ShmToken};
+use crate::shm::os::{
     FdBackend,
     unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm},
 };
-use evering_ipc::shm::tlsf::SpinTlsf;
-use evering_ipc::uring::{IReceiver, ISender, UringSpec};
-use evering_ipc::{IpcAlloc, IpcHandle, IpcSpec};
+use crate::shm::tlsf::SpinTlsf;
+use crate::tests::*;
+use crate::uring::{IReceiver, ISender, UringSpec};
+use crate::{IpcAlloc, IpcHandle, IpcSpec};
+
 use tokio::runtime::Builder;
-
-use super::*;
-
 use tokio::task::{spawn_local, yield_now};
 
 type ShmReq<I> = ShmBox<[u8], IpcAlloc<I>>;
@@ -75,7 +75,9 @@ impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
     type M = FdBackend<F>;
 }
 
-const CAP: usize = CONCURRENCY.next_power_of_two();
+const CONCURRENCY: usize = 200;
+
+const CAP: usize =8; 
 
 type MyIpc<F> = IpcHandle<MyIpcSpec<F>, MyPoolDriver<MyIpcSpec<F>>, CAP>;
 
@@ -102,7 +104,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
     let handle = init_or_load(shmsize, s_cfg);
 
     let runtime = Builder::new_multi_thread()
-        .worker_threads(1)
+        .worker_threads(10)
         .enable_all()
         .build()
         .unwrap();
@@ -119,6 +121,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                     let msg = match cq.recv().await {
                         Ok(m) => m,
                         Err(_) => {
+                            eprintln!("Server receive error or channel closed, exiting loop.");
                             break 'outer;
                         }
                     };
@@ -127,15 +130,18 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                     match data {
                         Sqe::Exit => {
                             cq.send(IdCell::new(id, Rqe::Exited)).await.unwrap();
+                            println!("Server received exit command. Exiting.");
                             break 'outer;
                         }
                         Sqe::Ping { ping, req, resp } => {
                             assert_eq!(ping, PING);
                             let buf = req.into_box();
                             check_req(bufsize, buf.as_ref());
+                            println!("server: req check correctly");
 
                             let mut resp_box = resp.into_box();
                             resp_box.as_mut().copy_from_slice(&respdata);
+                            println!("server: resp initialized correctly");
 
                             cq.send(IdCell::new(
                                 id,
@@ -146,6 +152,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                             ))
                             .await
                             .unwrap();
+                            println!("server: send resp");
                         }
                     }
                 }
@@ -180,6 +187,8 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                         .assume_init()
                                 };
 
+                                println!("client: req initialized correctly");
+
                                 let op = Sqe::Ping {
                                     ping: PING,
                                     req: req_box.into(),
@@ -189,6 +198,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                 match sb_c.try_submit(op) {
                                     Ok(op) => match op.await {
                                         Rqe::Exited => {
+                                            println!("client: server exited");
                                         }
                                         Rqe::Pong {
                                             pong,
@@ -197,9 +207,10 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                             let resp_ret = resp_ret_token.into_box();
                                             assert_eq!(pong, PONG);
                                             check_resp(bufsize, resp_ret.as_ref());
+                                            println!("client: resp check correctly.");
                                         }
                                     },
-                                    _ => {},
+                                    _ => println!("client: failed to submit op"),
                                 }
                             }
                         })
@@ -207,10 +218,12 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                     .collect::<Vec<_>>();
 
                 let now = Instant::now();
-                for task in tasks.into_iter() {
+                for (i, task) in tasks.into_iter().enumerate() {
                     task.await.unwrap();
+                    println!("task {i} done");
                 }
                 let elapsed = now.elapsed();
+                println!("exit");
                 sb.try_submit(Sqe::Exit).unwrap();
                 elapsed
             })
@@ -223,8 +236,18 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
 
     elapsed
 }
+
 #[test]
 fn ipc_test() {
-    let elapsed = bench("test", 1000, 1024);
-    println!("elapsed: {elapsed:?}");
+    let mut total = Duration::ZERO;
+    for i in 1..=5 {
+        let iter = i * 1000;
+        let elapsed = bench("2", iter, 2048);
+        total += elapsed;
+        println!("elapsed: {elapsed:?}");
+    }
+    let total_iter = (1..=5).map(|i| i * 1000).sum::<usize>();
+    let total_ns = total.as_nanos();
+    let per_iter = total_ns as f64 / total_iter as f64;
+    println!("per iter: {per_iter} ns");
 }

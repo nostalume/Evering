@@ -48,7 +48,7 @@ impl MyHandle {
             let mut f = false;
             while let Ok(msg) = cq.try_recv() {
                 f = true;
-                println!("[handle]: recv: {:?}", msg);
+                println!("[handle]: recv correctly");
                 let ans = msg.map(|r| {
                     let mut s = r.into_box();
                     s.copy_from_slice(SLICE);
@@ -110,13 +110,14 @@ fn queue_test() {
     dbg!(format!("{}, {}", len_a, len_b));
 }
 
-#[tokio::test(flavor = "current_thread")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ipc_test() {
-    let s_cfg = UnixFdConf::default_from_mem_fd("awdwada", SIZE, MFdFlags::empty()).unwrap();
-    let c_cfg = s_cfg.clone();
+    let s_cfg = UnixFdConf::default_from_mem_fd("something", SIZE, MFdFlags::empty()).unwrap();
+    let handle = init_or_load(SIZE, s_cfg);
+    let handle_c = handle.clone();
 
     tokio::spawn(async move {
-        let handle = init_or_load(SIZE, s_cfg);
+        let handle = handle_c;
         let cq = handle.server();
         for _ in 0..5 {
             let cq = cq.clone();
@@ -126,7 +127,6 @@ async fn ipc_test() {
         }
     });
     tokio::spawn(async move {
-        let handle = init_or_load(SIZE, c_cfg);
         let (sb, rb) = handle.client();
         let mut clients = Vec::new();
         for th in 0..5 {
@@ -146,7 +146,7 @@ async fn ipc_test() {
                     match sb.try_submit(req.into()) {
                         Ok(d) => {
                             let res = d.await;
-                            let buf: ShmBox<_, _> = res.into();
+                            let buf = res.into_box();
                             for i in buf.iter() {
                                 assert_eq!(*i, SLICE[0]);
                             }

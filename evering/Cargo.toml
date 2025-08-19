@@ -18,7 +18,7 @@ nightly = []
 evering-shm = { path = "../evering-shm" }
 
 lfqueue = { version = "0.8.1", default-features = false }
-async-channel = { path = "async-channel" }
+async-channel = "2.5.0"
 crossbeam-channel = "0.5"
 
 lock_api.workspace = true
@@ -27,8 +27,6 @@ parking_lot = { version = "0.12", optional = true }
 
 slab = "0.4.11"
 objectpool = { version = "0.1", default-features = false, features = ["alloc"] }
-
-futures = { version = "0.3", default-features = false }
 
 [dev-dependencies]
 fastrand.workspace = true

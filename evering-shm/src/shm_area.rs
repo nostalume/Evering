@@ -1,4 +1,3 @@
-
 use memory_addr::{AddrRange, MemoryAddr};
 
 pub trait ShmSpec {
@@ -33,6 +32,19 @@ pub struct ShmArea<S: ShmSpec, M: ShmBackend<S>> {
 impl<S: ShmSpec, M: ShmBackend<S>> ShmSpec for ShmArea<S, M> {
     type Addr = S::Addr;
     type Flags = S::Flags;
+}
+
+impl<S: ShmSpec, M: ShmBackend<S>> Clone for ShmArea<S, M>
+where
+    M: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            va_range: self.va_range.clone(),
+            flags: self.flags.clone(),
+            bk: self.bk.clone(),
+        }
+    }
 }
 
 impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
@@ -117,9 +129,7 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
     ) -> Option<(*mut T, S::Addr, usize)> {
         // including padding
         let t_start = start.add(t_size).align_up(t_align);
-        let free = self
-            .end()
-            .checked_sub_addr(t_start)?;
+        let free = self.end().checked_sub_addr(t_start)?;
         let ptr = start.into() as *mut T;
         Some((ptr, t_start, free))
     }
@@ -164,11 +174,5 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
     #[inline]
     pub fn backend_mut(&mut self) -> &mut M {
         &mut self.bk
-    }
-}
-
-impl<S: ShmSpec, M: ShmBackend<S>> Drop for ShmArea<S, M> {
-    fn drop(&mut self) {
-        let _ = M::unmap(self);
     }
 }

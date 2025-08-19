@@ -30,7 +30,6 @@ const BUFSIZES: &[usize] = &[
 
 const CONCURRENCY: usize = 200;
 
-// Fixed constants
 const PING: i32 = 1;
 const PONG: i32 = 2;
 
@@ -45,7 +44,7 @@ const fn shmsize(bufsize: usize) -> usize {
     } else if bufsize < (4 << 20) {
         1 << 30
     } else {
-        2 << 30
+        2 << 31
     }
 }
 
@@ -106,7 +105,7 @@ fn groups(c: &mut Criterion) {
     let mut g = c.benchmark_group("ipc_benchmark");
     for (i, bufsize) in BUFSIZES.iter().copied().enumerate() {
         let bsize = ByteSize::b(bufsize as u64).display().iec_short();
-        for (name, f) in benches![evering, monoio, shmipc] {
+        for (name, f) in benches![monoio, shmipc, evering] {
             let id = format!("ipc_benchmark_{i:02}_{bsize:.0}_{name}");
             g.bench_function(&id, |b| {
                 b.iter_custom(|iters| f(&id, iters as usize, bufsize))

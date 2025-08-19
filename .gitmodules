@@ -1,6 +1,0 @@
-[submodule "evering/async-channel"]
-	path = evering/async-channel
-	url = https://github.com/evering/async-channel.git
-[submodule "evering/concurrent-queue"]
-	path = evering/concurrent-queue
-	url = https://github.com/smol-rs/concurrent-queue.git
