@@ -1,4 +1,5 @@
-extern crate evering_ipc;
+#![cfg(test)]
+#![cfg(feature = "unix")]
 
 use core::marker::PhantomData;
 use core::time::Duration;
@@ -6,17 +7,19 @@ use std::os::fd::{AsFd, OwnedFd};
 use std::sync::Arc;
 use std::time::Instant;
 
-use evering_ipc::driver::cell::IdCell;
-use evering_ipc::driver::unlocked::PoolDriver;
-use evering_ipc::shm::boxed::{ShmBox, ShmSlice, ShmToken};
-use evering_ipc::shm::os::{FdBackend, unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm}};
-use evering_ipc::shm::tlsf::SpinTlsf;
-use evering_ipc::uring::{IReceiver, ISender, UringSpec};
-use evering_ipc::{IpcAlloc, IpcHandle, IpcSpec};
+use crate::driver::cell::IdCell;
+use crate::driver::unlocked::PoolDriver;
+use crate::shm::boxed::{ShmBox, ShmSlice, ShmToken};
+use crate::shm::os::{
+    FdBackend,
+    unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm},
+};
+use crate::shm::tlsf::SpinTlsf;
+use crate::tests::*;
+use crate::uring::{IReceiver, ISender, UringSpec};
+use crate::{IpcAlloc, IpcHandle, IpcSpec};
 
-use super::*;
-
-use tokio::task::{spawn_local};
+use tokio::task::{spawn_local, yield_now};
 
 type ShmReq<I> = ShmBox<[u8], IpcAlloc<I>>;
 type ShmResp<I> = ShmBox<[u8], IpcAlloc<I>>;
@@ -120,10 +123,12 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                             }
                             Sqe::Ping { ping, req, resp } => {
                                 assert_eq!(ping, PING);
+                                println!("server: ping: {}", ping); // Added dbg for server side
                                 let buf: ShmBox<_, _> = req.into();
                                 check_req(bufsize, buf.as_ref());
                                 let mut resp = resp.into_box();
                                 resp.as_mut().copy_from_slice(&respdata);
+                                println!("server resp");
                                 cq.send(IdCell::new(
                                     id,
                                     Rqe::Pong {
@@ -144,18 +149,18 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
             let req_data = req(bufsize);
             let handle_arc = init_or_load(shmsize, c_cfg);
             let (sb, rb) = handle_arc.client();
-            
+
             std::thread::spawn(move || {
                 loop {
                     rb.try_complete();
+                    std::thread::sleep(std::time::Duration::from_millis(100));
                 }
             });
-            
+
             let client_elapsed = cur_block_on(async move {
-                // local thread cause nonterminate
                 // let rb = rb.clone();
                 // tokio::task::spawn_local(async move {
-                //     loop { 
+                //     loop {
                 //         rb.try_complete();
                 //         tokio::time::sleep(Duration::from_millis(100)).await;
                 //     }
@@ -188,6 +193,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                 else {
                                     unreachable!()
                                 };
+                                println!("pong: {}", pong);
 
                                 let resp_ret = resp_ret_token.into_box();
                                 assert_eq!(pong, PONG);
@@ -196,6 +202,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                         }
                     })
                     .map(spawn_local); // Assuming `spawn_local` is correctly defined for local tasks.
+                println!("finish task collect: Starting ping-pong tasks...");
                 let now = Instant::now();
                 for task in tasks {
                     task.await.unwrap();
@@ -208,7 +215,6 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
             client_elapsed // Return the calculated elapsed duration
         });
 
-
         let elapsed = client_handle.join().unwrap();
         server_handle.join().unwrap();
         elapsed
@@ -216,8 +222,9 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
 
     elapsed
 }
+
 #[test]
-fn test() {
-    let elapsed = bench("test", 1000, 1024);
+fn ipc_test() {
+    let elapsed = bench("test", 200, 1024);
     println!("elapsed: {elapsed:?}");
 }

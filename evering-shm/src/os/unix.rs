@@ -55,12 +55,6 @@ impl UnixFdConf<OwnedFd> {
         let owned = nix::unistd::dup(self.f.as_fd())?;
         Ok(UnixFdConf::new(owned, self.mflags, self.offset))
     }
-
-    pub fn close(self) -> Result<(), nix::Error> {
-        let raw = self.f.as_fd().as_raw_fd();
-        core::mem::forget(self);
-        nix::unistd::close(raw)
-    }
 }
 
 impl Clone for UnixFdConf<OwnedFd> {

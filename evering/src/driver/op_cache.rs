@@ -69,7 +69,8 @@ pub mod unlocked {
     pub struct CacheState<T> {
         state: AtomicU8,
         waker: UnsafeCell<MaybeUninit<Waker>>,
-        payload: UnsafeCell<MaybeUninit<T>>,
+        // take rather read to move out, avoiding free after read.
+        payload: UnsafeCell<Option<T>>,
     }
 
     unsafe impl<T: Send> Send for CacheState<T> {}
@@ -86,7 +87,7 @@ pub mod unlocked {
             Self {
                 state: AtomicU8::new(INIT),
                 waker: UnsafeCell::new(MaybeUninit::uninit()),
-                payload: UnsafeCell::new(MaybeUninit::uninit()),
+                payload: UnsafeCell::new(None),
             }
         }
 
@@ -94,7 +95,7 @@ pub mod unlocked {
             let state = *self.state.get_mut();
             if state == COMPLETED {
                 unsafe {
-                    (*self.payload.get()).assume_init_drop();
+                    (*self.payload.get()).take();
                 }
             }
             if state == WAITING {
@@ -107,7 +108,7 @@ pub mod unlocked {
         }
 
         pub fn try_complete(&self, payload: T) {
-            unsafe { (*self.payload.get()).write(payload) };
+            unsafe { (*self.payload.get()).replace(payload) };
             if self
                 .state
                 .swap(COMPLETED, core::sync::atomic::Ordering::AcqRel)
@@ -123,12 +124,16 @@ pub mod unlocked {
                 match self.state.load(core::sync::atomic::Ordering::Acquire) {
                     INIT => {
                         unsafe { (*self.waker.get()).write(cx.waker().clone()) };
-                        if self.state.compare_exchange(
-                            INIT,
-                            WAITING,
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        ).is_ok() {
+                        if self
+                            .state
+                            .compare_exchange(
+                                INIT,
+                                WAITING,
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
                             return Poll::Pending;
                         }
                     }
@@ -137,17 +142,21 @@ pub mod unlocked {
                         if !waker.will_wake(cx.waker()) {
                             unsafe { (*self.waker.get()).write(cx.waker().clone()) };
                         }
-                        if self.state.compare_exchange(
-                            WAITING,
-                            WAITING,
-                            core::sync::atomic::Ordering::AcqRel,
-                            core::sync::atomic::Ordering::Acquire,
-                        ).is_ok() {
+                        if self
+                            .state
+                            .compare_exchange(
+                                WAITING,
+                                WAITING,
+                                core::sync::atomic::Ordering::AcqRel,
+                                core::sync::atomic::Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
                             return Poll::Pending;
                         }
                     }
                     COMPLETED => {
-                        let payload = unsafe { (*self.payload.get()).assume_init_read() };
+                        let payload = unsafe { (*self.payload.get()).take().unwrap() };
                         return Poll::Ready(payload);
                     }
                     _ => unreachable!(),

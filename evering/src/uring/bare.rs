@@ -102,6 +102,9 @@ pub struct Channel<T, U, P: QPair<T, U, N>, const N: usize> {
     r: P::Receiver,
 }
 
+unsafe impl<T, U, P: QPair<T, U, N>, const N: usize> Send for Channel<T, U, P, N> {}
+unsafe impl<T, U, P: QPair<T, U, N>, const N: usize> Sync for Channel<T, U, P, N> {}
+
 impl<T, U, P: QPair<T, U, N>, const N: usize> Clone for Channel<T, U, P, N>
 where
     P::Sender: Clone,

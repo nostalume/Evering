@@ -1,4 +1,5 @@
 use core::alloc::Layout;
+use core::fmt::Debug;
 use core::marker::PhantomData;
 use core::mem;
 use core::mem::MaybeUninit;
@@ -20,7 +21,30 @@ use crate::shm_alloc::ShmAllocator;
 #[repr(C)]
 pub struct ShmBox<T: ?Sized, A: ShmAllocator>(NonNull<T>, A);
 
+impl<T: ?Sized, A: ShmAllocator> Drop for ShmBox<T, A> {
+    fn drop(&mut self) {
+        // the T in the Box is dropped by the compiler before the destructor is run
+        let ptr = self.0;
+
+        unsafe {
+            let layout = Layout::for_value_raw(ptr.as_ptr());
+            if layout.size() != 0 {
+                self.1.deallocate(From::from(ptr.cast()), layout);
+            }
+        }
+    }
+}
+
 impl<T, A: ShmAllocator> ShmBox<T, A> {
+    pub fn take(self) -> T {
+        let ShmBox(ptr, _) = self;
+        unsafe { ptr::read(ptr.as_ptr()) }
+    }
+
+    pub fn into_token(self) -> ShmToken<T, A, ShmSized> {
+        self.into()
+    }
+
     pub fn new_in(x: T, alloc: A) -> ShmBox<T, A> {
         let boxed = Self::new_uninit_in(alloc);
         boxed.write(x)
@@ -115,6 +139,10 @@ impl<T: ?Sized, A: ShmAllocator> ShmBox<T, A> {
 }
 
 impl<T, A: ShmAllocator> ShmBox<[T], A> {
+    pub fn into_token(self) -> ShmToken<T, A, ShmSlice> {
+        self.into()
+    }
+
     pub fn copy_from_slice(src: &[T], alloc: A) -> ShmBox<[T], A> {
         let len = src.len();
         let mut m = ShmBox::new_uninit_slice_in(len, alloc);
@@ -193,6 +221,12 @@ impl<T, A: ShmAllocator> ShmBox<[MaybeUninit<T>], A> {
     }
 }
 
+impl<T, A: ShmAllocator> Debug for ShmBox<T, A> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ShmBox").field(&self.0).finish()
+    }
+}
+
 impl<T: ?Sized, A: ShmAllocator> Deref for ShmBox<T, A> {
     type Target = T;
     fn deref(&self) -> &Self::Target {
@@ -206,29 +240,34 @@ impl<T: ?Sized, A: ShmAllocator> DerefMut for ShmBox<T, A> {
     }
 }
 
-unsafe impl<T: Send, A: ShmAllocator> Send for ShmBox<T, A> {}
+unsafe impl<T, A: ShmAllocator> Send for ShmBox<T, A> {}
 unsafe impl<T: Sync, A: ShmAllocator> Sync for ShmBox<T, A> {}
 
 pub trait AsShmToken: Sealed {}
-
-pub struct ShmSized<T: ?Sized>(PhantomData<T>);
-impl<T: ?Sized> Sealed for ShmSized<T> {}
-impl<T: ?Sized> AsShmToken for ShmSized<T> {}
-pub struct ShmSlice<T: ?Sized>(usize, PhantomData<T>);
-impl<T: ?Sized> Sealed for ShmSlice<T> {}
-impl<T: ?Sized> AsShmToken for ShmSlice<T> {}
+pub struct ShmSized;
+impl Sealed for ShmSized {}
+impl AsShmToken for ShmSized {}
+pub struct ShmSlice(usize);
+impl Sealed for ShmSlice {}
+impl AsShmToken for ShmSlice {}
 
 /// A token that can be transferred between processes.
-pub struct ShmToken<T: ?Sized, A: ShmAllocator, S: AsShmToken>(isize, A, S, PhantomData<T>);
+pub struct ShmToken<T, A: ShmAllocator, S: AsShmToken>(isize, A, S, PhantomData<T>);
 
-impl<T: ?Sized, A: ShmAllocator> ShmToken<T, A, ShmSized<T>> {
+impl<T, A: ShmAllocator> ShmToken<T, A, ShmSized> {
+    pub fn into_box(self) -> ShmBox<T, A> {
+        self.into()
+    }
     /// Returns the offset to the start memory region of the allocator.
     pub fn offset(&self) -> isize {
         self.0
     }
 }
 
-impl<T, A: ShmAllocator> ShmToken<[T], A, ShmSlice<T>> {
+impl<T, A: ShmAllocator> ShmToken<T, A, ShmSlice> {
+    pub fn into_box(self) -> ShmBox<[T], A> {
+        self.into()
+    }
     pub fn len(&self) -> usize {
         self.2.0
     }
@@ -238,19 +277,25 @@ impl<T, A: ShmAllocator> ShmToken<[T], A, ShmSlice<T>> {
 unsafe impl<T, A: ShmAllocator, S: AsShmToken> Send for ShmToken<T, A, S> {}
 unsafe impl<T: Sync, A: ShmAllocator, S: AsShmToken> Sync for ShmToken<T, A, S> {}
 
-impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A, ShmSized<T>> {
+impl<T, A: ShmAllocator, S: AsShmToken> Debug for ShmToken<T, A, S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_tuple("ShmToken").field(&self.0).finish()
+    }
+}
+
+impl<T, A: ShmAllocator> From<ShmBox<T, A>> for ShmToken<T, A, ShmSized> {
     fn from(value: ShmBox<T, A>) -> Self {
         let (ptr, allocator) = ShmBox::into_raw_with_allocator(value);
 
         // Safety: the ptr is allocated by the allocator
         let offset = unsafe { allocator.offset(ptr) };
 
-        ShmToken(offset, allocator, ShmSized(PhantomData), PhantomData)
+        ShmToken(offset, allocator, ShmSized, PhantomData)
     }
 }
 
-impl<T, A: ShmAllocator> From<ShmToken<T, A, ShmSized<T>>> for ShmBox<T, A> {
-    fn from(value: ShmToken<T, A, ShmSized<T>>) -> Self {
+impl<T, A: ShmAllocator> From<ShmToken<T, A, ShmSized>> for ShmBox<T, A> {
+    fn from(value: ShmToken<T, A, ShmSized>) -> Self {
         let ShmToken(offset, alloc, _, _) = value;
 
         let ptr = unsafe { alloc.get_aligned_ptr_mut::<T>(offset) };
@@ -258,18 +303,18 @@ impl<T, A: ShmAllocator> From<ShmToken<T, A, ShmSized<T>>> for ShmBox<T, A> {
     }
 }
 
-impl<T, A: ShmAllocator> From<ShmBox<[T], A>> for ShmToken<[T], A, ShmSlice<T>> {
+impl<T, A: ShmAllocator> From<ShmBox<[T], A>> for ShmToken<T, A, ShmSlice> {
     fn from(value: ShmBox<[T], A>) -> Self {
         let len = value.len();
         let (ptr, allocator) = ShmBox::into_raw_with_allocator(value);
 
         let offset = unsafe { allocator.offset(ptr) };
-        ShmToken(offset, allocator, ShmSlice(len, PhantomData), PhantomData)
+        ShmToken(offset, allocator, ShmSlice(len), PhantomData)
     }
 }
 
-impl<T, A: ShmAllocator> From<ShmToken<[T], A, ShmSlice<T>>> for ShmBox<[T], A> {
-    fn from(value: ShmToken<[T], A, ShmSlice<T>>) -> Self {
+impl<T, A: ShmAllocator> From<ShmToken<T, A, ShmSlice>> for ShmBox<[T], A> {
+    fn from(value: ShmToken<T, A, ShmSlice>) -> Self {
         let ShmToken(offset, alloc, l, _) = value;
         let len = l.0;
 

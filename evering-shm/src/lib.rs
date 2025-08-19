@@ -3,7 +3,7 @@
 #![feature(const_index, const_trait_impl)]
 #![feature(ptr_as_uninit)]
 #![feature(slice_ptr_get)]
-#![feature(sized_type_properties)]
+#![feature(sized_type_properties,layout_for_ptr)]
 
 use core::{
     alloc::Layout,

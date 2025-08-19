@@ -1,9 +1,11 @@
+use core::time::Duration;
 use std::marker::PhantomData;
 
 use evering::driver::locked::{LockDriverSpec, SlabDriver};
 use evering::driver::unlocked::PoolDriver;
-use evering::driver::{asynch::Completer, Driver};
+use evering::driver::{Driver, asynch::Completer};
 use evering::uring::{IReceiver, ISender, UringSpec};
+use tokio::time;
 
 pub struct CharUring;
 impl UringSpec for CharUring {
@@ -37,7 +39,7 @@ impl MyHandle<MySlabDriver> {
     pub async fn handle(cq: Completer<MySlabDriver>) {
         while let Ok(ch) = cq.recv().await {
             println!("[handle]: recv: {}", ch);
-            // time::sleep(Duration::from_millis(50)).await;
+            time::sleep(Duration::from_micros(50)).await;
             let res = fastrand::alphabetic();
             if let Err(e) = cq.send(ch.replace(res)).await {
                 println!("[handle]: send err: {}", e);

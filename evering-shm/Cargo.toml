@@ -26,5 +26,3 @@ memory_set = "0.4.0"
 
 nix = { workspace = true, optional = true, features = ["fs", "mman"] }
 
-[profile.test.unix]
-features = ["unix"]

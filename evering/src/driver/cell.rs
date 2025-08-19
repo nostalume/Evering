@@ -10,11 +10,11 @@ pub struct IdCell<Id, T> {
 }
 
 impl<Id, T> IdCell<Id, T> {
-    pub(crate) fn new(id: Id, data: T) -> Self {
+    pub fn new(id: Id, data: T) -> Self {
         IdCell { id, data }
     }
 
-    pub(crate) fn into_inner(self) -> (Id, T) {
+    pub fn into_inner(self) -> (Id, T) {
         (self.id, self.data)
     }
 
@@ -97,11 +97,9 @@ where
 }
 
 impl<Id, T> Debug for IdCell<Id, T>
-where
-    T: Debug,
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("IdCell").field("data", &self.data).finish()
+        f.debug_struct("IdCell").finish()
     }
 }
 

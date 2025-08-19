@@ -6,7 +6,7 @@ license.workspace = true
 edition.workspace = true
 
 [features]
-default = []
+default = ["unix"]
 
 unix = ["evering-shm/unix"]
 
@@ -18,5 +18,7 @@ lfqueue = "0.8.1"
 
 [dev-dependencies]
 evering-shm = { path = "../evering-shm", features = ["unix"] }
-tokio.workspace = true
 fastrand.workspace = true
+tokio.workspace = true
+bytes.workspace = true
+bytesize.workspace = true

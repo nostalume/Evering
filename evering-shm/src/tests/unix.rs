@@ -13,6 +13,7 @@ type Error = ShmAllocError<UnixShm, FdBackend<OwnedFd>>;
 
 const SIZE: usize = 0x10000;
 const SLICE: &[u8] = &[1u8; 100];
+const SLICE2: &[u8] = &[2u8; 100];
 
 fn create<P: nix::NixPath + ?Sized>(name: &P, size: usize) -> Result<TestShm, Error> {
     let cfg = UnixFdConf::default_from_mem_fd(name, SIZE, MFdFlags::empty())
@@ -47,10 +48,14 @@ fn box_test(m: &TestShm) {
     for i in u.iter() {
         assert_eq!(*i, 1);
     }
-    let t: ShmToken<[u8],_, _> = u.into();
-    let u = ShmBox::from(t);
+    let t: ShmToken<u8, _, _> = u.into();
+    let mut u = ShmBox::from(t);
     for i in u.iter() {
         assert_eq!(*i, 1);
+    }
+    u.as_mut().copy_from_slice(SLICE2);
+    for i in u.iter() {
+        assert_eq!(*i, 2);
     }
 }
 

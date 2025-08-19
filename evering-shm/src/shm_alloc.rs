@@ -1,3 +1,4 @@
+use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::ptr::NonNull;
 
@@ -57,6 +58,8 @@ pub struct ShmAlloc<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> {
     area: ShmArea<S, M>,
     phantom: core::marker::PhantomData<A>,
 }
+
+unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Send for ShmAlloc<A, S, M> {}
 
 impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> Deref for ShmAlloc<A, S, M> {
     type Target = A;
@@ -274,7 +277,7 @@ pub unsafe trait ShmAllocator: IAllocator {
     /// ## Safety
     /// - `ptr` must be allocated by this allocator.
     #[inline]
-    unsafe fn offset<T:?Sized>(&self, ptr: *const T) -> isize {
+    unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> isize {
         // Safety: `ptr` must has address greater than `self.raw_ptr()`.
         unsafe { ptr.byte_offset_from(self.start_ptr()) }
     }
@@ -336,7 +339,7 @@ unsafe impl<A: ShmAllocator> ShmAllocator for &A {
     }
 }
 
-unsafe impl<A:ShmAllocator> ShmAllocator for Arc<A> {
+unsafe impl<A: ShmAllocator> ShmAllocator for Arc<A> {
     fn start_ptr(&self) -> *const u8 {
         (**self).start_ptr()
     }
@@ -352,23 +355,32 @@ pub unsafe trait ShmHeader {
         self.spec_raw(idx)
             .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
     }
-    unsafe fn spec_in<T>(self, idx: usize) -> Option<ShmBox<T, Self>>
+    unsafe fn spec_in<T>(&self, idx: usize) -> Option<ShmBox<T, Self>>
     where
-        Self: ShmAllocator + Sized,
+        Self: ShmAllocator + Sized + Clone,
     {
         self.spec_raw(idx)
-            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
+            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self.clone()) })
     }
     unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool;
     fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize) -> bool
     where
         Self: ShmAllocator + Sized,
     {
+        // manually drop to elide deconstructor after store.
+        let spec = ManuallyDrop::new(spec);
         unsafe { self.init_spec_raw(spec.as_ref(), idx) }
+    }
+
+    unsafe fn clean_spec<T>(&self, idx: usize)
+    where
+        Self: ShmAllocator + Sized,
+    {
+        unsafe { self.spec::<T>(idx).map(|b| drop(b)) };
     }
 }
 
-unsafe impl<A:ShmHeader> ShmHeader for &A {
+unsafe impl<A: ShmHeader> ShmHeader for &A {
     fn header(&self) -> &Header {
         (**self).header()
     }
@@ -382,15 +394,15 @@ unsafe impl<A:ShmHeader> ShmHeader for &A {
     }
 }
 
-unsafe impl<A:ShmHeader> ShmHeader for Arc<A> {
+unsafe impl<A: ShmHeader> ShmHeader for Arc<A> {
     fn header(&self) -> &Header {
         (**self).header()
     }
-    
+
     fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
         (**self).spec_raw(idx)
     }
-    
+
     unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
         unsafe { (**self).init_spec_raw(spec, idx) }
     }

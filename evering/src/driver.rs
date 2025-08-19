@@ -5,7 +5,7 @@ use crate::{
     uring::{IReceiver, ISender, UringSpec},
 };
 
-mod cell;
+pub mod cell;
 pub mod locked;
 mod op_cache;
 pub mod unlocked;
@@ -42,6 +42,9 @@ pub struct BridgeTmpl<D: Driver, T: ISender + IReceiver + Clone, R: Role> {
     sq: T,
     _marker: PhantomData<R>,
 }
+
+unsafe impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Send for BridgeTmpl<D, T, R> {}
+unsafe impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Sync for BridgeTmpl<D, T, R> {}
 
 impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Clone for BridgeTmpl<D, T, R> {
     fn clone(&self) -> Self {
