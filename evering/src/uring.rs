@@ -3,6 +3,8 @@ pub mod bare;
 pub mod sync;
 mod tests;
 
+use crate::seal::Sealed;
+
 pub trait UringSpec {
     type SQE;
     type CQE;
@@ -29,9 +31,3 @@ pub trait IReceiver: Sealed {
     }
     fn try_recv(&self) -> Result<Self::Item, Self::TryError>;
 }
-
-pub trait Closable: Sealed + ISender {
-    fn close(&self);
-}
-
-use crate::seal::Sealed;

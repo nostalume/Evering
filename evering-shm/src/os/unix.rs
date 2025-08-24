@@ -15,7 +15,7 @@ use crate::{
 
 type UnixAddr = usize;
 
-unsafe fn usize_as_c_void(ptr: UnixAddr) -> NonNull<c_void> {
+unsafe fn as_c_void(ptr: UnixAddr) -> NonNull<c_void> {
     let ptr = ptr as *mut c_void;
     unsafe { NonNull::new_unchecked(ptr) }
 }
@@ -69,13 +69,6 @@ impl<F: AsFd> UnixFdConf<F> {
     }
 }
 
-// impl<F: AsFd> Drop for UnixFdConf<F> {
-//     fn drop(&mut self) {
-//         let Self { f, .. } = self;
-//         nix::unistd::close(f.as_fd().as_raw_fd()).unwrap();
-//     }
-// }
-
 pub struct UnixShm;
 
 impl ShmSpec for UnixShm {
@@ -121,7 +114,7 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
     }
 
     fn unmap(area: &mut ShmArea<UnixShm, Self>) -> Result<(), Self::Error> {
-        let addr = unsafe { usize_as_c_void(area.start().into()) };
+        let addr = unsafe { as_c_void(area.start().into()) };
         let size = area.size();
         unsafe { nix::sys::mman::munmap(addr, size) }
     }
@@ -132,7 +125,7 @@ impl<F: AsFd> ShmProtect<UnixShm> for FdBackend<F> {
         area: &mut ShmArea<UnixShm, Self>,
         new_flags: <UnixShm as ShmSpec>::Flags,
     ) -> Result<(), Self::Error> {
-        let start = unsafe { usize_as_c_void(area.start().into()) };
+        let start = unsafe { as_c_void(area.start().into()) };
         let size = area.size();
         unsafe { nix::sys::mman::mprotect(start, size, new_flags) }
     }

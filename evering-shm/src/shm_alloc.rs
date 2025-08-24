@@ -263,24 +263,6 @@ pub unsafe trait ShmInit: IAllocator + Sized {
 }
 
 pub unsafe trait ShmAllocator: IAllocator {
-    // Returns the number of bytes that are reserved by the allocator.
-    // fn reserved(&self) -> usize;
-    // /// Returns the data offset of the allocator. The offset is the end of the reserved bytes of the allocator.
-    // fn reserved_offset(&self) -> usize;
-    // /// Returns the number of bytes allocated by the allocator.
-    // fn allocated(&self) -> usize;
-    // /// Returns the offset of the allocator, where the offset is the end of reserved bytes of allocator.
-    // #[inline]
-    // fn allocated_slice(&self) -> &[u8] {
-    //     unsafe {
-    //         let offset = self.reserved_offset();
-    //         let ptr = self.raw_ptr().add(offset);
-    //         let allocated = self.allocated();
-    //         core::slice::from_raw_parts(ptr, allocated - offset)
-    //     }
-    // }
-    //
-    //
     /// Returns the start pointer of the main memory of the allocator.
     fn start_ptr(&self) -> *const u8;
 
