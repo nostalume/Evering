@@ -76,15 +76,15 @@ The basic design is a shared memory initiated by os backend with a continuous la
 ---
 
 - `Sealed`: Provide a private trait to forbid others implement the exposed trait.
-- `IAllocator`: A self-contained allocator api, especially `Arc<A>` isn't supported as a `Allocator`.
 
 ---
 
-- `shm_alloc`: allocator behavoir in shared memeory.
+- `malloc`: allocator behavoir in shared memeory.
+	- `IAllocator`: A self-contained allocator api, especially `Arc<A>` isn't supported as a `Allocator`.
 	- `blink/gma/tlsf`: interface implementation for specific allocator.
 	- `ShmAllocator`: allocator in shared memory with offset based data acquirement ability.
 	- `ShmInit`: allocator that can utilize a continuous memory block.
-- `shm_header`: header in shared memory.
+- `header`: header in shared memory.
 	- `Header`: `RwLock<T>` based with necessary information to identify a correct shared memory.
 
 ```rust
@@ -108,7 +108,7 @@ pub enum ShmStatus {
 }
 ```
 
-- `shm_box`: allocated data structure in shared memory.
+- `boxed`: allocated data structure in shared memory.
 	- `ShmBox`: a `Box`-like data structure.
 	- `ShmToken`: offset based for IPC with compiled time size.
 
@@ -125,7 +125,7 @@ impl AsShmToken for ShmSlice {}
 pub struct ShmToken<T, A: ShmAllocator, S: AsShmToken>(isize, A, S, PhantomData<T>);
 ```
 
-- `shm_area`: continuous shared memory related data structure.
+- `area`: continuous shared memory related data structure.
 	- `ShmSpec`: basic spec of os addr/flags.
 	- `ShmBackend`: a specific backend based on `ShmSpec`, for example, `FdBackend` implements `Windows` and `Unix`.
 	- `ShmArea`: a area with range, flags, and backend. `backend` should be `Clone` to across threads.

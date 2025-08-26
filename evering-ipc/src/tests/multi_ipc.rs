@@ -9,8 +9,8 @@ use evering::driver::unlocked::PoolDriver;
 use evering::uring::{IReceiver, ISender, UringSpec};
 use evering_shm::os::FdBackend;
 use evering_shm::os::unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm};
-use evering_shm::shm_alloc::tlsf::SpinTlsf;
-use evering_shm::shm_box::{ShmBox, ShmSized, ShmSlice, ShmToken};
+use evering_shm::alloc::tlsf::SpinTlsf;
+use evering_shm::boxed::{ShmBox, ShmSized, ShmSlice, ShmToken};
 use tokio::task::yield_now;
 use tokio::time;
 
@@ -79,7 +79,7 @@ fn init_or_load<F: AsFd + 'static>(size: usize, cfg: UnixFdConf<F>) -> Arc<MyIpc
 
 #[test]
 fn queue_test() {
-    let cfg = UnixFdConf::default_from_mem_fd("test", SIZE, MFdFlags::empty()).unwrap();
+    let cfg = UnixFdConf::default_mem_fd("test", SIZE, MFdFlags::empty()).unwrap();
     let handle = init_or_load(SIZE, cfg);
 
     type BooT = ShmToken<u8, IpcAlloc<MyIpcSpec<OwnedFd>>, ShmSlice>;
@@ -112,7 +112,7 @@ fn queue_test() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ipc_test() {
-    let s_cfg = UnixFdConf::default_from_mem_fd("something", SIZE, MFdFlags::empty()).unwrap();
+    let s_cfg = UnixFdConf::default_mem_fd("something", SIZE, MFdFlags::empty()).unwrap();
     let handle = init_or_load(SIZE, s_cfg);
     let handle_c = handle.clone();
 

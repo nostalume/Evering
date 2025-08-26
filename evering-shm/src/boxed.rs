@@ -10,26 +10,22 @@ use core::pin::Pin;
 use core::ptr;
 use core::ptr::NonNull;
 
-#[cfg(feature = "nightly")]
-use alloc::alloc::{AllocError, handle_alloc_error};
-#[cfg(not(feature = "nightly"))]
-use allocator_api2::alloc::{AllocError, handle_alloc_error};
+use crate::malloc::{AllocError, handle_alloc_error};
 
+use crate::malloc::ShmAllocator;
 use crate::seal::Sealed;
-use crate::shm_alloc::ShmAllocator;
 
 #[repr(C)]
 pub struct ShmBox<T: ?Sized, A: ShmAllocator>(NonNull<T>, A);
 
 impl<T: ?Sized, A: ShmAllocator> Drop for ShmBox<T, A> {
     fn drop(&mut self) {
-        // the T in the Box is dropped by the compiler before the destructor is run
         let ptr = self.0;
 
         unsafe {
             let layout = Layout::for_value_raw(ptr.as_ptr());
             if layout.size() != 0 {
-                self.1.deallocate(From::from(ptr.cast()), layout);
+                self.1.deallocate(ptr.cast(), layout);
             }
         }
     }

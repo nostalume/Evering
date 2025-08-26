@@ -4,9 +4,8 @@ use core::ptr;
 use core::ptr::NonNull;
 use rlsf::Tlsf;
 
+use crate::malloc::{AllocError, IAllocator, ShmInit};
 use crate::seal::Sealed;
-use crate::shm_alloc::ShmInit;
-use crate::{AllocError, IAllocator};
 
 pub type SpinTlsf = SpinTlsfIn<'static>;
 type MyTlsf<'a> = Tlsf<'a, u32, u32, 24, 8>;

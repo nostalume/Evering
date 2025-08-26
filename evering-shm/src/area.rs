@@ -40,8 +40,8 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            va_range: self.va_range.clone(),
-            flags: self.flags.clone(),
+            va_range: self.va_range,
+            flags: self.flags,
             bk: self.bk.clone(),
         }
     }
@@ -56,26 +56,6 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
             flags,
             bk,
         }
-    }
-
-    /// Given a start address, acquire a new start address by skipping
-    /// instance `T`.
-    ///
-    /// ## Panics
-    /// `start.add(size_of<T>())` overflows.
-    ///
-    /// ## Safety
-    /// User should ensure the validity of memory area and instance.
-    ///
-    /// ## Returns
-    /// `next_start`: `start + size_of<T>()
-    #[inline]
-    pub(crate) unsafe fn with_offset<T: Sized>(&self, start: S::Addr) -> Option<S::Addr> {
-        let t_size = core::mem::size_of::<T>();
-        let t_align = core::mem::align_of::<T>();
-        let t_start = start.add(t_size).align_up(t_align);
-        let _ = self.end().checked_sub_addr(t_start);
-        Some(t_start)
     }
 
     /// Given a start address, acquire the `Sized` instance.

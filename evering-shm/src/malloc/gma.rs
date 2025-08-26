@@ -6,9 +6,8 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
+use crate::malloc::{AllocError, IAllocator, ShmInit};
 use crate::seal::Sealed;
-use crate::shm_alloc::ShmInit;
-use crate::{IAllocator,AllocError};
 
 pub struct SpinGma(GmaSpinAllocator);
 

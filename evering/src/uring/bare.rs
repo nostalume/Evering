@@ -1,7 +1,7 @@
 use core::{marker::PhantomData, ops::Deref, task::Poll};
 
 use alloc::sync::Arc;
-use evering_shm::{shm_alloc::ShmAllocator, shm_box::ShmBox};
+use evering_shm::{perlude::ShmAllocator, boxed::ShmBox};
 use lfqueue::ConstBoundedQueue as CBQueue;
 
 use crate::{

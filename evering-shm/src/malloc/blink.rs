@@ -7,10 +7,8 @@ use core::alloc::Layout;
 use core::ptr::NonNull;
 use good_memory_allocator::SpinLockedAllocator as GmaSpinAllocator;
 
-use crate::AllocError;
+use crate::malloc::{AllocError, IAllocator, ShmInit};
 use crate::seal::Sealed;
-use crate::IAllocator;
-use crate::shm_alloc::ShmInit;
 
 type GmaBlinkIn = SyncBlinkAlloc<GmaSpinAllocator>;
 

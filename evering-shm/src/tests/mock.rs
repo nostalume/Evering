@@ -4,9 +4,9 @@ use core::ops::AddAssign;
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::shm_alloc::{ShmAllocator, ShmHeader, ShmSpinGma, ShmSpinTlsf};
-use crate::shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
-use crate::shm_box::{ShmBox, ShmToken};
+use crate::area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
+use crate::boxed::{ShmBox, ShmToken};
+use crate::perlude::{ShmAllocator, ShmHeader, ShmSpinGma, ShmSpinTlsf};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -121,7 +121,7 @@ fn token_test(alloc: &impl ShmAllocator) {
 fn spec_test(alloc: &(impl ShmAllocator + ShmHeader)) {
     let bb = ShmBox::new_in(32u16, &alloc);
     alloc.init_spec(bb, 0);
-    match unsafe { alloc.spec::<u16>(0) } {
+    match unsafe { alloc.spec_ref::<u16>(0) } {
         Some(spec) => {
             dbg!(format!("spec address: {:?}", spec.as_ptr()));
             assert_eq!(*spec, 32);

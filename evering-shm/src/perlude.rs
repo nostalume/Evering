@@ -1,26 +1,14 @@
-use core::mem::ManuallyDrop;
 use core::ops::Deref;
 use core::ptr::NonNull;
 
-#[cfg(feature = "nightly")]
-use alloc::alloc::{AllocError, Allocator};
-#[cfg(not(feature = "nightly"))]
-use allocator_api2::alloc::{AllocError, Allocator};
-
-use alloc::sync::Arc;
 use memory_addr::MemoryAddr;
 
-use crate::IAllocator;
+use crate::area::ShmArea;
+pub use crate::area::{ShmBackend, ShmProtect, ShmSpec};
+use crate::header::Header;
+pub use crate::malloc::{AllocError, IAllocator, ShmAllocator, ShmHeader, ShmInit};
+use crate::malloc::{blink, gma, tlsf};
 use crate::seal::Sealed;
-use crate::shm_area::ShmArea;
-use crate::shm_area::ShmBackend;
-use crate::shm_area::ShmSpec;
-use crate::shm_box::ShmBox;
-use crate::shm_header::Header;
-
-pub mod blink;
-pub mod gma;
-pub mod tlsf;
 
 pub type ShmSpinTlsf<S, M> = ShmAlloc<tlsf::SpinTlsf, S, M>;
 pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
@@ -79,6 +67,7 @@ where
     M: Clone,
 {
     fn clone(&self) -> Self {
+        self.header().write().incre_rc();
         Self {
             area: self.area.clone(),
             phantom: self.phantom,
@@ -124,7 +113,7 @@ impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmAlloc<A, S, M> {
             let mut header_write = header_ref.write();
 
             // TODO!
-            use crate::shm_header::ShmStatus;
+            use crate::header::ShmStatus;
             if !header_write.valid_magic() {
                 header_write.intializing();
                 let (a_ptr, a_start, a_size) = area
@@ -229,184 +218,5 @@ unsafe impl<A: ShmInit, S: ShmSpec, M: ShmBackend<S>> ShmHeader for ShmAlloc<A, 
     fn header(&self) -> &Header {
         let ptr = self.area.start().into() as *mut Header;
         unsafe { &*ptr }
-    }
-}
-
-pub unsafe trait ShmInit: IAllocator + Sized {
-    const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
-    const USIZE_SIZE: usize = core::mem::size_of::<usize>();
-    const ALLOCATOR_SIZE: usize = core::mem::size_of::<Self>();
-
-    // IMPORTANT:
-    // `MIN_ALIGNMENT` must be larger than 4, so that storing the size as a
-    // `DivisibleBy4Usize` is safe.
-    const MIN_ALIGNMENT: usize = if Self::USIZE_ALIGNMENT < 8 {
-        8
-    } else {
-        Self::USIZE_ALIGNMENT
-    };
-
-    /// Initializes the allocator by addr and size.
-    ///
-    /// ## Safety
-    /// user must ensure that the provided memory are valid and ready for allocation.
-    unsafe fn init_addr(start: usize, size: usize) -> Self;
-
-    /// Initializes the allocator by a block of memory.
-    #[inline]
-    fn init_ptr(blk: NonNull<[u8]>) -> Self
-    where
-        Self: Sized,
-    {
-        unsafe { Self::init_addr(blk.as_ptr().addr(), blk.len()) }
-    }
-}
-
-pub unsafe trait ShmAllocator: IAllocator {
-    /// Returns the start pointer of the main memory of the allocator.
-    fn start_ptr(&self) -> *const u8;
-
-    /// Returns the start pointer of the main memory of the allocator.
-    ///
-    /// ## Safety
-    /// The `ptr` should be correctly modified.
-    #[inline]
-    unsafe fn start_mut_ptr(&self) -> *mut u8 {
-        self.start_ptr().cast_mut()
-    }
-
-    /// Returns the offset to the start of the allocator.
-    ///
-    /// ## Safety
-    /// - `ptr` must be allocated by this allocator.
-    #[inline]
-    unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> isize {
-        // Safety: `ptr` must has address greater than `self.raw_ptr()`.
-        unsafe { ptr.byte_offset_from(self.start_ptr()) }
-    }
-
-    /// Returns a pointer to the memory at the given offset.
-    #[inline]
-    fn get_ptr(&self, offset: isize) -> *const u8 {
-        unsafe {
-            if offset < 0 {
-                return self.start_ptr().sub(-offset as usize);
-            }
-            self.start_ptr().add(offset as usize)
-        }
-    }
-
-    /// Returns a pointer to the memory at the given offset.
-    #[inline]
-    fn get_ptr_mut(&self, offset: isize) -> *mut u8 {
-        unsafe {
-            if offset < 0 {
-                return self.start_mut_ptr().sub(-offset as usize);
-            }
-            self.start_mut_ptr().add(offset as usize)
-        }
-    }
-    /// Returns an aligned pointer to the memory at the given offset.
-    ///
-    /// ## Safety
-    /// - `offset..offset + mem::size_of::<T>() + padding` must be allocated memory.
-    #[inline]
-    unsafe fn get_aligned_ptr<T>(&self, offset: isize) -> *const T {
-        self.get_ptr(offset).cast()
-    }
-    /// Returns an aligned pointer to the memory at the given offset.
-    ///
-    /// ## Safety
-    /// - `offset..offset + mem::size_of::<T>() + padding` must be allocated memory.
-    #[inline]
-    unsafe fn get_aligned_ptr_mut<T>(&self, offset: isize) -> NonNull<T> {
-        unsafe {
-            let ptr = self.get_ptr_mut(offset).cast();
-            NonNull::new_unchecked(ptr)
-        }
-    }
-
-    #[inline]
-    unsafe fn get_aligned_slice_mut<T>(&self, offset: isize, len: usize) -> NonNull<[T]> {
-        unsafe {
-            let ptr = self.get_ptr_mut(offset).cast();
-            NonNull::new_unchecked(core::slice::from_raw_parts_mut(ptr, len))
-        }
-    }
-}
-
-unsafe impl<A: ShmAllocator> ShmAllocator for &A {
-    #[inline]
-    fn start_ptr(&self) -> *const u8 {
-        (**self).start_ptr()
-    }
-}
-
-unsafe impl<A: ShmAllocator> ShmAllocator for Arc<A> {
-    fn start_ptr(&self) -> *const u8 {
-        (**self).start_ptr()
-    }
-}
-
-pub unsafe trait ShmHeader {
-    fn header(&self) -> &Header;
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>>;
-    unsafe fn spec<T>(&self, idx: usize) -> Option<ShmBox<T, &Self>>
-    where
-        Self: ShmAllocator + Sized,
-    {
-        self.spec_raw(idx)
-            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
-    }
-    unsafe fn spec_in<T>(&self, idx: usize) -> Option<ShmBox<T, Self>>
-    where
-        Self: ShmAllocator + Sized + Clone,
-    {
-        self.spec_raw(idx)
-            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self.clone()) })
-    }
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool;
-    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize) -> bool
-    where
-        Self: ShmAllocator + Sized,
-    {
-        // manually drop to elide deconstructor after store.
-        let spec = ManuallyDrop::new(spec);
-        unsafe { self.init_spec_raw(spec.as_ref(), idx) }
-    }
-
-    unsafe fn clean_spec<T>(&self, idx: usize)
-    where
-        Self: ShmAllocator + Sized,
-    {
-        unsafe { self.spec::<T>(idx).map(|b| drop(b)) };
-    }
-}
-
-unsafe impl<A: ShmHeader> ShmHeader for &A {
-    fn header(&self) -> &Header {
-        (**self).header()
-    }
-
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
-        (**self).spec_raw(idx)
-    }
-
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
-        unsafe { (**self).init_spec_raw(spec, idx) }
-    }
-}
-
-unsafe impl<A: ShmHeader> ShmHeader for Arc<A> {
-    fn header(&self) -> &Header {
-        (**self).header()
-    }
-
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
-        (**self).spec_raw(idx)
-    }
-
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
-        unsafe { (**self).init_spec_raw(spec, idx) }
     }
 }

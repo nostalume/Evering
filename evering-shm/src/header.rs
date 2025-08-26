@@ -69,7 +69,7 @@ impl HeaderIn {
             idx < self.spec.len(),
             "idx must smaller than length of spec",
         );
-        // Safety: assert!()
+        // Safety: assert!
         *self.spec.get(idx).unwrap()
     }
 

@@ -6,11 +6,11 @@ pub use nix::{
     sys::memfd::MFdFlags,
     sys::mman::{MapFlags, ProtFlags},
 };
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use crate::{
     os::FdBackend,
-    shm_area::{ShmArea, ShmBackend, ShmProtect, ShmSpec},
+    area::{ShmArea, ShmBackend, ShmProtect, ShmSpec},
 };
 
 type UnixAddr = usize;
@@ -27,15 +27,15 @@ pub struct UnixFdConf<F: AsFd> {
 }
 
 impl UnixFdConf<OwnedFd> {
-    pub fn default_from_mem_fd<P: nix::NixPath + ?Sized>(
+    pub fn default_mem_fd<P: nix::NixPath + ?Sized>(
         name: &P,
         size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
     ) -> Result<Self, nix::Error> {
-        Self::from_mem_fd(name, size, mfd_flags, MapFlags::MAP_SHARED, 0)
+        Self::mem_fd(name, size, mfd_flags, MapFlags::MAP_SHARED, 0)
     }
 
-    pub fn from_mem_fd<P: nix::NixPath + ?Sized>(
+    pub fn mem_fd<P: nix::NixPath + ?Sized>(
         name: &P,
         size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
@@ -114,7 +114,7 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
     }
 
     fn unmap(area: &mut ShmArea<UnixShm, Self>) -> Result<(), Self::Error> {
-        let addr = unsafe { as_c_void(area.start().into()) };
+        let addr = unsafe { as_c_void(area.start()) };
         let size = area.size();
         unsafe { nix::sys::mman::munmap(addr, size) }
     }
@@ -125,7 +125,7 @@ impl<F: AsFd> ShmProtect<UnixShm> for FdBackend<F> {
         area: &mut ShmArea<UnixShm, Self>,
         new_flags: <UnixShm as ShmSpec>::Flags,
     ) -> Result<(), Self::Error> {
-        let start = unsafe { as_c_void(area.start().into()) };
+        let start = unsafe { as_c_void(area.start()) };
         let size = area.size();
         unsafe { nix::sys::mman::mprotect(start, size, new_flags) }
     }

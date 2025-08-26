@@ -110,7 +110,7 @@ impl<
         if let Ok(data) = self.sq.try_recv() {
             let (id, payload) = data.into_inner();
             self.driver.complete(id, payload);
-            return true
+            return true;
         }
         false
     }
@@ -179,7 +179,7 @@ pub mod asynch {
 pub mod bare {
     use core::marker::PhantomData;
 
-    use evering_shm::shm_alloc::ShmAllocator;
+    use evering_shm::perlude::ShmAllocator;
 
     use crate::driver::{BridgeTmpl, Dring, Driver, Receive, Submit};
     use crate::uring::UringSpec;

@@ -19,10 +19,9 @@ pub mod uring {
 }
 
 pub mod shm {
-    pub use evering_shm::shm_alloc::*;
-    pub use evering_shm::shm_area::{ShmBackend, ShmSpec};
+    pub use evering_shm::perlude::{ShmBackend, ShmSpec};
     pub mod boxed {
-        pub use evering_shm::shm_box::*;
+        pub use evering_shm::boxed::*;
     }
     pub mod os {
         pub use evering_shm::os::FdBackend;
@@ -37,8 +36,7 @@ pub mod shm {
 use evering::driver::Driver;
 use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_client, box_server};
 use evering::uring::bare::{BoxQueue, Boxed};
-use evering_shm::shm_alloc::{ShmAlloc, ShmAllocError, ShmHeader, ShmInit};
-use evering_shm::shm_area::{ShmBackend, ShmSpec};
+use evering_shm::perlude::{ShmAlloc, ShmAllocError, ShmBackend, ShmHeader, ShmInit, ShmSpec};
 
 pub trait IpcSpec {
     type A: ShmInit;
@@ -76,7 +74,7 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
     unsafe fn queue_ref<T>(&self, idx: usize) -> BoxQueue<T, IpcAllocRef<'_, I>, N> {
         assert!(idx <= 2);
         loop {
-            match unsafe { self.0.as_ref().spec(idx) } {
+            match unsafe { self.0.as_ref().spec_ref(idx) } {
                 Some(u) => break u,
                 None => {
                     let q = Boxed::new::<T, N>(self.0.clone());
@@ -90,7 +88,7 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
     unsafe fn queue<T>(&self, idx: usize) -> IpcQueue<T, I, N> {
         assert!(idx <= 2);
         loop {
-            match unsafe { self.0.spec_in(idx) } {
+            match unsafe { self.0.spec(idx) } {
                 Some(u) => break u,
                 None => {
                     let q = Boxed::new::<T, N>(self.0.clone());

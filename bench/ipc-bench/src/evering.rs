@@ -80,7 +80,7 @@ const CAP: usize = CONCURRENCY.next_power_of_two();
 type MyIpc<F> = IpcHandle<MyIpcSpec<F>, MyPoolDriver<MyIpcSpec<F>>, CAP>;
 
 fn default_cfg(id: &str, size: usize) -> UnixFdConf<OwnedFd> {
-    UnixFdConf::default_from_mem_fd(id, size, MFdFlags::empty()).unwrap()
+    UnixFdConf::default_mem_fd(id, size, MFdFlags::empty()).unwrap()
 }
 
 fn init_or_load<F: AsFd + 'static>(size: usize, cfg: UnixFdConf<F>) -> Arc<MyIpc<F>> {
