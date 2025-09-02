@@ -5,11 +5,11 @@ use std::os::fd::OwnedFd;
 
 use crate::boxed::{ShmBox, ShmToken};
 use crate::os::FdBackend;
-use crate::os::unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm};
-use crate::perlude::{ShmAllocError, ShmHeader, ShmSpinTlsf};
+use crate::os::unix::{MFdFlags, ProtFlags, UnixFdConf};
+use crate::perlude::{AsShmAlloc, AsShmAllocError, ShmAllocError, ShmHeader};
 
-type TestShm = ShmSpinTlsf<UnixShm, FdBackend<OwnedFd>>;
-type Error = ShmAllocError<UnixShm, FdBackend<OwnedFd>>;
+type TestShm = AsShmAlloc<FdBackend<OwnedFd>>;
+type Error = AsShmAllocError<FdBackend<OwnedFd>>;
 
 const SIZE: usize = 0x10000;
 const SLICE: &[u8] = &[1u8; 100];

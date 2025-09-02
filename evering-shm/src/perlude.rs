@@ -10,34 +10,54 @@ pub use crate::malloc::{AllocError, IAllocator, ShmAllocator, ShmHeader, ShmInit
 use crate::malloc::{blink, gma, tlsf};
 use crate::seal::Sealed;
 
-pub type ShmSpinTlsf<S, M> = ShmAlloc<tlsf::SpinTlsf, S, M>;
-pub type ShmSpinGma<S, M> = ShmAlloc<gma::SpinGma, S, M>;
-pub type ShmBlinkGma<S, M> = ShmAlloc<blink::BlinkGma, S, M>;
+#[cfg(feature = "unix")]
+pub type DefaultShmSpec = crate::os::unix::UnixShm;
+#[cfg(feature = "windows")]
+pub type DefaultShmSpec = crate::os::windows::WinShm;
+#[cfg(not(any(feature = "unix", feature = "windows")))]
+pub type DefaultShmSpec = ();
 
+pub type DefaultAlloc = tlsf::SpinTlsf;
+
+pub type ShmSpinTlsf<M, S = DefaultShmSpec> = ShmAlloc<tlsf::SpinTlsf, S, M>;
+pub type ShmSpinGma<M, S = DefaultShmSpec> = ShmAlloc<gma::SpinGma, S, M>;
+pub type ShmBlinkGma<M, S = DefaultShmSpec> = ShmAlloc<blink::BlinkGma, S, M>;
+
+pub type AsShmAlloc<M, A = DefaultAlloc, S = DefaultShmSpec> = ShmAlloc<A, S, M>;
+pub type AsShmAllocError<M, S = DefaultShmSpec> = ShmAllocError<S, M>;
 pub enum ShmAllocError<S: ShmSpec, M: ShmBackend<S>> {
     UnenoughSpace,
     InvalidHeader,
     MapError(M::Error),
+    AllocError(AllocError),
+}
+
+impl<S: ShmSpec, M: ShmBackend<S>> From<AllocError> for ShmAllocError<S, M> {
+    fn from(err: AllocError) -> Self {
+        Self::AllocError(err)
+    }
 }
 
 impl<S: ShmSpec, M: ShmBackend<S>> core::error::Error for ShmAllocError<S, M> {}
 
-impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Display for ShmAllocError<S, M> {
+impl<S: ShmSpec, M: ShmBackend<S>> alloc::fmt::Debug for ShmAllocError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UnenoughSpace => write!(f, "UnenoughSpace"),
-            Self::InvalidHeader => write!(f, "InvalidHeader"),
-            Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
+            Self::UnenoughSpace => write!(f, "Not enough space available"),
+            Self::InvalidHeader => write!(f, "Invalid header detected"),
+            Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
+            Self::AllocError(err) => write!(f, "Allocation error: {:?}", err),
         }
     }
 }
 
-impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Debug for ShmAllocError<S, M> {
+impl<S: ShmSpec, M: ShmBackend<S>> core::fmt::Display for ShmAllocError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UnenoughSpace => write!(f, "UnenoughSpace"),
-            Self::InvalidHeader => write!(f, "InvalidHeader"),
-            Self::MapError(arg0) => f.debug_tuple("MapError").field(arg0).finish(),
+            Self::UnenoughSpace => write!(f, "Not enough space available"),
+            Self::InvalidHeader => write!(f, "Invalid header detected"),
+            Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
+            Self::AllocError(err) => write!(f, "Allocation error: {:?}", err),
         }
     }
 }

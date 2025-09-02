@@ -89,9 +89,9 @@ impl<'a> ShmProtect<MockSpec> for MockBackend<'a> {
     }
 }
 
-type MySpinGma<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
-type MyTlsf<'a> = ShmSpinTlsf<MockSpec, MockBackend<'a>>;
-type MyBlink<'a> = ShmSpinGma<MockSpec, MockBackend<'a>>;
+type MySpinGma<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
+type MyTlsf<'a> = ShmSpinTlsf<MockBackend<'a>, MockSpec>;
+type MyBlink<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
 
 fn box_test(alloc: &impl ShmAllocator) {
     let mut bb = ShmBox::new_in(1u8, alloc);
