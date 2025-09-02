@@ -1,6 +1,8 @@
+use core::future::Future;
 use core::marker::PhantomData;
 
 use crate::{
+    driver::{cell::IdCell, locked::LockFor},
     seal::Sealed,
     uring::{IReceiver, ISender, UringSpec},
 };
@@ -10,26 +12,37 @@ pub mod locked;
 mod op_cache;
 pub mod unlocked;
 
-pub trait Driver: UringSpec + Clone + Default {
-    type Id;
+pub trait Driver: Clone + Default {
+    type Id: Clone;
     type Config;
-    type Op: Future<Output = Self::CQE>;
+    type Op: Future;
+
     fn register(&self) -> (Self::Id, Self::Op);
     fn complete(&self, id: Self::Id, payload: <Self::Op as Future>::Output);
     fn new(cfg: Self::Config) -> Self;
 }
 
-pub struct Dring<D: Driver> {
-    _marker: PhantomData<D>,
+pub trait DriverFor<S: UringSpec> {
+    type Driver: Driver;
 }
 
-impl<D: Driver> UringSpec for Dring<D> {
-    type SQE = cell::IdCell<D::Id, D::SQE>;
-    type CQE = cell::IdCell<D::Id, D::CQE>;
+pub struct Pool;
+impl<S: UringSpec> DriverFor<S> for Pool
+where
+    S::CQE: 'static,
+{
+    type Driver = crate::driver::unlocked::PoolDriver<S::CQE>;
+}
+
+pub struct Slab<L: LockFor>(PhantomData<L>);
+impl<S: UringSpec, L: LockFor> DriverFor<S> for Slab<L>
+where
+    S::CQE: 'static,
+{
+    type Driver = crate::driver::locked::SlabDriver<S::CQE, L>;
 }
 
 pub trait Role: Sealed {}
-
 pub struct Submit;
 impl Sealed for Submit {}
 impl Role for Submit {}
@@ -37,213 +50,247 @@ pub struct Receive;
 impl Sealed for Receive {}
 impl Role for Receive {}
 
-pub struct BridgeTmpl<D: Driver, T: ISender + IReceiver + Clone, R: Role> {
-    driver: D,
-    sq: T,
-    _marker: PhantomData<R>,
+pub struct BridgeTmpl<S: UringSpec, Sel: DriverFor<S>> {
+    pub driver: Sel::Driver,
+    _marker: PhantomData<S>,
 }
 
-unsafe impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Send for BridgeTmpl<D, T, R> {}
-unsafe impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Sync for BridgeTmpl<D, T, R> {}
-
-impl<D: Driver, T: ISender + IReceiver + Clone, R: Role> Clone for BridgeTmpl<D, T, R> {
+impl<S: UringSpec, Sel: DriverFor<S>> Clone for BridgeTmpl<S, Sel> {
     fn clone(&self) -> Self {
         Self {
             driver: self.driver.clone(),
-            sq: self.sq.clone(),
             _marker: PhantomData,
         }
     }
 }
 
-impl<
-    D: Driver,
-    T: ISender<Item = <Dring<D> as UringSpec>::SQE>
-        + IReceiver<Item = <Dring<D> as UringSpec>::CQE>
-        + Clone,
-> BridgeTmpl<D, T, Submit>
-{
-    /// submits a request in pending blocking.
-    ///
-    /// If the channel is closed, it will return an error.
-    pub async fn submit(&self, data: D::SQE) -> Result<D::Op, <T as ISender>::Error> {
-        let (id, op) = self.driver.register();
-        let req = cell::IdCell::new(id, data);
-        self.sq.send(req).await?;
+impl<S: UringSpec, Sel: DriverFor<S>> UringSpec for BridgeTmpl<S, Sel> {
+    type SQE = IdCell<<Sel::Driver as Driver>::Id, S::SQE>;
+    type CQE = IdCell<<Sel::Driver as Driver>::Id, S::CQE>;
+}
 
+pub struct Bridge<S: UringSpec, Chan, R: Role, Sel: DriverFor<S>> {
+    bt: BridgeTmpl<S, Sel>,
+    chan: Chan, // Submitter<BridgeTmpl<S, Sel>> or Completer<BridgeTmpl<S, Sel>>.
+    _marker: PhantomData<R>,
+}
+
+impl<S: UringSpec, Chan: Clone, R: Role, Sel: DriverFor<S>> Clone for Bridge<S, Chan, R, Sel>
+where
+    BridgeTmpl<S, Sel>: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            bt: self.bt.clone(),
+            chan: self.chan.clone(),
+            _marker: PhantomData,
+        }
+    }
+}
+
+impl<S, Tx, Sel> Bridge<S, Tx, Submit, Sel>
+where
+    S: UringSpec,
+    Sel: DriverFor<S>,
+    Tx: ISender<Item = <BridgeTmpl<S, Sel> as UringSpec>::SQE> + Clone,
+    <Sel::Driver as Driver>::Op: Future<Output = S::CQE>,
+{
+    pub async fn submit(
+        &self,
+        data: S::SQE,
+    ) -> Result<<Sel::Driver as Driver>::Op, <Tx as ISender>::Error> {
+        let (id, op) = self.bt.driver.register();
+        let req = IdCell::new(id, data);
+        self.chan.send(req).await?;
         Ok(op)
     }
 
-    /// submits a request in non-blocking.
-    ///
-    /// If the channel is closed or full, it will return an error immediately.
-    pub fn try_submit(&self, data: D::SQE) -> Result<D::Op, <T as ISender>::TryError> {
-        let (id, op) = self.driver.register();
-        let req = cell::IdCell::new(id, data);
-        self.sq.try_send(req)?;
-
+    pub fn try_submit(
+        &self,
+        data: S::SQE,
+    ) -> Result<<Sel::Driver as Driver>::Op, <Tx as ISender>::TryError> {
+        let (id, op) = self.bt.driver.register();
+        let req = IdCell::new(id, data);
+        self.chan.try_send(req)?;
         Ok(op)
     }
 }
 
-impl<
-    D: Driver,
-    T: ISender<Item = <Dring<D> as UringSpec>::SQE>
-        + IReceiver<Item = <Dring<D> as UringSpec>::CQE>
-        + Clone,
-> BridgeTmpl<D, T, Receive>
+impl<S, Rx, Sel> Bridge<S, Rx, Receive, Sel>
+where
+    S: UringSpec,
+    Sel: DriverFor<S>,
+    Rx: IReceiver<Item = <BridgeTmpl<S, Sel> as UringSpec>::CQE> + Clone,
+    <Sel::Driver as Driver>::Op: Future<Output = S::CQE>,
 {
-    /// Receives completed msgs by blocking in pending.
-    ///
-    /// If the channel is empty or closed, it will block in pending.
     pub async fn complete(&self) {
-        while let Ok(data) = self.sq.recv().await {
+        while let Ok(data) = self.chan.recv().await {
             let (id, payload) = data.into_inner();
-            self.driver.complete(id, payload);
+            self.bt.driver.complete(id, payload);
         }
     }
 
-    /// Receives completed msgs in non-blocking.
-    ///
-    /// If the channel is empty or closed, it will return immediately.
     pub fn try_complete(&self) -> bool {
-        if let Ok(data) = self.sq.try_recv() {
+        if let Ok(data) = self.chan.try_recv() {
             let (id, payload) = data.into_inner();
-            self.driver.complete(id, payload);
-            return true;
+            self.bt.driver.complete(id, payload);
+            true
+        } else {
+            false
         }
-        false
     }
 }
-
-macro_rules! build_bridge {
-    ($sq:expr) => {
-        build_bridge!(@impl $sq, D::default())
+fn build_with_driver<S, Chan, Sel>(
+    chan: Chan,
+    driver: Sel::Driver,
+) -> (Bridge<S, Chan, Submit, Sel>, Bridge<S, Chan, Receive, Sel>)
+where
+    S: UringSpec,
+    Chan: Clone,
+    Sel: DriverFor<S>,
+    Sel::Driver: Clone,
+{
+    let sq = Bridge {
+        bt: BridgeTmpl {
+            driver: driver.clone(),
+            _marker: PhantomData,
+        },
+        chan: chan.clone(),
+        _marker: PhantomData,
     };
-
-    ($sq:expr, $driver_cfg:expr) => {
-        build_bridge!(@impl $sq, D::new($driver_cfg))
+    let rq = Bridge {
+        bt: BridgeTmpl {
+            driver,
+            _marker: PhantomData,
+        },
+        chan,
+        _marker: PhantomData,
     };
+    (sq, rq)
+}
 
-    // The leading `@` is a convention for internal rules.
-    (@impl $sq:expr, $driver_init:expr) => {{
-        let d = $driver_init;
-        (
-            BridgeTmpl {
-                driver: d.clone(),
-                sq: $sq.clone(),
-                _marker: PhantomData,
-            },
-            BridgeTmpl {
-                driver: d,
-                sq: $sq,
-                _marker: PhantomData,
-            },
-        )
-    }};
+fn build_default_bridge<S, Chan, Sel>(
+    chan: Chan,
+) -> (Bridge<S, Chan, Submit, Sel>, Bridge<S, Chan, Receive, Sel>)
+where
+    S: UringSpec,
+    Chan: Clone,
+    Sel: DriverFor<S>,
+{
+    build_with_driver(chan, Sel::Driver::default())
+}
+
+fn build_bridge<S, Chan, Sel>(
+    chan: Chan,
+    cfg: <Sel::Driver as Driver>::Config,
+) -> (Bridge<S, Chan, Submit, Sel>, Bridge<S, Chan, Receive, Sel>)
+where
+    S: UringSpec,
+    Chan: Clone,
+    Sel: DriverFor<S>,
+{
+    build_with_driver(chan, Sel::Driver::new(cfg))
 }
 
 pub mod asynch {
-    use core::marker::PhantomData;
-
-    use crate::driver::{BridgeTmpl, Receive, Submit};
+    use crate::driver::{
+        BridgeTmpl, Driver, DriverFor, Pool, Receive, Submit, build_bridge, build_default_bridge,
+    };
+    use crate::uring::UringSpec;
     use crate::{
-        driver::{Dring, Driver},
-        uring::asynch::{
-            Completer as UCompleter, Submitter as USubmitter, channel, default_channel,
-        },
+        driver::Bridge,
+        uring::asynch::{Completer, Submitter, channel, default_channel},
     };
 
-    pub type Submitter<D> = USubmitter<Dring<D>>;
-    pub type Completer<D> = UCompleter<Dring<D>>;
+    pub type CompleterBridge<S, D = Pool> = Completer<BridgeTmpl<S, D>>;
+    pub type SubmitBridge<S, D = Pool> = Bridge<S, Submitter<BridgeTmpl<S, D>>, Submit, D>;
+    pub type ReceiveBridge<S, D = Pool> = Bridge<S, Submitter<BridgeTmpl<S, D>>, Receive, D>;
 
-    pub type Bridge<D, R> = BridgeTmpl<D, Submitter<D>, R>;
-    pub type SubmitBridge<D> = Bridge<D, Submit>;
-    pub type ReceiveBridge<D> = Bridge<D, Receive>;
+    type Conn<S, D> = (
+        SubmitBridge<S, D>,
+        ReceiveBridge<S, D>,
+        Completer<BridgeTmpl<S, D>>,
+    );
 
-    type UringBridge<D> = (SubmitBridge<D>, ReceiveBridge<D>, Completer<D>);
-
-    pub fn new<D: Driver>(uring_cap: usize, driver_cfg: D::Config) -> UringBridge<D> {
-        let (sq, cq) = channel::<Dring<D>>(uring_cap);
-        let (sb, cb) = build_bridge!(sq, driver_cfg);
+    pub fn new<S: UringSpec, D: DriverFor<S>>(
+        uring_cap: usize,
+        driver_cfg: <D::Driver as Driver>::Config,
+    ) -> Conn<S, D> {
+        let (sq, cq) = channel::<BridgeTmpl<S, D>>(uring_cap);
+        let (sb, cb) = build_bridge(sq, driver_cfg);
         (sb, cb, cq)
     }
 
-    pub fn default<D: Driver>() -> UringBridge<D> {
-        let (sq, cq) = default_channel::<Dring<D>>();
-        let (sb, cb) = build_bridge!(sq);
+    pub fn default<S: UringSpec, D: DriverFor<S>>() -> Conn<S, D> {
+        let (sq, cq) = default_channel::<BridgeTmpl<S, D>>();
+        let (sb, cb) = build_default_bridge(sq);
         (sb, cb, cq)
     }
 }
 
 pub mod bare {
-    use core::marker::PhantomData;
-
     use evering_shm::perlude::ShmAllocator;
 
-    use crate::driver::{BridgeTmpl, Dring, Driver, Receive, Submit};
-    use crate::uring::UringSpec;
-    use crate::uring::bare::{
-        BoxQueue, Boxed, Completer as UringCompleter, Submitter as UringSubbmiter, box_channel,
-        channel,
+    use crate::driver::{
+        Bridge, BridgeTmpl, Driver, DriverFor, Pool, Receive, Submit, build_bridge,
+        build_default_bridge,
     };
+    use crate::uring::UringSpec;
+    use crate::uring::bare::{BoxQueue, Boxed, Completer, Submitter, box_channel, channel};
 
-    pub type Submitter<D, P, const N: usize> = UringSubbmiter<Dring<D>, P, N>;
-    pub type Completer<D, P, const N: usize> = UringCompleter<Dring<D>, P, N>;
+    pub type SubmitBridge<S, P, const N: usize, D = Pool> =
+        Bridge<S, Submitter<BridgeTmpl<S, D>, P, N>, Submit, D>;
+    pub type ReceiveBridge<S, P, const N: usize, D = Pool> =
+        Bridge<S, Submitter<BridgeTmpl<S, D>, P, N>, Receive, D>;
 
-    pub type Bridge<D, P, const N: usize, R> = BridgeTmpl<D, Submitter<D, P, N>, R>;
-    pub type SubmitBridge<D, P, const N: usize> = Bridge<D, P, N, Submit>;
-    pub type ReceiveBridge<D, P, const N: usize> = Bridge<D, P, N, Receive>;
-
-    pub type UringBridge<D, P, const N: usize> = (
-        SubmitBridge<D, P, N>,
-        ReceiveBridge<D, P, N>,
-        Completer<D, P, N>,
+    pub type Conn<S, P, const N: usize, D> = (
+        SubmitBridge<S, P, N, D>,
+        ReceiveBridge<S, P, N, D>,
+        Completer<BridgeTmpl<S, D>, P, N>,
     );
-    pub type OwnUringBridge<D, const N: usize> = UringBridge<D, (), N>;
-    pub type BoxUringBridge<D, A, const N: usize> = UringBridge<D, Boxed<A>, N>;
+    pub type OwnConn<S, const N: usize, D> = Conn<S, (), N, D>;
+    pub type BoxConn<S, A, const N: usize, D> = Conn<S, Boxed<A>, N, D>;
 
-    pub fn own_new<D: Driver, const N: usize>(driver_cfg: D::Config) -> OwnUringBridge<D, N> {
-        let (sq, cq) = channel::<Dring<D>, N>();
-        let (sb, cb) = build_bridge!(sq, driver_cfg);
+    pub fn own_new<S: UringSpec, const N: usize, D: DriverFor<S>>(
+        driver_cfg: <D::Driver as Driver>::Config,
+    ) -> OwnConn<S, N, D> {
+        let (sq, cq) = channel::<BridgeTmpl<S, D>, N>();
+        let (sb, cb) = build_bridge(sq, driver_cfg);
         (sb, cb, cq)
     }
 
-    pub fn own_default<D: Driver, const N: usize>() -> OwnUringBridge<D, N> {
-        let (sq, cq) = channel::<Dring<D>, N>();
-        let (sb, cb) = build_bridge!(sq);
-        (sb, cb, cq)
-    }
-
-    pub fn box_default<D: Driver, A: ShmAllocator, const N: usize>(
+    pub fn box_conn<S: UringSpec, A: ShmAllocator, const N: usize, D: DriverFor<S>>(
         q: (
-            BoxQueue<<Dring<D> as UringSpec>::SQE, A, N>,
-            BoxQueue<<Dring<D> as UringSpec>::CQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::SQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::CQE, A, N>,
         ),
-    ) -> BoxUringBridge<D, A, N> {
-        let (sq, cq) = box_channel::<Dring<D>, A, N>(q.0, q.1);
-        let (sb, cb) = build_bridge!(sq);
+    ) -> BoxConn<S, A, N, D> {
+        let (sq, cq) = box_channel::<BridgeTmpl<S, D>, A, N>(q.0, q.1);
+        let (sb, cb) = build_default_bridge(sq);
         (sb, cb, cq)
     }
 
-    pub fn box_client<D: Driver, A: ShmAllocator, const N: usize>(
+    pub fn box_client<S: UringSpec, A: ShmAllocator, const N: usize, D: DriverFor<S>>(
         q: (
-            BoxQueue<<Dring<D> as UringSpec>::SQE, A, N>,
-            BoxQueue<<Dring<D> as UringSpec>::CQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::SQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::CQE, A, N>,
         ),
-    ) -> (SubmitBridge<D, Boxed<A>, N>, ReceiveBridge<D, Boxed<A>, N>) {
-        let (sq, _) = box_channel::<Dring<D>, A, N>(q.0, q.1);
-        let (sb, cb) = build_bridge!(sq);
+    ) -> (
+        SubmitBridge<S, Boxed<A>, N, D>,
+        ReceiveBridge<S, Boxed<A>, N, D>,
+    ) {
+        let (sq, _) = box_channel::<BridgeTmpl<S, D>, A, N>(q.0, q.1);
+        let (sb, cb) = build_default_bridge(sq);
         (sb, cb)
     }
 
-    pub fn box_server<D: Driver, A: ShmAllocator, const N: usize>(
+    pub fn box_server<S: UringSpec, A: ShmAllocator, const N: usize, D: DriverFor<S>>(
         q: (
-            BoxQueue<<Dring<D> as UringSpec>::SQE, A, N>,
-            BoxQueue<<Dring<D> as UringSpec>::CQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::SQE, A, N>,
+            BoxQueue<<BridgeTmpl<S, D> as UringSpec>::CQE, A, N>,
         ),
-    ) -> Completer<D, Boxed<A>, N> {
-        let (_, cq) = box_channel::<Dring<D>, A, N>(q.0, q.1);
+    ) -> Completer<BridgeTmpl<S, D>, Boxed<A>, N> {
+        let (_, cq) = box_channel::<BridgeTmpl<S, D>, A, N>(q.0, q.1);
         cq
     }
 }

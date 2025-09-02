@@ -1,28 +1,19 @@
+use evering::driver::Pool;
 use tokio::task::yield_now;
+
+use crate::op::{CharUring, handle};
 
 mod op;
 
-use op::MyHandle;
-
-use crate::op::MyPoolDriver;
-
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
-    // let (sb, cb, cq) = evering::driver::new::<MySlabDriver>();
-    let (sb, cb, cq) = evering::driver::asynch::default::<MyPoolDriver>();
+    let (sb, cb, cq) = evering::driver::asynch::default::<CharUring, Pool>();
 
     for _ in 0..5 {
         let cq = cq.clone();
         let cb = cb.clone();
-        // tokio::spawn(async move {
-        //     loop {
-        //         cb.try_complete();
-        //         MyHandle::try_handle_ref(&cq);
-        //         yield_now().await;
-        //     }
-        // });
         tokio::spawn(async move { cb.complete().await });
-        tokio::spawn(async move { MyHandle::<MyPoolDriver>::handle(cq).await });
+        tokio::spawn(async move { handle(&cq).await });
     }
 
     for th in 0..5 {

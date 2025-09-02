@@ -6,20 +6,17 @@ use core::{
 use alloc::sync::Arc;
 use objectpool::{Pool, ReusableObject};
 
-use crate::{
-    driver::{Driver, op_cache::unlocked::CacheState},
-    uring::UringSpec,
-};
+use crate::driver::{Driver, op_cache::unlocked::CacheState};
 
 type OpCache<T> = CacheState<T>;
 type OpId<T> = Arc<ReusableObject<OpCache<T>>>;
 type OpPool<T> = Pool<OpCache<T>>;
 
-pub struct PoolDriver<U: UringSpec> {
-    pool: OpPool<U::CQE>,
+pub struct PoolDriver<T> {
+    pool: OpPool<T>,
 }
 
-impl<U: UringSpec> Clone for PoolDriver<U> {
+impl<T> Clone for PoolDriver<T> {
     fn clone(&self) -> Self {
         Self {
             pool: self.pool.clone(),
@@ -27,13 +24,13 @@ impl<U: UringSpec> Clone for PoolDriver<U> {
     }
 }
 
-impl<U: UringSpec> Default for PoolDriver<U>
+impl<T> Default for PoolDriver<T>
 where
-    U::CQE: 'static,
+    T: 'static,
 {
     fn default() -> Self {
         Self {
-            pool: Pool::unbounded(Default::default, |op_cache: &mut OpCache<U::CQE>| {
+            pool: Pool::unbounded(Default::default, |op_cache: &mut OpCache<T>| {
                 // let mut inner = op_cache.lock();
                 op_cache.clean()
             }),
@@ -41,21 +38,16 @@ where
     }
 }
 
-impl<U: UringSpec> UringSpec for PoolDriver<U> {
-    type SQE = U::SQE;
-    type CQE = U::CQE;
-}
-
-impl<U: UringSpec> Driver for PoolDriver<U>
+impl<T> Driver for PoolDriver<T>
 where
-    <U as UringSpec>::CQE: 'static,
+    T: 'static,
 {
-    type Id = OpId<U::CQE>;
-    type Op = Op<U>;
+    type Id = OpId<T>;
+    type Op = Op<T>;
     type Config = usize;
     fn new(cap: usize) -> Self {
         Self {
-            pool: Pool::bounded(cap, Default::default, |op_cache: &mut OpCache<U::CQE>| {
+            pool: Pool::bounded(cap, Default::default, |op_cache: &mut OpCache<T>| {
                 // let mut inner = op_cache.lock();
                 op_cache.clean()
             }),
@@ -73,12 +65,12 @@ where
     }
 }
 
-pub struct Op<U: UringSpec> {
-    id: OpId<U::CQE>,
+pub struct Op<T> {
+    id: OpId<T>,
 }
 
-impl<U: UringSpec> Future for Op<U> {
-    type Output = U::CQE;
+impl<T> Future for Op<T> {
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         self.id.try_poll(cx)

@@ -9,7 +9,7 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::{driver::Driver, driver::op_cache::locked::CacheState, uring::UringSpec};
+use crate::{driver::Driver, driver::op_cache::locked::CacheState};
 
 pub mod lock {
     pub type SpinMutex = spin::Mutex<()>;
@@ -18,7 +18,7 @@ pub mod lock {
     pub type StdMutex = parking_lot::RawMutex;
 }
 
-pub trait LockDriverSpec {
+pub trait LockFor {
     type Lock: RawMutex;
     // ...
 }
@@ -78,11 +78,11 @@ impl<T> Drop for SlabDriverCore<T> {
     }
 }
 
-pub struct SlabDriver<U: UringSpec, D: LockDriverSpec> {
-    inner: Arc<Mutex<D::Lock, SlabDriverCore<U::CQE>>>,
+pub struct SlabDriver<T, D: LockFor> {
+    inner: Arc<Mutex<D::Lock, SlabDriverCore<T>>>,
 }
 
-impl<U: UringSpec, D: LockDriverSpec> Default for SlabDriver<U, D> {
+impl<T, D: LockFor> Default for SlabDriver<T, D> {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SlabDriverCore::default())),
@@ -90,21 +90,16 @@ impl<U: UringSpec, D: LockDriverSpec> Default for SlabDriver<U, D> {
     }
 }
 
-impl<U: UringSpec, D: LockDriverSpec> Clone for SlabDriver<U, D> {
+impl<T, D: LockFor> Clone for SlabDriver<T, D> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
         Self { inner }
     }
 }
 
-impl<U: UringSpec, D: LockDriverSpec> UringSpec for SlabDriver<U, D> {
-    type SQE = U::SQE;
-    type CQE = U::CQE;
-}
-
-impl<U: UringSpec, D: LockDriverSpec> Driver for SlabDriver<U, D> {
+impl<T, D: LockFor> Driver for SlabDriver<T, D> {
     type Id = OpId;
-    type Op = Op<U, D>;
+    type Op = Op<T, D>;
     type Config = usize;
 
     fn new(cap: usize) -> Self {
@@ -132,13 +127,13 @@ impl<U: UringSpec, D: LockDriverSpec> Driver for SlabDriver<U, D> {
     }
 }
 
-pub struct Op<U: UringSpec, D: LockDriverSpec> {
+pub struct Op<T, D: LockFor> {
     id: OpId,
-    driver: SlabDriver<U, D>,
+    driver: SlabDriver<T, D>,
 }
 
-impl<U: UringSpec, D: LockDriverSpec> Future for Op<U, D> {
-    type Output = U::CQE;
+impl<T, D: LockFor> Future for Op<T, D> {
+    type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let mut core = self.driver.inner.lock();
@@ -156,7 +151,7 @@ impl<U: UringSpec, D: LockDriverSpec> Future for Op<U, D> {
     }
 }
 
-impl<U: UringSpec, D: LockDriverSpec> Drop for Op<U, D> {
+impl<T, D: LockFor> Drop for Op<T, D> {
     fn drop(&mut self) {
         let mut core = self.driver.inner.lock();
         core.ops.try_remove(self.id);

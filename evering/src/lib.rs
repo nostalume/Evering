@@ -1,4 +1,3 @@
-#![feature(associated_type_defaults)]
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
 
