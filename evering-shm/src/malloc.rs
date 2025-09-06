@@ -258,12 +258,12 @@ pub unsafe trait ShmHeader {
         self.spec_raw(idx)
             .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
     }
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool;
-    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize) -> bool
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize);
+    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize)
     where
         Self: ShmAllocator + Sized,
     {
-        // manually drop to elide deallocation after store.
+        // manually drop to elide deallocation.
         let spec = ManuallyDrop::new(spec);
         unsafe { self.init_spec_raw(spec.as_ref(), idx) }
     }
@@ -278,7 +278,7 @@ unsafe impl<A: ShmHeader> ShmHeader for &A {
         (**self).spec_raw(idx)
     }
 
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) {
         unsafe { (**self).init_spec_raw(spec, idx) }
     }
 }
@@ -292,7 +292,7 @@ unsafe impl<A: ShmHeader> ShmHeader for Arc<A> {
         (**self).spec_raw(idx)
     }
 
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) -> bool {
+    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) {
         unsafe { (**self).init_spec_raw(spec, idx) }
     }
 }

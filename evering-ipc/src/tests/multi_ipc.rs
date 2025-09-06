@@ -79,7 +79,7 @@ fn init_or_load<F: AsFd + 'static>(size: usize, cfg: UnixFdConf<F>) -> Arc<MyIpc
 
 #[test]
 fn queue_test() {
-    let cfg = UnixFdConf::default_mem_fd("test", SIZE, MFdFlags::empty()).unwrap();
+    let cfg = UnixFdConf::default_mem("test", SIZE, MFdFlags::empty()).unwrap();
     let handle = init_or_load(SIZE, cfg);
 
     type BooT = ShmToken<u8, IpcAlloc<MyIpcSpec<OwnedFd>>, ShmSlice>;
@@ -112,7 +112,7 @@ fn queue_test() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ipc_test() {
-    let s_cfg = UnixFdConf::default_mem_fd("something", SIZE, MFdFlags::empty()).unwrap();
+    let s_cfg = UnixFdConf::default_mem("something", SIZE, MFdFlags::empty()).unwrap();
     let handle = init_or_load(SIZE, s_cfg);
     let handle_c = handle.clone();
 

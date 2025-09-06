@@ -6,11 +6,14 @@ pub use nix::{
     sys::memfd::MFdFlags,
     sys::mman::{MapFlags, ProtFlags},
 };
-use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::{
+    os::fd::{AsFd, BorrowedFd, OwnedFd},
+    path::{Path, PathBuf},
+};
 
 use crate::{
-    os::FdBackend,
     area::{ShmArea, ShmBackend, ShmProtect, ShmSpec},
+    os::FdBackend,
 };
 
 type UnixAddr = usize;
@@ -27,22 +30,53 @@ pub struct UnixFdConf<F: AsFd> {
 }
 
 impl UnixFdConf<OwnedFd> {
-    pub fn default_mem_fd<P: nix::NixPath + ?Sized>(
-        name: &P,
+    fn resolve_named<P: AsRef<Path> + ?Sized>(name: &P) -> PathBuf {
+        const BASE: &str = "/dev/shm";
+        const TMP: &str = "/tmp";
+
+        let base = Path::new(BASE);
+        let path = if base.exists() {
+            base.join(name.as_ref())
+        } else {
+            Path::new(TMP).join(name.as_ref())
+        };
+        path
+    }
+    pub fn named<P: AsRef<Path> + ?Sized>(name: &P, size: usize) -> Result<Self, nix::Error> {
+        use nix::fcntl::OFlag;
+        let path = Self::resolve_named(name);
+        let oflags = OFlag::O_RDWR | OFlag::O_CREAT;
+        let fd = nix::fcntl::open(
+            &path,
+            oflags,
+            nix::sys::stat::Mode::from_bits_truncate(0o600),
+        )?;
+        nix::unistd::ftruncate(&fd, size as i64)?;
+
+        Ok(Self::new(fd, MapFlags::MAP_SHARED, 0))
+    }
+
+    pub fn clean_named<P: AsRef<Path> + ?Sized>(name: &P) -> Result<(), nix::Error> {
+        let path = Self::resolve_named(name);
+        nix::unistd::unlink(&path)
+    }
+
+    pub fn default_mem<P: nix::NixPath + ?Sized>(
+        path: &P,
         size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
     ) -> Result<Self, nix::Error> {
-        Self::mem_fd(name, size, mfd_flags, MapFlags::MAP_SHARED, 0)
+        Self::mem(path, size, mfd_flags, MapFlags::MAP_SHARED, 0)
     }
 
-    pub fn mem_fd<P: nix::NixPath + ?Sized>(
-        name: &P,
+    pub fn mem<P: nix::NixPath + ?Sized>(
+        path: &P,
         size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
         mflags: MapFlags,
         offset: off_t,
     ) -> Result<Self, nix::Error> {
-        let f = nix::sys::memfd::memfd_create(name, mfd_flags)?;
+        let f = nix::sys::memfd::memfd_create(path, mfd_flags)?;
         nix::unistd::ftruncate(f.as_fd(), size as i64)?;
         Ok(Self::new(f, mflags, offset))
     }

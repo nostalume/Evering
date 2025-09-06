@@ -58,7 +58,14 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
         }
     }
 
-    /// Given a start address, acquire the `Sized` instance.
+    #[inline]
+    pub(crate) fn as_addr(&self, offset: usize) -> Option<(S::Addr, usize)> {
+        let addr = self.start().add(offset);
+        let size = self.end().checked_sub_addr(addr)?;
+        Some((addr, size))
+    }
+
+    /// Given a offset related to start, acquire the `Sized` instance.
     /// from the area.
     ///
     /// ## Panics
@@ -71,19 +78,22 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
     /// (`*mut T`, `next_start`)
     /// - `*mut T`: the pointer to the instance.
     /// - `next_start`: `start + size_of<T>()`
-    /// - `free_size`: `end - next_start`
     #[inline]
-    pub(crate) unsafe fn acquire<T: Sized>(
+    pub(crate) unsafe fn acquire_by_offset<T: Sized>(
         &self,
-        start: S::Addr,
-    ) -> Option<(*mut T, S::Addr, usize)> {
-        // including padding
+        offset: usize,
+    ) -> Option<(*mut T, usize)> {
         let t_size = core::mem::size_of::<T>();
         let t_align = core::mem::align_of::<T>();
-        let t_start = start.add(t_size).align_up(t_align);
-        let free = self.end().checked_sub_addr(t_start)?;
-        let ptr = start.into() as *mut T;
-        Some((ptr, t_start, free))
+
+        let t_start = self.start().add(offset);
+        let new_offset = offset.add(t_size).align_up(t_align);
+        let t_end = t_start.add(new_offset);
+        if t_end > self.end() {
+            return None;
+        }
+        let ptr = t_start.into() as *mut T;
+        Some((ptr, new_offset))
     }
 
     /// Given a start address, acquire the `Sized` instance.
@@ -99,19 +109,13 @@ impl<S: ShmSpec, M: ShmBackend<S>> ShmArea<S, M> {
     /// (`*mut T`, `next_start`)
     /// - `*mut T`: the pointer to the instance.
     /// - `next_start`: `start + size_of<T>()`
-    /// - `free_size`: `end - next_start`
     #[inline]
-    pub(crate) unsafe fn acquire_raw<T: Sized>(
+    pub(crate) unsafe fn acquire_by_addr<T: Sized>(
         &self,
         start: S::Addr,
-        t_size: usize,
-        t_align: usize,
-    ) -> Option<(*mut T, S::Addr, usize)> {
-        // including padding
-        let t_start = start.add(t_size).align_up(t_align);
-        let free = self.end().checked_sub_addr(t_start)?;
-        let ptr = start.into() as *mut T;
-        Some((ptr, t_start, free))
+    ) -> Option<(*mut T, usize)> {
+        let offset = start.sub_addr(self.start());
+        unsafe { self.acquire_by_offset(offset) }
     }
 }
 
