@@ -1,5 +1,5 @@
 #![cfg(test)]
-use crate::uring::{asynch, bare, IReceiver, ISender};
+use crate::uring::{IReceiver, ISender, asynch};
 use crate::uring::{UringSpec, sync};
 
 use std::sync::atomic::{AtomicBool, Ordering};

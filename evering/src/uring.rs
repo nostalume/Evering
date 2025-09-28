@@ -3,8 +3,6 @@ pub mod bare;
 pub mod sync;
 mod tests;
 
-use crate::seal::Sealed;
-
 pub trait UringSpec {
     type SQE;
     type CQE;
@@ -12,7 +10,7 @@ pub trait UringSpec {
 
 pub const DEFAULT_CAP: usize = 1 << 5;
 
-pub trait ISender: Sealed {
+pub trait ISender {
     type Item;
     type Error;
     type TryError;
@@ -22,7 +20,7 @@ pub trait ISender: Sealed {
     fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError>;
 }
 
-pub trait IReceiver: Sealed {
+pub trait IReceiver {
     type Item;
     type Error;
     type TryError;

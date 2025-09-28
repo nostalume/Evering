@@ -8,7 +8,6 @@ extern crate alloc;
 
 mod area;
 pub mod boxed;
-mod header;
 mod malloc;
 pub mod os;
 pub mod perlude;

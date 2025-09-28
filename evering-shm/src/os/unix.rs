@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    area::{ShmArea, ShmBackend, ShmProtect, ShmSpec},
+    area::{AddrSpec, MemBlkSpec, Mmap, Mprotect, RawMemBlk},
     os::FdBackend,
 };
 
@@ -30,6 +30,7 @@ pub struct UnixFdConf<F: AsFd> {
 }
 
 impl UnixFdConf<OwnedFd> {
+    const BASE_MFLAGS: MapFlags = MapFlags::MAP_SHARED;
     fn resolve_named<P: AsRef<Path> + ?Sized>(name: &P) -> PathBuf {
         const BASE: &str = "/dev/shm";
         const TMP: &str = "/tmp";
@@ -53,7 +54,7 @@ impl UnixFdConf<OwnedFd> {
         )?;
         nix::unistd::ftruncate(&fd, size as i64)?;
 
-        Ok(Self::new(fd, MapFlags::MAP_SHARED, 0))
+        Ok(Self::new(fd, UnixFdConf::BASE_MFLAGS, 0))
     }
 
     pub fn clean_named<P: AsRef<Path> + ?Sized>(name: &P) -> Result<(), nix::Error> {
@@ -66,7 +67,7 @@ impl UnixFdConf<OwnedFd> {
         size: usize,
         mfd_flags: nix::sys::memfd::MFdFlags,
     ) -> Result<Self, nix::Error> {
-        Self::mem(path, size, mfd_flags, MapFlags::MAP_SHARED, 0)
+        Self::mem(path, size, mfd_flags, UnixFdConf::BASE_MFLAGS, 0)
     }
 
     pub fn mem<P: nix::NixPath + ?Sized>(
@@ -76,6 +77,7 @@ impl UnixFdConf<OwnedFd> {
         mflags: MapFlags,
         offset: off_t,
     ) -> Result<Self, nix::Error> {
+        let mflags = mflags.union(UnixFdConf::BASE_MFLAGS);
         let f = nix::sys::memfd::memfd_create(path, mfd_flags)?;
         nix::unistd::ftruncate(f.as_fd(), size as i64)?;
         Ok(Self::new(f, mflags, offset))
@@ -103,24 +105,24 @@ impl<F: AsFd> UnixFdConf<F> {
     }
 }
 
-pub struct UnixShm;
+pub struct UnixAddrSpec;
 
-impl ShmSpec for UnixShm {
+impl AddrSpec for UnixAddrSpec {
     type Addr = UnixAddr;
     type Flags = ProtFlags;
 }
 
-impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
+impl<F: AsFd> Mmap<UnixAddrSpec> for FdBackend<F> {
     type Config = UnixFdConf<F>;
     type Error = nix::Error;
 
     fn map(
         self,
-        start: Option<<UnixShm as ShmSpec>::Addr>,
+        start: Option<<UnixAddrSpec as AddrSpec>::Addr>,
         size: usize,
-        flags: <UnixShm as ShmSpec>::Flags,
+        flags: <UnixAddrSpec as AddrSpec>::Flags,
         cfg: UnixFdConf<F>,
-    ) -> Result<ShmArea<UnixShm, Self>, Self::Error> {
+    ) -> Result<RawMemBlk<UnixAddrSpec, Self>, Self::Error> {
         let start = start.and_then(NonZeroUsize::new);
         let len = size as i64;
         let size = match NonZeroUsize::new(size) {
@@ -130,37 +132,35 @@ impl<F: AsFd> ShmBackend<UnixShm> for FdBackend<F> {
 
         let UnixFdConf {
             ref f,
-            mflags: mflag,
+            mflags,
             offset,
         } = cfg;
 
         unsafe {
             let stat = nix::sys::stat::fstat(f.as_fd())?;
-            let m = core::cmp::max(len, offset);
-            if stat.st_size < m {
-                nix::unistd::ftruncate(f.as_fd(), m)?;
+            let f_size = offset + len;
+            if stat.st_size < f_size {
+                nix::unistd::ftruncate(f.as_fd(), f_size)?;
             }
-            nix::sys::mman::mmap(start, size, flags, mflag, f.as_fd(), offset).map(|ptr| {
-                let start = ptr.addr().into();
-                ShmArea::new(start, size.get(), flags, self)
-            })
+            nix::sys::mman::mmap(start, size, flags, mflags, f.as_fd(), offset)
+                .map(|ptr| RawMemBlk::from_raw(ptr.addr().into(), size.get(), flags, self))
         }
     }
 
-    fn unmap(area: &mut ShmArea<UnixShm, Self>) -> Result<(), Self::Error> {
-        let addr = unsafe { as_c_void(area.start()) };
-        let size = area.size();
-        unsafe { nix::sys::mman::munmap(addr, size) }
+    fn unmap(area: &mut RawMemBlk<UnixAddrSpec, Self>) -> Result<(), Self::Error> {
+        let start = unsafe { as_c_void(area.a.start()) };
+        let size = area.a.size();
+        unsafe { nix::sys::mman::munmap(start, size) }
     }
 }
 
-impl<F: AsFd> ShmProtect<UnixShm> for FdBackend<F> {
+impl<F: AsFd> Mprotect<UnixAddrSpec> for FdBackend<F> {
     fn protect(
-        area: &mut ShmArea<UnixShm, Self>,
-        new_flags: <UnixShm as ShmSpec>::Flags,
+        area: &mut RawMemBlk<UnixAddrSpec, Self>,
+        new_flags: <UnixAddrSpec as AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
-        let start = unsafe { as_c_void(area.start()) };
-        let size = area.size();
+        let start = unsafe { as_c_void(area.a.start()) };
+        let size = area.a.size();
         unsafe { nix::sys::mman::mprotect(start, size, new_flags) }
     }
 }

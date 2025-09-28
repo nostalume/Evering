@@ -11,7 +11,7 @@ use evering_ipc::driver::unlocked::PoolDriver;
 use evering_ipc::shm::boxed::{ShmBox, ShmSlice, ShmToken};
 use evering_ipc::shm::os::{
     FdBackend,
-    unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm},
+    unix::{MFdFlags, ProtFlags, UnixFdConf, UnixAddrSpec},
 };
 use evering_ipc::shm::tlsf::SpinTlsf;
 use evering_ipc::uring::{IReceiver, ISender, UringSpec};
@@ -71,7 +71,7 @@ type MyPoolDriver<I> = PoolDriver<IpcInfo<I>>;
 struct MyIpcSpec<F>(PhantomData<F>);
 impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
     type A = SpinTlsf;
-    type S = UnixShm;
+    type S = UnixAddrSpec;
     type M = FdBackend<F>;
 }
 

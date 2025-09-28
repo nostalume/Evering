@@ -19,7 +19,7 @@ pub mod uring {
 }
 
 pub mod shm {
-    pub use evering_shm::perlude::{ShmBackend, ShmSpec};
+    pub use evering_shm::perlude::{Mmap, AddrSpec};
     pub mod boxed {
         pub use evering_shm::boxed::*;
     }
@@ -36,12 +36,12 @@ pub mod shm {
 use evering::driver::Driver;
 use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_client, box_server};
 use evering::uring::bare::{BoxQueue, Boxed};
-use evering_shm::perlude::{ShmAlloc, ShmAllocError, ShmBackend, ShmHeader, ShmInit, ShmSpec};
+use evering_shm::perlude::{ShmAlloc, ShmAllocError, Mmap, ShmHeader, ShmInit, AddrSpec};
 
 pub trait IpcSpec {
     type A: ShmInit;
-    type S: ShmSpec;
-    type M: ShmBackend<Self::S>;
+    type S: AddrSpec;
+    type M: Mmap<Self::S>;
 }
 
 pub type IpcAlloc<I: IpcSpec> = Arc<ShmAlloc<I::A, I::S, I::M>>;
@@ -61,10 +61,10 @@ impl<I: IpcSpec, D: Driver, const N: usize> IpcHandle<I, D, N> {
 
     pub fn init_or_load(
         state: I::M,
-        start: Option<<I::S as ShmSpec>::Addr>,
+        start: Option<<I::S as AddrSpec>::Addr>,
         size: usize,
-        flags: <I::S as ShmSpec>::Flags,
-        cfg: <I::M as ShmBackend<I::S>>::Config,
+        flags: <I::S as AddrSpec>::Flags,
+        cfg: <I::M as Mmap<I::S>>::Config,
     ) -> Result<Self, IpcError<I>> {
         let area = ShmAlloc::init_or_load(state, start, size, flags, cfg)?;
         let area = Arc::new(area);

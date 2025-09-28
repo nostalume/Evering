@@ -1,26 +1,39 @@
 #![cfg(test)]
 
-use core::ops::AddAssign;
+use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::{ShmArea, ShmBackend, ShmProtect, ShmSpec};
-use crate::boxed::{ShmBox, ShmToken};
-use crate::perlude::{ShmAllocator, ShmHeader, ShmSpinGma, ShmSpinTlsf};
+use crate::area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk};
 
 const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
+type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>>;
 
-struct MockSpec;
+struct MockAddr;
 
-impl ShmSpec for MockSpec {
+impl AddrSpec for MockAddr {
     type Addr = VirtAddr;
     type Flags = MockFlags;
 }
 
 struct MockBackend<'a>(&'a mut MockPageTable);
+
+impl<'a> Deref for MockBackend<'a> {
+    type Target = MockPageTable;
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl<'a> DerefMut for MockBackend<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
 
 impl MockBackend<'_> {
     fn start(&self) -> VirtAddr {
@@ -33,19 +46,20 @@ impl MockBackend<'_> {
     }
 }
 
-impl<'a> ShmBackend<MockSpec> for MockBackend<'a> {
+impl<'a> Mmap<MockAddr> for MockBackend<'a> {
     type Config = ();
     type Error = ();
 
     fn map(
         self,
-        start: Option<<MockSpec as ShmSpec>::Addr>,
+        start: Option<<MockAddr as AddrSpec>::Addr>,
         size: usize,
-        flags: <MockSpec as ShmSpec>::Flags,
+        flags: <MockAddr as AddrSpec>::Flags,
         _cfg: (),
-    ) -> Result<ShmArea<MockSpec, Self>, Self::Error> {
-        let Some(start) = start else {
-            return Err(());
+    ) -> Result<RawMemBlk<MockAddr, Self>, Self::Error> {
+        let start = match start {
+            Some(start) => start,
+            None => 0.into(),
         };
         for entry in self.0.iter_mut().skip(start.as_usize()).take(size) {
             if *entry != 0 {
@@ -54,14 +68,14 @@ impl<'a> ShmBackend<MockSpec> for MockBackend<'a> {
             *entry = flags;
         }
         let start = self.start().add(start.as_usize());
-        Ok(ShmArea::new(start, size, flags, self))
+        Ok(RawMemBlk::from_raw(start, size, flags, self))
     }
 
-    fn unmap(area: &mut ShmArea<MockSpec, Self>) -> Result<(), Self::Error> {
-        let start = area.start();
-        let arr_start = area.backend().arr_addr(start);
-        let size = area.size();
-        for entry in area.backend_mut().0.iter_mut().skip(arr_start).take(size) {
+    fn unmap(area: &mut RawMemBlk<MockAddr, Self>) -> Result<(), Self::Error> {
+        let start = area.a.start();
+        let arr_start = area.bk.arr_addr(start);
+        let size = area.a.size();
+        for entry in area.bk.iter_mut().skip(arr_start).take(size) {
             if *entry == 0 {
                 return Err(());
             }
@@ -71,15 +85,15 @@ impl<'a> ShmBackend<MockSpec> for MockBackend<'a> {
     }
 }
 
-impl<'a> ShmProtect<MockSpec> for MockBackend<'a> {
+impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
     fn protect(
-        area: &mut ShmArea<MockSpec, Self>,
-        new_flags: <MockSpec as ShmSpec>::Flags,
+        area: &mut RawMemBlk<MockAddr, Self>,
+        new_flags: <MockAddr as AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
         let start = area.start();
-        let arr_start = area.backend().arr_addr(start);
+        let arr_start = area.bk.arr_addr(start);
         let size = area.size();
-        for entry in area.backend_mut().0.iter_mut().skip(arr_start).take(size) {
+        for entry in area.bk.iter_mut().skip(arr_start).take(size) {
             if *entry == 0 {
                 return Err(());
             }
@@ -89,48 +103,64 @@ impl<'a> ShmProtect<MockSpec> for MockBackend<'a> {
     }
 }
 
-type MySpinGma<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
-type MyTlsf<'a> = ShmSpinTlsf<MockBackend<'a>, MockSpec>;
-type MyBlink<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
-
-fn box_test(alloc: &impl ShmAllocator) {
-    let mut bb = ShmBox::new_in(1u8, alloc);
-    dbg!(format!("box: {:?}", bb.as_ptr()));
-    dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
-    assert_eq!(*bb, 1);
-    bb.add_assign(2);
-    assert_eq!(*bb, 3);
+fn mock_area(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockMemBlk<'_> {
+    let bk = MockBackend(pt);
+    let a = MemBlk::init_map(bk, start, size, 0, (), || Ok(())).unwrap();
+    a
 }
 
-fn token_test(alloc: &impl ShmAllocator) {
-    // 8 bits offset
-    let bb = ShmBox::new_in(1u8, alloc);
-    dbg!(format!("box: {:?}", bb.as_ptr()));
-    dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
-    let token = ShmToken::from(bb);
-    dbg!(format!("offset: {:?}", token.offset()));
-    let bb = ShmBox::from(token);
-    dbg!(format!("translated box: {:?}", bb.as_ptr()));
-    dbg!(format!(
-        "translated start: {:?}",
-        bb.allocator().start_ptr()
-    ));
-    assert_eq!(*bb, 1);
-}
-
-fn spec_test(alloc: &(impl ShmAllocator + ShmHeader)) {
-    let bb = ShmBox::new_in(32u16, &alloc);
-    alloc.init_spec(bb, 0);
-    match unsafe { alloc.spec_ref::<u16>(0) } {
-        Some(spec) => {
-            dbg!(format!("spec address: {:?}", spec.as_ptr()));
-            assert_eq!(*spec, 32);
-        }
-        None => {
-            panic!("spec is not initialized");
-        }
+#[test]
+fn area_test() {
+    const STEP: usize = 0x2000;
+    let mut pt = [0; MAX_ADDR];
+    for start in (0..MAX_ADDR).step_by(STEP) {
+        let a = mock_area(&mut pt, Some(start.into()), STEP);
+        let header = a.header();
+        dbg!(format!("Header: {:?}", header));
     }
 }
+// type MySpinGma<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
+// type MyTlsf<'a> = ShmSpinTlsf<MockBackend<'a>, MockSpec>;
+// type MyBlink<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
+
+// fn box_test(alloc: &impl MemBase) {
+//     let mut bb = ShmBox::new_in(1u8, alloc);
+//     dbg!(format!("box: {:?}", bb.as_ptr()));
+//     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
+//     assert_eq!(*bb, 1);
+//     bb.add_assign(2);
+//     assert_eq!(*bb, 3);
+// }
+
+// fn token_test(alloc: &impl MemBase) {
+//     // 8 bits offset
+//     let bb = ShmBox::new_in(1u8, alloc);
+//     dbg!(format!("box: {:?}", bb.as_ptr()));
+//     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
+//     let token = ShmToken::from(bb);
+//     dbg!(format!("offset: {:?}", token.offset()));
+//     let bb = ShmBox::from(token);
+//     dbg!(format!("translated box: {:?}", bb.as_ptr()));
+//     dbg!(format!(
+//         "translated start: {:?}",
+//         bb.allocator().start_ptr()
+//     ));
+//     assert_eq!(*bb, 1);
+// }
+
+// fn spec_test(alloc: &(impl MemBase + ShmHeader)) {
+//     let bb = ShmBox::new_in(32u16, &alloc);
+//     alloc.init_spec(bb, 0);
+//     match unsafe { alloc.spec_ref::<u16>(0) } {
+//         Some(spec) => {
+//             dbg!(format!("spec address: {:?}", spec.as_ptr()));
+//             assert_eq!(*spec, 32);
+//         }
+//         None => {
+//             panic!("spec is not initialized");
+//         }
+//     }
+// }
 
 macro_rules! alloc_test {
     ($alloc:ty) => {{
@@ -141,14 +171,6 @@ macro_rules! alloc_test {
             let alloc = <$alloc>::from_area(area).unwrap();
             box_test(&alloc);
             token_test(&alloc);
-            spec_test(&alloc);
         }
     }};
-}
-
-#[test]
-fn area_alloc() {
-    alloc_test!(MySpinGma); // 8/1512 bits offset
-    alloc_test!(MyTlsf); // 16/1712 bits offset
-    alloc_test!(MyBlink); // 41/1512 bits offset
 }

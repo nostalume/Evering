@@ -10,8 +10,6 @@ pub use allocator_api2::alloc::{AllocError, handle_alloc_error};
 
 use alloc::sync::Arc;
 
-use crate::boxed::ShmBox;
-use crate::header::Header;
 use crate::seal::Sealed;
 
 pub mod blink;
@@ -155,7 +153,7 @@ unsafe impl<A: IAllocator> IAllocator for Arc<A> {
     }
 }
 
-pub unsafe trait ShmAllocator: IAllocator {
+pub unsafe trait MemBase {
     /// Returns the start pointer of the main memory of the allocator.
     fn start_ptr(&self) -> *const u8;
 
@@ -228,71 +226,15 @@ pub unsafe trait ShmAllocator: IAllocator {
     }
 }
 
-unsafe impl<A: ShmAllocator> ShmAllocator for &A {
+unsafe impl<A: MemBase> MemBase for &A {
     #[inline]
     fn start_ptr(&self) -> *const u8 {
         (**self).start_ptr()
     }
 }
 
-unsafe impl<A: ShmAllocator> ShmAllocator for Arc<A> {
+unsafe impl<A: MemBase> MemBase for Arc<A> {
     fn start_ptr(&self) -> *const u8 {
         (**self).start_ptr()
-    }
-}
-
-pub unsafe trait ShmHeader {
-    fn header(&self) -> &Header;
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>>;
-    unsafe fn spec<T>(&self, idx: usize) -> Option<ShmBox<T, Self>>
-    where
-        Self: ShmAllocator + Sized + Clone,
-    {
-        self.spec_raw(idx)
-            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self.clone()) })
-    }
-    unsafe fn spec_ref<T>(&self, idx: usize) -> Option<ShmBox<T, &Self>>
-    where
-        Self: ShmAllocator + Sized,
-    {
-        self.spec_raw(idx)
-            .map(|ptr| unsafe { ShmBox::from_raw_in(ptr.as_ptr(), self) })
-    }
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize);
-    fn init_spec<T, A: ShmAllocator>(&self, spec: ShmBox<T, A>, idx: usize)
-    where
-        Self: ShmAllocator + Sized,
-    {
-        // manually drop to elide deallocation.
-        let spec = ManuallyDrop::new(spec);
-        unsafe { self.init_spec_raw(spec.as_ref(), idx) }
-    }
-}
-
-unsafe impl<A: ShmHeader> ShmHeader for &A {
-    fn header(&self) -> &Header {
-        (**self).header()
-    }
-
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
-        (**self).spec_raw(idx)
-    }
-
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) {
-        unsafe { (**self).init_spec_raw(spec, idx) }
-    }
-}
-
-unsafe impl<A: ShmHeader> ShmHeader for Arc<A> {
-    fn header(&self) -> &Header {
-        (**self).header()
-    }
-
-    fn spec_raw<T>(&self, idx: usize) -> Option<NonNull<T>> {
-        (**self).spec_raw(idx)
-    }
-
-    unsafe fn init_spec_raw<T>(&self, spec: &T, idx: usize) {
-        unsafe { (**self).init_spec_raw(spec, idx) }
     }
 }

@@ -8,7 +8,7 @@ use std::sync::Arc;
 use evering::driver::unlocked::PoolDriver;
 use evering::uring::{IReceiver, ISender, UringSpec};
 use evering_shm::os::FdBackend;
-use evering_shm::os::unix::{MFdFlags, ProtFlags, UnixFdConf, UnixShm};
+use evering_shm::os::unix::{MFdFlags, ProtFlags, UnixFdConf, UnixAddrSpec};
 use evering_shm::alloc::tlsf::SpinTlsf;
 use evering_shm::boxed::{ShmBox, ShmSized, ShmSlice, ShmToken};
 use tokio::task::yield_now;
@@ -31,7 +31,7 @@ type MyPoolDriver<I> = PoolDriver<Bsl<I>>;
 struct MyIpcSpec<F>(PhantomData<F>);
 impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
     type A = SpinTlsf;
-    type S = UnixShm;
+    type S = UnixAddrSpec;
     type M = FdBackend<F>;
 }
 
