@@ -7,6 +7,8 @@
 extern crate alloc;
 
 mod area;
+mod arena;
+mod header;
 pub mod boxed;
 mod malloc;
 pub mod os;

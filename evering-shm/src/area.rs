@@ -1,14 +1,14 @@
-use core::{fmt::Debug, ops::Deref, ptr::NonNull, sync::atomic::AtomicU32};
+use core::{ops::Deref, sync::atomic::AtomicU32};
 use memory_addr::{AddrRange, MemoryAddr};
 
-use spin::RwLock;
+use crate::header::HeaderStatus;
 
 pub trait AddrSpec {
     type Addr: MemoryAddr;
     type Flags: Copy;
 }
 
-pub trait Mmap<S: AddrSpec>: Sized {
+pub(crate) trait Mmap<S: AddrSpec>: Sized {
     type Config;
     type Error: core::fmt::Debug;
 
@@ -22,7 +22,7 @@ pub trait Mmap<S: AddrSpec>: Sized {
     fn unmap(area: &mut RawMemBlk<S, Self>) -> Result<(), Self::Error>;
 }
 
-pub trait Mprotect<S: AddrSpec>: Mmap<S> {
+pub(crate) trait Mprotect<S: AddrSpec>: Mmap<S> {
     fn protect(area: &mut RawMemBlk<S, Self>, new_flags: S::Flags) -> Result<(), Self::Error>;
 }
 
@@ -257,28 +257,16 @@ impl<S: AddrSpec> MemBlkSpec<S> {
 #[repr(C)]
 pub struct Metadata {
     magic: u16,
-    status: MapStatus,
     // own counts
     rc: AtomicU32,
 }
 
-#[repr(transparent)]
-pub struct Header(RwLock<Metadata>);
-
-#[repr(u8)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MapStatus {
-    Uninitialized = 0,
-    Initializing = 1,
-    Initialized = 2,
-    Corrupted = 3, // optional
-}
+type Header = crate::header::Header<Metadata>;
 
 impl alloc::fmt::Debug for Metadata {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Metadata of Header")
             .field("magic", &self.magic)
-            .field("status", &self.status)
             .field("reference count", &self.rc)
             .finish()
     }
@@ -290,36 +278,37 @@ impl core::fmt::Display for Metadata {
     }
 }
 
-impl Metadata {
-    // TODO
-    pub const MAGIC_VALUE: u16 = 0x7203;
-
+impl crate::header::Layout for Metadata {
     #[inline]
-    pub fn attempt_init(&mut self) {
+    fn init(&mut self) -> HeaderStatus {
+        use crate::header::Metadata;
         self.with_magic();
-        self.with_status(MapStatus::Initializing);
         self.rc.store(1, core::sync::atomic::Ordering::Relaxed);
+        HeaderStatus::Initialized
     }
 
     #[inline]
-    pub const fn with_magic(&mut self) {
-        self.magic = Self::MAGIC_VALUE;
+    fn attach(&self) -> HeaderStatus {
+        self.inc_rc();
+        HeaderStatus::Initialized
     }
+}
 
+impl crate::header::Metadata for Metadata {
     #[inline]
-    pub const fn valid_magic(&self) -> bool {
+    fn valid_magic(&self) -> bool {
         self.magic == Self::MAGIC_VALUE
     }
 
     #[inline]
-    pub const fn status(&self) -> MapStatus {
-        self.status
+    fn with_magic(&mut self) {
+        self.magic = Self::MAGIC_VALUE
     }
+}
 
-    #[inline]
-    pub const fn with_status(&mut self, status: MapStatus) {
-        self.status = status;
-    }
+impl Metadata {
+    // TODO
+    pub const MAGIC_VALUE: u16 = 0x7203;
 
     #[inline]
     pub fn inc_rc(&self) -> u32 {
@@ -340,85 +329,10 @@ impl Metadata {
     }
 }
 
-impl alloc::fmt::Debug for Header {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let h = self.read();
-        f.debug_struct("Metadata of Header")
-            .field("magic", &h.magic)
-            .field("status", &h.status)
-            .field("reference count", &h.rc)
-            .finish()
-    }
-}
-
-impl core::fmt::Display for Header {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        alloc::fmt::Debug::fmt(self, f)
-    }
-}
-
-impl Header {
-    const TRYTIMES: u8 = 50;
-
-    pub fn init_with<E, F: FnOnce() -> Result<(), E>>(&self, f: F) -> Result<(), E> {
-        let mut inner = self.0.write();
-        if inner.valid_magic() {
-            inner.inc_rc();
-            Ok(())
-        } else {
-            inner.attempt_init();
-            let res = f();
-            if res.is_ok() {
-                inner.with_status(MapStatus::Initialized);
-            } else {
-                inner.with_status(MapStatus::Corrupted);
-            }
-            res
-        }
-    }
-
-    pub fn claim(&self) -> MapStatus {
-        let header_read = self.0.read();
-        if header_read.valid_magic() {
-            match header_read.status() {
-                MapStatus::Initialized => {
-                    header_read.inc_rc();
-                    return MapStatus::Initialized;
-                }
-                MapStatus::Initializing => {
-                    drop(header_read);
-                    for _ in 0..Self::TRYTIMES {
-                        let header_try = self.read();
-                        match header_try.status() {
-                            MapStatus::Initialized => {
-                                header_try.inc_rc();
-                                return MapStatus::Initialized;
-                            }
-                            _ => core::hint::spin_loop(),
-                        }
-                    }
-                    return MapStatus::Initializing;
-                }
-                _ => return MapStatus::Corrupted,
-            }
-        } else {
-            return MapStatus::Uninitialized;
-        }
-    }
-}
-
-impl Deref for Header {
-    type Target = RwLock<Metadata>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 pub enum MmapError<S: AddrSpec, M: Mmap<S>> {
     UnenoughSpace,
-    InvalidHeader,
     Contention,
+    InvalidHeader,
     MapError(M::Error),
 }
 
@@ -428,8 +342,8 @@ impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for MmapError<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnenoughSpace => write!(f, "Not enough space available"),
-            Self::InvalidHeader => write!(f, "Invalid header detected"),
-            Self::Contention => write!(f, "Attempt failed due to Contention"),
+            Self::Contention => write!(f, "Contention"),
+            Self::InvalidHeader => write!(f, "Header initialization failed"),
             Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
         }
     }
@@ -454,6 +368,21 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
     pub(crate) fn from_raw(start: S::Addr, size: usize, flags: S::Flags, bk: M) -> Self {
         let a = MemBlkSpec::new(start, size, flags);
         Self { a, bk }
+    }
+
+    pub(crate) unsafe fn init_header<T>(&self, offset: usize) -> Result<usize, MmapError<S, M>> {
+        use crate::header::Layout;
+        unsafe {
+            let (header, hoffset) = self
+                .obtain_by_offset::<Header>(offset)
+                .ok_or(MmapError::UnenoughSpace)?;
+            let header_ref = Layout::from_raw(header);
+            match header_ref.attach_or_init() {
+                HeaderStatus::Initialized => Ok(hoffset),
+                HeaderStatus::Initializing => return Err(MmapError::Contention),
+                _ => return Err(MmapError::InvalidHeader),
+            }
+        }
     }
 }
 
@@ -482,19 +411,26 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for RawMemBlk<S, M> {
     }
 }
 
-pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
+use crate::header::Layout;
+
+pub struct MemBlk<S: AddrSpec, M: Mmap<S>, L: Layout> {
     a: MemBlkSpec<S>,
     bk: M,
+    marker: core::marker::PhantomData<L>,
 }
 
-impl<S: AddrSpec, M: Mmap<S>> Into<MemBlk<S, M>> for RawMemBlk<S, M> {
-    fn into(self) -> MemBlk<S, M> {
+impl<S: AddrSpec, M: Mmap<S>, L: Layout> Into<MemBlk<S, M, L>> for RawMemBlk<S, M> {
+    fn into(self) -> MemBlk<S, M, L> {
         let Self { a, bk } = self;
-        MemBlk { a, bk }
+        MemBlk {
+            a,
+            bk,
+            marker: core::marker::PhantomData,
+        }
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlk<S, M>
+impl<S: AddrSpec, M: Mmap<S>, L: Layout> Clone for MemBlk<S, M, L>
 where
     M: Clone,
 {
@@ -502,13 +438,14 @@ where
         Self {
             a: self.a.clone(),
             bk: self.bk.clone(),
+            marker: self.marker,
         }
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
+impl<S: AddrSpec, M: Mmap<S>, L: Layout> Drop for MemBlk<S, M, L> {
     fn drop(&mut self) {
-        let rc = self.header().write().dec_rc();
+        let rc = self.header().write().inner.dec_rc();
 
         rc.map(|s| {
             if s == 1 {
@@ -521,7 +458,7 @@ impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     }
 }
 
-unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for MemBlk<S, M> {
+unsafe impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlkOps for MemBlk<S, M, L> {
     fn start_ptr(&self) -> *const u8 {
         self.a.start().into() as *const u8
     }
@@ -535,38 +472,27 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for MemBlk<S, M> {
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
-    // After init_map!
+impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlk<S, M, L> {
     pub fn header(&self) -> &Header {
         unsafe {
             let ptr = self.a.start().into() as *const Header;
             &*ptr
         }
     }
-    pub fn init_map<F: FnOnce() -> Result<(), MmapError<S, M>>>(
+
+    pub fn init(
         bk: M,
         start: Option<S::Addr>,
         size: usize,
         flags: S::Flags,
         cfg: M::Config,
-        f: F,
     ) -> Result<Self, MmapError<S, M>> {
         let area = bk
             .map(start, size, flags, cfg)
             .map_err(MmapError::MapError)?;
         unsafe {
-            let (header, _) = area
-                .obtain_by_offset::<Header>(0)
-                .ok_or(MmapError::UnenoughSpace)?;
-            let header_ref = &mut *header;
-
-            match header_ref.claim() {
-                MapStatus::Initialized => {}
-                MapStatus::Corrupted | MapStatus::Uninitialized => {
-                    header_ref.init_with(f)?;
-                }
-                MapStatus::Initializing => return Err(MmapError::Contention),
-            }
+            area.init_header::<Header>(0)?;
+            area.init_header::<L>(0)?;
         }
 
         Ok(area.into())

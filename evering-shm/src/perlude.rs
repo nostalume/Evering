@@ -4,7 +4,7 @@ use core::ptr::{self, NonNull};
 use memory_addr::MemoryAddr;
 
 use crate::area::RawMemBlk;
-pub use crate::area::{Mmap, Mprotect, AddrSpec};
+pub use crate::area::AddrSpec;
 pub use crate::malloc::{AllocError, IAllocator, MemBase, ShmInit};
 use crate::malloc::{blink, gma, tlsf};
 use crate::seal::Sealed;

@@ -10,7 +10,7 @@ const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
-type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>>;
+type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>, ()>;
 
 struct MockAddr;
 
@@ -105,7 +105,7 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
 
 fn mock_area(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockMemBlk<'_> {
     let bk = MockBackend(pt);
-    let a = MemBlk::init_map(bk, start, size, 0, (), || Ok(())).unwrap();
+    let a = MemBlk::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
