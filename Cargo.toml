@@ -16,12 +16,16 @@ edition = "2024"
 
 [workspace.dependencies]
 tokio = { version = "1.47.1", features = ["full"] }
-fastrand = "2.3.0"
-lock_api = "0.4.13"
+
+crossbeam-utils = { version = "0.8", default-features = false }
+lock_api = "0.4.14"
 spin = { version = "0.10.0", features = ["lock_api"] }
-nix = "0.30.1"
+fastrand = "2.3.0"
+
 bytes = "1.10.1"
-bytesize = "2.0.1"
+bytesize = "2.1.0"
+
+nix = "0.30.1"
 
 evering = { path = "evering" }
 evering-shm = { path = "evering-shm" }

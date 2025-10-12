@@ -59,9 +59,9 @@ pub unsafe trait MemBlkOps {
     /// ## Safety
     /// - `ptr` must be allocated in the memory.
     #[inline]
-    unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> isize {
-        // Safety: `ptr` must has address greater than `self.raw_ptr()`.
-        unsafe { ptr.byte_offset_from(self.start_ptr()) }
+    unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> usize {
+        // Safety: `ptr` must has address greater than `self.start_ptr()`.
+        unsafe { ptr.byte_offset_from_unsigned(self.start_ptr()) }
     }
 
     /// Returns a pointer to the memory at the given offset.

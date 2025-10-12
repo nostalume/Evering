@@ -12,7 +12,6 @@ use core::ptr::NonNull;
 
 use crate::malloc::{AllocError, handle_alloc_error};
 
-use crate::malloc::MemBase;
 use crate::seal::Sealed;
 
 // #[repr(C)]
