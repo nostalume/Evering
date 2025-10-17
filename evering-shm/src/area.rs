@@ -1,10 +1,9 @@
 use core::{ops::Deref, sync::atomic::AtomicU32};
-use memory_addr::{AddrRange, MemoryAddr};
 
 use crate::header::HeaderStatus;
 
 pub trait AddrSpec {
-    type Addr: MemoryAddr;
+    type Addr: memory_addr::MemoryAddr;
     type Flags: Copy;
 }
 
@@ -26,9 +25,100 @@ pub(crate) trait Mprotect<S: AddrSpec>: Mmap<S> {
     fn protect(area: &mut RawMemBlk<S, Self>, new_flags: S::Flags) -> Result<(), Self::Error>;
 }
 
+macro_rules! addr_span {
+    ($ty:ty) => {
+        impl AddrSpan<$ty> {
+            #[inline]
+            pub const fn null() -> Self {
+                Self {
+                    start_offset: 0,
+                    size: 0,
+                }
+            }
+
+            #[inline]
+            pub const fn end_offset(&self) -> $ty {
+                self.start_offset + self.size
+            }
+
+            #[inline]
+            pub const fn align_of<T>(&self) -> Self {
+                use crate::numeric::Alignable;
+                Self {
+                    start_offset: self.start_offset.align_up_of::<T>(),
+                    size: <$ty>::size_of::<T>(),
+                }
+            }
+
+            #[inline]
+            pub const fn align_to(&self, align: $ty) -> Self {
+                use crate::numeric::Alignable;
+                let aligned_offset = self.start_offset.align_up(align);
+                let new_size = self.end_offset() - aligned_offset;
+
+                Self {
+                    start_offset: aligned_offset,
+                    size: new_size,
+                }
+            }
+
+            #[inline]
+            pub const fn align_to_of<T>(&self) -> Self {
+                use crate::numeric::Alignable;
+                let aligned_offset = self.start_offset.align_up_of::<T>();
+                let new_size = self.end_offset() - aligned_offset;
+
+                Self {
+                    start_offset: aligned_offset,
+                    size: new_size,
+                }
+            }
+
+            #[inline]
+            const fn shift(&self, delta: $ty) -> Self {
+                Self {
+                    start_offset: self.start_offset.saturating_add(delta),
+                    size: self.size,
+                }
+            }
+
+            #[inline]
+            const unsafe fn as_ptr(&self, base_ptr: *const u8) -> *const u8 {
+                use crate::numeric::CastInto;
+                unsafe { base_ptr.add(self.start_offset.cast_into()) }
+            }
+
+            #[inline]
+            const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
+                use crate::numeric::CastInto;
+                unsafe { base_ptr.add(self.start_offset.cast_into()) }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddrSpan<T> {
+    pub start_offset: T,
+    pub size: T,
+}
+
+impl<T> AddrSpan<T> {
+    #[inline]
+    pub const fn new(offset: T, size: T) -> Self {
+        Self {
+            start_offset: offset,
+            size,
+        }
+    }
+}
+
+addr_span!(u32);
+addr_span!(usize);
+
 pub unsafe trait MemBlkOps {
     #[inline]
-    fn start<Addr: MemoryAddr>(&self) -> Addr {
+    fn start<Addr: memory_addr::MemoryAddr>(&self) -> Addr {
         self.start_ptr().addr().into()
     }
 
@@ -36,7 +126,7 @@ pub unsafe trait MemBlkOps {
     fn start_ptr(&self) -> *const u8;
 
     #[inline]
-    fn end<Addr: MemoryAddr>(&self) -> Addr {
+    fn end<Addr: memory_addr::MemoryAddr>(&self) -> Addr {
         self.end_ptr().addr().into()
     }
 
@@ -67,13 +157,13 @@ pub unsafe trait MemBlkOps {
     /// Returns a pointer to the memory at the given offset.
     #[inline]
     fn get_ptr(&self, offset: usize) -> *const u8 {
-        unsafe { self.start_ptr().add(offset as usize) }
+        unsafe { self.start_ptr().add(offset) }
     }
 
     /// Returns a pointer to the memory at the given offset.
     #[inline]
-    fn get_ptr_mut(&self, offset: usize) -> *mut u8 {
-        unsafe { self.start_mut_ptr().add(offset as usize) }
+    fn get_mut_ptr(&self, offset: usize) -> *mut u8 {
+        unsafe { self.start_mut_ptr().add(offset) }
     }
 
     /// Given a offset related to start, acquire the `Sized` instance.
@@ -90,18 +180,19 @@ pub unsafe trait MemBlkOps {
     /// - `*mut T`: the pointer to the instance.
     /// - `next_offset`: `offset + size_of<T>()`
     #[inline]
-    unsafe fn obtain_by_offset<T>(&self, offset: usize) -> Option<(*mut T, usize)> {
+    unsafe fn obtain_by_offset<T>(&self, offset: usize) -> Result<(*mut T, usize), usize> {
+        use memory_addr::MemoryAddr;
         let t_size = core::mem::size_of::<T>();
         let t_align = core::mem::align_of::<T>();
 
         unsafe {
             let t_start = self.start_ptr().add(offset);
-            let new_offset = offset.add(t_size).align_up(t_align);
+            let new_offset = MemoryAddr::align_up(offset.add(t_size), t_align);
             if new_offset > self.size() {
-                return None;
+                return Err(new_offset);
             }
             let ptr = t_start.cast::<T>().cast_mut();
-            Some((ptr, new_offset))
+            Ok((ptr, new_offset))
         }
     }
 
@@ -119,12 +210,15 @@ pub unsafe trait MemBlkOps {
     /// - `*mut T`: the pointer to the instance.
     /// - `next_offset`: `offset + size_of<T>()`
     #[inline]
-    unsafe fn obtain_by_addr<T, Addr: MemoryAddr>(&self, start: Addr) -> Option<(*mut T, usize)> {
+    unsafe fn obtain_by_addr<T, Addr: memory_addr::MemoryAddr>(
+        &self,
+        start: Addr,
+    ) -> Result<(*mut T, usize), Option<usize>> {
         if start < self.start() {
-            return None;
+            return Err(None);
         }
         let offset = start.sub_addr(self.start());
-        unsafe { self.obtain_by_offset(offset) }
+        unsafe { self.obtain_by_offset(offset).map_err(Option::Some) }
     }
 
     /// Given a offset related to start, acquire the slice instance.
@@ -145,19 +239,23 @@ pub unsafe trait MemBlkOps {
         &self,
         offset: usize,
         len: usize,
-    ) -> Option<(*mut [T], usize)> {
-        let t_size = core::mem::size_of::<T>();
-        let t_align = core::mem::align_of::<T>();
+    ) -> Result<(*mut [T], usize), Option<usize>> {
+        use alloc::alloc::Layout;
+        use memory_addr::MemoryAddr;
+
+        let layout = Layout::array::<T>(len).map_err(|_| Option::None)?;
+        let arr_size = layout.size();
+        let arr_align = layout.align();
 
         unsafe {
             let t_start = self.start_ptr().add(offset);
-            let new_offset = offset.add(t_size).align_up(t_align);
+            let new_offset = offset.add(arr_size).align_up(arr_align);
             if new_offset > self.size() {
-                return None;
+                return Err(Some(new_offset));
             }
             let ptr = t_start.cast::<T>().cast_mut();
             let ptr = core::slice::from_raw_parts_mut(ptr, len);
-            Some((ptr, new_offset))
+            Ok((ptr, new_offset))
         }
     }
 
@@ -175,13 +273,13 @@ pub unsafe trait MemBlkOps {
     /// - `*mut [T]`: the pointer to the slice.
     /// - `next_offset`: `offset + size_of<T>() * len`
     #[inline]
-    unsafe fn obtain_slice_by_addr<T, Addr: MemoryAddr>(
+    unsafe fn obtain_slice_by_addr<T, Addr: memory_addr::MemoryAddr>(
         &self,
         start: Addr,
         len: usize,
-    ) -> Option<(*mut [T], usize)> {
+    ) -> Result<(*mut [T], usize), Option<usize>> {
         if start < self.start() {
-            return None;
+            return Err(None);
         }
         let offset = start.sub_addr(self.start());
         unsafe { self.obtain_slice_by_offset(offset, len) }
@@ -189,14 +287,14 @@ pub unsafe trait MemBlkOps {
 }
 
 pub struct MemBlkSpec<S: AddrSpec> {
-    va_range: AddrRange<S::Addr>,
+    range: memory_addr::AddrRange<S::Addr>,
     flags: S::Flags,
 }
 
 impl<S: AddrSpec> Clone for MemBlkSpec<S> {
     fn clone(&self) -> Self {
         Self {
-            va_range: self.va_range.clone(),
+            range: self.range.clone(),
             flags: self.flags.clone(),
         }
     }
@@ -210,8 +308,11 @@ impl<S: AddrSpec> AddrSpec for MemBlkSpec<S> {
 impl<S: AddrSpec> MemBlkSpec<S> {
     /// Create a memory area spec.
     pub(crate) fn new(start: S::Addr, size: usize, flags: S::Flags) -> Self {
-        let va_range = AddrRange::from_start_size(start, size);
-        Self { va_range, flags }
+        let va_range = memory_addr::AddrRange::from_start_size(start, size);
+        Self {
+            range: va_range,
+            flags,
+        }
     }
 
     // #[inline]
@@ -225,8 +326,8 @@ impl<S: AddrSpec> MemBlkSpec<S> {
 impl<S: AddrSpec> MemBlkSpec<S> {
     /// Returns the virtual address range.
     #[inline]
-    pub const fn va_range(&self) -> AddrRange<S::Addr> {
-        self.va_range
+    pub const fn va_range(&self) -> memory_addr::AddrRange<S::Addr> {
+        self.range
     }
 
     /// Returns the memory flags, e.g., the permission bits.
@@ -238,19 +339,19 @@ impl<S: AddrSpec> MemBlkSpec<S> {
     /// Returns the start address of the memory area.
     #[inline]
     pub const fn start(&self) -> S::Addr {
-        self.va_range.start
+        self.range.start
     }
 
     /// Returns the end address of the memory area.
     #[inline]
     pub const fn end(&self) -> S::Addr {
-        self.va_range.end
+        self.range.end
     }
 
     /// Returns the size of the memory area.
     #[inline]
     pub fn size(&self) -> usize {
-        self.va_range.size()
+        self.range.size()
     }
 }
 
@@ -261,7 +362,7 @@ pub struct Metadata {
     rc: AtomicU32,
 }
 
-type Header = crate::header::Header<Metadata>;
+pub type Header = crate::header::Header<Metadata>;
 
 impl alloc::fmt::Debug for Metadata {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -279,8 +380,9 @@ impl core::fmt::Display for Metadata {
 }
 
 impl crate::header::Layout for Metadata {
+    type Config = ();
     #[inline]
-    fn init(&mut self) -> HeaderStatus {
+    fn init(&mut self, _cfg: ()) -> HeaderStatus {
         use crate::header::Metadata;
         self.with_magic();
         self.rc.store(1, core::sync::atomic::Ordering::Relaxed);
@@ -289,8 +391,13 @@ impl crate::header::Layout for Metadata {
 
     #[inline]
     fn attach(&self) -> HeaderStatus {
-        self.inc_rc();
-        HeaderStatus::Initialized
+        use crate::header::Metadata;
+        if self.valid_magic() {
+            self.inc_rc();
+            HeaderStatus::Initialized
+        } else {
+            HeaderStatus::Uninitialized
+        }
     }
 }
 
@@ -329,19 +436,32 @@ impl Metadata {
     }
 }
 
-pub enum MmapError<S: AddrSpec, M: Mmap<S>> {
-    UnenoughSpace,
+pub enum Error<S: AddrSpec, M: Mmap<S>> {
+    OutofSize { requested: usize, bound: usize },
+    UnenoughSpace { requested: usize, allocated: usize },
     Contention,
     InvalidHeader,
     MapError(M::Error),
 }
 
-impl<S: AddrSpec, M: Mmap<S>> core::error::Error for MmapError<S, M> {}
+impl<S: AddrSpec, M: Mmap<S>> core::error::Error for Error<S, M> {}
 
-impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for MmapError<S, M> {
+impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for Error<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::UnenoughSpace => write!(f, "Not enough space available"),
+            Self::UnenoughSpace {
+                requested,
+                allocated,
+            } => write!(
+                f,
+                "Not enough space available, requested {}, allocated {}",
+                requested, allocated
+            ),
+            Self::OutofSize { requested, bound } => write!(
+                f,
+                "Out of upper bounded size, requested {}, upper bound {}",
+                requested, bound
+            ),
             Self::Contention => write!(f, "Contention"),
             Self::InvalidHeader => write!(f, "Header initialization failed"),
             Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
@@ -349,7 +469,7 @@ impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for MmapError<S, M> {
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for MmapError<S, M> {
+impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         alloc::fmt::Debug::fmt(self, f)
     }
@@ -370,17 +490,24 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
         Self { a, bk }
     }
 
-    pub(crate) unsafe fn init_header<T>(&self, offset: usize) -> Result<usize, MmapError<S, M>> {
+    pub(crate) unsafe fn init_header<T: Layout>(
+        &self,
+        offset: usize,
+        cfg: T::Config,
+    ) -> Result<usize, Error<S, M>> {
         use crate::header::Layout;
         unsafe {
-            let (header, hoffset) = self
-                .obtain_by_offset::<Header>(offset)
-                .ok_or(MmapError::UnenoughSpace)?;
+            let (header, hoffset) = self.obtain_by_offset::<T>(offset).map_err(|new_offset| {
+                Error::UnenoughSpace {
+                    requested: new_offset,
+                    allocated: self.size(),
+                }
+            })?;
             let header_ref = Layout::from_raw(header);
-            match header_ref.attach_or_init() {
+            match header_ref.attach_or_init(cfg) {
                 HeaderStatus::Initialized => Ok(hoffset),
-                HeaderStatus::Initializing => return Err(MmapError::Contention),
-                _ => return Err(MmapError::InvalidHeader),
+                HeaderStatus::Initializing => return Err(Error::Contention),
+                _ => return Err(Error::InvalidHeader),
             }
         }
     }
@@ -412,25 +539,19 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for RawMemBlk<S, M> {
 }
 
 use crate::header::Layout;
-
-pub struct MemBlk<S: AddrSpec, M: Mmap<S>, L: Layout> {
+pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
     a: MemBlkSpec<S>,
     bk: M,
-    marker: core::marker::PhantomData<L>,
 }
 
-impl<S: AddrSpec, M: Mmap<S>, L: Layout> Into<MemBlk<S, M, L>> for RawMemBlk<S, M> {
-    fn into(self) -> MemBlk<S, M, L> {
+impl<S: AddrSpec, M: Mmap<S>> Into<MemBlk<S, M>> for RawMemBlk<S, M> {
+    fn into(self) -> MemBlk<S, M> {
         let Self { a, bk } = self;
-        MemBlk {
-            a,
-            bk,
-            marker: core::marker::PhantomData,
-        }
+        MemBlk { a, bk }
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>, L: Layout> Clone for MemBlk<S, M, L>
+impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlk<S, M>
 where
     M: Clone,
 {
@@ -438,12 +559,11 @@ where
         Self {
             a: self.a.clone(),
             bk: self.bk.clone(),
-            marker: self.marker,
         }
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>, L: Layout> Drop for MemBlk<S, M, L> {
+impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
         let rc = self.header().write().inner.dec_rc();
 
@@ -458,7 +578,7 @@ impl<S: AddrSpec, M: Mmap<S>, L: Layout> Drop for MemBlk<S, M, L> {
     }
 }
 
-unsafe impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlkOps for MemBlk<S, M, L> {
+unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for MemBlk<S, M> {
     fn start_ptr(&self) -> *const u8 {
         self.a.start().into() as *const u8
     }
@@ -472,10 +592,10 @@ unsafe impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlkOps for MemBlk<S, M, L> {
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlk<S, M, L> {
+impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
     pub fn header(&self) -> &Header {
         unsafe {
-            let ptr = self.a.start().into() as *const Header;
+            let ptr = self.start_ptr() as *const Header;
             &*ptr
         }
     }
@@ -485,14 +605,13 @@ impl<S: AddrSpec, M: Mmap<S>, L: Layout> MemBlk<S, M, L> {
         start: Option<S::Addr>,
         size: usize,
         flags: S::Flags,
-        cfg: M::Config,
-    ) -> Result<Self, MmapError<S, M>> {
+        mcfg: M::Config,
+    ) -> Result<Self, Error<S, M>> {
         let area = bk
-            .map(start, size, flags, cfg)
-            .map_err(MmapError::MapError)?;
+            .map(start, size, flags, mcfg)
+            .map_err(Error::MapError)?;
         unsafe {
-            area.init_header::<Header>(0)?;
-            area.init_header::<L>(0)?;
+            area.init_header::<Header>(0, ())?;
         }
 
         Ok(area.into())

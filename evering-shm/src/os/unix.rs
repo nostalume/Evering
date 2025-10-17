@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    area::{AddrSpec, MemBlkSpec, Mmap, Mprotect, RawMemBlk},
+    area::{AddrSpec, Mmap, Mprotect, RawMemBlk},
     os::FdBackend,
 };
 

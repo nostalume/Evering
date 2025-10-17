@@ -4,13 +4,18 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk};
+use super::super::{
+    area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk},
+    arena::{ArenaMemBlk, Optimistic},
+    malloc::MemAllocInfo,
+};
 
 const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
-type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>, ()>;
+type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>>;
+type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
 
 struct MockAddr;
 
@@ -109,68 +114,57 @@ fn mock_area(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> Mo
     a
 }
 
+fn mock_arena(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
+    let bk = MockBackend(pt);
+    let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
+    a
+}
+
 #[test]
 fn area_test() {
     const STEP: usize = 0x2000;
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
         let a = mock_area(&mut pt, Some(start.into()), STEP);
-        let header = a.header();
-        dbg!(format!("Header: {:?}", header));
     }
 }
-// type MySpinGma<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
-// type MyTlsf<'a> = ShmSpinTlsf<MockBackend<'a>, MockSpec>;
-// type MyBlink<'a> = ShmSpinGma<MockBackend<'a>, MockSpec>;
 
-// fn box_test(alloc: &impl MemBase) {
-//     let mut bb = ShmBox::new_in(1u8, alloc);
-//     dbg!(format!("box: {:?}", bb.as_ptr()));
-//     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
-//     assert_eq!(*bb, 1);
-//     bb.add_assign(2);
-//     assert_eq!(*bb, 3);
-// }
+#[test]
+fn arena_test() {
+    use std::sync::Barrier;
+    use std::thread;
+    
+    const BYTES_SIZE: u32 = 50;
+    const REDUCED_SIZE:u32 = 35;
 
-// fn token_test(alloc: &impl MemBase) {
-//     // 8 bits offset
-//     let bb = ShmBox::new_in(1u8, alloc);
-//     dbg!(format!("box: {:?}", bb.as_ptr()));
-//     dbg!(format!("start: {:?}", bb.allocator().start_ptr()));
-//     let token = ShmToken::from(bb);
-//     dbg!(format!("offset: {:?}", token.offset()));
-//     let bb = ShmBox::from(token);
-//     dbg!(format!("translated box: {:?}", bb.as_ptr()));
-//     dbg!(format!(
-//         "translated start: {:?}",
-//         bb.allocator().start_ptr()
-//     ));
-//     assert_eq!(*bb, 1);
-// }
+    let mut pt = [0u8; MAX_ADDR];
+    let mem = mock_arena(&mut pt, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
 
-// fn spec_test(alloc: &(impl MemBase + ShmHeader)) {
-//     let bb = ShmBox::new_in(32u16, &alloc);
-//     alloc.init_spec(bb, 0);
-//     match unsafe { alloc.spec_ref::<u16>(0) } {
-//         Some(spec) => {
-//             dbg!(format!("spec address: {:?}", spec.as_ptr()));
-//             assert_eq!(*spec, 32);
-//         }
-//         None => {
-//             panic!("spec is not initialized");
-//         }
-//     }
-// }
+    let bar = Barrier::new(5);
+    let mut metas = Vec::new();
 
-macro_rules! alloc_test {
-    ($alloc:ty) => {{
-        let mut pt = [0; MAX_ADDR];
-        for start in (0..MAX_ADDR).step_by(0x2000) {
-            let bk = MockBackend(&mut pt);
-            let area = bk.map(Some(start.into()), 0x2000, 0, ()).unwrap();
-            let alloc = <$alloc>::from_area(area).unwrap();
-            box_test(&alloc);
-            token_test(&alloc);
+    for _ in 1..=5 {
+        let bytes = a.alloc_bytes(BYTES_SIZE).unwrap().unwrap();
+        metas.push(bytes);
+    }
+
+    let remained = a.remained();
+    let _remained_bytes = a.alloc_bytes(remained as u32).unwrap();
+    metas.drain(..).for_each(|meta| {
+        a.dealloc(meta);
+    });
+
+    thread::scope(|s| {
+        for _ in (1..=5).rev() {
+            let a = &a;
+            let bar = &bar;
+
+            s.spawn(move || {
+                bar.wait();
+                let mut bytes = a.alloc_bytes(REDUCED_SIZE).unwrap().unwrap();
+                // do something with bytes...
+            });
         }
-    }};
+    });
 }

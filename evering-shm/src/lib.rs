@@ -3,7 +3,7 @@
 #![feature(const_trait_impl)]
 #![feature(const_convert)]
 #![feature(sized_type_properties, layout_for_ptr)]
-#![feature(const_index, slice_ptr_get)]
+#![feature(const_index, slice_ptr_get,const_try)]
 
 extern crate alloc;
 
@@ -17,6 +17,7 @@ mod header;
 mod malloc;
 pub mod os;
 pub mod perlude;
+mod queue;
 mod tests;
 
 mod seal {
@@ -61,6 +62,7 @@ mod numeric {
     mod target32 {
         cast!(from:usize, to:u64);
         cast!(from:usize, to:u32);
+        cast!(from:usize, to:usize);
         cast!(from:u32, to:usize);
         cast!(from:u32, to:u64);
     }
@@ -71,12 +73,12 @@ mod numeric {
     mod target64 {
         cast!(from:usize, to:u128);
         cast!(from:usize, to:u64);
+        cast!(from:usize, to:usize);
         cast!(from:u64, to:usize);
         cast!(from:u32, to:usize);
         cast!(from:u32, to:u64);
     }
-    #[cfg(target_pointer_width = "64")]
-    pub use target64::*;
+    
 
     #[const_trait]
     pub trait Alignable {

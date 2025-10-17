@@ -1,18 +1,5 @@
-use core::alloc::Layout;
-use core::fmt::Debug;
-use core::marker::PhantomData;
-use core::mem;
-use core::mem::MaybeUninit;
-use core::mem::SizedTypeProperties;
-use core::ops::Deref;
-use core::ops::DerefMut;
-use core::pin::Pin;
-use core::ptr;
-use core::ptr::NonNull;
 
-use crate::malloc::{AllocError, handle_alloc_error};
 
-use crate::seal::Sealed;
 
 // #[repr(C)]
 // pub struct ShmBox<T: ?Sized, A: MemBase>(NonNull<T>, A);

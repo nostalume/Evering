@@ -1,45 +1,28 @@
 use core::alloc::Layout;
-use core::mem::ManuallyDrop;
-use core::ops::Deref;
+use core::mem::{self};
 use core::{ptr, ptr::NonNull};
 
 #[cfg(feature = "nightly")]
-pub use alloc::alloc::{AllocError, handle_alloc_error};
+pub use alloc::alloc::AllocError;
 #[cfg(not(feature = "nightly"))]
 pub use allocator_api2::alloc::{AllocError, handle_alloc_error};
 
-use alloc::sync::Arc;
+use memory_addr::MemoryAddr;
 
+use crate::area::MemBlkOps;
 use crate::seal::Sealed;
 
-pub mod blink;
-pub mod gma;
-pub mod tlsf;
-
-pub unsafe trait ShmInit: IAllocator + Sized {
-    const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
-    const USIZE_SIZE: usize = core::mem::size_of::<usize>();
-    const ALLOCATOR_SIZE: usize = core::mem::size_of::<Self>();
-
-    const MIN_ALIGNMENT: usize = if Self::USIZE_ALIGNMENT < 8 {
-        8
-    } else {
-        Self::USIZE_ALIGNMENT
-    };
-
-    /// Initializes the allocator by addr and size.
-    ///
-    /// ## Safety
-    /// user must ensure that the provided memory are valid and ready for allocation.
-    unsafe fn init_addr(start: usize, size: usize) -> Self;
-
-    /// Initializes the allocator by a block of memory.
-    #[inline]
-    fn init_ptr(blk: NonNull<[u8]>) -> Self
-    where
-        Self: Sized,
-    {
-        unsafe { Self::init_addr(blk.as_ptr().addr(), blk.len()) }
+pub trait MemAllocInfo: MemBlkOps {
+    type Header;
+    fn header(&self) -> &Self::Header;
+    fn allocated(&self) -> usize;
+    fn remained(&self) -> usize;
+    fn discarded(&self) -> usize;
+    unsafe fn alloc_ptr(&self) -> *const u8 {
+        self.get_ptr(mem::size_of::<Self::Header>().align_up(mem::align_of::<Self::Header>()))
+    }
+    unsafe fn alloc_mut_ptr(&self) -> *mut u8 {
+        self.get_mut_ptr(mem::size_of::<Self::Header>().align_up(mem::align_of::<Self::Header>()))
     }
 }
 
@@ -141,14 +124,29 @@ unsafe impl<A: IAllocator> IAllocator for &A {
     }
 }
 
-impl<A: IAllocator> Sealed for Arc<A> {}
+// pub unsafe trait ShmInit: IAllocator + Sized {
+//     const USIZE_ALIGNMENT: usize = core::mem::align_of::<usize>();
+//     const USIZE_SIZE: usize = core::mem::size_of::<usize>();
+//     const ALLOCATOR_SIZE: usize = core::mem::size_of::<Self>();
 
-unsafe impl<A: IAllocator> IAllocator for Arc<A> {
-    fn allocate(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
-        self.deref().allocate(layout)
-    }
+//     const MIN_ALIGNMENT: usize = if Self::USIZE_ALIGNMENT < 8 {
+//         8
+//     } else {
+//         Self::USIZE_ALIGNMENT
+//     };
 
-    unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
-        unsafe { self.deref().deallocate(ptr, layout) };
-    }
-}
+//     /// Initializes the allocator by addr and size.
+//     ///
+//     /// ## Safety
+//     /// user must ensure that the provided memory are valid and ready for allocation.
+//     unsafe fn init_addr(start: usize, size: usize) -> Self;
+
+//     /// Initializes the allocator by a block of memory.
+//     #[inline]
+//     fn init_ptr(blk: NonNull<[u8]>) -> Self
+//     where
+//         Self: Sized,
+//     {
+//         unsafe { Self::init_addr(blk.as_ptr().addr(), blk.len()) }
+//     }
+// }

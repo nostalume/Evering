@@ -1,13 +1,7 @@
-use core::ops::Deref;
-use core::ptr::{self, NonNull};
 
-use memory_addr::MemoryAddr;
 
-use crate::area::RawMemBlk;
 pub use crate::area::AddrSpec;
-pub use crate::malloc::{AllocError, IAllocator, ShmInit};
-use crate::malloc::{blink, gma, tlsf};
-use crate::seal::Sealed;
+pub use crate::malloc::{AllocError, IAllocator};
 
 // #[cfg(feature = "unix")]
 // pub type DefaultShmSpec = crate::os::unix::UnixAddrSpec;

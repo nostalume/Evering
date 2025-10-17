@@ -1,10 +1,14 @@
 use core::{
-    mem,
+    marker::PhantomData,
     ops::Deref,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
-use crate::numeric::{Alignable, CastInto, Packable};
+use crate::{
+    area::MemBlkOps,
+    malloc::MemAllocInfo,
+    numeric::{Alignable, CastInto, Packable},
+};
 use crossbeam_utils::Backoff;
 
 type UInt = u32;
@@ -13,6 +17,7 @@ type AtomicPackedUInt = AtomicU64;
 
 type Offset = UInt;
 type Size = UInt;
+type AddrSpan = crate::area::AddrSpan<UInt>;
 
 const ARENA_MAX_CAPACITY: Size = UInt::MAX;
 const SENTINEL_OFFSET: Offset = UInt::MAX;
@@ -22,29 +27,27 @@ const SEGMENT_NODE_REMOVED: Size = 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// Insufficient space in the arena
-    InsufficientSpace {
-        /// The requested size
-        requested: UInt,
-        /// The remaining size
-        available: UInt,
-    },
-    /// The arena is read-only
     ReadOnly,
-
-    /// Index is out of range
-    OutOfBounds {
-        /// The offset
-        offset: usize,
-        /// The current allocated size of the arena
-        allocated: usize,
+    UnenoughSpace {
+        /// The requested size
+        requested: Size,
+        /// The remaining size
+        available: usize,
     },
+    // /// Index is out of range
+    // OutOfBounds {
+    //     /// The offset
+    //     offset: usize,
+    //     /// The current allocated size of the arena
+    //     allocated: usize,
+    // },
 }
 
 impl core::fmt::Display for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::InsufficientSpace {
+            Self::ReadOnly => write!(f, "Arena is read-only"),
+            Self::UnenoughSpace {
                 requested,
                 available,
             } => write!(
@@ -52,79 +55,12 @@ impl core::fmt::Display for Error {
                 "Allocation failed: requested size is {}, but only {} is available",
                 requested, available
             ),
-            Self::ReadOnly => write!(f, "Arena is read-only"),
-            Self::OutOfBounds { offset, allocated } => write!(
-                f,
-                "Index out of bounds: offset {} is out of range, the current allocated size is {}",
-                offset, allocated
-            ),
+            // Self::OutOfBounds { offset, allocated } => write!(
+            //     f,
+            //     "Index out of bounds: offset {} is out of range, the current allocated size is {}",
+            //     offset, allocated
+            // ),
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AddrSpan {
-    pub start_offset: Offset,
-    pub size: Size,
-}
-
-impl AddrSpan {
-    #[inline]
-    pub const fn null() -> Self {
-        Self {
-            start_offset: 0,
-            size: 0,
-        }
-    }
-
-    #[inline]
-    pub const fn new(offset: Offset, size: Size) -> Self {
-        Self {
-            start_offset: offset,
-            size,
-        }
-    }
-
-    #[inline]
-    pub const fn end_offset(&self) -> u32 {
-        self.start_offset + self.size
-    }
-
-    #[inline]
-    pub const fn align_of<T>(&self) -> Self {
-        Self {
-            start_offset: self.start_offset.align_up_of::<T>(),
-            size: UInt::size_of::<T>(),
-        }
-    }
-
-    #[inline]
-    pub const fn align_to<T>(&self) -> Self {
-        let aligned_offset = self.start_offset.align_up_of::<T>();
-        let new_size = self.end_offset() - aligned_offset;
-
-        Self {
-            start_offset: aligned_offset,
-            size: new_size,
-        }
-    }
-
-    #[inline]
-    const fn shift(&self, delta: Offset) -> Self {
-        Self {
-            start_offset: self.start_offset.saturating_add(delta),
-            size: self.size,
-        }
-    }
-
-    #[inline]
-    const unsafe fn as_ptr(&self, base_ptr: *const u8) -> *const u8 {
-        unsafe { base_ptr.add(self.start_offset.cast_into()) }
-    }
-
-    #[inline]
-    const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
-        unsafe { base_ptr.add(self.start_offset.cast_into()) }
     }
 }
 
@@ -167,44 +103,104 @@ impl Meta {
     }
 
     #[inline]
-    unsafe fn clear<A: crate::area::MemBlkOps>(&self, arena: &A) {
-        unsafe {
-            let ptr = arena.get_ptr_mut(self.view.start_offset as usize);
-            core::ptr::write_bytes(ptr, 0, self.view.size as usize);
+    const fn from_req_seg(base_ptr: *const u8, req_seg: ReqSegment) -> Self {
+        Self {
+            base_ptr,
+            raw: AddrSpan {
+                start_offset: req_seg.seg.node_offset,
+                size: req_seg.seg.data_size,
+            },
+            view: AddrSpan {
+                start_offset: req_seg.seg.data_offset(),
+                size: req_seg.req_size,
+            },
         }
     }
 
     #[inline]
-    fn align_to<T>(&mut self) {
-        let aligned = self.raw.align_to::<T>();
-        self.view = aligned;
+    unsafe fn clear<M: crate::area::MemBlkOps>(&self, arena: &M) {
+        const NULL: u8 = 0;
+        unsafe {
+            let ptr = arena.get_mut_ptr(self.view.start_offset.cast_into());
+            core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
+        }
     }
 
     #[inline]
-    fn align_of<T>(&mut self) {
+    fn align_of<T>(self) -> Self {
+        let mut meta = self;
         let aligned = self.raw.align_of::<T>();
-        self.view = aligned;
+        meta.view = aligned;
+        meta
+    }
+
+    #[inline]
+    fn align_to(self, align: UInt) -> Self {
+        let mut meta = self;
+        let aligned = self.raw.align_to(align);
+        meta.view = aligned;
+        meta
+    }
+
+    #[inline]
+    fn align_to_of<T>(self) -> Self {
+        let mut meta = self;
+        let aligned = self.raw.align_to_of::<T>();
+        meta.view = aligned;
+        meta
     }
 }
 
-#[derive(Debug)]
 #[repr(C, align(8))]
-pub struct Header {
-    /// The sentinel node for the ordered free list.
-    pub(super) sentinel: SegmentNode,
-    pub(super) allocated: AtomicUInt,
-    pub(super) min_segment_size: AtomicUInt,
-    pub(super) discarded: AtomicUInt,
+pub struct Header<S: Strategy> {
+    sentinel: SegmentNode,
+    allocated: AtomicUInt,
+    discarded: AtomicUInt,
+    min_segment_size: AtomicUInt,
+    strategy: PhantomData<S>,
 }
 
-impl Header {
+impl<S: Strategy> core::fmt::Debug for Header<S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let allocated = self.allocated();
+        let discarded = self.discarded();
+        f.debug_struct("Header")
+            .field("allocated", &allocated)
+            .field("discarded", &discarded)
+            .finish()
+    }
+}
+
+impl<S: Strategy> crate::header::Layout for Header<S> {
+    type Config = u32;
     #[inline]
-    fn new(initial_size: u32, min_segment_size: u32) -> Self {
+    fn init(&mut self, cfg: Self::Config) -> crate::header::HeaderStatus {
+        let data = Self::new(cfg);
+        let ptr = self as *mut Self;
+        unsafe { ptr.write(data) };
+        crate::header::HeaderStatus::Initialized
+    }
+
+    #[inline]
+    fn attach(&self) -> crate::header::HeaderStatus {
+        if self.allocated.load(Ordering::Relaxed) == 0 {
+            crate::header::HeaderStatus::Uninitialized
+        } else {
+            crate::header::HeaderStatus::Uninitialized
+        }
+    }
+}
+
+impl<S: Strategy> Header<S> {
+    const MIN_SEGMENT_SIZE: u32 = 20;
+    #[inline]
+    fn new(min_seg_size: u32) -> Self {
         Self {
-            allocated: AtomicU32::new(initial_size),
             sentinel: SegmentNode::sentinel(),
-            min_segment_size: AtomicU32::new(min_segment_size),
+            allocated: AtomicU32::new(UInt::size_of::<Self>().align_up_of::<Self>()),
             discarded: AtomicU32::new(0),
+            min_segment_size: AtomicU32::new(min_seg_size),
+            strategy: PhantomData,
         }
     }
 
@@ -214,12 +210,11 @@ impl Header {
     }
 
     #[inline]
-    fn allocate<T>(&self, total: u32) -> Option<(Size, Size)> {
+    fn alloc(&self, a: &Arena<S>, size: UInt, align: UInt) -> Option<Meta> {
         let mut allocated = self.allocated();
         loop {
-            let aligned_offset = allocated.align_up_of::<T>();
-            let want = aligned_offset + UInt::size_of::<T>();
-            if want > total {
+            let want = allocated.align_up(align) + size;
+            if want > a.size {
                 break None;
             }
 
@@ -229,7 +224,21 @@ impl Header {
                 Ordering::SeqCst,
                 Ordering::Acquire,
             ) {
-                Ok(old) => break Some((want, old)),
+                Ok(allocated) => {
+                    break {
+                        let size = want - allocated;
+
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            "allocate {} bytes at offset {} from arena",
+                            size,
+                            allocated
+                        );
+                        let meta = Meta::raw(a.start_ptr(), allocated, size).align_to(align);
+                        unsafe { meta.clear(a) }
+                        Some(meta)
+                    };
+                }
                 Err(changed) => {
                     allocated = changed;
                     continue;
@@ -239,13 +248,44 @@ impl Header {
     }
 
     #[inline]
-    fn allocated(&self) -> Size {
+    // remove the last node: `offset+size` or return false
+    fn dealloc(&self, offset: u32, size: u32) -> bool {
+        if self
+            .allocated
+            .compare_exchange(offset + size, offset, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
+            return true;
+        }
+
+        false
+    }
+
+    #[inline]
+    pub fn allocated(&self) -> Size {
         self.allocated.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn min_segment_size(&self) -> u32 {
+    pub fn discarded(&self) -> u32 {
+        self.discarded.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn incre_discarded(&self, size: u32) {
+        #[cfg(feature = "tracing")]
+        tracing::debug!("discard {size} bytes");
+        self.discarded.fetch_add(size, Ordering::Release);
+    }
+
+    #[inline]
+    pub fn min_segment_size(&self) -> u32 {
         self.min_segment_size.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    fn with_min_segment_size(&self, size: u32) {
+        self.min_segment_size.store(size, Ordering::Release);
     }
 }
 
@@ -423,6 +463,8 @@ impl SegmentNode {
 
     #[inline]
     fn insert(&self, next: Segment) -> Result<(), SegmentNodeData> {
+        // prev(self) -> next(new segment)
+        next.init_node(self);
         let cur = self.load();
         if cur.next == next.node_offset {
             // we are already linked to the next node.
@@ -434,15 +476,6 @@ impl SegmentNode {
             Err(word) => Err(word),
         }
     }
-
-    #[inline]
-    fn loose_advance(&self, next_to: &SegmentNode) {
-        let cur = self.load();
-        let next_to = next_to.load();
-        let advanced = cur.advance(next_to);
-        self.store(advanced);
-    }
-
     #[inline]
     fn advance(&self, next_to: &SegmentNode) -> Result<(), SegmentNodeData> {
         let cur = self.load();
@@ -456,13 +489,10 @@ impl SegmentNode {
 }
 
 type SegmentView<'a> = (&'a SegmentNode, SegmentNodeData);
-type Prev<'a> = SegmentView<'a>;
-type Next<'a> = SegmentView<'a>;
-type SegmentViewPair<'a> = (Prev<'a>, Next<'a>);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 struct Segment {
-    base_ptr: *mut u8,
+    base_ptr: *const u8,
     node_offset: Offset,
     data_size: Size,
 }
@@ -471,7 +501,7 @@ impl Segment {
     /// # Safety
     /// - offset must point to a well-aligned and in-bounds SegmentNode
     #[inline]
-    const unsafe fn raw(base_ptr: *mut u8, node_offset: Offset, data_size: Size) -> Self {
+    const unsafe fn raw(base_ptr: *const u8, node_offset: Offset, data_size: Size) -> Self {
         Self {
             base_ptr,
             node_offset,
@@ -480,12 +510,14 @@ impl Segment {
     }
 
     #[inline]
-    const fn node(&self) -> &SegmentNode {
-        // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
-        unsafe {
-            let ptr = self.base_ptr.add(self.node_offset.cast_into());
-            &*ptr.cast::<SegmentNode>()
-        }
+    const fn new(
+        base_ptr: *const u8,
+        offset: Offset,
+        size: Size,
+        min_data_size: Size,
+    ) -> Option<Self> {
+        let (aligned_offset, _, available) = Self::validate(offset, size, min_data_size)?;
+        unsafe { Some(Self::raw(base_ptr, aligned_offset, available)) }
     }
 
     #[inline]
@@ -494,10 +526,56 @@ impl Segment {
     }
 
     #[inline]
-    const fn data_ptr(&self) -> *mut u8 {
+    const fn end_offset(&self) -> Offset {
+        self.data_offset() + self.data_size
+    }
+
+    #[inline]
+    const fn size(&self) -> Size {
+        self.data_size + SEGMENT_NODE_SIZE
+    }
+
+    #[inline]
+    const fn data_ptr(&self) -> *const u8 {
         unsafe {
             self.base_ptr
                 .add((self.node_offset + SEGMENT_NODE_SIZE).cast_into())
+        }
+    }
+
+    #[inline]
+    const fn validate(offset: Offset, size: Size, min_data_size: Size) -> Option<(u32, u32, u32)> {
+        let aligned_offset = offset.align_up_of::<SegmentNode>();
+        let overhead = offset.align_offset_of::<SegmentNode>() + SEGMENT_NODE_SIZE;
+        let available = size.checked_sub(overhead)?;
+        if available < min_data_size {
+            return None;
+        }
+
+        Some((aligned_offset, overhead, available))
+    }
+
+    #[inline]
+    const fn is_valid(offset: Offset, size: Size, min_data_size: Size) -> bool {
+        if offset == 0 || size == 0 {
+            return false;
+        }
+
+        Self::validate(offset, size, min_data_size).is_some()
+    }
+
+    #[inline]
+    fn init_node(&self, prev: &SegmentNode) {
+        // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
+        unsafe {
+            let ptr = self.base_ptr.add(self.node_offset.cast_into());
+            let node = &*ptr.cast::<SegmentNode>();
+            let prev_data = prev.load();
+            let node_data = SegmentNodeData {
+                size: self.data_size,
+                next: prev_data.next,
+            };
+            node.store(node_data);
         }
     }
 }
@@ -515,31 +593,64 @@ impl Deref for ReqSegment {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    read_only: bool,
+    min_segment_size: u32,
+    max_retries: u32,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            min_segment_size: Self::MIN_SEGMENT_SIZE,
+            max_retries: Self::MAX_RETRIES,
+            read_only: false,
+        }
+    }
+}
+
+impl Config {
+    const MIN_SEGMENT_SIZE: u32 = 20;
+    const MAX_RETRIES: u32 = 5;
+
+    fn with_read_only(self, read_only: bool) -> Self {
+        Self { read_only, ..self }
+    }
+
+    fn with_min_segment_size(self, seg_size: u32) -> Self {
+        Self {
+            min_segment_size: seg_size,
+            ..self
+        }
+    }
+    fn with_max_retries(self, retries: u32) -> Self {
+        Self {
+            max_retries: retries,
+            ..self
+        }
+    }
+}
+
 trait Strategy: Sized {
     /// Check ordering relation between segment sizes.
     fn order(val: u32, next_node_size: u32) -> bool;
     fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error>;
 }
 
-pub struct Arena<S: Strategy> {
-    ptr: *mut u8,
-    header: Header,
-    magic: u16,
-    version: u16,
+pub struct Arena<'a, S: Strategy> {
+    h: &'a Header<S>,
+    start: *const u8,
+    size: u32,
     read_only: bool,
-    max_retries: u16,
-    // memory info
-    cap: u32,
-    reserved: usize,
-    data_offset: usize,
-    strategy: S,
+    max_retries: u32,
 }
 
-struct Pessimistic;
-struct Optimistic;
+pub struct Pessimistic;
+pub struct Optimistic;
 
-type OArena = Arena<Pessimistic>;
-type PArena = Arena<Optimistic>;
+type OArena<'a> = Arena<'a, Pessimistic>;
+type PArena<'a> = Arena<'a, Optimistic>;
 
 impl Strategy for Optimistic {
     #[inline]
@@ -561,9 +672,9 @@ impl Strategy for Pessimistic {
 
     fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error> {
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
-            return Err(Error::InsufficientSpace {
+            return Err(Error::UnenoughSpace {
                 requested: size,
-                available: arena.remaining() as Size,
+                available: arena.remained(),
             });
         };
 
@@ -571,16 +682,84 @@ impl Strategy for Pessimistic {
     }
 }
 
-impl<S: Strategy> Arena<S> {
-    fn header(&self) -> &Header {
-        &self.header
+unsafe impl<S:Strategy> Sync for Arena<'_,S> {}
+unsafe impl<S:Strategy> Send for Arena<'_,S> {}
+
+impl<S: Strategy> Clone for Arena<'_, S> {
+    fn clone(&self) -> Self {
+        Self {
+            h: self.h,
+            start: self.start.clone(),
+            size: self.size.clone(),
+            read_only: self.read_only.clone(),
+            max_retries: self.max_retries.clone(),
+        }
+    }
+}
+
+unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
+    #[inline]
+    fn start_ptr(&self) -> *const u8 {
+        self.start
     }
 
     #[inline]
+    fn end_ptr(&self) -> *const u8 {
+        unsafe { self.start.add(self.size.cast_into()) }
+    }
+
+    #[inline]
+    fn size(&self) -> usize {
+        self.size.cast_into()
+    }
+}
+
+impl<S: Strategy> MemAllocInfo for Arena<'_, S> {
+    type Header = Header<S>;
+
+    #[inline]
+    fn header(&self) -> &Self::Header {
+        self.h
+    }
+
+    fn allocated(&self) -> usize {
+        self.header().allocated().cast_into()
+    }
+
+    fn remained(&self) -> usize {
+        self.size()
+            .saturating_sub(self.header().allocated().cast_into())
+    }
+
+    fn discarded(&self) -> usize {
+        self.header().discarded().cast_into()
+    }
+}
+
+impl<'a, S: Strategy> Arena<'a, S> {
+    #[inline]
+    pub fn from_header(h: &'a Header<S>, size: Size, cfg: Config) -> Self {
+        let Config {
+            min_segment_size,
+            max_retries,
+            read_only,
+        } = cfg;
+        h.with_min_segment_size(min_segment_size);
+        let start = (h as *const Header<S>).cast();
+        Self {
+            h,
+            start,
+            size,
+            read_only,
+            max_retries,
+        }
+    }
+}
+
+impl<S: Strategy> Arena<'_, S> {
+    #[inline]
     fn meta(&self, seg: ReqSegment) -> Meta {
-        let mut meta = Meta::raw(self.ptr.cast(), seg.node_offset, seg.data_size);
-        meta.view.start_offset = seg.data_offset();
-        meta.view.size = seg.req_size;
+        let meta = Meta::from_req_seg(self.start_ptr(), seg);
         unsafe {
             meta.clear(self);
         }
@@ -588,14 +767,71 @@ impl<S: Strategy> Arena<S> {
     }
 
     #[inline]
-    unsafe fn raw_segment(&self, offset: Offset, size: Size) -> Segment {
+    fn new_segment(&self, offset: Offset, size: Size) -> Option<Segment> {
+        if offset == 0 || size == 0 {
+            return None;
+        }
+        Segment::new(
+            self.start_ptr(),
+            offset,
+            size,
+            self.header().min_segment_size(),
+        )
+    }
+
+    #[inline]
+    unsafe fn raw_segment(&self, offset: Offset, data_size: Size) -> Segment {
         // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
-        unsafe { Segment::raw(self.ptr, offset, size) }
+        unsafe { Segment::raw(self.start_ptr(), offset, data_size) }
     }
 
     #[inline]
     unsafe fn segment_from_pair(&self, prev: SegmentNodeData, cur: SegmentNodeData) -> Segment {
         unsafe { self.raw_segment(prev.next, cur.size) }
+    }
+
+    #[inline]
+    fn split_segment(&self, segment: &ReqSegment) -> Option<(ReqSegment, Segment)> {
+        let req_size = segment.req_size;
+        let rem_size = segment.data_size - req_size;
+        let rem_offset = segment.data_offset() + req_size;
+        let rem_segment = self.new_segment(rem_offset, rem_size)?;
+        let alloc_segment = unsafe { self.raw_segment(segment.node_offset, req_size) };
+        Some((
+            ReqSegment {
+                seg: alloc_segment,
+                req_size,
+            },
+            rem_segment,
+        ))
+    }
+
+    #[inline]
+    fn merge_segment(&self, prev: &Segment, next: &Segment) -> Option<Segment> {
+        if prev.end_offset() != next.node_offset {
+            return None;
+        }
+        let merged_data_size = prev.data_size + next.size();
+        unsafe { Some(self.raw_segment(prev.node_offset, merged_data_size)) }
+    }
+
+    #[inline]
+    fn recycle_segment(&self, segment: Segment) {
+        unsafe { self.dealloc_by(segment.data_offset(), segment.data_size) };
+    }
+
+    #[inline]
+    fn next_segment_node(&self, data: SegmentNodeData) -> &SegmentNode {
+        self.segment_node(data.next)
+    }
+
+    #[inline]
+    fn segment_node(&self, offset: Offset) -> &SegmentNode {
+        // Safety: the offset is in bounds and well aligned.
+        unsafe {
+            let ptr = self.start_ptr().add(offset.cast_into());
+            &*ptr.cast()
+        }
     }
 
     #[inline]
@@ -631,97 +867,13 @@ impl<S: Strategy> Arena<S> {
         Ok(Some((seg, cur)))
     }
 
-    #[inline]
-    fn split_segment(&self, segment: &ReqSegment) -> Option<(ReqSegment, Segment)> {
-        let req_size = segment.req_size;
-        let rem_size = segment.data_size - req_size;
-        let rem_offset = segment.data_offset() + req_size;
-        // check if the remaining is enough to allocate a new segment.
-        if !self.is_valid_segment(rem_offset, rem_size) {
-            return None;
-        }
-        let alloc_seg = unsafe { self.raw_segment(segment.node_offset, req_size) };
-        let rem_seg = unsafe { self.raw_segment(rem_offset, rem_size) };
-        Some((
-            ReqSegment {
-                seg: alloc_seg,
-                req_size,
-            },
-            rem_seg,
-        ))
-    }
-
-    #[inline]
-    fn merge_segment(&self, first: &Segment, second: &Segment) -> Option<Segment> {
-        if first.data_offset() + first.data_size != second.node_offset {
-            return None;
-        }
-        let merged_size = first.data_size + second.data_size;
-        unsafe { Some(self.raw_segment(first.node_offset, merged_size)) }
-    }
-
-    #[inline]
-    fn recycle_segment(&self, segment: Segment) {
-        if self.is_valid_segment(segment.node_offset, segment.data_size) {
-            self.g_dealloc(segment.data_offset(), segment.data_size);
-        }
-    }
-
-    #[inline]
-    fn next_segment_node(&self, data: SegmentNodeData) -> &SegmentNode {
-        self.segment_node(data.next)
-    }
-
-    #[inline]
-    fn segment_node(&self, offset: Offset) -> &SegmentNode {
-        // Safety: the offset is in bounds and well aligned.
-        unsafe {
-            let ptr = self.ptr.add(offset as usize);
-            &*ptr.cast()
-        }
-    }
-
-    #[inline]
-    fn validate_segment(&self, offset: Offset, size: Size) -> Option<(u32, u32, u32)> {
-        if offset == 0 || size == 0 {
-            return None;
-        }
-
-        let aligned_offset = offset.align_up_of::<SegmentNode>();
-        let overhead = offset.align_offset_of::<SegmentNode>() + SEGMENT_NODE_SIZE;
-        let available = size.checked_sub(overhead)?;
-        if available < self.header().min_segment_size() {
-            return None;
-        }
-
-        Some((aligned_offset, overhead, available))
-    }
-
-    #[inline]
-    fn is_valid_segment(&self, offset: Offset, size: Size) -> bool {
-        self.validate_segment(offset, size).is_some()
-    }
-
-    #[inline]
-    fn new_segment(&self, offset: Offset, size: Size) -> Option<Segment> {
-        let (aligned_offset, _, available) = self.validate_segment(offset, size)?;
-        unsafe { Some(self.raw_segment(aligned_offset, available)) }
-    }
-
-    #[inline]
-    fn increase_discarded(&self, size: Size) {
-        #[cfg(feature = "tracing")]
-        tracing::debug!("discard {size} bytes");
-
-        self.header().discarded.fetch_add(size, Ordering::Release);
-    }
-
     // find prev and next node that satisfies the given size check.
-    fn find_by(&self, size: Size) -> Result<SegmentView, SegmentView> {
+    fn find_by(&self, size: Size) -> Result<SegmentView<'_>, SegmentView<'_>> {
+        let backoff = Backoff::new();
+
         let header = self.header();
         let mut cur = &header.sentinel;
         let mut cur_data = cur.load();
-        let backoff = Backoff::new();
 
         loop {
             // the list is empty
@@ -766,15 +918,13 @@ impl<S: Strategy> Arena<S> {
         }
     }
 
-    /// Returns the free list position to insert the value.
-    /// - `None` means that we should insert to the head.
-    /// - `Some(offset)` means that we should insert after the offset. offset -> new -> next
-    // fn find_pos(&self, size: Size) -> Result<SegmentView, SegmentView> {
-    //     match self.find_by(size) {
-    //         Ok((cur_view, _)) => Ok(cur_view),
-    //         Err(cur_view) => Err(cur_view),
-    //     }
-    // }
+    fn discard_freelist(&self) -> Result<u32, Error> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+
+        Ok(self.discard_freelist_in())
+    }
 
     fn discard_freelist_in(&self) -> u32 {
         let header = self.header();
@@ -804,7 +954,7 @@ impl<S: Strategy> Arena<S> {
 
             match header.sentinel.advance(head) {
                 Ok(_) => {
-                    self.increase_discarded(old_head_data.size);
+                    header.incre_discarded(old_head_data.size);
                     discarded += old_head_data.size;
                     continue;
                 }
@@ -820,8 +970,17 @@ impl<S: Strategy> Arena<S> {
         }
     }
 
-    fn g_dealloc(&self, offset: u32, size: u32) -> bool {
-        // check if we have enough space to allocate a new segment in this segment.
+    pub fn dealloc(&self, meta: Meta) -> bool {
+        unsafe { self.dealloc_by(meta.raw.start_offset, meta.raw.size) }
+    }
+
+    unsafe fn dealloc_by(&self, offset: UInt, size: UInt) -> bool {
+        let header = self.header();
+        if header.dealloc(offset, size) {
+            return true;
+        }
+
+        // enough space to initiate segment?
         let Some(segment) = self.new_segment(offset, size) else {
             return false;
         };
@@ -839,15 +998,11 @@ impl<S: Strategy> Arena<S> {
                 continue;
             }
 
-            // we found ourselves, then we need to refind the position.
+            // found original node, then we need to refind the position.
             if segment.node_offset == cur_data.next {
                 backoff.snooze();
                 continue;
             }
-
-            // segment -> next
-            let segment_node = segment.node();
-            segment_node.loose_advance(cur);
 
             match cur.insert(segment) {
                 Ok(_) => {
@@ -859,7 +1014,7 @@ impl<S: Strategy> Arena<S> {
                         cur_data.next,
                     );
 
-                    self.increase_discarded(SEGMENT_NODE_SIZE);
+                    header.incre_discarded(SEGMENT_NODE_SIZE);
                     return true;
                 }
                 Err(cur) => {
@@ -874,15 +1029,14 @@ impl<S: Strategy> Arena<S> {
         }
     }
     fn alloc_slow_by(&self, cur: &SegmentNode, size: u32) -> Result<Meta, Error> {
-        let header = self.header();
         let backoff = Backoff::new();
 
         loop {
-            let (segment, head) = match self.segment_req(cur, size) {
+            let (segment, next) = match self.segment_req(cur, size) {
                 Err(_) => {
-                    return Err(Error::InsufficientSpace {
+                    return Err(Error::UnenoughSpace {
                         requested: size,
-                        available: self.remaining() as Size,
+                        available: self.remained(),
                     });
                 }
                 Ok(None) => {
@@ -893,12 +1047,12 @@ impl<S: Strategy> Arena<S> {
                 Ok(Some(res)) => res,
             };
 
-            if head.remove().is_err() {
+            if next.remove().is_err() {
                 backoff.snooze();
                 continue;
             };
 
-            match header.sentinel.advance(head) {
+            match cur.advance(next) {
                 Ok(_) => {
                     #[cfg(feature = "tracing")]
                     tracing::debug!(
@@ -924,7 +1078,8 @@ impl<S: Strategy> Arena<S> {
             }
         }
     }
-    fn g_alloc<T>(&self, size: u32) -> Result<Option<Meta>, Error> {
+
+    pub fn alloc(&self, size: UInt, align: UInt) -> Result<Option<Meta>, Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -933,45 +1088,92 @@ impl<S: Strategy> Arena<S> {
         }
 
         let header = self.header();
-        if let Some((want, old)) = header.allocate::<T>(self.cap) {
-            #[cfg(feature = "tracing")]
-            tracing::debug!("allocate {} bytes at offset {} from arena", size, old);
-
-            let mut meta = Meta::raw(self.ptr.cast(), old, want - old);
-            meta.align_to::<T>();
-            unsafe {
-                meta.clear(self);
-            }
+        if let Some(meta) = header.alloc(self, size, align) {
             return Ok(Some(meta));
         } else {
             for i in 0..self.max_retries {
-                let want = UInt::align_of::<T>() + UInt::size_of::<T>() - 1;
+                let want = size + align - 1;
 
                 match S::alloc_slow(self, want) {
                     Ok(m) => return Ok(Some(m)),
                     Err(e) if i + 1 == self.max_retries => return Err(e),
-                    Err(e) => { /* retry */ }
+                    Err(_) => { /* retry */ }
                 }
             }
             unreachable!()
-            // if no retries configured or all retries exhausted, return insufficient space
-            // return Err(Error::InsufficientSpace {
-            //     requested: size,
-            //     available: self.remaining() as Size,
-            // });
         }
     }
-    fn alloc_bytes_in(&self, size: u32) -> Result<Option<Meta>, Error> {
-        self.g_alloc::<()>(size)
-    }
 
-    fn alloc_aligned_bytes_in<T>(&self, extra: u32) -> Result<Option<Meta>, Error> {
-        let size = UInt::size_of::<T>() + extra;
-        self.g_alloc::<T>(size)
-    }
-
-    fn alloc_in<T>(&self) -> Result<Option<Meta>, Error> {
+    pub fn alloc_of<T>(&self) -> Result<Option<Meta>, Error> {
         let size = UInt::size_of::<T>();
-        self.g_alloc::<T>(size)
+        let align = UInt::align_of::<T>();
+        self.alloc(size, align)
+    }
+
+    pub fn alloc_bytes(&self, size: u32) -> Result<Option<Meta>, Error> {
+        let align = UInt::align_of::<u8>();
+        self.alloc(size, align)
+    }
+}
+
+use crate::area::{self, AddrSpec, MemBlk, Mmap};
+
+pub struct ArenaMemBlk<S: AddrSpec, M: Mmap<S>, G: Strategy> {
+    m: MemBlk<S, M>,
+    alloch: usize,
+    size: UInt,
+    marker: PhantomData<Header<G>>,
+}
+
+impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
+    pub fn header(&self) -> &crate::area::Header {
+        unsafe {
+            let ptr = self.m.start_ptr() as *const crate::area::Header;
+            &*ptr
+        }
+    }
+
+    pub fn alloc_header(&self) -> &Header<G> {
+        let ptr = self.m.get_ptr(self.alloch);
+        unsafe { &*ptr.cast() }
+    }
+
+    pub fn arena(&self) -> Arena<'_, G> {
+        let cfg = Config::default();
+        Arena::from_header(self.alloc_header(), self.size, cfg)
+    }
+
+    pub fn init(
+        bk: M,
+        start: Option<S::Addr>,
+        size: usize,
+        flags: S::Flags,
+        mcfg: M::Config,
+    ) -> Result<Self, area::Error<S, M>> {
+        if let Ok(bound) = ARENA_MAX_CAPACITY.try_into()
+            && size > bound
+        {
+            return Err(area::Error::OutofSize {
+                requested: size,
+                bound,
+            });
+        }
+
+        let area = bk
+            .map(start, size, flags, mcfg)
+            .map_err(area::Error::MapError)?;
+        unsafe {
+            let hoffset = area.init_header::<crate::area::Header>(0, ())?;
+            let aoffset = area.init_header::<Header<G>>(hoffset, Header::<G>::MIN_SEGMENT_SIZE)?;
+            let size = (area.size() - aoffset) as UInt;
+
+            Ok(Self {
+                m: area.into(),
+                alloch: hoffset,
+                // Safety: Previous arithmetic check
+                size,
+                marker: PhantomData,
+            })
+        }
     }
 }

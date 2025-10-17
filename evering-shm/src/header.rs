@@ -3,7 +3,8 @@ use core::ops::Deref;
 use spin::RwLock;
 
 impl Layout for () {
-    fn init(&mut self) -> HeaderStatus {
+    type Config = ();
+    fn init(&mut self, _cfg: ()) -> HeaderStatus {
         HeaderStatus::Initialized
     }
 
@@ -13,22 +14,19 @@ impl Layout for () {
 }
 
 pub(crate) trait Layout: core::fmt::Debug + Sized {
-	// #[inline]
-    // unsafe fn from_ptr<'a>(ptr: *mut u8) -> &'a mut Self {
-    //     unsafe { &mut *(ptr.cast()) }
-    // }
-	#[inline]
+    type Config: Clone;
+    #[inline]
     unsafe fn from_raw<'a>(ptr: *mut Self) -> &'a mut Self {
         unsafe { &mut *(ptr.cast()) }
     }
-    fn init(&mut self) -> HeaderStatus;
+    fn init(&mut self, cfg: Self::Config) -> HeaderStatus;
     fn attach(&self) -> HeaderStatus;
-	#[inline]
-    fn attach_or_init(&mut self) -> HeaderStatus {
+    #[inline]
+    fn attach_or_init(&mut self, cfg: Self::Config) -> HeaderStatus {
         match self.attach() {
             HeaderStatus::Initialized => HeaderStatus::Initialized,
             HeaderStatus::Corrupted | HeaderStatus::Uninitialized => {
-                if self.init().is_ok() {
+                if self.init(cfg).is_ok() {
                     HeaderStatus::Initialized
                 } else {
                     HeaderStatus::Corrupted
@@ -42,10 +40,6 @@ pub(crate) trait Layout: core::fmt::Debug + Sized {
 pub(crate) trait Metadata: Layout {
     fn valid_magic(&self) -> bool;
     fn with_magic(&mut self);
-}
-
-pub(crate) trait Recoverable: Layout {
-    fn recover(&mut self) -> bool;
 }
 
 #[repr(u8)]
@@ -114,9 +108,10 @@ impl<T: Metadata + core::fmt::Display> core::fmt::Display for Header<T> {
 }
 
 impl<T: Metadata> Layout for Header<T> {
-    fn init(&mut self) -> HeaderStatus {
+    type Config = T::Config;
+    fn init(&mut self, cfg: Self::Config) -> HeaderStatus {
         let mut write = self.write();
-        if write.inner.init().is_ok() {
+        if write.inner.init(cfg).is_ok() {
             write.with_status(HeaderStatus::Initialized);
             HeaderStatus::Initialized
         } else {
