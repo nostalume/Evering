@@ -8,7 +8,7 @@ use core::{
 
 use crate::{
     area::MemBlkOps,
-    malloc::MemAllocInfo,
+    malloc::{self, MemAllocInfo},
     numeric::{Alignable, CastInto, Packable},
 };
 use crossbeam_utils::Backoff;
@@ -22,12 +22,8 @@ type Size = UInt;
 type AddrSpan = crate::area::AddrSpan<UInt>;
 
 const fn max_bound(n: usize) -> Option<UInt> {
-    let n = u32::try_from(n).ok()?;
-    if n < ARENA_MAX_CAPACITY {
-        Some(n)
-    } else {
-        None
-    }
+    let n = UInt::try_from(n).ok()?;
+    Some(n)
 }
 
 const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
@@ -61,12 +57,6 @@ pub enum Error {
         /// The remaining size
         available: usize,
     },
-    // OutOfBounds {
-    //     /// The offset
-    //     offset: usize,
-    //     /// The current allocated size of the arena
-    //     allocated: usize,
-    // },
 }
 
 impl core::fmt::Display for Error {
@@ -84,32 +74,6 @@ impl core::fmt::Display for Error {
             Self::OutofBounds { requested } => write!(f, "Allocation failed: {}", requested,),
         }
     }
-}
-
-pub trait MetaAlloc {
-    fn base_ptr(&self) -> *const u8;
-    fn malloc(&self, size: Size, align: Offset) -> Result<Meta, Error>;
-    fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
-        let size = layout.size();
-        let size = max_bound_ok(size)?;
-        let align = layout.align();
-        let align = max_bound_ok(align)?;
-
-        self.malloc(size, align)
-    }
-
-    fn malloc_of<T>(&self) -> Result<Meta, Error> {
-        let size = UInt::size_of::<T>();
-        let align = UInt::align_of::<T>();
-        self.malloc(size, align)
-    }
-
-    fn malloc_bytes(&self, size: Size) -> Result<Meta, Error> {
-        let align = UInt::align_of::<u8>();
-        self.malloc(size, align)
-    }
-
-    fn demalloc(&self, meta: Meta) -> bool;
 }
 
 /// The metadata of the structs allocated from ARENA.
@@ -777,14 +741,26 @@ unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
     }
 }
 
-impl<S: Strategy> MetaAlloc for Arena<'_, S> {
+pub trait MetaAlloc: malloc::MemAlloc<Meta> + malloc::MemDealloc<Meta> {}
+
+impl<T:malloc::MemAlloc<Meta> + malloc::MemDealloc<Meta>> MetaAlloc for T {} 
+
+unsafe impl<S: Strategy> malloc::MemAlloc<Meta> for Arena<'_, S> {
+    type Error = Error;
     fn base_ptr(&self) -> *const u8 {
         self.start_ptr()
     }
-    fn malloc(&self, size: Size, align: Offset) -> Result<Meta, Error> {
+    fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
+        let size = layout.size();
+        let size = max_bound_ok(size)?;
+        let align = layout.align();
+        let align = max_bound_ok(align)?;
+
         self.alloc(size, align)
     }
+}
 
+unsafe impl<S:Strategy> malloc::MemDealloc<Meta> for Arena<'_,S> {
     fn demalloc(&self, meta: Meta) -> bool {
         self.dealloc(meta)
     }

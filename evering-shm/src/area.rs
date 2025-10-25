@@ -286,6 +286,20 @@ pub unsafe trait MemBlkOps {
     }
 }
 
+unsafe impl<M: MemBlkOps> MemBlkOps for &M {
+    fn start_ptr(&self) -> *const u8 {
+        (*self).start_ptr()
+    }
+
+    fn end_ptr(&self) -> *const u8 {
+        (*self).end_ptr()
+    }
+
+    fn size(&self) -> usize {
+        (*self).size()
+    }
+}
+
 pub struct MemBlkSpec<S: AddrSpec> {
     range: memory_addr::AddrRange<S::Addr>,
     flags: S::Flags,

@@ -8,7 +8,7 @@ use core::{mem, ptr::NonNull};
 use std::alloc::handle_alloc_error;
 
 use crate::arena::{Meta, MetaAlloc};
-use crate::perlude::AllocError;
+use crate::malloc::AllocError;
 
 const fn is_zst<T>() -> bool {
     size_of::<T>() == 0
