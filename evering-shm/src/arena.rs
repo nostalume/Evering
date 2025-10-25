@@ -84,12 +84,9 @@ pub struct Meta {
     view: AddrSpan,
 }
 
-unsafe impl Send for Meta {}
-unsafe impl Sync for Meta {}
-
-impl Meta {
+unsafe impl const malloc::Meta for Meta {
     #[inline]
-    pub const fn null() -> Self {
+    fn null() -> Self {
         Self {
             base_ptr: core::ptr::null(),
             raw: AddrSpan::null(),
@@ -99,9 +96,21 @@ impl Meta {
 
     #[inline]
     fn is_null(&self) -> bool {
-        self.raw == AddrSpan::null() || self.view == AddrSpan::null()
+        self.raw.is_null() || self.view.is_null()
     }
 
+    #[inline]
+    fn as_ptr_of<T>(&self) -> NonNull<MaybeUninit<T>> {
+        if self.is_null() {
+            return NonNull::dangling();
+        }
+        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
+        // memory allocated while it may be uninitiated.
+        unsafe { NonNull::new_unchecked(ptr as *mut _) }
+    }
+}
+
+impl Meta {
     #[inline]
     const fn raw(base_ptr: *const u8, raw_offset: Offset, raw_size: Size) -> Self {
         Self {
@@ -141,16 +150,6 @@ impl Meta {
             let ptr = arena.get_mut_ptr(self.view.start_offset.cast_into());
             core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
         }
-    }
-
-    #[inline]
-    pub fn as_ptr_of<T>(&self) -> NonNull<MaybeUninit<T>> {
-        if self.is_null() {
-            return NonNull::dangling();
-        }
-        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
-        // memory allocated while it may be uninitiated.
-        unsafe { NonNull::new_unchecked(ptr as *mut _) }
     }
 
     #[inline]
@@ -262,7 +261,7 @@ impl<S: Strategy> Header<S> {
                             allocated
                         );
                         let meta = Meta::raw(a.start_ptr(), allocated, size).align_to(align);
-                        unsafe { meta.clear(a) }
+                        // unsafe { meta.clear(a) }
                         Some(meta)
                     };
                 }
@@ -659,7 +658,7 @@ impl Config {
     }
 }
 
-trait Strategy: Sized {
+pub trait Strategy: Sized {
     /// Check ordering relation between segment sizes.
     fn order(val: u32, next_node_size: u32) -> bool;
     fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error>;
@@ -741,11 +740,8 @@ unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
     }
 }
 
-pub trait MetaAlloc: malloc::MemAlloc<Meta> + malloc::MemDealloc<Meta> {}
-
-impl<T:malloc::MemAlloc<Meta> + malloc::MemDealloc<Meta>> MetaAlloc for T {} 
-
-unsafe impl<S: Strategy> malloc::MemAlloc<Meta> for Arena<'_, S> {
+unsafe impl<S: Strategy> malloc::MemAlloc for Arena<'_, S> {
+    type Meta = Meta;
     type Error = Error;
     fn base_ptr(&self) -> *const u8 {
         self.start_ptr()
@@ -760,7 +756,7 @@ unsafe impl<S: Strategy> malloc::MemAlloc<Meta> for Arena<'_, S> {
     }
 }
 
-unsafe impl<S:Strategy> malloc::MemDealloc<Meta> for Arena<'_,S> {
+unsafe impl<S: Strategy> malloc::MemDealloc for Arena<'_, S> {
     fn demalloc(&self, meta: Meta) -> bool {
         self.dealloc(meta)
     }
@@ -812,9 +808,7 @@ impl<S: Strategy> Arena<'_, S> {
     #[inline]
     fn meta(&self, seg: ReqSegment) -> Meta {
         let meta = Meta::from_req_seg(self.start_ptr(), seg);
-        unsafe {
-            meta.clear(self);
-        }
+        // unsafe { meta.clear(self) }
         meta
     }
 
@@ -1136,6 +1130,7 @@ impl<S: Strategy> Arena<'_, S> {
             return Err(Error::ReadOnly);
         }
         if size == 0 {
+            use malloc::Meta;
             return Ok(Meta::null());
         }
 

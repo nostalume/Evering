@@ -1,4 +1,3 @@
-use alloc::boxed;
 use core::alloc::Layout;
 use core::mem::MaybeUninit;
 use core::ops::{Deref, DerefMut};
@@ -7,30 +6,30 @@ use core::sync::atomic::AtomicUsize;
 use core::{mem, ptr::NonNull};
 use std::alloc::handle_alloc_error;
 
-use crate::arena::{Meta, MetaAlloc};
-use crate::malloc::AllocError;
+use crate::malloc::{AllocError, MemAllocator, Meta};
 
 const fn is_zst<T>() -> bool {
     size_of::<T>() == 0
 }
 
 #[repr(C)]
-pub struct PBox<T: ?Sized, A: MetaAlloc> {
+pub struct PBox<T: ?Sized, A: MemAllocator> {
     ptr: NonNull<T>,
-    meta: Meta,
+    meta: A::Meta,
     alloc: A,
 }
 
-unsafe impl<T: ?Sized + Send, A: MetaAlloc + Send> Send for PBox<T, A> {}
-unsafe impl<T: ?Sized + Sync, A: MetaAlloc + Sync> Sync for PBox<T, A> {}
+unsafe impl<T: ?Sized + Send, A: MemAllocator + Send> Send for PBox<T, A> {}
+unsafe impl<T: ?Sized + Sync, A: MemAllocator + Sync> Sync for PBox<T, A> {}
 
-impl<T: ?Sized, A: MetaAlloc> Drop for PBox<T, A> {
+impl<T: ?Sized, A: MemAllocator> Drop for PBox<T, A> {
     fn drop(&mut self) {
-        self.alloc.demalloc(self.meta);
+        let meta = mem::replace(&mut self.meta, Meta::null());
+        self.alloc.demalloc(meta);
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> Deref for PBox<T, A> {
+impl<T: ?Sized, A: MemAllocator> Deref for PBox<T, A> {
     type Target = T;
 
     #[inline]
@@ -39,14 +38,14 @@ impl<T: ?Sized, A: MetaAlloc> Deref for PBox<T, A> {
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> DerefMut for PBox<T, A> {
+impl<T: ?Sized, A: MemAllocator> DerefMut for PBox<T, A> {
     #[inline]
     fn deref_mut(&mut self) -> &mut Self::Target {
         unsafe { self.ptr.as_mut() }
     }
 }
 
-impl<T, A: MetaAlloc> PBox<T, A> {
+impl<T, A: MemAllocator> PBox<T, A> {
     pub fn new_in(x: T, alloc: A) -> PBox<T, A> {
         let boxed = Self::new_uninit_in(alloc);
         boxed.write(x)
@@ -76,15 +75,18 @@ impl<T, A: MetaAlloc> PBox<T, A> {
         Ok(PBox::from_meta(meta, alloc))
     }
 
-    pub fn from_meta(meta: Meta, alloc: A) -> PBox<mem::MaybeUninit<T>, A> {
+    pub fn from_meta(meta: A::Meta, alloc: A) -> PBox<mem::MaybeUninit<T>, A> {
         let ptr = meta.as_ptr_of();
         PBox { ptr, meta, alloc }
     }
 
     #[inline]
-    pub const fn null(alloc: A) -> Self {
+    pub const fn null(alloc: A) -> Self
+    where
+        A::Meta: [const] Meta,
+    {
         let ptr = NonNull::dangling();
-        let meta = Meta::null();
+        let meta = A::Meta::null();
         unsafe { PBox::from_raw_ptr(ptr.as_ptr(), meta, alloc) }
     }
 
@@ -109,11 +111,11 @@ impl<T, A: MetaAlloc> PBox<T, A> {
     // }
 }
 
-impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
-    #[inline]
-    pub fn token(self) -> Token {
-        Token::token(self)
-    }
+impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
+    // #[inline]
+    // pub fn token(self) -> Token {
+    //     Token::token(self)
+    // }
 
     #[inline]
     pub fn as_ref(&self) -> &T {
@@ -136,7 +138,7 @@ impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
     }
 
     #[inline]
-    pub fn leak<'a>(b: Self) -> (&'a mut T, Meta)
+    pub fn leak<'a>(b: Self) -> (&'a mut T, A::Meta)
     where
         A: 'a,
     {
@@ -146,7 +148,7 @@ impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
     }
 
     #[inline]
-    const fn into_raw(b: Self) -> (Meta, A) {
+    const fn into_raw(b: Self) -> (A::Meta, A) {
         let b = mem::ManuallyDrop::new(b);
         let m = unsafe { ptr::read(&b.meta) };
         let alloc = unsafe { ptr::read(&b.alloc) };
@@ -154,7 +156,7 @@ impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
     }
 
     #[inline]
-    fn into_raw_ptr(b: Self) -> (*mut T, Meta, A) {
+    fn into_raw_ptr(b: Self) -> (*mut T, A::Meta, A) {
         let mut b = mem::ManuallyDrop::new(b);
         let ptr = &raw mut **b;
         let m = unsafe { ptr::read(&b.meta) };
@@ -163,7 +165,7 @@ impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
     }
 
     #[inline]
-    const unsafe fn from_raw_ptr(ptr: *mut T, meta: Meta, alloc: A) -> Self {
+    const unsafe fn from_raw_ptr(ptr: *mut T, meta: A::Meta, alloc: A) -> Self {
         unsafe {
             let ptr = NonNull::new_unchecked(ptr);
             Self { ptr, meta, alloc }
@@ -171,7 +173,7 @@ impl<T: ?Sized, A: MetaAlloc> PBox<T, A> {
     }
 }
 
-impl<T, A: MetaAlloc> PBox<[T], A> {
+impl<T, A: MemAllocator> PBox<[T], A> {
     pub fn copy_from_slice(src: &[T], alloc: A) -> PBox<[T], A> {
         let len = src.len();
         let mut m = PBox::new_uninit_slice_in(len, alloc);
@@ -229,7 +231,7 @@ impl<T, A: MetaAlloc> PBox<[T], A> {
     // }
 }
 
-impl<T, A: MetaAlloc> PBox<mem::MaybeUninit<T>, A> {
+impl<T, A: MemAllocator> PBox<mem::MaybeUninit<T>, A> {
     #[inline]
     pub unsafe fn assume_init(self) -> PBox<T, A> {
         let (ptr, meta, alloc) = PBox::into_raw_ptr(self);
@@ -246,7 +248,7 @@ impl<T, A: MetaAlloc> PBox<mem::MaybeUninit<T>, A> {
     }
 }
 
-impl<T, A: MetaAlloc> PBox<[mem::MaybeUninit<T>], A> {
+impl<T, A: MemAllocator> PBox<[mem::MaybeUninit<T>], A> {
     #[inline]
     pub unsafe fn assume_init(self) -> PBox<[T], A> {
         let (ptr, meta, alloc) = PBox::into_raw_ptr(self);
@@ -254,7 +256,7 @@ impl<T, A: MetaAlloc> PBox<[mem::MaybeUninit<T>], A> {
     }
 }
 
-impl<T, A: MetaAlloc> core::fmt::Debug for PBox<T, A> {
+impl<T, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_tuple("LocalBox").field(&self.ptr).finish()
     }
@@ -279,22 +281,22 @@ fn arcin_layout_of(layout: Layout) -> Layout {
 unsafe impl<T: ?Sized + Send> Send for PArcIn<T> {}
 unsafe impl<T: ?Sized + Sync> Sync for PArcIn<T> {}
 
-pub struct PArc<T: ?Sized, A: MetaAlloc> {
+pub struct PArc<T: ?Sized, A: MemAllocator> {
     ptr: NonNull<PArcIn<T>>,
-    meta: Meta,
+    meta: A::Meta,
     alloc: A,
 }
 
-unsafe impl<T: ?Sized + Send, A: MetaAlloc + Send> Send for PArc<T, A> {}
-unsafe impl<T: ?Sized + Sync, A: MetaAlloc + Sync> Sync for PArc<T, A> {}
+unsafe impl<T: ?Sized + Send, A: MemAllocator + Send> Send for PArc<T, A> {}
+unsafe impl<T: ?Sized + Sync, A: MemAllocator + Sync> Sync for PArc<T, A> {}
 
-impl<T: ?Sized + core::fmt::Debug, A: MetaAlloc> core::fmt::Debug for PArc<T, A> {
+impl<T: ?Sized + core::fmt::Debug, A: MemAllocator> core::fmt::Debug for PArc<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         core::fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> Deref for PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator> Deref for PArc<T, A> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -302,15 +304,15 @@ impl<T: ?Sized, A: MetaAlloc> Deref for PArc<T, A> {
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> AsRef<T> for PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator> AsRef<T> for PArc<T, A> {
     fn as_ref(&self) -> &T {
         &**self
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> Unpin for PArc<T, A> {}
+impl<T: ?Sized, A: MemAllocator> Unpin for PArc<T, A> {}
 
-impl<T: ?Sized, A: MetaAlloc + Clone> Clone for PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator + Clone> Clone for PArc<T, A> {
     #[inline]
     fn clone(&self) -> Self {
         let old_size = self
@@ -324,7 +326,7 @@ impl<T: ?Sized, A: MetaAlloc + Clone> Clone for PArc<T, A> {
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> Drop for PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator> Drop for PArc<T, A> {
     fn drop(&mut self) {
         if self
             .inner()
@@ -340,9 +342,9 @@ impl<T: ?Sized, A: MetaAlloc> Drop for PArc<T, A> {
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
     #[inline]
-    const fn into_raw(a: Self) -> (Meta, A) {
+    const fn into_raw(a: Self) -> (A::Meta, A) {
         let a = mem::ManuallyDrop::new(a);
         let m = unsafe { ptr::read(&a.meta) };
         let alloc = unsafe { ptr::read(&a.alloc) };
@@ -350,7 +352,7 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
     }
 
     #[inline]
-    const fn into_raw_ptr(a: Self) -> (NonNull<PArcIn<T>>, Meta, A) {
+    const fn into_raw_ptr(a: Self) -> (NonNull<PArcIn<T>>, A::Meta, A) {
         let a = mem::ManuallyDrop::new(a);
         let m = unsafe { ptr::read(&a.meta) };
         let alloc = unsafe { ptr::read(&a.alloc) };
@@ -358,17 +360,17 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
     }
 
     #[inline]
-    const unsafe fn from_inner(ptr: NonNull<PArcIn<T>>, meta: Meta, alloc: A) -> Self {
+    const unsafe fn from_inner(ptr: NonNull<PArcIn<T>>, meta: A::Meta, alloc: A) -> Self {
         Self { ptr, meta, alloc }
     }
 
     #[inline]
-    const unsafe fn from_raw_ptr(ptr: *mut PArcIn<T>, meta: Meta, alloc: A) -> Self {
+    const unsafe fn from_raw_ptr(ptr: *mut PArcIn<T>, meta: A::Meta, alloc: A) -> Self {
         unsafe { Self::from_inner(NonNull::new_unchecked(ptr), meta, alloc) }
     }
 }
 
-impl<T, A: MetaAlloc> PArc<T, A> {
+impl<T, A: MemAllocator> PArc<T, A> {
     #[inline]
     pub fn new_in(data: T, alloc: A) -> PArc<T, A> {
         let x: PBox<_, A> = PBox::new_in(
@@ -431,7 +433,7 @@ impl<T, A: MetaAlloc> PArc<T, A> {
     }
 }
 
-impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
+impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
     #[inline]
     fn inner(&self) -> &PArcIn<T> {
         unsafe { self.ptr.as_ref() }
@@ -453,9 +455,9 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
     #[inline]
     unsafe fn allocate_by<E>(
         layout: Layout,
-        allocate: impl FnOnce(Layout) -> Result<Meta, E>,
-        to_arcin: impl FnOnce(&Meta) -> *mut PArcIn<T>,
-    ) -> (*mut PArcIn<T>, Meta) {
+        allocate: impl FnOnce(Layout) -> Result<A::Meta, E>,
+        to_arcin: impl FnOnce(&A::Meta) -> *mut PArcIn<T>,
+    ) -> (*mut PArcIn<T>, A::Meta) {
         let layout = arcin_layout_of(layout);
         let meta = allocate(layout).unwrap_or_else(|_| handle_alloc_error(layout));
         unsafe { Self::init_arcin(meta, layout, to_arcin) }
@@ -464,9 +466,9 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
     #[inline]
     unsafe fn try_allocate_by<E>(
         layout: Layout,
-        allocate: impl FnOnce(Layout) -> Result<Meta, E>,
-        to_arcin: impl FnOnce(&Meta) -> *mut PArcIn<T>,
-    ) -> Result<(*mut PArcIn<T>, Meta), E> {
+        allocate: impl FnOnce(Layout) -> Result<A::Meta, E>,
+        to_arcin: impl FnOnce(&A::Meta) -> *mut PArcIn<T>,
+    ) -> Result<(*mut PArcIn<T>, A::Meta), E> {
         let layout = arcin_layout_of(layout);
         let meta = allocate(layout)?;
         unsafe { Ok(Self::init_arcin(meta, layout, to_arcin)) }
@@ -474,10 +476,10 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
 
     #[inline]
     unsafe fn init_arcin(
-        meta: Meta,
+        meta: A::Meta,
         layout: Layout,
-        to_arcin: impl FnOnce(&Meta) -> (*mut PArcIn<T>),
-    ) -> (*mut PArcIn<T>, Meta) {
+        to_arcin: impl FnOnce(&A::Meta) -> *mut PArcIn<T> ,
+    ) -> (*mut PArcIn<T>, A::Meta) {
         let inner = to_arcin(&meta);
         debug_assert_eq!(unsafe { Layout::for_value_raw(inner) }, layout);
 
@@ -489,14 +491,14 @@ impl<T: ?Sized, A: MetaAlloc> PArc<T, A> {
     }
 }
 
-pub struct Token(Meta);
+// pub struct Token(A::Meta);
 
-impl Token {
-    fn token<T: ?Sized, A: MetaAlloc>(b: PBox<T, A>) -> Self {
-        let (m, _) = PBox::into_raw(b);
-        Self(m)
-    }
-}
+// impl Token {
+//     fn token<T: ?Sized, A: MemAllocator>(b: PBox<T, A>) -> Self {
+//         let (m, _) = PBox::into_raw(b);
+//         Self(m)
+//     }
+// }
 
-unsafe impl Send for Token {}
-unsafe impl Sync for Token {}
+// unsafe impl Send for Token {}
+// unsafe impl Sync for Token {}

@@ -35,6 +35,11 @@ macro_rules! addr_span {
                     size: 0,
                 }
             }
+            
+            #[inline]
+            pub const fn is_null(&self) -> bool {
+                self.start_offset == 0 || self.size == 0
+            }
 
             #[inline]
             pub const fn end_offset(&self) -> $ty {
@@ -97,7 +102,7 @@ macro_rules! addr_span {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq,Eq)]
 pub struct AddrSpan<T> {
     pub start_offset: T,
     pub size: T,

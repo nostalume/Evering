@@ -133,9 +133,11 @@ fn area_test() {
 fn arena_test() {
     use std::sync::Barrier;
     use std::thread;
-    
-    const BYTES_SIZE: u32 = 50;
-    const REDUCED_SIZE:u32 = 35;
+
+    use crate::malloc::MemAlloc;
+
+    const BYTES_SIZE: usize = 50;
+    const REDUCED_SIZE: usize = 35;
 
     let mut pt = [0u8; MAX_ADDR];
     let mem = mock_arena(&mut pt, Some(0.into()), MAX_ADDR);
@@ -145,12 +147,12 @@ fn arena_test() {
     let mut metas = Vec::new();
 
     for _ in 1..=5 {
-        let bytes = a.alloc_bytes(BYTES_SIZE).unwrap().unwrap();
+        let bytes = a.malloc_bytes(BYTES_SIZE).unwrap();
         metas.push(bytes);
     }
 
     let remained = a.remained();
-    let _remained_bytes = a.alloc_bytes(remained as u32).unwrap();
+    let _remained_bytes = a.malloc_bytes(remained).unwrap();
     metas.drain(..).for_each(|meta| {
         a.dealloc(meta);
     });
@@ -162,7 +164,7 @@ fn arena_test() {
 
             s.spawn(move || {
                 bar.wait();
-                let mut bytes = a.alloc_bytes(REDUCED_SIZE).unwrap().unwrap();
+                let mut bytes = a.malloc_bytes(REDUCED_SIZE).unwrap();
                 // do something with bytes...
             });
         }
