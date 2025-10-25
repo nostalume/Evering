@@ -1,6 +1,8 @@
 use core::{
     marker::PhantomData,
+    mem::MaybeUninit,
     ops::Deref,
+    ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
@@ -19,6 +21,28 @@ type Offset = UInt;
 type Size = UInt;
 type AddrSpan = crate::area::AddrSpan<UInt>;
 
+const fn max_bound(n: usize) -> Option<UInt> {
+    let n = u32::try_from(n).ok()?;
+    if n < ARENA_MAX_CAPACITY {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
+    max_bound(n).ok_or(Error::OutofBounds { requested: n })
+}
+
+const fn bound(n: usize, available: UInt) -> Option<UInt> {
+    if !(available < ARENA_MAX_CAPACITY) {
+        return None;
+    }
+
+    let n = u32::try_from(n).ok()?;
+    if n < available { Some(n) } else { None }
+}
+
 const ARENA_MAX_CAPACITY: Size = UInt::MAX;
 const SENTINEL_OFFSET: Offset = UInt::MAX;
 const SENTINEL_SIZE: Size = UInt::MAX;
@@ -28,13 +52,15 @@ const SEGMENT_NODE_REMOVED: Size = 0;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     ReadOnly,
+    OutofBounds {
+        requested: usize,
+    },
     UnenoughSpace {
         /// The requested size
         requested: Size,
         /// The remaining size
         available: usize,
     },
-    // /// Index is out of range
     // OutOfBounds {
     //     /// The offset
     //     offset: usize,
@@ -55,13 +81,35 @@ impl core::fmt::Display for Error {
                 "Allocation failed: requested size is {}, but only {} is available",
                 requested, available
             ),
-            // Self::OutOfBounds { offset, allocated } => write!(
-            //     f,
-            //     "Index out of bounds: offset {} is out of range, the current allocated size is {}",
-            //     offset, allocated
-            // ),
+            Self::OutofBounds { requested } => write!(f, "Allocation failed: {}", requested,),
         }
     }
+}
+
+pub trait MetaAlloc {
+    fn base_ptr(&self) -> *const u8;
+    fn malloc(&self, size: Size, align: Offset) -> Result<Meta, Error>;
+    fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
+        let size = layout.size();
+        let size = max_bound_ok(size)?;
+        let align = layout.align();
+        let align = max_bound_ok(align)?;
+
+        self.malloc(size, align)
+    }
+
+    fn malloc_of<T>(&self) -> Result<Meta, Error> {
+        let size = UInt::size_of::<T>();
+        let align = UInt::align_of::<T>();
+        self.malloc(size, align)
+    }
+
+    fn malloc_bytes(&self, size: Size) -> Result<Meta, Error> {
+        let align = UInt::align_of::<u8>();
+        self.malloc(size, align)
+    }
+
+    fn demalloc(&self, meta: Meta) -> bool;
 }
 
 /// The metadata of the structs allocated from ARENA.
@@ -77,12 +125,17 @@ unsafe impl Sync for Meta {}
 
 impl Meta {
     #[inline]
-    const fn null(base_ptr: *const u8) -> Self {
+    pub const fn null() -> Self {
         Self {
-            base_ptr,
+            base_ptr: core::ptr::null(),
             raw: AddrSpan::null(),
             view: AddrSpan::null(),
         }
+    }
+
+    #[inline]
+    fn is_null(&self) -> bool {
+        self.raw == AddrSpan::null() || self.view == AddrSpan::null()
     }
 
     #[inline]
@@ -124,6 +177,16 @@ impl Meta {
             let ptr = arena.get_mut_ptr(self.view.start_offset.cast_into());
             core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
         }
+    }
+
+    #[inline]
+    pub fn as_ptr_of<T>(&self) -> NonNull<MaybeUninit<T>> {
+        if self.is_null() {
+            return NonNull::dangling();
+        }
+        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
+        // memory allocated while it may be uninitiated.
+        unsafe { NonNull::new_unchecked(ptr as *mut _) }
     }
 
     #[inline]
@@ -682,8 +745,8 @@ impl Strategy for Pessimistic {
     }
 }
 
-unsafe impl<S:Strategy> Sync for Arena<'_,S> {}
-unsafe impl<S:Strategy> Send for Arena<'_,S> {}
+unsafe impl<S: Strategy> Sync for Arena<'_, S> {}
+unsafe impl<S: Strategy> Send for Arena<'_, S> {}
 
 impl<S: Strategy> Clone for Arena<'_, S> {
     fn clone(&self) -> Self {
@@ -711,6 +774,19 @@ unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
     #[inline]
     fn size(&self) -> usize {
         self.size.cast_into()
+    }
+}
+
+impl<S: Strategy> MetaAlloc for Arena<'_, S> {
+    fn base_ptr(&self) -> *const u8 {
+        self.start_ptr()
+    }
+    fn malloc(&self, size: Size, align: Offset) -> Result<Meta, Error> {
+        self.alloc(size, align)
+    }
+
+    fn demalloc(&self, meta: Meta) -> bool {
+        self.dealloc(meta)
     }
 }
 
@@ -1079,40 +1155,29 @@ impl<S: Strategy> Arena<'_, S> {
         }
     }
 
-    pub fn alloc(&self, size: UInt, align: UInt) -> Result<Option<Meta>, Error> {
+    pub fn alloc(&self, size: UInt, align: UInt) -> Result<Meta, Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
         if size == 0 {
-            return Ok(None);
+            return Ok(Meta::null());
         }
 
         let header = self.header();
         if let Some(meta) = header.alloc(self, size, align) {
-            return Ok(Some(meta));
+            return Ok(meta);
         } else {
             for i in 0..self.max_retries {
                 let want = size + align - 1;
 
                 match S::alloc_slow(self, want) {
-                    Ok(m) => return Ok(Some(m)),
+                    Ok(m) => return Ok(m),
                     Err(e) if i + 1 == self.max_retries => return Err(e),
                     Err(_) => { /* retry */ }
                 }
             }
             unreachable!()
         }
-    }
-
-    pub fn alloc_of<T>(&self) -> Result<Option<Meta>, Error> {
-        let size = UInt::size_of::<T>();
-        let align = UInt::align_of::<T>();
-        self.alloc(size, align)
-    }
-
-    pub fn alloc_bytes(&self, size: u32) -> Result<Option<Meta>, Error> {
-        let align = UInt::align_of::<u8>();
-        self.alloc(size, align)
     }
 }
 

@@ -100,6 +100,6 @@ macro_rules! collect_test {
 
 #[test]
 fn collect() {
-    collect_test!(sync::default_channel::<CharUring>());
-    collect_test!(asynch::default_channel::<CharUring>());
+    collect_test!(sync::default::<CharUring>());
+    collect_test!(asynch::default::<CharUring>());
 }

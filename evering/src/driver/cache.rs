@@ -58,7 +58,7 @@ pub mod unlocked {
     use core::{
         cell::UnsafeCell,
         mem::MaybeUninit,
-        sync::atomic::AtomicU8,
+        sync::atomic::{AtomicU8, AtomicU32},
         task::{Context, Poll, Waker},
     };
 
@@ -66,7 +66,9 @@ pub mod unlocked {
     const WAITING: u8 = 1;
     const COMPLETED: u8 = 2;
 
+    #[repr(C)]
     pub struct CacheState<T> {
+        magic: AtomicU32,
         state: AtomicU8,
         waker: UnsafeCell<MaybeUninit<Waker>>,
         // take rather read to move out, avoiding free after read.
@@ -76,15 +78,38 @@ pub mod unlocked {
     unsafe impl<T: Send> Send for CacheState<T> {}
     unsafe impl<T: Sync> Sync for CacheState<T> {}
 
+    impl<T> core::fmt::Debug for CacheState<T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.debug_struct("CacheState")
+                .field("state", &self.state)
+                .field("waker", &self.waker)
+                .field("payload", &self.payload)
+                .finish()
+        }
+    }
+
     impl<T> Default for CacheState<T> {
         fn default() -> Self {
-            Self::init()
+            Self::empty()
         }
     }
 
     impl<T> CacheState<T> {
-        pub fn init() -> Self {
+        const MAGIC: u32 = 0x12312;
+        pub fn init(&self) {
+            if !self.valid_magic() {
+                unsafe { (self as *const Self as *mut Self).write(Self::empty()) }
+            }
+        }
+
+        pub fn valid_magic(&self) -> bool {
+            let magic = self.magic.load(core::sync::atomic::Ordering::Relaxed);
+            magic == Self::MAGIC
+        }
+
+        pub const fn empty() -> Self {
             Self {
+                magic: AtomicU32::new(Self::MAGIC),
                 state: AtomicU8::new(INIT),
                 waker: UnsafeCell::new(MaybeUninit::uninit()),
                 payload: UnsafeCell::new(None),

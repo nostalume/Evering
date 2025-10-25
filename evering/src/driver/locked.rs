@@ -9,18 +9,12 @@ use core::{
     task::{Context, Poll},
 };
 
-use crate::{driver::Driver, driver::op_cache::locked::CacheState};
+use crate::driver::locked::lock::ParkMutex;
+use crate::{driver::Driver, driver::cache::locked::CacheState};
 
 pub mod lock {
     pub type SpinMutex = spin::Mutex<()>;
-
-    #[cfg(feature = "std")]
-    pub type StdMutex = parking_lot::RawMutex;
-}
-
-pub trait LockFor {
-    type Lock: RawMutex;
-    // ...
+    pub type ParkMutex = parking_lot::RawMutex;
 }
 
 type OpId = usize;
@@ -78,11 +72,11 @@ impl<T> Drop for SlabDriverCore<T> {
     }
 }
 
-pub struct SlabDriver<T, D: LockFor> {
-    inner: Arc<Mutex<D::Lock, SlabDriverCore<T>>>,
+pub struct SlabDriver<T, L: RawMutex = ParkMutex> {
+    inner: Arc<Mutex<L, SlabDriverCore<T>>>,
 }
 
-impl<T, D: LockFor> Default for SlabDriver<T, D> {
+impl<T, L: RawMutex> Default for SlabDriver<T, L> {
     fn default() -> Self {
         Self {
             inner: Arc::new(Mutex::new(SlabDriverCore::default())),
@@ -90,16 +84,16 @@ impl<T, D: LockFor> Default for SlabDriver<T, D> {
     }
 }
 
-impl<T, D: LockFor> Clone for SlabDriver<T, D> {
+impl<T, L: RawMutex> Clone for SlabDriver<T, L> {
     fn clone(&self) -> Self {
         let inner = self.inner.clone();
         Self { inner }
     }
 }
 
-impl<T, D: LockFor> Driver for SlabDriver<T, D> {
+impl<T, L: RawMutex> Driver for SlabDriver<T, L> {
     type Id = OpId;
-    type Op = Op<T, D>;
+    type Op = Op<T, L>;
     type Config = usize;
 
     fn new(cap: usize) -> Self {
@@ -127,12 +121,12 @@ impl<T, D: LockFor> Driver for SlabDriver<T, D> {
     }
 }
 
-pub struct Op<T, D: LockFor> {
+pub struct Op<T, L: RawMutex> {
     id: OpId,
-    driver: SlabDriver<T, D>,
+    driver: SlabDriver<T, L>,
 }
 
-impl<T, D: LockFor> Future for Op<T, D> {
+impl<T, L: RawMutex> Future for Op<T, L> {
     type Output = T;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -151,7 +145,7 @@ impl<T, D: LockFor> Future for Op<T, D> {
     }
 }
 
-impl<T, D: LockFor> Drop for Op<T, D> {
+impl<T, L: RawMutex> Drop for Op<T, L> {
     fn drop(&mut self) {
         let mut core = self.driver.inner.lock();
         core.ops.try_remove(self.id);

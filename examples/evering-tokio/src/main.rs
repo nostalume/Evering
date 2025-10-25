@@ -30,5 +30,5 @@ async fn main() {
     }
 
     use tokio::time::{self, Duration};
-    time::sleep(Duration::from_secs(7)).await;
+    time::sleep(Duration::from_secs(10)).await;
 }

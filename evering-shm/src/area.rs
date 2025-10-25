@@ -75,7 +75,7 @@ macro_rules! addr_span {
             }
 
             #[inline]
-            const fn shift(&self, delta: $ty) -> Self {
+            pub const fn shift(&self, delta: $ty) -> Self {
                 Self {
                     start_offset: self.start_offset.saturating_add(delta),
                     size: self.size,
@@ -83,13 +83,13 @@ macro_rules! addr_span {
             }
 
             #[inline]
-            const unsafe fn as_ptr(&self, base_ptr: *const u8) -> *const u8 {
+            pub const unsafe fn as_ptr(&self, base_ptr: *const u8) -> *const u8 {
                 use crate::numeric::CastInto;
                 unsafe { base_ptr.add(self.start_offset.cast_into()) }
             }
 
             #[inline]
-            const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
+            pub const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
                 use crate::numeric::CastInto;
                 unsafe { base_ptr.add(self.start_offset.cast_into()) }
             }

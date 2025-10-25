@@ -1,9 +1,8 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
-#![feature(const_trait_impl)]
-#![feature(const_convert)]
+#![feature(const_trait_impl,const_convert,const_try,const_index, const_result_trait_fn,const_option_ops)]
 #![feature(sized_type_properties, layout_for_ptr)]
-#![feature(const_index, slice_ptr_get,const_try)]
+#![feature(slice_ptr_get)]
 
 extern crate alloc;
 

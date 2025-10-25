@@ -2,14 +2,14 @@ use core::future::Future;
 use core::marker::PhantomData;
 
 use crate::{
-    driver::{cell::IdCell, locked::LockFor},
+    driver::cell::IdCell,
     seal::Sealed,
     uring::{IReceiver, ISender, UringSpec},
 };
 
+mod cache;
 pub mod cell;
 pub mod locked;
-mod op_cache;
 pub mod unlocked;
 
 pub trait Driver: Clone + Default {
@@ -34,13 +34,13 @@ where
     type Driver = crate::driver::unlocked::PoolDriver<S::CQE>;
 }
 
-pub struct Slab<L: LockFor>(PhantomData<L>);
-impl<S: UringSpec, L: LockFor> DriverFor<S> for Slab<L>
-where
-    S::CQE: 'static,
-{
-    type Driver = crate::driver::locked::SlabDriver<S::CQE, L>;
-}
+// pub struct Slab<L: LockFor>(PhantomData<L>);
+// impl<S: UringSpec, L: LockFor> DriverFor<S> for Slab<L>
+// where
+//     S::CQE: 'static,
+// {
+//     type Driver = crate::driver::locked::SlabDriver<S::CQE, L>;
+// }
 
 pub trait Role: Sealed {}
 pub struct Submit;
@@ -130,13 +130,10 @@ where
         }
     }
 
-    pub fn try_complete(&self) -> bool {
+    pub fn try_complete(&self) {
         if let Ok(data) = self.chan.try_recv() {
             let (id, payload) = data.into_inner();
             self.bt.driver.complete(id, payload);
-            true
-        } else {
-            false
         }
     }
 }
@@ -199,7 +196,7 @@ pub mod asynch {
     use crate::uring::UringSpec;
     use crate::{
         driver::Bridge,
-        uring::asynch::{Completer, Submitter, channel, default_channel},
+        uring::asynch::{self, Completer, Submitter},
     };
 
     pub type CompleterBridge<S, D = Pool> = Completer<BridgeTmpl<S, D>>;
@@ -216,13 +213,13 @@ pub mod asynch {
         uring_cap: usize,
         driver_cfg: <D::Driver as Driver>::Config,
     ) -> Conn<S, D> {
-        let (sq, cq) = channel::<BridgeTmpl<S, D>>(uring_cap);
+        let (sq, cq) = asynch::new::<BridgeTmpl<S, D>>(uring_cap);
         let (sb, cb) = build_bridge(sq, driver_cfg);
         (sb, cb, cq)
     }
 
     pub fn default<S: UringSpec, D: DriverFor<S>>() -> Conn<S, D> {
-        let (sq, cq) = default_channel::<BridgeTmpl<S, D>>();
+        let (sq, cq) = asynch::default::<BridgeTmpl<S, D>>();
         let (sb, cb) = build_default_bridge(sq);
         (sb, cb, cq)
     }

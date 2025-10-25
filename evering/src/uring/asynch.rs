@@ -55,12 +55,12 @@ impl<T, U> IReceiver for Channel<T, U> {
     }
 }
 
-pub fn channel<S: UringSpec>(cap: usize) -> Uring<S> {
+pub fn new<S: UringSpec>(cap: usize) -> Uring<S> {
     let (sqs, cqr) = async_channel::bounded(cap);
     let (cqs, sqr) = async_channel::bounded(cap);
     (Channel { s: sqs, r: sqr }, Channel { s: cqs, r: cqr })
 }
 
-pub fn default_channel<S: UringSpec>() -> Uring<S> {
-    channel::<S>(crate::uring::DEFAULT_CAP)
+pub fn default<S: UringSpec>() -> Uring<S> {
+    new::<S>(crate::uring::DEFAULT_CAP)
 }
