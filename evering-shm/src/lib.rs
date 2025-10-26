@@ -15,6 +15,7 @@ pub mod boxed;
 mod header;
 mod malloc;
 pub mod os;
+mod reg;
 mod queue;
 mod tests;
 

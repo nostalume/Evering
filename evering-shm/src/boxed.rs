@@ -89,26 +89,6 @@ impl<T, A: MemAllocator> PBox<T, A> {
         let meta = A::Meta::null();
         unsafe { PBox::from_raw_ptr(ptr.as_ptr(), meta, alloc) }
     }
-
-    // pub fn new_zeroed_in(alloc: A) -> ShmBox<MaybeUninit<T>, A> {
-    //     let layout = Layout::new::<mem::MaybeUninit<T>>();
-    //     // NOTE: Prefer match over unwrap_or_else since closure sometimes not inlineable.
-    //     // That would make code size bigger.
-    //     match LocalBox::try_new_zeroed_in(alloc) {
-    //         Ok(m) => m,
-    //         Err(_) => handle_alloc_error(layout),
-    //     }
-    // }
-
-    // pub fn try_new_zeroed_in(alloc: A) -> Result<ShmBox<MaybeUninit<T>, A>, AllocError> {
-    //     let ptr = if T::IS_ZST {
-    //         NonNull::dangling()
-    //     } else {
-    //         let layout = Layout::new::<mem::MaybeUninit<T>>();
-    //         alloc.allocate_zeroed(layout)?.cast()
-    //     };
-    //     unsafe { Ok(ShmBox::from_raw_in(ptr.as_ptr(), alloc)) }
-    // }
 }
 
 impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
@@ -213,22 +193,6 @@ impl<T, A: MemAllocator> PBox<[T], A> {
         let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut mem::MaybeUninit<T>, len);
         unsafe { Ok(PBox::from_raw_ptr(slice, meta, alloc)) }
     }
-    // pub fn try_new_zeroed_slice_in(
-    //     len: usize,
-    //     alloc: A,
-    // ) -> Result<LocalBox<[mem::MaybeUninit<T>], A>, AllocError> {
-    //     let ptr = if T::IS_ZST || len == 0 {
-    //         NonNull::dangling()
-    //     } else {
-    //         let layout = match Layout::array::<mem::MaybeUninit<T>>(len) {
-    //             Ok(l) => l,
-    //             Err(_) => return Err(AllocError),
-    //         };
-    //         alloc.allocate_zeroed(layout)?.cast()
-    //     };
-    //     let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut MaybeUninit<T>, len);
-    //     unsafe { Ok(LocalBox::from_raw_in(slice, alloc)) }
-    // }
 }
 
 impl<T, A: MemAllocator> PBox<mem::MaybeUninit<T>, A> {
@@ -490,15 +454,3 @@ impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
         (inner, meta)
     }
 }
-
-// pub struct Token(A::Meta);
-
-// impl Token {
-//     fn token<T: ?Sized, A: MemAllocator>(b: PBox<T, A>) -> Self {
-//         let (m, _) = PBox::into_raw(b);
-//         Self(m)
-//     }
-// }
-
-// unsafe impl Send for Token {}
-// unsafe impl Sync for Token {}
