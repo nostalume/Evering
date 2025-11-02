@@ -1,9 +1,9 @@
 use core::alloc::Layout;
 use core::mem::{self, MaybeUninit};
-use core::ptr::NonNull;
+use core::ptr::{self, NonNull};
 
 #[cfg(feature = "nightly")]
-pub use alloc::alloc::AllocError;
+pub use alloc::alloc::{AllocError, handle_alloc_error};
 #[cfg(not(feature = "nightly"))]
 pub use allocator_api2::alloc::{AllocError, handle_alloc_error};
 
@@ -25,15 +25,34 @@ pub trait MemAllocInfo: MemBlkOps {
     }
 }
 
+pub type MetaOf<A> = <A as MemAlloc>::Meta;
+pub type SpanOf<M> = <M as Meta>::SpanMeta;
+
 #[const_trait]
-pub unsafe trait Meta:Clone {
+pub unsafe trait Meta: Clone {
+    type SpanMeta: Clone;
     fn null() -> Self;
     fn is_null(&self) -> bool;
-    fn as_ptr_of<T>(&self) -> NonNull<MaybeUninit<T>>;
+    fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>>;
+    unsafe fn as_ptr<T>(&self) -> *mut T {
+        self.as_uninit::<T>().as_ptr().cast()
+    }
+    fn as_uninit_slice<T>(&self, len: usize) -> NonNull<[MaybeUninit<T>]> {
+        let ptr = self.as_uninit::<T>();
+        let slice = NonNull::slice_from_raw_parts(ptr, len);
+        slice
+    }
+    unsafe fn as_slice<T>(&self, len: usize) -> *mut [T] {
+        let ptr = unsafe { self.as_ptr::<T>() };
+        let slice = ptr::slice_from_raw_parts_mut(ptr, len);
+        slice
+    }
+    fn forget(self) -> Self::SpanMeta;
+    unsafe fn resolve(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
 }
 
-pub trait MemAllocator : MemAlloc + MemDealloc {}
-pub trait MemAllocator2 : MemAlloc + MemDeallocBy {}
+pub trait MemAllocator: MemAlloc + MemDealloc {}
+pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
 
 /// Allocate or deallocate raw type `T` in persistence.
 pub unsafe trait MemAlloc: MemBlkOps {

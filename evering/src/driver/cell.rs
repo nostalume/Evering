@@ -96,8 +96,7 @@ where
     }
 }
 
-impl<Id, T> Debug for IdCell<Id, T>
-{
+impl<Id, T> Debug for IdCell<Id, T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("IdCell").finish()
     }

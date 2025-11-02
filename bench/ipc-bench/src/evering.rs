@@ -11,7 +11,7 @@ use evering_ipc::driver::unlocked::PoolDriver;
 use evering_ipc::shm::boxed::{ShmBox, ShmSlice, ShmToken};
 use evering_ipc::shm::os::{
     FdBackend,
-    unix::{MFdFlags, ProtFlags, UnixFdConf, UnixAddrSpec},
+    unix::{MFdFlags, ProtFlags, UnixAddrSpec, UnixFdConf},
 };
 use evering_ipc::shm::tlsf::SpinTlsf;
 use evering_ipc::uring::{IReceiver, ISender, UringSpec};
@@ -188,8 +188,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
 
                                 match sb_c.try_submit(op) {
                                     Ok(op) => match op.await {
-                                        Rqe::Exited => {
-                                        }
+                                        Rqe::Exited => {}
                                         Rqe::Pong {
                                             pong,
                                             resp: resp_ret_token,
@@ -199,7 +198,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                             check_resp(bufsize, resp_ret.as_ref());
                                         }
                                     },
-                                    _ => {},
+                                    _ => {}
                                 }
                             }
                         })

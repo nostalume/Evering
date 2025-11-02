@@ -2,7 +2,7 @@ use core::{
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Deref,
-    ptr::NonNull,
+    ptr::{self, NonNull},
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
 
@@ -84,7 +84,14 @@ pub struct Meta {
     view: AddrSpan,
 }
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SpanMeta {
+    raw: AddrSpan,
+    view: AddrSpan,
+}
+
 unsafe impl const malloc::Meta for Meta {
+    type SpanMeta = SpanMeta;
     #[inline]
     fn null() -> Self {
         Self {
@@ -100,7 +107,7 @@ unsafe impl const malloc::Meta for Meta {
     }
 
     #[inline]
-    fn as_ptr_of<T>(&self) -> NonNull<MaybeUninit<T>> {
+    fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>> {
         if self.is_null() {
             return NonNull::dangling();
         }
@@ -108,9 +115,61 @@ unsafe impl const malloc::Meta for Meta {
         // memory allocated while it may be uninitiated.
         unsafe { NonNull::new_unchecked(ptr as *mut _) }
     }
+
+    #[inline]
+    fn forget(self) -> Self::SpanMeta {
+        SpanMeta {
+            raw: self.raw,
+            view: self.view,
+        }
+    }
+
+    #[inline]
+    unsafe fn resolve(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
+        Meta {
+            base_ptr,
+            raw: span.raw,
+            view: span.view,
+        }
+    }
+}
+
+impl SpanMeta {
+    #[inline]
+    const fn raw(raw_offset: Offset, raw_size: Size) -> Self {
+        Self {
+            raw: AddrSpan {
+                start_offset: raw_offset,
+                size: raw_size,
+            },
+            // just set the ptr_offset to the memory_offset, and ptr_size to the memory_size.
+            // we will align the ptr_offset and ptr_size when it should be aligned.
+            view: AddrSpan {
+                start_offset: raw_offset,
+                size: raw_size,
+            },
+        }
+    }
+
+    #[inline]
+    pub const unsafe fn resolve(self, base_ptr: *const u8) -> Meta {
+        Meta {
+            base_ptr,
+            raw: self.raw,
+            view: self.view,
+        }
+    }
 }
 
 impl Meta {
+    #[inline]
+    pub const fn forget(self) -> SpanMeta {
+        SpanMeta {
+            raw: self.raw,
+            view: self.view,
+        }
+    }
+
     #[inline]
     const fn raw(base_ptr: *const u8, raw_offset: Offset, raw_size: Size) -> Self {
         Self {
@@ -144,10 +203,10 @@ impl Meta {
     }
 
     #[inline]
-    unsafe fn clear<M: crate::area::MemBlkOps>(&self, arena: &M) {
+    unsafe fn clear(&self) {
         const NULL: u8 = 0;
         unsafe {
-            let ptr = arena.get_mut_ptr(self.view.start_offset.cast_into());
+            let ptr = self.view.as_ptr(self.base_ptr).cast_mut();
             core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
         }
     }

@@ -35,7 +35,7 @@ macro_rules! addr_span {
                     size: 0,
                 }
             }
-            
+
             #[inline]
             pub const fn is_null(&self) -> bool {
                 self.start_offset == 0 || self.size == 0
@@ -102,7 +102,7 @@ macro_rules! addr_span {
     };
 }
 
-#[derive(Debug, Clone, Copy, PartialEq,Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddrSpan<T> {
     pub start_offset: T,
     pub size: T,
@@ -516,12 +516,12 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
     ) -> Result<usize, Error<S, M>> {
         use crate::header::Layout;
         unsafe {
-            let (header, hoffset) = self.obtain_by_offset::<T>(offset).map_err(|new_offset| {
-                Error::UnenoughSpace {
-                    requested: new_offset,
-                    allocated: self.size(),
-                }
-            })?;
+            let (header, hoffset) =
+                self.obtain_by_offset::<T>(offset)
+                    .map_err(|new_offset| Error::UnenoughSpace {
+                        requested: new_offset,
+                        allocated: self.size(),
+                    })?;
             let header_ref = Layout::from_raw(header);
             match header_ref.attach_or_init(cfg) {
                 HeaderStatus::Initialized => Ok(hoffset),
@@ -626,9 +626,7 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
         flags: S::Flags,
         mcfg: M::Config,
     ) -> Result<Self, Error<S, M>> {
-        let area = bk
-            .map(start, size, flags, mcfg)
-            .map_err(Error::MapError)?;
+        let area = bk.map(start, size, flags, mcfg).map_err(Error::MapError)?;
         unsafe {
             area.init_header::<Header>(0, ())?;
         }

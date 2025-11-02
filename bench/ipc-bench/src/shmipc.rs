@@ -79,7 +79,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                     write_i32(conn, PONG).unwrap();
                                     write_all(conn, &respdata).unwrap(); // write response
                                     must_flush(conn, false).await.unwrap();
-                                },
+                                }
                                 Err(Error::StreamClosed | Error::EndOfStream) => break,
                                 Err(e) => panic!("{e}"),
                             }
@@ -175,7 +175,7 @@ pub async fn must_flush(conn: &mut Stream, eos: bool) -> Result<()> {
             Err(Error::QueueFull) => {
                 tokio::time::sleep(Duration::from_micros(1)).await;
                 continue;
-            },
+            }
             Err(e) => return Err(e),
         }
     }

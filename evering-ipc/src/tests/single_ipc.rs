@@ -12,7 +12,7 @@ use crate::driver::unlocked::PoolDriver;
 use crate::shm::boxed::{ShmBox, ShmSlice, ShmToken};
 use crate::shm::os::{
     FdBackend,
-    unix::{MFdFlags, ProtFlags, UnixFdConf, UnixAddrSpec},
+    unix::{MFdFlags, ProtFlags, UnixAddrSpec, UnixFdConf},
 };
 use crate::shm::tlsf::SpinTlsf;
 use crate::tests::*;
@@ -77,7 +77,7 @@ impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
 
 const CONCURRENCY: usize = 200;
 
-const CAP: usize =8; 
+const CAP: usize = 8;
 
 type MyIpc<F> = IpcHandle<MyIpcSpec<F>, MyPoolDriver<MyIpcSpec<F>>, CAP>;
 

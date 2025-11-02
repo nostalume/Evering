@@ -2,8 +2,6 @@ use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
 const MAX_QUEUES: usize = 2 * 6;
 
-type AddrSpan = crate::area::AddrSpan<usize>;
-
 #[repr(C)]
 struct RegistryEntry {
     span: AddrSpan,

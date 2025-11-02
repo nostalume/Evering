@@ -15,17 +15,15 @@ unix = ["std", "dep:nix"]
 windows = ["std"]
 
 [dependencies]
-lfqueue = { version = "0.8.1", default-features = false }
-
 allocator-api2 = "0.3.0"
-blink-alloc = { version = "0.3.1", features = ["nightly", "sync"] }
-good_memory_allocator = { version = "0.1.7", features = ["allocator"] }
-rlsf = "0.2.1"
 
+# memory control
 spin.workspace = true
 crossbeam-utils.workspace = true
+bytemuck = "1.24.0"
 memory_addr = "0.4.0"
 
+# code aid
 tracing = { version = "0.1", optional = true }
 paste = "1"
 
@@ -33,7 +31,7 @@ paste = "1"
 nix = { workspace = true, optional = true, features = ["fs", "mman"] }
 
 [dev-dependencies]
-rand = "0.9"
+fastrand.workspace = true
 crossbeam-queue = "0.3"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

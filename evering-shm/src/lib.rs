@@ -1,8 +1,14 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![cfg_attr(feature = "nightly", feature(allocator_api))]
-#![feature(const_trait_impl,const_convert,const_try,const_index, const_result_trait_fn,const_option_ops)]
-#![feature(sized_type_properties, layout_for_ptr)]
-#![feature(slice_ptr_get)]
+#![feature(
+    const_trait_impl,
+    const_convert,
+    const_try,
+    const_index,
+    const_result_trait_fn,
+    const_option_ops
+)]
+#![feature(sized_type_properties, layout_for_ptr, ptr_metadata, slice_ptr_get)]
 
 extern crate alloc;
 
@@ -15,8 +21,9 @@ pub mod boxed;
 mod header;
 mod malloc;
 pub mod os;
-mod reg;
 mod queue;
+mod msg;
+mod reg;
 mod tests;
 
 mod seal {
@@ -77,7 +84,6 @@ mod numeric {
         cast!(from:u32, to:usize);
         cast!(from:u32, to:u64);
     }
-    
 
     #[const_trait]
     pub trait Alignable {

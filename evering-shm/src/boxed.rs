@@ -1,12 +1,12 @@
 use core::alloc::Layout;
-use core::mem::MaybeUninit;
+use core::marker::PhantomData;
+use core::mem;
 use core::ops::{Deref, DerefMut};
-use core::ptr;
+use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
-use core::{mem, ptr::NonNull};
-use std::alloc::handle_alloc_error;
 
-use crate::malloc::{AllocError, MemAllocator, Meta};
+use crate::malloc::{AllocError, MemAllocator, Meta, MetaOf, SpanOf, handle_alloc_error};
+use crate::msg::{ATokenOf, TokenOf};
 
 const fn is_zst<T>() -> bool {
     size_of::<T>() == 0
@@ -46,6 +46,29 @@ impl<T: ?Sized, A: MemAllocator> DerefMut for PBox<T, A> {
 }
 
 impl<T, A: MemAllocator> PBox<T, A> {
+    #[inline]
+    pub fn token(self) -> ATokenOf<T, A> {
+        let (token, alloc) = self.token_with();
+        mem::forget(alloc);
+        token
+    }
+
+    #[inline]
+    pub fn token_with(self) -> (ATokenOf<T, A>, A) {
+        let (ptr, meta, alloc) = Self::into_raw_ptr(self);
+        let token = unsafe { TokenOf::from_ptr(meta.forget(), ptr) };
+        (token, alloc)
+    }
+
+    #[inline]
+    pub fn detoken(token: ATokenOf<T, A>, alloc: A) -> Self {
+        unsafe {
+            ATokenOf::<T, A>::detokenize(token, alloc, |meta, ptr, alloc| {
+                Self::from_raw_ptr(ptr, meta, alloc)
+            })
+        }
+    }
+
     pub fn new_in(x: T, alloc: A) -> PBox<T, A> {
         let boxed = Self::new_uninit_in(alloc);
         boxed.write(x)
@@ -76,7 +99,7 @@ impl<T, A: MemAllocator> PBox<T, A> {
     }
 
     pub fn from_meta(meta: A::Meta, alloc: A) -> PBox<mem::MaybeUninit<T>, A> {
-        let ptr = meta.as_ptr_of();
+        let ptr = meta.as_uninit();
         PBox { ptr, meta, alloc }
     }
 
@@ -93,8 +116,26 @@ impl<T, A: MemAllocator> PBox<T, A> {
 
 impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
     // #[inline]
-    // pub fn token(self) -> Token {
-    //     Token::token(self)
+    // pub fn token(self) -> ATokenOf<T, A> {
+    //     let (token, alloc) = self.token_with();
+    //     mem::forget(alloc);
+    //     token
+    // }
+
+    // #[inline]
+    // pub fn token_with(self) -> (ATokenOf<T, A>, A) {
+    //     let (ptr, meta, alloc) = Self::into_raw_ptr(self);
+    //     let token = unsafe { TokenOf::from_ptr(meta.forget(), ptr) };
+    //     (token, alloc)
+    // }
+
+    // #[inline]
+    // pub fn detoken(t: ATokenOf<T, A>, alloc: A) -> PBox<T, A> {
+    //     unsafe {
+    //         ATokenOf::<T, A>::detokenize(t, alloc, |meta, ptr, alloc| {
+    //             Self::from_raw_ptr(ptr, meta, alloc)
+    //         })
+    //     }
     // }
 
     #[inline]
@@ -154,6 +195,29 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
 }
 
 impl<T, A: MemAllocator> PBox<[T], A> {
+    #[inline]
+    pub fn token(self) -> ATokenOf<[T], A> {
+        let (token, alloc) = self.token_with();
+        mem::forget(alloc);
+        token
+    }
+
+    #[inline]
+    pub fn token_with(self) -> (ATokenOf<[T], A>, A) {
+        let (ptr, meta, alloc) = Self::into_raw_ptr(self);
+        let token = unsafe { TokenOf::from_slice(meta.forget(), ptr) };
+        (token, alloc)
+    }
+
+    #[inline]
+    pub fn detoken(token: ATokenOf<[T], A>, alloc: A) -> Self {
+        unsafe {
+            ATokenOf::<[T], A>::detokenize(token, alloc, |meta, ptr, alloc| {
+                Self::from_raw_ptr(ptr, meta, alloc)
+            })
+        }
+    }
+
     pub fn copy_from_slice(src: &[T], alloc: A) -> PBox<[T], A> {
         let len = src.len();
         let mut m = PBox::new_uninit_slice_in(len, alloc);
@@ -170,11 +234,6 @@ impl<T, A: MemAllocator> PBox<[T], A> {
         m.unwrap()
     }
 
-    // pub fn new_zeroed_slice_in(len: usize, alloc: A) -> LocalBox<[mem::MaybeUninit<T>], A> {
-    //     let m = LocalBox::try_new_zeroed_slice_in(len, alloc);
-    //     m.unwrap()
-    // }
-
     pub fn try_new_uninit_slice_in(
         len: usize,
         alloc: A,
@@ -189,8 +248,8 @@ impl<T, A: MemAllocator> PBox<[T], A> {
             alloc.malloc_by(layout).map_err(|_| AllocError)?
         };
 
-        let ptr = meta.as_ptr_of();
-        let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr() as *mut mem::MaybeUninit<T>, len);
+        let ptr = meta.as_uninit();
+        let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr(), len);
         unsafe { Ok(PBox::from_raw_ptr(slice, meta, alloc)) }
     }
 }
@@ -229,7 +288,7 @@ impl<T, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
 const MAX_REFCOUNT: usize = (isize::MAX) as usize;
 
 #[repr(C)]
-struct PArcIn<T: ?Sized> {
+pub struct PArcIn<T: ?Sized> {
     rc: AtomicUsize,
     data: T,
 }
@@ -307,6 +366,29 @@ impl<T: ?Sized, A: MemAllocator> Drop for PArc<T, A> {
 }
 
 impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
+    // #[inline]
+    // pub fn token(self) -> PArcTokenOf<T, A> {
+    //     let (token, alloc) = self.token_with();
+    //     mem::forget(alloc);
+    //     token
+    // }
+
+    // #[inline]
+    // pub fn token_with(self) -> (PArcTokenOf<T, A>, A) {
+    //     let (ptr, m, alloc) = PArc::into_raw_ptr(self);
+    //     let token = unsafe { TokenOf::from_raw(m.forget(), ptr::metadata(ptr.as_ptr())) };
+    //     (token, alloc)
+    // }
+
+    // #[inline]
+    // pub fn detoken(t: PArcTokenOf<T, A>, alloc: A) -> Self {
+    //     unsafe {
+    //         PArcTokenOf::<T, A>::detokenize(t, alloc, |meta, ptr, alloc| {
+    //             PArc::from_inner(NonNull::new_unchecked(ptr), meta, alloc)
+    //         })
+    //     }
+    // }
+
     #[inline]
     const fn into_raw(a: Self) -> (A::Meta, A) {
         let a = mem::ManuallyDrop::new(a);
@@ -355,8 +437,8 @@ impl<T, A: MemAllocator> PArc<T, A> {
                 Layout::new::<T>(),
                 |layout| alloc.malloc_by(layout),
                 |meta| {
-                    meta.as_ptr_of::<PArcIn<T>>()
-                        .cast::<PArcIn<MaybeUninit<T>>>()
+                    meta.as_uninit::<PArcIn<T>>()
+                        .cast::<PArcIn<mem::MaybeUninit<T>>>()
                         .as_ptr()
                 },
             )
@@ -385,8 +467,8 @@ impl<T, A: MemAllocator> PArc<T, A> {
                 Layout::new::<T>(),
                 |layout| alloc.malloc_by(layout),
                 |meta| {
-                    meta.as_ptr_of::<PArcIn<T>>()
-                        .cast::<PArcIn<MaybeUninit<T>>>()
+                    meta.as_uninit::<PArcIn<T>>()
+                        .cast::<PArcIn<mem::MaybeUninit<T>>>()
                         .as_ptr()
                 },
             )
@@ -442,7 +524,7 @@ impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
     unsafe fn init_arcin(
         meta: A::Meta,
         layout: Layout,
-        to_arcin: impl FnOnce(&A::Meta) -> *mut PArcIn<T> ,
+        to_arcin: impl FnOnce(&A::Meta) -> *mut PArcIn<T>,
     ) -> (*mut PArcIn<T>, A::Meta) {
         let inner = to_arcin(&meta);
         debug_assert_eq!(unsafe { Layout::for_value_raw(inner) }, layout);
@@ -454,3 +536,39 @@ impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
         (inner, meta)
     }
 }
+
+// type ATokenOf<T, A> = TokenOf<T, SpanOf<MetaOf<A>>>;
+// type PArcTokenOf<T, A> = ATokenOf<PArcIn<T>, A>;
+
+// No static reflection, can't safely erase `Metadata` type
+// while retains information
+// pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
+//     span: M,
+//     metadata: T::Metadata,
+// }
+
+// impl<T: ?Sized + ptr::Pointee, M> TokenOf<T, M> {
+//     #[inline(always)]
+//     const unsafe fn from_raw(span: M, metadata: T::Metadata) -> Self {
+//         TokenOf { span, metadata }
+//     }
+
+//     #[inline(always)]
+//     const unsafe fn from_ptr(span: M, ptr: *const T) -> Self {
+//         let metadata = ptr::metadata(ptr);
+//         TokenOf { span, metadata }
+//     }
+
+//     unsafe fn detokenize<A: MemAllocator, Out>(
+//         t: TokenOf<T, SpanOf<A::Meta>>,
+//         alloc: A,
+//         f: impl FnOnce(A::Meta, *mut T, A) -> Out,
+//     ) -> Out {
+//         let TokenOf { span, metadata } = t;
+//         let meta = unsafe { A::Meta::resolve(span, alloc.base_ptr()) };
+//         let thin_ptr = meta.as_uninit::<u8>();
+//         let ptr = ptr::from_raw_parts_mut::<T>(thin_ptr.as_ptr(), metadata);
+//         f(meta, ptr, alloc)
+//     }
+// }
+//

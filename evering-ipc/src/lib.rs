@@ -19,7 +19,7 @@ pub mod uring {
 }
 
 pub mod shm {
-    pub use evering_shm::perlude::{Mmap, AddrSpec};
+    pub use evering_shm::perlude::{AddrSpec, Mmap};
     pub mod boxed {
         pub use evering_shm::boxed::*;
     }
@@ -36,7 +36,7 @@ pub mod shm {
 use evering::driver::Driver;
 use evering::driver::bare::{Completer, ReceiveBridge, SubmitBridge, box_client, box_server};
 use evering::uring::bare::{BoxQueue, Boxed};
-use evering_shm::perlude::{ShmAlloc, ShmAllocError, Mmap, ShmHeader, ShmInit, AddrSpec};
+use evering_shm::perlude::{AddrSpec, Mmap, ShmAlloc, ShmAllocError, ShmHeader, ShmInit};
 
 pub trait IpcSpec {
     type A: ShmInit;

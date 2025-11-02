@@ -1,5 +1,5 @@
-use evering::driver::asynch::CompleterBridge;
 use evering::driver::Pool;
+use evering::driver::asynch::CompleterBridge;
 use evering::uring::{IReceiver, ISender, UringSpec};
 
 pub struct CharUring;
