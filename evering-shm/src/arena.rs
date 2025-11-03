@@ -2,20 +2,24 @@ use core::{
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Deref,
-    ptr::{self, NonNull},
+    ptr::NonNull,
     sync::atomic::{AtomicU32, AtomicU64, Ordering},
 };
+
+use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{
     area::MemBlkOps,
     malloc::{self, MemAllocInfo},
     numeric::{Alignable, CastInto, Packable},
 };
-use crossbeam_utils::Backoff;
 
 type UInt = u32;
+type PackedUInt = u64;
 type AtomicUInt = AtomicU32;
 type AtomicPackedUInt = AtomicU64;
+type PAtomicUInt = CachePadded<AtomicUInt>;
+type PAtomicPackedUInt = CachePadded<AtomicPackedUInt>;
 
 type Offset = UInt;
 type Size = UInt;
@@ -35,7 +39,7 @@ const fn bound(n: usize, available: UInt) -> Option<UInt> {
         return None;
     }
 
-    let n = u32::try_from(n).ok()?;
+    let n = UInt::try_from(n).ok()?;
     if n < available { Some(n) } else { None }
 }
 
@@ -239,9 +243,9 @@ impl Meta {
 #[repr(C, align(8))]
 pub struct Header<S: Strategy> {
     sentinel: SegmentNode,
-    allocated: AtomicUInt,
-    discarded: AtomicUInt,
-    min_segment_size: AtomicUInt,
+    allocated: PAtomicUInt,
+    discarded: PAtomicUInt,
+    min_segment_size: PAtomicUInt,
     strategy: PhantomData<S>,
 }
 
@@ -257,7 +261,7 @@ impl<S: Strategy> core::fmt::Debug for Header<S> {
 }
 
 impl<S: Strategy> crate::header::Layout for Header<S> {
-    type Config = u32;
+    type Config = Size;
     #[inline]
     fn init(&mut self, cfg: Self::Config) -> crate::header::HeaderStatus {
         let data = Self::new(cfg);
@@ -271,20 +275,22 @@ impl<S: Strategy> crate::header::Layout for Header<S> {
         if self.allocated.load(Ordering::Relaxed) == 0 {
             crate::header::HeaderStatus::Uninitialized
         } else {
-            crate::header::HeaderStatus::Uninitialized
+            crate::header::HeaderStatus::Initialized
         }
     }
 }
 
 impl<S: Strategy> Header<S> {
-    const MIN_SEGMENT_SIZE: u32 = 20;
+    const MIN_SEGMENT_SIZE: UInt = 20;
     #[inline]
-    fn new(min_seg_size: u32) -> Self {
+    fn new(min_seg_size: UInt) -> Self {
         Self {
             sentinel: SegmentNode::sentinel(),
-            allocated: AtomicU32::new(UInt::size_of::<Self>().align_up_of::<Self>()),
-            discarded: AtomicU32::new(0),
-            min_segment_size: AtomicU32::new(min_seg_size),
+            allocated: CachePadded::new(AtomicUInt::new(
+                UInt::size_of::<Self>().align_up_of::<Self>(),
+            )),
+            discarded: CachePadded::new(AtomicUInt::new(0)),
+            min_segment_size: CachePadded::new(AtomicUInt::new(min_seg_size)),
             strategy: PhantomData,
         }
     }
@@ -334,7 +340,7 @@ impl<S: Strategy> Header<S> {
 
     #[inline]
     // remove the last node: `offset+size` or return false
-    fn dealloc(&self, offset: u32, size: u32) -> bool {
+    fn dealloc(&self, offset: Offset, size: Size) -> bool {
         if self
             .allocated
             .compare_exchange(offset + size, offset, Ordering::SeqCst, Ordering::Relaxed)
@@ -352,24 +358,24 @@ impl<S: Strategy> Header<S> {
     }
 
     #[inline]
-    pub fn discarded(&self) -> u32 {
+    pub fn discarded(&self) -> Size {
         self.discarded.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn incre_discarded(&self, size: u32) {
+    fn incre_discarded(&self, size: Size) {
         #[cfg(feature = "tracing")]
         tracing::debug!("discard {size} bytes");
         self.discarded.fetch_add(size, Ordering::Release);
     }
 
     #[inline]
-    pub fn min_segment_size(&self) -> u32 {
+    pub fn min_segment_size(&self) -> Size {
         self.min_segment_size.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn with_min_segment_size(&self, size: u32) {
+    fn with_min_segment_size(&self, size: Size) {
         self.min_segment_size.store(size, Ordering::Release);
     }
 }
@@ -378,18 +384,6 @@ impl<S: Strategy> Header<S> {
 struct SegmentNodeData {
     size: Size,
     next: Offset,
-}
-
-impl From<u64> for SegmentNodeData {
-    fn from(value: u64) -> Self {
-        Self::decode(value)
-    }
-}
-
-impl Into<u64> for SegmentNodeData {
-    fn into(self) -> u64 {
-        self.encode()
-    }
 }
 
 impl core::fmt::Debug for SegmentNodeData {
@@ -502,7 +496,7 @@ impl SegmentNode {
     }
 
     #[inline]
-    fn load_word(&self) -> u64 {
+    fn load_word(&self) -> PackedUInt {
         self.node.load(Ordering::Acquire)
     }
 
@@ -527,8 +521,8 @@ impl SegmentNode {
         let current = current.encode();
         let new = new.encode();
         match self.node.compare_exchange(current, new, success, failure) {
-            Ok(word) => Ok(SegmentNodeData::from(word)),
-            Err(word) => Err(SegmentNodeData::from(word)),
+            Ok(word) => Ok(SegmentNodeData::decode(word)),
+            Err(word) => Err(SegmentNodeData::decode(word)),
         }
     }
 
@@ -629,7 +623,11 @@ impl Segment {
     }
 
     #[inline]
-    const fn validate(offset: Offset, size: Size, min_data_size: Size) -> Option<(u32, u32, u32)> {
+    const fn validate(
+        offset: Offset,
+        size: Size,
+        min_data_size: Size,
+    ) -> Option<(Offset, Size, Size)> {
         let aligned_offset = offset.align_up_of::<SegmentNode>();
         let overhead = offset.align_offset_of::<SegmentNode>() + SEGMENT_NODE_SIZE;
         let available = size.checked_sub(overhead)?;
@@ -681,7 +679,7 @@ impl Deref for ReqSegment {
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     read_only: bool,
-    min_segment_size: u32,
+    min_segment_size: Size,
     max_retries: u32,
 }
 
@@ -696,14 +694,14 @@ impl Default for Config {
 }
 
 impl Config {
-    const MIN_SEGMENT_SIZE: u32 = 20;
+    const MIN_SEGMENT_SIZE: Size = 20;
     const MAX_RETRIES: u32 = 5;
 
     fn with_read_only(self, read_only: bool) -> Self {
         Self { read_only, ..self }
     }
 
-    fn with_min_segment_size(self, seg_size: u32) -> Self {
+    fn with_min_segment_size(self, seg_size: Size) -> Self {
         Self {
             min_segment_size: seg_size,
             ..self
@@ -719,14 +717,14 @@ impl Config {
 
 pub trait Strategy: Sized {
     /// Check ordering relation between segment sizes.
-    fn order(val: u32, next_node_size: u32) -> bool;
-    fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error>;
+    fn order(val: Size, next_node_size: Size) -> bool;
+    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error>;
 }
 
 pub struct Arena<'a, S: Strategy> {
     h: &'a Header<S>,
     start: *const u8,
-    size: u32,
+    size: Size,
     read_only: bool,
     max_retries: u32,
 }
@@ -739,11 +737,11 @@ type PArena<'a> = Arena<'a, Optimistic>;
 
 impl Strategy for Optimistic {
     #[inline]
-    fn order(val: u32, next_node_size: u32) -> bool {
+    fn order(val: Size, next_node_size: Size) -> bool {
         val >= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error> {
         let cur = &arena.header().sentinel;
         arena.alloc_slow_by(&cur, size)
     }
@@ -751,11 +749,11 @@ impl Strategy for Optimistic {
 
 impl Strategy for Pessimistic {
     #[inline]
-    fn order(val: u32, next_node_size: u32) -> bool {
+    fn order(val: Size, next_node_size: Size) -> bool {
         val <= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: u32) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error> {
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
             return Err(Error::UnenoughSpace {
                 requested: size,
@@ -1023,7 +1021,7 @@ impl<S: Strategy> Arena<'_, S> {
         }
     }
 
-    fn discard_freelist(&self) -> Result<u32, Error> {
+    fn discard_freelist(&self) -> Result<Size, Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
@@ -1031,7 +1029,7 @@ impl<S: Strategy> Arena<'_, S> {
         Ok(self.discard_freelist_in())
     }
 
-    fn discard_freelist_in(&self) -> u32 {
+    fn discard_freelist_in(&self) -> Size {
         let header = self.header();
         let backoff = Backoff::new();
 
@@ -1133,7 +1131,7 @@ impl<S: Strategy> Arena<'_, S> {
             }
         }
     }
-    fn alloc_slow_by(&self, cur: &SegmentNode, size: u32) -> Result<Meta, Error> {
+    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size) -> Result<Meta, Error> {
         let backoff = Backoff::new();
 
         loop {

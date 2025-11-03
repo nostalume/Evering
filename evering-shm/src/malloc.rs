@@ -27,6 +27,7 @@ pub trait MemAllocInfo: MemBlkOps {
 
 pub type MetaOf<A> = <A as MemAlloc>::Meta;
 pub type SpanOf<M> = <M as Meta>::SpanMeta;
+pub type MetaSpanOf<A> = SpanOf<MetaOf<A>>;
 
 #[const_trait]
 pub unsafe trait Meta: Clone {

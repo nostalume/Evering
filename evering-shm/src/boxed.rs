@@ -1,11 +1,10 @@
 use core::alloc::Layout;
-use core::marker::PhantomData;
 use core::mem;
 use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
 
-use crate::malloc::{AllocError, MemAllocator, Meta, MetaOf, SpanOf, handle_alloc_error};
+use crate::malloc::{AllocError, MemAllocator, Meta, handle_alloc_error};
 use crate::msg::{ATokenOf, TokenOf};
 
 const fn is_zst<T>() -> bool {

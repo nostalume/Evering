@@ -37,7 +37,9 @@ pub(crate) trait Layout: core::fmt::Debug + Sized {
     }
 }
 
+pub(crate) type MAGIC = u16;
 pub(crate) trait Metadata: Layout {
+    const MAGIC_VALUE: MAGIC;
     fn valid_magic(&self) -> bool;
     fn with_magic(&mut self);
 }
@@ -60,6 +62,14 @@ impl HeaderStatus {
 pub struct SanityMetadata<T: Metadata> {
     pub inner: T,
     status: HeaderStatus,
+}
+
+impl<T: Metadata> Deref for SanityMetadata<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 impl<T: Metadata> SanityMetadata<T> {

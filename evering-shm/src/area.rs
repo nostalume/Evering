@@ -376,7 +376,7 @@ impl<S: AddrSpec> MemBlkSpec<S> {
 
 #[repr(C)]
 pub struct Metadata {
-    magic: u16,
+    magic: MAGIC,
     // own counts
     rc: AtomicU32,
 }
@@ -421,6 +421,7 @@ impl crate::header::Layout for Metadata {
 }
 
 impl crate::header::Metadata for Metadata {
+    const MAGIC_VALUE: MAGIC = 0x7203;
     #[inline]
     fn valid_magic(&self) -> bool {
         self.magic == Self::MAGIC_VALUE
@@ -433,9 +434,6 @@ impl crate::header::Metadata for Metadata {
 }
 
 impl Metadata {
-    // TODO
-    pub const MAGIC_VALUE: u16 = 0x7203;
-
     #[inline]
     pub fn inc_rc(&self) -> u32 {
         self.rc.fetch_add(1, core::sync::atomic::Ordering::AcqRel)
@@ -444,14 +442,11 @@ impl Metadata {
     #[inline]
     pub fn dec_rc(&self) -> Option<u32> {
         use core::sync::atomic::Ordering;
-        match self
-            .rc
+        self.rc
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
                 if cur == 0 { None } else { Some(cur - 1) }
-            }) {
-            Ok(prev) => Some(prev),
-            Err(_) => None,
-        }
+            })
+            .ok()
     }
 }
 
@@ -558,10 +553,14 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for RawMemBlk<S, M> {
 }
 
 use crate::header::Layout;
+use crate::header::MAGIC;
+/// A handle of **mapped** memory block.
 pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
     a: MemBlkSpec<S>,
     bk: M,
 }
+
+pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(alloc::sync::Arc<MemBlk<S, M>>);
 
 impl<S: AddrSpec, M: Mmap<S>> Into<MemBlk<S, M>> for RawMemBlk<S, M> {
     fn into(self) -> MemBlk<S, M> {
@@ -582,18 +581,17 @@ where
     }
 }
 
+impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlkHandle<S, M> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
-        let rc = self.header().write().inner.dec_rc();
-
-        rc.map(|s| {
-            if s == 1 {
-                unsafe {
-                    let ptr = self as *mut Self as *mut RawMemBlk<S, M>;
-                    let _ = M::unmap(&mut *ptr);
-                }
-            }
-        });
+        self.header().read().dec_rc();
+        let blk = self.as_raw();
+        let _ = M::unmap(blk);
     }
 }
 
@@ -611,7 +609,18 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for MemBlk<S, M> {
     }
 }
 
+impl<S: AddrSpec, M: Mmap<S>> Deref for MemBlkHandle<S, M> {
+    type Target = MemBlk<S, M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
+    pub(crate) fn as_raw(&mut self) -> &mut RawMemBlk<S, M> {
+        unsafe { &mut *(self as *mut _ as *mut _) }
+    }
     pub fn header(&self) -> &Header {
         unsafe {
             let ptr = self.start_ptr() as *const Header;
@@ -632,5 +641,11 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
         }
 
         Ok(area.into())
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> MemBlkHandle<S, M> {
+    pub fn from_blk(blk: MemBlk<S, M>) -> Self {
+        Self(alloc::sync::Arc::new(blk))
     }
 }

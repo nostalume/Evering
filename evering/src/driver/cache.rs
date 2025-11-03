@@ -72,7 +72,7 @@ pub mod unlocked {
         state: AtomicU8,
         waker: UnsafeCell<MaybeUninit<Waker>>,
         // take rather read to move out, avoiding free after read.
-        payload: UnsafeCell<Option<T>>,
+        payload: UnsafeCell<MaybeUninit<T>>,
     }
 
     unsafe impl<T: Send> Send for CacheState<T> {}
@@ -112,7 +112,38 @@ pub mod unlocked {
                 magic: AtomicU32::new(Self::MAGIC),
                 state: AtomicU8::new(INIT),
                 waker: UnsafeCell::new(MaybeUninit::uninit()),
-                payload: UnsafeCell::new(None),
+                payload: UnsafeCell::new(MaybeUninit::uninit()),
+            }
+        }
+
+        unsafe fn init_waker(&self, cx: &Context<'_>) {
+            unsafe {
+                (*self.waker.get()).write(cx.waker().clone());
+            }
+        }
+
+        unsafe fn read_waker_ref(&self) -> &Waker {
+            unsafe { (*self.waker.get()).assume_init_ref() }
+        }
+
+        unsafe fn read_waker(&self) -> Waker {
+            unsafe { (*self.waker.get()).assume_init_read() }
+        }
+
+        unsafe fn drop_waker(&self) {
+            unsafe { (*self.waker.get()).assume_init_drop() }
+        }
+
+        unsafe fn init_payload(&self, payload: T) {
+            unsafe {
+                (*self.payload.get()).write(payload);
+            }
+        }
+
+        unsafe fn take_payload(&self) -> T {
+            unsafe {
+                // **Take out the value**
+                self.payload.replace(MaybeUninit::uninit()).assume_init()
             }
         }
 
@@ -120,12 +151,12 @@ pub mod unlocked {
             let state = *self.state.get_mut();
             if state == COMPLETED {
                 unsafe {
-                    (*self.payload.get()).take();
+                    let _ = self.take_payload();
                 }
             }
             if state == WAITING {
                 unsafe {
-                    (*self.waker.get()).assume_init_drop();
+                    self.drop_waker();
                 }
             }
 
@@ -133,13 +164,15 @@ pub mod unlocked {
         }
 
         pub fn try_complete(&self, payload: T) {
-            unsafe { (*self.payload.get()).replace(payload) };
+            unsafe {
+                self.init_payload(payload);
+            };
             if self
                 .state
                 .swap(COMPLETED, core::sync::atomic::Ordering::AcqRel)
                 == WAITING
             {
-                let waker = unsafe { (*self.waker.get()).assume_init_read() };
+                let waker = unsafe { self.read_waker() };
                 waker.wake();
             }
         }
@@ -163,9 +196,11 @@ pub mod unlocked {
                         }
                     }
                     WAITING => {
-                        let waker = unsafe { (*self.waker.get()).assume_init_read() };
+                        let waker = unsafe { self.read_waker_ref() };
                         if !waker.will_wake(cx.waker()) {
-                            unsafe { (*self.waker.get()).write(cx.waker().clone()) };
+                            unsafe {
+                                self.init_waker(cx);
+                            };
                         }
                         if self
                             .state
@@ -181,7 +216,7 @@ pub mod unlocked {
                         }
                     }
                     COMPLETED => {
-                        let payload = unsafe { (*self.payload.get()).take().unwrap() };
+                        let payload = unsafe { self.take_payload() };
                         return Poll::Ready(payload);
                     }
                     _ => unreachable!(),

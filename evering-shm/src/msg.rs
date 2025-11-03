@@ -2,7 +2,7 @@ use core::marker::PhantomData;
 use core::ptr;
 
 use crate::boxed::PBox;
-use crate::malloc::{MemAllocator, Meta, MetaOf, SpanOf};
+use crate::malloc::{MemAllocator, Meta, MetaSpanOf};
 
 pub mod type_id {
     pub type TypeId = u64;
@@ -30,7 +30,7 @@ pub mod type_id {
 
     #[inline]
     const fn fnv1a64(s: &str) -> TypeId {
-        let mut hash = 0xcbf29ce484222325u64;
+        let mut hash = 0xcbf29ce484222325;
         let bytes = s.as_bytes();
         let mut i = 0;
         while i < bytes.len() {
@@ -69,7 +69,7 @@ impl Metadata {
     }
 }
 
-pub type ATokenOf<T, A> = TokenOf<T, SpanOf<MetaOf<A>>>;
+pub type ATokenOf<T, A> = TokenOf<T, MetaSpanOf<A>>;
 
 pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
     span: M,
@@ -133,7 +133,7 @@ impl<T, M> TokenOf<[T], M> {
     }
 }
 
-pub use self::type_id::{TypeId, TypeTag, type_id};
+pub use self::type_id::{TypeId, TypeTag};
 
 trait Message: TypeTag {
     type Semantics;
@@ -146,7 +146,7 @@ pub struct Move;
 pub trait MoveMessage: Message<Semantics = Move> {}
 impl<T: MoveMessage> MoveMessage for [T] {}
 
-type AToken<A> = Token<SpanOf<MetaOf<A>>>;
+type AToken<A> = Token<MetaSpanOf<A>>;
 struct Token<M> {
     span: M,
     metadata: Metadata,
@@ -210,3 +210,15 @@ impl Move {
         Some(b)
     }
 }
+
+trait Envelope {}
+
+impl Envelope for () {}
+
+struct PackToken<H: Envelope, M> {
+    h: H,
+    token: Token<M>,
+}
+
+pub type ThinToken<M> = PackToken<(), M>;
+pub type AThinToken<A> = PackToken<(), MetaSpanOf<A>>;

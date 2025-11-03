@@ -8,7 +8,14 @@
     const_result_trait_fn,
     const_option_ops
 )]
-#![feature(sized_type_properties, layout_for_ptr, ptr_metadata, slice_ptr_get)]
+#![feature(
+    sized_type_properties,
+    layout_for_ptr,
+    ptr_metadata,
+    slice_ptr_get,
+    get_mut_unchecked,
+    unsafe_cell_access
+)]
 
 extern crate alloc;
 
@@ -20,9 +27,9 @@ mod arena;
 pub mod boxed;
 mod header;
 mod malloc;
+mod msg;
 pub mod os;
 mod queue;
-mod msg;
 mod reg;
 mod tests;
 

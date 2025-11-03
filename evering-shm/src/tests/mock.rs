@@ -4,6 +4,8 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
+use crate::area::MemBlkHandle;
+
 use super::super::{
     area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk},
     arena::{ArenaMemBlk, Optimistic},
@@ -15,6 +17,7 @@ const MAX_ADDR: usize = 0x10000;
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
 type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>>;
+type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
 type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
 
 struct MockAddr;
@@ -114,6 +117,11 @@ fn mock_area(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> Mo
     a
 }
 
+fn mock_handle(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
+    let a = mock_area(pt, start, size);
+    MockMemHandle::from_blk(a)
+}
+
 fn mock_arena(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
     let bk = MockBackend(pt);
     let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
@@ -125,7 +133,9 @@ fn area_test() {
     const STEP: usize = 0x2000;
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
-        let a = mock_area(&mut pt, Some(start.into()), STEP);
+        let a = mock_handle(&mut pt, Some(start.into()), STEP);
+        let header = a.header();
+        tracing::debug!("{}", header);
     }
 }
 
