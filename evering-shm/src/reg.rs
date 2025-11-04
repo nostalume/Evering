@@ -1,4 +1,3 @@
-
 use core::{
     cell::UnsafeCell,
     mem::MaybeUninit,
@@ -12,16 +11,17 @@ const FREE: u8 = 0;
 const INITIALIZING: u8 = 1;
 const ACTIVE: u8 = 2;
 const INACTIVE: u8 = 3;
+const DEINITIALIZING: u8 = 4;
 
 #[repr(C)]
-struct Entry<T> {
+pub struct Entry<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     rc: AtomicUsize,
     state: AtomicU8,
 }
 
 #[repr(transparent)]
-struct EntryGuard<'a, T> {
+pub struct EntryGuard<'a, T> {
     e: &'a Entry<T>,
 }
 
@@ -77,10 +77,17 @@ impl<T> Entry<T> {
     pub fn reset<F: FnOnce(T)>(&self, f: F) {
         if self
             .state
-            .compare_exchange_weak(INACTIVE, FREE, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(
+                INACTIVE,
+                DEINITIALIZING,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
             .is_ok()
         {
+            // Me is the sole owner.
             let data = unsafe { self.get() };
+            self.state.store(FREE, Ordering::Relaxed);
             f(data)
         }
     }
@@ -108,7 +115,7 @@ impl<T> Deref for EntryGuard<'_, T> {
 }
 
 #[repr(C)]
-struct Registry<T, const N: usize> {
+pub struct Registry<T, const N: usize> {
     magic: crate::header::MAGIC,
     counts: AtomicU32,
     entries: [Entry<T>; N],
@@ -151,4 +158,8 @@ impl<T, const N: usize> crate::header::Metadata for Registry<T, N> {
     fn with_magic(&mut self) {
         self.magic = Self::MAGIC_VALUE
     }
+}
+
+impl<T, const N: usize> Registry<T, N> {
+    // pub fn init(&self, idx:usize, data:T)
 }

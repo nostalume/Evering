@@ -1,5 +1,5 @@
 use core::marker::PhantomData;
-use core::ptr;
+use core::ptr::{self, NonNull};
 
 use crate::boxed::PBox;
 use crate::malloc::{MemAllocator, Meta, MetaSpanOf};
@@ -52,6 +52,7 @@ pub mod type_id {
     }
 }
 
+#[derive(Clone, Copy)]
 enum Metadata {
     Sized,
     Slice(usize),
@@ -78,8 +79,20 @@ pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
 }
 
 impl<T, M> TokenOf<T, M> {
+    #[inline]
+    pub unsafe fn as_ptr<A: MemAllocator>(t: &ATokenOf<T, A>, alloc: A) -> NonNull<T> {
+        let meta = unsafe { A::Meta::resolve(t.span.clone(), alloc.base_ptr()) };
+        match t.metadata {
+            Metadata::Sized => {
+                let ptr = unsafe { meta.as_ptr::<T>() };
+                unsafe { NonNull::new_unchecked(ptr) }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[inline(always)]
-    pub const unsafe fn from_ptr(span: M, ptr: *const T) -> Self {
+    pub const unsafe fn from_raw(span: M, ptr: *const T) -> Self {
         let metadata = Metadata::from_ptr(ptr);
         TokenOf {
             span,
@@ -106,6 +119,18 @@ impl<T, M> TokenOf<T, M> {
 }
 
 impl<T, M> TokenOf<[T], M> {
+    #[inline]
+    pub unsafe fn as_ptr<A: MemAllocator>(t: &ATokenOf<[T], A>, alloc: A) -> NonNull<[T]> {
+        let meta = unsafe { A::Meta::resolve(t.span.clone(), alloc.base_ptr()) };
+        match t.metadata {
+            Metadata::Slice(len) => {
+                let ptr = unsafe { meta.as_slice::<T>(len) };
+                unsafe { NonNull::new_unchecked(ptr) }
+            }
+            _ => unreachable!(),
+        }
+    }
+
     #[inline(always)]
     pub const unsafe fn from_slice(span: M, ptr: *const [T]) -> Self {
         let metadata = Metadata::from_slice(ptr);
@@ -191,6 +216,16 @@ impl Move {
         token
     }
 
+    pub fn slice_token<T: MoveMessage, A: MemAllocator, F: FnMut(usize) -> T>(
+        len: usize,
+        f: F,
+        alloc: A,
+    ) -> AToken<A> {
+        let b = PBox::new_slice_in(len, f, alloc);
+        let token = Token::erase(b.token());
+        token
+    }
+
     pub fn detoken<T: MoveMessage, A: MemAllocator>(t: AToken<A>, alloc: A) -> Option<PBox<T, A>> {
         let Some(token_of) = Token::recall::<T>(t) else {
             return None;
@@ -211,14 +246,35 @@ impl Move {
     }
 }
 
-trait Envelope {}
+pub(crate) trait Envelope {
+    fn init_by<M>(t: &Token<M>) -> Self;
+}
 
-impl Envelope for () {}
+impl Envelope for () {
+    fn init_by<M>(_t: &Token<M>) -> Self {
+        ()
+    }
+}
 
-struct PackToken<H: Envelope, M> {
+pub struct PackToken<H: Envelope, M> {
     h: H,
     token: Token<M>,
 }
+pub type PAToken<H, A> = PackToken<H, MetaSpanOf<A>>;
+pub type ThinPToken<M> = PackToken<(), M>;
 
-pub type ThinToken<M> = PackToken<(), M>;
-pub type AThinToken<A> = PackToken<(), MetaSpanOf<A>>;
+impl<H: Envelope, M> PackToken<H, M> {
+    #[inline]
+    pub fn from_token(t: Token<M>) -> Self {
+        Self {
+            h: H::init_by(&t),
+            token: t,
+        }
+    }
+
+    #[inline]
+    pub fn from_token_of<T: Message + ?Sized>(t: TokenOf<T, M>) -> Self {
+        let t = Token::erase(t);
+        Self::from_token(t)
+    }
+}

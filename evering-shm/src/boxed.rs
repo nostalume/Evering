@@ -55,7 +55,7 @@ impl<T, A: MemAllocator> PBox<T, A> {
     #[inline]
     pub fn token_with(self) -> (ATokenOf<T, A>, A) {
         let (ptr, meta, alloc) = Self::into_raw_ptr(self);
-        let token = unsafe { TokenOf::from_ptr(meta.forget(), ptr) };
+        let token = unsafe { TokenOf::from_raw(meta.forget(), ptr) };
         (token, alloc)
     }
 
@@ -217,6 +217,37 @@ impl<T, A: MemAllocator> PBox<[T], A> {
         }
     }
 
+    #[inline]
+    pub fn copy_elem(elem: T, len: usize, alloc: A) -> PBox<[T], A>
+    where
+        T: Clone,
+    {
+        Self::new_slice_in(len, |_| elem.clone(), alloc)
+    }
+
+    #[inline]
+    pub fn new_slice_in<F: FnMut(usize) -> T>(len: usize, f: F, alloc: A) -> PBox<[T], A> {
+        match Self::try_new_slice_in(len, f, alloc) {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("{}", e)
+            }
+        }
+    }
+
+    #[inline]
+    pub fn try_new_slice_in<F: FnMut(usize) -> T>(
+        len: usize,
+        mut f: F,
+        alloc: A,
+    ) -> Result<PBox<[T], A>, AllocError> {
+        let mut uninit = Self::try_new_uninit_slice_in(len, alloc)?;
+        for (i, elm) in uninit.iter_mut().enumerate() {
+            elm.write(f(i));
+        }
+        Ok(unsafe { uninit.assume_init() })
+    }
+
     pub fn copy_from_slice(src: &[T], alloc: A) -> PBox<[T], A> {
         let len = src.len();
         let mut m = PBox::new_uninit_slice_in(len, alloc);
@@ -228,9 +259,14 @@ impl<T, A: MemAllocator> PBox<[T], A> {
         }
     }
 
+    #[inline]
     pub fn new_uninit_slice_in(len: usize, alloc: A) -> PBox<[mem::MaybeUninit<T>], A> {
-        let m = PBox::try_new_uninit_slice_in(len, alloc);
-        m.unwrap()
+        match PBox::try_new_uninit_slice_in(len, alloc) {
+            Ok(b) => b,
+            Err(e) => {
+                panic!("{}", e)
+            }
+        }
     }
 
     pub fn try_new_uninit_slice_in(

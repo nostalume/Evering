@@ -58,13 +58,14 @@ pub mod unlocked {
     use core::{
         cell::UnsafeCell,
         mem::MaybeUninit,
-        sync::atomic::{AtomicU8, AtomicU32},
+        sync::atomic::{AtomicU8, AtomicU32, Ordering},
         task::{Context, Poll, Waker},
     };
 
     const INIT: u8 = 0;
     const WAITING: u8 = 1;
     const COMPLETED: u8 = 2;
+    const IN_PROGRESS: u8 = 3; // reservation state used by completer
 
     #[repr(C)]
     pub struct CacheState<T> {
@@ -81,39 +82,26 @@ pub mod unlocked {
     impl<T> core::fmt::Debug for CacheState<T> {
         fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
             f.debug_struct("CacheState")
-                .field("state", &self.state)
-                .field("waker", &self.waker)
-                .field("payload", &self.payload)
+                .field("state", &self.state.load(Ordering::Relaxed))
                 .finish()
-        }
-    }
-
-    impl<T> Default for CacheState<T> {
-        fn default() -> Self {
-            Self::empty()
         }
     }
 
     impl<T> CacheState<T> {
         const MAGIC: u32 = 0x12312;
-        pub fn init(&self) {
-            if !self.valid_magic() {
-                unsafe { (self as *const Self as *mut Self).write(Self::empty()) }
-            }
-        }
 
-        pub fn valid_magic(&self) -> bool {
-            let magic = self.magic.load(core::sync::atomic::Ordering::Relaxed);
-            magic == Self::MAGIC
-        }
-
-        pub const fn empty() -> Self {
+        #[inline]
+        pub const fn new() -> Self {
             Self {
                 magic: AtomicU32::new(Self::MAGIC),
                 state: AtomicU8::new(INIT),
                 waker: UnsafeCell::new(MaybeUninit::uninit()),
                 payload: UnsafeCell::new(MaybeUninit::uninit()),
             }
+        }
+
+        pub fn valid_magic(&self) -> bool {
+            self.magic.load(Ordering::Relaxed) == Self::MAGIC
         }
 
         unsafe fn init_waker(&self, cx: &Context<'_>) {
@@ -163,33 +151,58 @@ pub mod unlocked {
             *self.state.get_mut() = INIT;
         }
 
-        pub fn try_complete(&self, payload: T) {
+        #[inline]
+        pub fn try_complete(&self, payload: T) -> bool {
+            loop {
+                let s = self.state.load(Ordering::Acquire);
+                match s {
+                    COMPLETED => {
+                        drop(payload);
+                        return false;
+                    }
+                    IN_PROGRESS => {
+                        core::hint::spin_loop();
+                        continue;
+                    }
+                    _ => {
+                        if self
+                            .state
+                            .compare_exchange_weak(
+                                s,
+                                IN_PROGRESS,
+                                Ordering::AcqRel,
+                                Ordering::Acquire,
+                            )
+                            .is_ok()
+                        {
+                            break;
+                        } else {
+                            continue;
+                        }
+                    }
+                }
+            }
+
             unsafe {
                 self.init_payload(payload);
-            };
-            if self
-                .state
-                .swap(COMPLETED, core::sync::atomic::Ordering::AcqRel)
-                == WAITING
-            {
-                let waker = unsafe { self.read_waker() };
-                waker.wake();
             }
+            let prev = self.state.swap(COMPLETED, Ordering::AcqRel);
+            if prev == WAITING {
+                let w = unsafe { self.read_waker() };
+                w.wake();
+            }
+            true
         }
 
+        #[inline]
         pub fn try_poll(&self, cx: &mut Context<'_>) -> Poll<T> {
             loop {
-                match self.state.load(core::sync::atomic::Ordering::Acquire) {
+                match self.state.load(Ordering::Acquire) {
                     INIT => {
                         unsafe { (*self.waker.get()).write(cx.waker().clone()) };
                         if self
                             .state
-                            .compare_exchange(
-                                INIT,
-                                WAITING,
-                                core::sync::atomic::Ordering::AcqRel,
-                                core::sync::atomic::Ordering::Acquire,
-                            )
+                            .compare_exchange(INIT, WAITING, Ordering::AcqRel, Ordering::Acquire)
                             .is_ok()
                         {
                             return Poll::Pending;
@@ -199,6 +212,7 @@ pub mod unlocked {
                         let waker = unsafe { self.read_waker_ref() };
                         if !waker.will_wake(cx.waker()) {
                             unsafe {
+                                // replace!
                                 self.init_waker(cx);
                             };
                         }
@@ -213,6 +227,8 @@ pub mod unlocked {
                             .is_ok()
                         {
                             return Poll::Pending;
+                        } else {
+                            continue;
                         }
                     }
                     COMPLETED => {
