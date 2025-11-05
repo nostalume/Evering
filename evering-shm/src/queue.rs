@@ -1,8 +1,8 @@
 use core::cell::UnsafeCell;
-use core::fmt;
 use core::mem::MaybeUninit;
 use core::panic::{RefUnwindSafe, UnwindSafe};
 use core::sync::atomic::{self, AtomicUsize, Ordering};
+use core::{fmt, ptr};
 
 use crossbeam_utils::{Backoff, CachePadded};
 
@@ -84,26 +84,20 @@ impl<T> UnwindSafe for BoxQueueHandle<'_, T> {}
 impl<T> RefUnwindSafe for BoxQueueHandle<'_, T> {}
 
 use crate::boxed::PBox;
-pub(crate) use crate::malloc::{MemAllocator, MetaSpanOf};
-pub(crate) use crate::msg::{Envelope, PackToken, TokenOf};
-type TokenSlots<H, M> = Slots<PackToken<H, M>>;
-type TokenOfSlots<H, M> = TokenOf<TokenSlots<H, M>, M>;
+pub(crate) use crate::malloc::MemAllocator;
+pub(crate) use crate::msg::{ATokenOf, Envelope, PAToken};
+pub(crate) use crate::reg::{EntryView, Project, Resource};
+type TokenSlots<H, A> = Slots<PAToken<H, A>>;
+type TokenOfSlots<H, A> = ATokenOf<TokenSlots<H, A>, A>;
+type QEntryView<'a, H, A> = EntryView<'a, TokenQueue<H, A>>;
 struct TokenQueue<H: Envelope, A: MemAllocator> {
     h: Header,
-    buf: TokenOfSlots<H, MetaSpanOf<A>>,
+    buf: TokenOfSlots<H, A>,
 }
 unsafe impl<H: Send + Envelope, A: MemAllocator> Send for TokenQueue<H, A> {}
 unsafe impl<H: Send + Envelope, A: MemAllocator> Sync for TokenQueue<H, A> {}
 impl<H: Envelope, A: MemAllocator> UnwindSafe for TokenQueue<H, A> {}
 impl<H: Envelope, A: MemAllocator> RefUnwindSafe for TokenQueue<H, A> {}
-
-pub(crate) use crate::reg::{Entry, EntryGuard};
-type QEntry<H, A> = Entry<TokenQueue<H, A>>;
-type QEntryGuard<'a, H, A> = EntryGuard<'a, TokenQueue<H, A>>;
-struct TokenQueueHandle<'a, H: Envelope, A: MemAllocator> {
-    g: QEntryGuard<'a, H, A>,
-    buf: &'a TokenSlots<H, MetaSpanOf<A>>,
-}
 
 impl<T> BoxQueue<T> {
     fn new(cap: usize) -> Self {
@@ -144,8 +138,12 @@ impl<T> QueueOps for BoxQueueHandle<'_, T> {
     }
 }
 
-impl<H: Envelope, A: MemAllocator> TokenQueue<H, A> {
-    pub fn new(cap: usize, alloc: A) -> (Self, A) {
+impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
+    type Config = usize;
+    type Ctx = A;
+    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
+        let cap = cfg;
+        let alloc = ctx;
         let h = Header::new(cap);
         let buffer: PBox<_, A> = PBox::new_slice_in(
             cap,
@@ -159,42 +157,35 @@ impl<H: Envelope, A: MemAllocator> TokenQueue<H, A> {
         (TokenQueue { h, buf }, alloc)
     }
 
-    /// Drop the slots with explicit allocator handle.
-    ///
-    /// Otherwise the slot won't be deallocated.
-    pub fn drop_in(self, alloc: A) {
+    fn drop_in(self, ctx: Self::Ctx) {
+        let alloc = ctx;
         let Self { h: _, buf } = self;
         let b = PBox::<[_], A>::detoken(buf, alloc);
         drop(b)
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> TokenQueueHandle<'a, H, A> {
-    fn from_guard(g: QEntryGuard<'a, H, A>, alloc: A) -> Self {
-        let buf = unsafe { TokenOf::<[_], MetaSpanOf<A>>::as_ptr(&g.buf, alloc).as_ref() };
-        Self { g, buf }
+impl<H: Envelope, A: MemAllocator> Project for TokenQueue<H, A> {
+    type View = ptr::NonNull<TokenSlots<H, A>>;
+
+    fn project(&self, ctx: Self::Ctx) -> Self::View {
+        let alloc = ctx;
+        let buf = ATokenOf::<[_], A>::as_ptr(&self.buf, alloc);
+        buf
     }
 }
 
-impl<H: Envelope, A: MemAllocator> QEntry<H, A> {
-    fn qinit(s: QEntry<H, A>, cap: usize, alloc: A) -> Result<(), usize> {
-        let (q, alloc) = TokenQueue::<H, A>::new(cap, alloc);
-        s.init(q).map_err(|q| {
-            q.drop_in(alloc);
-            cap
-        })
+impl<H: Envelope, A: MemAllocator> QueueOps for QEntryView<'_, H, A> {
+    type Item = PAToken<H, A>;
+
+    #[inline]
+    fn header(&self) -> &Header {
+        &self.g.h
     }
 
-    fn qreset(&self, alloc: A) {
-        self.reset(|q| q.drop_in(alloc));
-    }
-
-    fn qacquire<'a>(&'a self, alloc: A) -> Option<TokenQueueHandle<'a, H, A>> {
-        if let Some(g) = self.acquire() {
-            Some(TokenQueueHandle::from_guard(g, alloc))
-        } else {
-            None
-        }
+    #[inline]
+    fn buf(&self) -> &Slots<Self::Item> {
+        unsafe { self.v.as_ref() }
     }
 }
 

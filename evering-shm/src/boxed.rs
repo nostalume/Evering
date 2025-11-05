@@ -23,6 +23,9 @@ unsafe impl<T: ?Sized + Sync, A: MemAllocator + Sync> Sync for PBox<T, A> {}
 
 impl<T: ?Sized, A: MemAllocator> Drop for PBox<T, A> {
     fn drop(&mut self) {
+        unsafe {
+            core::ptr::drop_in_place(self.ptr.as_ptr());
+        }
         let meta = mem::replace(&mut self.meta, Meta::null());
         self.alloc.demalloc(meta);
     }
@@ -314,9 +317,9 @@ impl<T, A: MemAllocator> PBox<[mem::MaybeUninit<T>], A> {
     }
 }
 
-impl<T, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
+impl<T: core::fmt::Debug + ?Sized, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_tuple("LocalBox").field(&self.ptr).finish()
+        core::fmt::Debug::fmt(&**self, f)
     }
 }
 

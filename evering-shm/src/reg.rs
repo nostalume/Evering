@@ -25,6 +25,28 @@ pub struct EntryGuard<'a, T> {
     e: &'a Entry<T>,
 }
 
+pub struct EntryView<'a, T: Project> {
+    pub g: EntryGuard<'a, T>,
+    pub v: T::View,
+}
+
+impl<T> core::fmt::Debug for Entry<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let s = match self.state.load(Ordering::Relaxed) {
+            0 => "FREE",
+            1 => "INITIALIZING",
+            2 => "ACTIVE",
+            3 => "INACTIVE",
+            4 => "DEINITIALIZING",
+            _ => unreachable!(),
+        };
+        f.debug_struct("Entry")
+            .field("ref counts", &self.rc.load(Ordering::Relaxed))
+            .field("state", &s)
+            .finish()
+    }
+}
+
 impl<T> Entry<T> {
     pub const fn null() -> Self {
         Self {
@@ -114,6 +136,21 @@ impl<T> Deref for EntryGuard<'_, T> {
     }
 }
 
+impl<T> core::fmt::Debug for EntryGuard<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EntryGuard").field("entry", self.e).finish()
+    }
+}
+
+impl<T: Project> core::fmt::Debug for EntryView<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("EntryView")
+            .field("entry", &self.g)
+            .field("view", &"{ .. }")
+            .finish()
+    }
+}
+
 #[repr(C)]
 pub struct Registry<T, const N: usize> {
     magic: crate::header::MAGIC,
@@ -162,4 +199,38 @@ impl<T, const N: usize> crate::header::Metadata for Registry<T, N> {
 
 impl<T, const N: usize> Registry<T, N> {
     // pub fn init(&self, idx:usize, data:T)
+}
+
+pub trait Resource: Sized {
+    type Config: Clone;
+    type Ctx;
+    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx);
+    fn drop_in(self, ctx: Self::Ctx);
+}
+
+pub trait Project: Resource {
+    type View;
+    fn project(&self, ctx: Self::Ctx) -> Self::View;
+}
+
+impl<T: Resource> Entry<T> {
+    pub fn rinit(&self, cfg: T::Config, ctx: T::Ctx) -> Result<(), T::Config> {
+        let (res, ctx) = T::new(cfg.clone(), ctx);
+        self.init(res).map_err(|res| {
+            res.drop_in(ctx);
+            cfg
+        })
+    }
+
+    pub fn rreset(&self, ctx: T::Ctx) {
+        self.reset(|res| res.drop_in(ctx))
+    }
+}
+
+impl<T: Project> Entry<T> {
+    pub fn rview<'a>(&'a self, ctx: T::Ctx) -> Option<EntryView<'a, T>> {
+        let g = self.acquire()?;
+        let v = g.project(ctx);
+        Some(EntryView { g, v })
+    }
 }

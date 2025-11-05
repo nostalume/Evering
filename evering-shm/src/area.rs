@@ -1,3 +1,4 @@
+use core::ptr::NonNull;
 use core::{ops::Deref, sync::atomic::AtomicU32};
 
 use crate::header::HeaderStatus;
@@ -190,15 +191,14 @@ pub unsafe trait MemBlkOps {
         let t_size = core::mem::size_of::<T>();
         let t_align = core::mem::align_of::<T>();
 
-        unsafe {
-            let t_start = self.start_ptr().add(offset);
-            let new_offset = MemoryAddr::align_up(offset.add(t_size), t_align);
-            if new_offset > self.size() {
-                return Err(new_offset);
-            }
-            let ptr = t_start.cast::<T>().cast_mut();
-            Ok((ptr, new_offset))
+        let start = self.start_ptr().addr();
+        let t_start = start.add(offset).align_up(t_align);
+        let new_offset = t_start.add(t_size) - start;
+        if new_offset > self.size() {
+            return Err(new_offset);
         }
+        let ptr = (t_start as *const u8).cast::<T>().cast_mut();
+        Ok((ptr, new_offset))
     }
 
     /// Given a absolute addr, acquire the `Sized` instance.
@@ -253,12 +253,13 @@ pub unsafe trait MemBlkOps {
         let arr_align = layout.align();
 
         unsafe {
-            let t_start = self.start_ptr().add(offset);
-            let new_offset = offset.add(arr_size).align_up(arr_align);
+            let start = self.start_ptr().addr();
+            let t_start = start.add(offset).align_up(arr_align);
+            let new_offset = t_start.add(arr_size) - start;
             if new_offset > self.size() {
                 return Err(Some(new_offset));
             }
-            let ptr = t_start.cast::<T>().cast_mut();
+            let ptr = (t_start as *const u8).cast::<T>().cast_mut();
             let ptr = core::slice::from_raw_parts_mut(ptr, len);
             Ok((ptr, new_offset))
         }
@@ -374,7 +375,7 @@ impl<S: AddrSpec> MemBlkSpec<S> {
     }
 }
 
-#[repr(C)]
+#[repr(C, align(8))]
 pub struct Metadata {
     magic: MAGIC,
     // own counts
@@ -387,7 +388,10 @@ impl alloc::fmt::Debug for Metadata {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Metadata of Header")
             .field("magic", &self.magic)
-            .field("reference count", &self.rc)
+            .field(
+                "reference count",
+                &self.rc.load(core::sync::atomic::Ordering::Relaxed),
+            )
             .finish()
     }
 }
@@ -508,7 +512,7 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
         &self,
         offset: usize,
         cfg: T::Config,
-    ) -> Result<usize, Error<S, M>> {
+    ) -> Result<(NonNull<T>, usize), Error<S, M>> {
         use crate::header::Layout;
         unsafe {
             let (header, hoffset) =
@@ -519,7 +523,7 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
                     })?;
             let header_ref = Layout::from_raw(header);
             match header_ref.attach_or_init(cfg) {
-                HeaderStatus::Initialized => Ok(hoffset),
+                HeaderStatus::Initialized => Ok((NonNull::new_unchecked(header), hoffset)),
                 HeaderStatus::Initializing => return Err(Error::Contention),
                 _ => return Err(Error::InvalidHeader),
             }

@@ -35,10 +35,6 @@ const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
 }
 
 const fn bound(n: usize, available: UInt) -> Option<UInt> {
-    if !(available < ARENA_MAX_CAPACITY) {
-        return None;
-    }
-
     let n = UInt::try_from(n).ok()?;
     if n < available { Some(n) } else { None }
 }
@@ -93,6 +89,8 @@ pub struct SpanMeta {
     raw: AddrSpan,
     view: AddrSpan,
 }
+
+unsafe impl Send for Meta {}
 
 unsafe impl const malloc::Meta for Meta {
     type SpanMeta = SpanMeta;
@@ -240,7 +238,7 @@ impl Meta {
     }
 }
 
-#[repr(C, align(8))]
+#[repr(C)]
 pub struct Header<S: Strategy> {
     sentinel: SegmentNode,
     allocated: PAtomicUInt,
@@ -317,15 +315,15 @@ impl<S: Strategy> Header<S> {
             ) {
                 Ok(allocated) => {
                     break {
-                        let size = want - allocated;
+                        let raw_size = want - allocated;
 
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
                             "allocate {} bytes at offset {} from arena",
-                            size,
+                            raw_size,
                             allocated
                         );
-                        let meta = Meta::raw(a.start_ptr(), allocated, size).align_to(align);
+                        let meta = Meta::raw(a.start_ptr(), allocated, raw_size).align_to(align);
                         // unsafe { meta.clear(a) }
                         Some(meta)
                     };
@@ -718,7 +716,7 @@ impl Config {
 pub trait Strategy: Sized {
     /// Check ordering relation between segment sizes.
     fn order(val: Size, next_node_size: Size) -> bool;
-    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error>;
+    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error>;
 }
 
 pub struct Arena<'a, S: Strategy> {
@@ -741,9 +739,9 @@ impl Strategy for Optimistic {
         val >= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error> {
         let cur = &arena.header().sentinel;
-        arena.alloc_slow_by(&cur, size)
+        arena.alloc_slow_by(&cur, size,align)
     }
 }
 
@@ -753,7 +751,7 @@ impl Strategy for Pessimistic {
         val <= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error> {
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
             return Err(Error::UnenoughSpace {
                 requested: size,
@@ -761,7 +759,7 @@ impl Strategy for Pessimistic {
             });
         };
 
-        arena.alloc_slow_by(&cur, size)
+        arena.alloc_slow_by(&cur, size,align)
     }
 }
 
@@ -819,7 +817,9 @@ unsafe impl<S: Strategy> malloc::MemDealloc for Arena<'_, S> {
     }
 }
 
-impl<S: Strategy> MemAllocInfo for Arena<'_, S> {
+impl<S: Strategy> malloc::MemAllocator for Arena<'_, S> {}
+
+impl<S: Strategy> malloc::MemAllocInfo for Arena<'_, S> {
     type Header = Header<S>;
 
     #[inline]
@@ -1131,11 +1131,12 @@ impl<S: Strategy> Arena<'_, S> {
             }
         }
     }
-    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size) -> Result<Meta, Error> {
+    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size,align: Offset) -> Result<Meta, Error> {
         let backoff = Backoff::new();
 
+        let want = size + align - 1;
         loop {
-            let (segment, next) = match self.segment_req(cur, size) {
+            let (cur_seg, next) = match self.segment_req(cur, want) {
                 Err(_) => {
                     return Err(Error::UnenoughSpace {
                         requested: size,
@@ -1161,13 +1162,14 @@ impl<S: Strategy> Arena<'_, S> {
                     tracing::debug!(
                         "allocate {} bytes at offset {} from segment",
                         size,
-                        segment.node_offset
+                        cur_seg.node_offset
                     );
-                    if let Some((alloc_seg, rem_seg)) = self.split_segment(&segment) {
+                    // `want = size + align - 1 -> offset.align_up(align)`
+                    if let Some((alloc_seg, rem_seg)) = self.split_segment(&cur_seg) {
                         self.recycle_segment(rem_seg);
-                        return Ok(self.meta(alloc_seg));
+                        return Ok(self.meta(alloc_seg).align_to(align));
                     }
-                    return Ok(self.meta(segment));
+                    return Ok(self.meta(cur_seg).align_to(align));
                 }
                 Err(cur) => {
                     if cur.is_removed() {
@@ -1196,9 +1198,7 @@ impl<S: Strategy> Arena<'_, S> {
             return Ok(meta);
         } else {
             for i in 0..self.max_retries {
-                let want = size + align - 1;
-
-                match S::alloc_slow(self, want) {
+                match S::alloc_slow(self, size,align) {
                     Ok(m) => return Ok(m),
                     Err(e) if i + 1 == self.max_retries => return Err(e),
                     Err(_) => { /* retry */ }
@@ -1213,22 +1213,19 @@ use crate::area::{self, AddrSpec, MemBlk, Mmap};
 
 pub struct ArenaMemBlk<S: AddrSpec, M: Mmap<S>, G: Strategy> {
     m: MemBlk<S, M>,
-    alloch: usize,
+    header: NonNull<crate::area::Header>,
+    alloc: NonNull<Header<G>>,
     size: UInt,
     marker: PhantomData<Header<G>>,
 }
 
 impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
     pub fn header(&self) -> &crate::area::Header {
-        unsafe {
-            let ptr = self.m.start_ptr() as *const crate::area::Header;
-            &*ptr
-        }
+        unsafe { self.header.as_ref() }
     }
 
-    pub fn alloc_header(&self) -> &Header<G> {
-        let ptr = self.m.get_ptr(self.alloch);
-        unsafe { &*ptr.cast() }
+    fn alloc_header(&self) -> &Header<G> {
+        unsafe { self.alloc.as_ref() }
     }
 
     pub fn arena(&self) -> Arena<'_, G> {
@@ -1243,26 +1240,24 @@ impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
         flags: S::Flags,
         mcfg: M::Config,
     ) -> Result<Self, area::Error<S, M>> {
-        if let Ok(bound) = ARENA_MAX_CAPACITY.try_into()
-            && size > bound
-        {
-            return Err(area::Error::OutofSize {
-                requested: size,
-                bound,
-            });
-        }
+        max_bound(size).ok_or(area::Error::OutofSize {
+            requested: size,
+            bound: ARENA_MAX_CAPACITY.cast_into(),
+        })?;
 
         let area = bk
             .map(start, size, flags, mcfg)
             .map_err(area::Error::MapError)?;
         unsafe {
-            let hoffset = area.init_header::<crate::area::Header>(0, ())?;
-            let aoffset = area.init_header::<Header<G>>(hoffset, Header::<G>::MIN_SEGMENT_SIZE)?;
+            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (alloc, aoffset) =
+                area.init_header::<Header<G>>(hoffset, Header::<G>::MIN_SEGMENT_SIZE)?;
             let size = (area.size() - aoffset) as UInt;
 
             Ok(Self {
                 m: area.into(),
-                alloch: hoffset,
+                header,
+                alloc,
                 // Safety: Previous arithmetic check
                 size,
                 marker: PhantomData,

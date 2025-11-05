@@ -53,7 +53,9 @@ pub unsafe trait Meta: Clone {
 }
 
 pub trait MemAllocator: MemAlloc + MemDealloc {}
+impl<A: MemAllocator> MemAllocator for &A {}
 pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
+impl<A: MemAllocator2> MemAllocator2 for &A {}
 
 /// Allocate or deallocate raw type `T` in persistence.
 pub unsafe trait MemAlloc: MemBlkOps {

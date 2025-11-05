@@ -4,13 +4,16 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::MemBlkHandle;
+use crate::{
+    area::MemBlkHandle,
+    malloc::{MemAlloc, MemAllocInfo}, queue::MemAllocator,
+};
 
 use super::super::{
     area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk},
     arena::{ArenaMemBlk, Optimistic},
-    malloc::MemAllocInfo,
 };
+use super::tracing_init;
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -111,36 +114,34 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
     }
 }
 
-fn mock_area(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockMemBlk<'_> {
-    let bk = MockBackend(pt);
+fn mock_area(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockMemBlk<'_> {
     let a = MemBlk::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
-fn mock_handle(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
-    let a = mock_area(pt, start, size);
+fn mock_handle(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
+    let a = mock_area(bk, start, size);
     MockMemHandle::from_blk(a)
 }
 
-fn mock_arena(pt: &mut MockPageTable, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
-    let bk = MockBackend(pt);
+fn mock_arena(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
     let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
 #[test]
-fn area_test() {
+fn area_init() {
     const STEP: usize = 0x2000;
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
-        let a = mock_handle(&mut pt, Some(start.into()), STEP);
-        let header = a.header();
-        tracing::debug!("{}", header);
+        let bk = MockBackend(&mut pt);
+        let a = mock_handle(bk, Some(start.into()), STEP);
+        tracing::debug!("{}", a.header());
     }
 }
 
 #[test]
-fn arena_test() {
+fn arena_exceed() {
     use std::sync::Barrier;
     use std::thread;
 
@@ -148,35 +149,291 @@ fn arena_test() {
 
     const BYTES_SIZE: usize = 50;
     const REDUCED_SIZE: usize = 35;
+    const START: usize = 1;
+    const NUM: usize = 5;
 
-    let mut pt = [0u8; MAX_ADDR];
-    let mem = mock_arena(&mut pt, Some(0.into()), MAX_ADDR);
+    tracing_init();
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
     let a = mem.arena();
 
-    let bar = Barrier::new(5);
+    let bar = Barrier::new(NUM);
     let mut metas = Vec::new();
 
-    for _ in 1..=5 {
+    for _ in START..=NUM {
         let bytes = a.malloc_bytes(BYTES_SIZE).unwrap();
         metas.push(bytes);
     }
 
+    // Fill the header reserved bytes
     let remained = a.remained();
-    let _remained_bytes = a.malloc_bytes(remained).unwrap();
+    let _ = a.malloc_bytes(remained).unwrap();
+    // Now it generate freelist nodes
     metas.drain(..).for_each(|meta| {
+        tracing::debug!("drain bytes: {:?}", meta);
         a.dealloc(meta);
     });
 
     thread::scope(|s| {
-        for _ in (1..=5).rev() {
+        for _ in (START..=NUM).rev() {
             let a = &a;
             let bar = &bar;
 
             s.spawn(move || {
                 bar.wait();
-                let mut bytes = a.malloc_bytes(REDUCED_SIZE).unwrap();
-                // do something with bytes...
+                let meta = a.malloc_bytes(REDUCED_SIZE).unwrap();
+                tracing::debug!("freelist bytes: {:?}", meta)
             });
         }
     });
+}
+
+#[test]
+fn arena_frag() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use crate::malloc::MemAlloc;
+
+    const BYTES_SIZE: usize = 4;
+    const ALLOC_NUM: usize = 1000;
+    const NUM: usize = 10;
+
+    tracing_init();
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+
+    let bar = Barrier::new(NUM);
+    thread::scope(|s| {
+        for _ in 0..NUM {
+            let a_ref = &a;
+            let b_ref = &bar;
+            s.spawn(move || {
+                b_ref.wait();
+
+                for _ in 0..ALLOC_NUM {
+                    if let Ok(meta) = a_ref.malloc_bytes(BYTES_SIZE) {
+                        tracing::debug!("{:?}", meta);
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn arena_dealloc() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use crate::malloc::MemAlloc;
+
+    const BYTES_SIZE: usize = 8;
+    const ALLOC_NUM: usize = 1000;
+    const NUM: usize = 5;
+
+    tracing_init();
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+
+    let bar = Barrier::new(NUM);
+    let mut metas: Vec<_> = (0..ALLOC_NUM)
+        .map(|_| a.malloc_bytes(BYTES_SIZE).unwrap())
+        .collect();
+    thread::scope(|s| {
+        for i in 0..NUM {
+            let a_ref = &a;
+            let b_ref = &bar;
+            let start = 0;
+            let end = if i == NUM - 1 {
+                metas.len()
+            } else {
+                ALLOC_NUM / NUM
+            };
+
+            let chunk: Vec<_> = metas.drain(start..end).collect();
+            s.spawn(move || {
+                b_ref.wait();
+                for meta in chunk {
+                    tracing::debug!("{:?}", meta);
+                    a_ref.dealloc(meta);
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn pbox_droppy() {
+    use std::sync::Arc;
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use crate::boxed::PBox;
+
+    tracing_init();
+    // It should be clarified that the heap allocation
+    // context shouldn't exist in allocator allocation
+    // if you want a process-invairant data.
+    let counter = Arc::new(AtomicUsize::new(0));
+    struct Droppy(Arc<AtomicUsize>);
+    impl Drop for Droppy {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    const ALLOC_NUM: usize = 1000;
+    const NUM: usize = 5;
+
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+
+    let bar = Barrier::new(NUM);
+    thread::scope(|s| {
+        for _ in 0..NUM {
+            let c_ref = counter.clone();
+            let a_ref = &a;
+            let b_ref = &bar;
+
+            s.spawn(move || {
+                b_ref.wait();
+                for _ in 0..ALLOC_NUM {
+                    let droppy = PBox::new_in(Droppy(c_ref.clone()), a_ref.clone());
+                    tracing::debug!("counter: {:?}", droppy.0.load(Ordering::Relaxed));
+                    drop(droppy)
+                    // drop(droppy)
+                }
+            });
+        }
+    });
+
+    assert_eq!(
+        counter.load(Ordering::Relaxed),
+        NUM * ALLOC_NUM,
+        "Counter must have been called on drop"
+    );
+}
+
+#[test]
+fn pbox_dyn() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use crate::boxed::PBox;
+
+    tracing_init();
+    #[derive(Debug)]
+    #[repr(C, align(64))]
+    struct HighAlign(u64);
+    const ALIGN: usize = core::mem::align_of::<HighAlign>();
+
+    fn rand_num() -> u64 {
+        const HRANGE: u64 = 500;
+        fastrand::u64(0..HRANGE)
+    }
+
+    fn rand_len() -> usize {
+        const SRANGE: usize = 20;
+        fastrand::usize(0..SRANGE)
+    }
+
+    // Choose a smaller number due to large allocation.
+    const ALLOC_NUM: usize = 100;
+    const NUM: usize = 5;
+
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+
+    let bar = Barrier::new(NUM);
+    thread::scope(|s| {
+        for _ in 0..NUM {
+            let a_ref = &a;
+            let b_ref = &bar;
+
+            s.spawn(move || {
+                b_ref.wait();
+                for _ in 0..ALLOC_NUM {
+                    let b = PBox::new_in(HighAlign(rand_num()), &a_ref);
+                    let ptr_addr = b.as_ptr().addr();
+
+                    let len = rand_len();
+                    let mut slice_b = PBox::new_slice_in(len, |_| rand_num(), &a_ref);
+
+                    // Modification
+                    const NULL: u64 = 0;
+                    for i in slice_b.iter_mut() {
+                        *i = NULL;
+                    }
+
+                    for i in slice_b.iter() {
+                        assert_eq!(*i, NULL, "PBox modification failed");
+                    }
+
+                    tracing::debug!("Align Box: {:?}", &b);
+                    tracing::debug!("Slice: {:?}", slice_b);
+                    assert_eq!(ptr_addr % ALIGN, 0, "PBox allocation in wrong alignment");
+                    assert_eq!(slice_b.len(), len, "PBox allocation in wrong length");
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn parc_stress() {
+    use std::sync::Barrier;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+
+    use crate::boxed::PArc;
+
+    tracing_init();
+    #[derive(Clone)]
+    struct Droppy<A:MemAllocator>(PArc<AtomicUsize,A>);
+    impl<A:MemAllocator> Drop for Droppy<A> {
+        fn drop(&mut self) {
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    const CLONE_NUM: usize = 1000;
+    const NUM: usize = 5;
+
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+    let droppy = Droppy(PArc::new_in(AtomicUsize::new(0), &a));
+
+    let bar = Barrier::new(NUM);
+    thread::scope(|s| {
+        for _ in 0..NUM {
+            let b_ref = &bar;
+
+            s.spawn( || {
+                b_ref.wait();
+                // clone and drop
+                let _:Vec<_> = (0..CLONE_NUM).map(|_| {
+                    droppy.clone()
+                }).collect();
+            });
+        }
+    });
+
+    assert_eq!(
+        droppy.0.load(Ordering::Relaxed),
+        NUM * CLONE_NUM,
+        "Counter must have been called on drop"
+    );
 }

@@ -80,7 +80,7 @@ pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
 
 impl<T, M> TokenOf<T, M> {
     #[inline]
-    pub unsafe fn as_ptr<A: MemAllocator>(t: &ATokenOf<T, A>, alloc: A) -> NonNull<T> {
+    pub fn as_ptr<A: MemAllocator>(t: &ATokenOf<T, A>, alloc: A) -> NonNull<T> {
         let meta = unsafe { A::Meta::resolve(t.span.clone(), alloc.base_ptr()) };
         match t.metadata {
             Metadata::Sized => {
@@ -120,7 +120,7 @@ impl<T, M> TokenOf<T, M> {
 
 impl<T, M> TokenOf<[T], M> {
     #[inline]
-    pub unsafe fn as_ptr<A: MemAllocator>(t: &ATokenOf<[T], A>, alloc: A) -> NonNull<[T]> {
+    pub fn as_ptr<A: MemAllocator>(t: &ATokenOf<[T], A>, alloc: A) -> NonNull<[T]> {
         let meta = unsafe { A::Meta::resolve(t.span.clone(), alloc.base_ptr()) };
         match t.metadata {
             Metadata::Slice(len) => {
