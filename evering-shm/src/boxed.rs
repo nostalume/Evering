@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
 
-use crate::malloc::{AllocError, MemAllocator, Meta, handle_alloc_error};
+use crate::malloc::{AllocError, IsMetaSpanOf, MemAllocator, Meta, handle_alloc_error};
 use crate::msg::{ATokenOf, TokenOf};
 
 const fn is_zst<T>() -> bool {
@@ -58,14 +58,14 @@ impl<T, A: MemAllocator> PBox<T, A> {
     #[inline]
     pub fn token_with(self) -> (ATokenOf<T, A>, A) {
         let (ptr, meta, alloc) = Self::into_raw_ptr(self);
-        let token = unsafe { TokenOf::from_raw(meta.forget(), ptr) };
+        let token = unsafe { TokenOf::from_raw(meta.erase(), ptr) };
         (token, alloc)
     }
 
     #[inline]
-    pub fn detoken(token: ATokenOf<T, A>, alloc: A) -> Self {
+    pub fn detoken<M:IsMetaSpanOf<A>>(token: TokenOf<T, M>, alloc: A) -> Self {
         unsafe {
-            ATokenOf::<T, A>::detokenize(token, alloc, |meta, ptr, alloc| {
+            token.detokenize(alloc, |meta, ptr, alloc| {
                 Self::from_raw_ptr(ptr, meta, alloc)
             })
         }
@@ -207,14 +207,14 @@ impl<T, A: MemAllocator> PBox<[T], A> {
     #[inline]
     pub fn token_with(self) -> (ATokenOf<[T], A>, A) {
         let (ptr, meta, alloc) = Self::into_raw_ptr(self);
-        let token = unsafe { TokenOf::from_slice(meta.forget(), ptr) };
+        let token = unsafe { TokenOf::from_slice(meta.erase(), ptr) };
         (token, alloc)
     }
 
     #[inline]
-    pub fn detoken(token: ATokenOf<[T], A>, alloc: A) -> Self {
+    pub fn detoken<M: IsMetaSpanOf<A>>(token: TokenOf<[T], M>, alloc: A) -> Self {
         unsafe {
-            ATokenOf::<[T], A>::detokenize(token, alloc, |meta, ptr, alloc| {
+            token.detokenize(alloc, |meta, ptr, alloc| {
                 Self::from_raw_ptr(ptr, meta, alloc)
             })
         }

@@ -6,7 +6,8 @@ use memory_addr::{MemoryAddr, VirtAddr};
 
 use crate::{
     area::MemBlkHandle,
-    malloc::{MemAlloc, MemAllocInfo}, queue::MemAllocator,
+    malloc::{MemAlloc, MemAllocInfo},
+    queue::MemAllocator,
 };
 
 use super::super::{
@@ -400,8 +401,8 @@ fn parc_stress() {
 
     tracing_init();
     #[derive(Clone)]
-    struct Droppy<A:MemAllocator>(PArc<AtomicUsize,A>);
-    impl<A:MemAllocator> Drop for Droppy<A> {
+    struct Droppy<A: MemAllocator>(PArc<AtomicUsize, A>);
+    impl<A: MemAllocator> Drop for Droppy<A> {
         fn drop(&mut self) {
             self.0.fetch_add(1, Ordering::Relaxed);
         }
@@ -421,12 +422,10 @@ fn parc_stress() {
         for _ in 0..NUM {
             let b_ref = &bar;
 
-            s.spawn( || {
+            s.spawn(|| {
                 b_ref.wait();
                 // clone and drop
-                let _:Vec<_> = (0..CLONE_NUM).map(|_| {
-                    droppy.clone()
-                }).collect();
+                let _: Vec<_> = (0..CLONE_NUM).map(|_| droppy.clone()).collect();
             });
         }
     });
@@ -436,4 +435,74 @@ fn parc_stress() {
         NUM * CLONE_NUM,
         "Counter must have been called on drop"
     );
+}
+
+#[test]
+fn token_of_pbox() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use crate::boxed::PBox;
+
+    tracing_init();
+    #[derive(Debug)]
+    struct Recover {
+        f1: u64,
+        f2: char,
+    }
+
+    impl Recover {
+        fn rand() -> Self {
+            Self {
+                f1: fastrand::u64(0..100),
+                f2: fastrand::char('a'..'z'),
+            }
+        }
+    }
+
+    const ALLOC_NUM: usize = 500;
+    const NUM: usize = 5;
+
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let a = mem.arena();
+
+    let bar = Barrier::new(NUM);
+    thread::scope(|s| {
+        let handles = (0..NUM)
+            .map(|_| {
+                let a_ref = &a;
+                let b_ref = &bar;
+
+                s.spawn(move || {
+                    b_ref.wait();
+                    (0..ALLOC_NUM)
+                        .map(move |_| {
+                            let recover = PBox::new_in(Recover::rand(), &a_ref);
+                            recover.token()
+                        })
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let tokens: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        let _: Vec<_> = tokens
+            .into_iter()
+            .map(|chunk| {
+                let a_ref = &a;
+                let b_ref = &bar;
+
+                s.spawn(move || {
+                    b_ref.wait();
+                    chunk.into_iter().for_each(|token| {
+                        let recover = token.detoken(&a_ref);
+                        tracing::debug!("{:?}", recover)
+                    })
+                })
+            })
+            .collect();
+    });
 }

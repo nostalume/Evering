@@ -29,6 +29,21 @@ pub type MetaOf<A> = <A as MemAlloc>::Meta;
 pub type SpanOf<M> = <M as Meta>::SpanMeta;
 pub type MetaSpanOf<A> = SpanOf<MetaOf<A>>;
 
+/// Marker trait for constraint of `MetaSpanOf<A>` for `A: MemAllocator`
+pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
+    fn erase(meta: MetaOf<A>) -> Self;
+    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A>;
+}
+impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
+    fn erase(meta: MetaOf<A>) -> Self {
+        meta.erase()
+    }
+
+    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A> {
+        unsafe { Meta::recall(self, base_ptr) }
+    }
+}
+
 #[const_trait]
 pub unsafe trait Meta: Clone {
     type SpanMeta: Clone;
@@ -48,8 +63,8 @@ pub unsafe trait Meta: Clone {
         let slice = ptr::slice_from_raw_parts_mut(ptr, len);
         slice
     }
-    fn forget(self) -> Self::SpanMeta;
-    unsafe fn resolve(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
+    fn erase(self) -> Self::SpanMeta;
+    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
 }
 
 pub trait MemAllocator: MemAlloc + MemDealloc {}

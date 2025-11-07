@@ -119,7 +119,7 @@ unsafe impl const malloc::Meta for Meta {
     }
 
     #[inline]
-    fn forget(self) -> Self::SpanMeta {
+    fn erase(self) -> Self::SpanMeta {
         SpanMeta {
             raw: self.raw,
             view: self.view,
@@ -127,7 +127,7 @@ unsafe impl const malloc::Meta for Meta {
     }
 
     #[inline]
-    unsafe fn resolve(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
+    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
         Meta {
             base_ptr,
             raw: span.raw,
