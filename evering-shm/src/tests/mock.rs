@@ -4,10 +4,11 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::tracing_init;
 use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk};
 use crate::malloc::{MemAllocInfo, MemAllocator};
-use crate::{ArenaMemBlk, Optimistic, RegMemBlk};
+use crate::msg::MoveMessage;
+use crate::tracing_init;
+use crate::{ArenaMemBlk, Conn, Optimistic};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -15,7 +16,7 @@ type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
 type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
 type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
-type MockReg<'a, T, const N: usize> = RegMemBlk<MockAddr, MockBackend<'a>, T, N>;
+type MockConn<'a, const N: usize> = Conn<'a, MockAddr, MockBackend<'a>, Optimistic, (), N>;
 
 struct MockAddr;
 
@@ -118,12 +119,12 @@ fn mock_arena(bk: MockBackend<'_>, start: Option<VirtAddr>, size: usize) -> Mock
     a
 }
 
-fn mock_reg<T, const N: usize>(
+fn mock_conn<const N: usize>(
     bk: MockBackend<'_>,
     start: Option<VirtAddr>,
     size: usize,
-) -> MockReg<'_, T, N> {
-    let a = RegMemBlk::init(bk, start, size, 0, ()).unwrap();
+) -> MockConn<'_, N> {
+    let a = Conn::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
@@ -478,7 +479,7 @@ fn token_of_pbox() {
                     (0..ALLOC_NUM)
                         .map(move |_| {
                             let recover = PBox::new_in(Recover::rand(), &a_ref);
-                            recover.token()
+                            recover.token_of()
                         })
                         .collect::<Vec<_>>()
                 })
@@ -503,4 +504,49 @@ fn token_of_pbox() {
             })
             .collect();
     });
+}
+
+#[test]
+fn conn() {
+    use crate::msg::{Message, Move, TypeTag, type_id};
+
+    const N: usize = 1;
+    const SIZE: usize = 20;
+
+    #[derive(Debug)]
+    struct Info(u32);
+
+    impl Info {
+        fn mock() -> Self {
+            Self(fastrand::u32(0..100))
+        }
+    }
+
+    impl TypeTag for Info {
+        const TYPE_ID: crate::msg::TypeId = type_id::type_id("My");
+    }
+
+    impl Message for Info {
+        type Semantics = Move;
+    }
+
+    tracing_init();
+
+    let mut pt = [0; MAX_ADDR];
+    let bk = MockBackend(&mut pt);
+    let conn = mock_conn::<N>(bk, Some(0.into()), MAX_ADDR);
+    let alloc = conn.arena();
+
+    let h = conn.prepare(SIZE).expect("alloc ok");
+    let q = conn.acquire(h).expect("view ok");
+
+    let (token_of, alloc) = Info::mock().token(alloc);
+    let token = token_of.pack();
+    let sr = q.clone().sr_duplex();
+    let rs = q.rs_duplex();
+
+    sr.try_send(token).expect("send ok");
+    let t = rs.try_recv().expect("recv ok");
+    let t = Info::detoken(t.unpack(), alloc).expect("detoken ok");
+    tracing::debug!("{:?}", t);
 }

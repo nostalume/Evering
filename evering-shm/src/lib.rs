@@ -23,8 +23,10 @@ pub use crate::arena::{Optimistic, Pessimistic};
 
 use crate::{
     area::{AddrSpec, MemBlkHandle, Mmap},
-    arena::{ARENA_MAX_CAPACITY, Strategy, UInt, max_bound},
+    arena::{ARENA_MAX_CAPACITY, Arena, Strategy, UInt, max_bound},
+    msg::Envelope,
     numeric::CastInto,
+    queue::TokenDuplex,
 };
 
 extern crate alloc;
@@ -276,19 +278,44 @@ impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
 }
 
 #[derive(Clone)]
-struct RegMemBlk<S: AddrSpec, M: Mmap<S>, T, const N: usize> {
+struct Conn<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> {
     m: MemBlkHandle<S, M>,
     header: NonNull<crate::area::Header>,
-    reg: NonNull<crate::reg::Registry<T, N>>,
+    alloc: NonNull<crate::arena::Header<G>>,
+    reg: NonNull<crate::reg::Registry<TokenDuplex<H, Arena<'a, G>>, N>>,
+    size: UInt,
 }
 
-impl<S: AddrSpec, M: Mmap<S>, T, const N: usize> RegMemBlk<S, M, T, N> {
+impl<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize>
+    Conn<'a, S, M, G, H, N>
+{
     pub fn header(&self) -> &crate::area::Header {
         unsafe { self.header.as_ref() }
     }
 
-    pub fn reg(&self) -> &crate::reg::Registry<T, N> {
+    pub fn reg(&self) -> &crate::reg::Registry<TokenDuplex<H, Arena<'a, G>>, N> {
         unsafe { self.reg.as_ref() }
+    }
+
+    pub fn arena(&self) -> crate::arena::Arena<'a, G> {
+        let config = crate::arena::Config::default();
+        Arena::from_header(unsafe { self.alloc.as_ref() }, self.size, config)
+    }
+
+    pub fn prepare(&self, cap: usize) -> Option<crate::reg::Id> {
+        let Ok((id, _)) = self.reg().prepare(cap, self.arena()) else {
+            return None;
+        };
+
+        Some(id)
+    }
+
+    pub fn acquire(
+        &self,
+        id: crate::reg::Id,
+    ) -> Option<crate::reg::EntryView<'_, TokenDuplex<H, Arena<'a, G>>>> {
+        let (duplex, _) = self.reg().view(id, self.arena());
+        duplex
     }
 
     pub fn init(
@@ -303,12 +330,19 @@ impl<S: AddrSpec, M: Mmap<S>, T, const N: usize> RegMemBlk<S, M, T, N> {
             .map_err(area::Error::MapError)?;
         unsafe {
             let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
-            let (reg, _) = area.init_header::<crate::reg::Registry<T, N>>(hoffset, ())?;
+            let (reg, roffset) = area.init_header::<crate::reg::Registry<_, N>>(hoffset, ())?;
+            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
+                roffset,
+                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
+            )?;
+            let size = (area.size() - aoffset) as UInt;
 
             Ok(Self {
                 m: area.into(),
                 header,
+                alloc,
                 reg,
+                size,
             })
         }
     }

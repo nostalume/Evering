@@ -70,11 +70,11 @@ pub mod type_id {
         }
 
         type_tag! {
-            u8, // Original
-            u32, // Original
-            f64, // Original
-            i32, // Added via macro
-            bool // Added via macro
+            u8,
+            u32,
+            f64,
+            i32,
+            bool
         }
 
         #[test]
@@ -162,7 +162,7 @@ pub mod type_id {
     }
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum Metadata {
     Sized,
     Slice(usize),
@@ -179,8 +179,6 @@ impl Metadata {
         Metadata::Slice(ptr.len())
     }
 }
-
-pub type SpanTokenOf<T, A> = TokenOf<T, MetaSpanOf<A>>;
 
 pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
     span: M,
@@ -237,7 +235,7 @@ impl<T, M> TokenOf<T, M> {
     where
         M: IsMetaSpanOf<A>,
     {
-        PBox::<T, A>::detoken(self, alloc)
+        PBox::<T, A>::detoken_of(self, alloc)
     }
 }
 
@@ -290,31 +288,93 @@ impl<T, M> TokenOf<[T], M> {
     where
         M: IsMetaSpanOf<A>,
     {
-        PBox::<[T], A>::detoken(self, alloc)
+        PBox::<[T], A>::detoken_of(self, alloc)
     }
 }
 
 pub use self::type_id::{TypeId, TypeTag};
 
-trait Message: TypeTag {
+pub trait Message: TypeTag {
     type Semantics;
 }
+
 impl<T: Message> Message for [T] {
     type Semantics = T::Semantics;
 }
 
 pub struct Move;
-pub trait MoveMessage: Message<Semantics = Move> {}
+pub trait MoveMessage: Message<Semantics = Move> {
+    #[inline]
+    fn token<A: MemAllocator>(self, alloc: A) -> (AllocToken<A>, A)
+    where
+        Self: Sized,
+    {
+        PBox::new_in(self, alloc).token_with()
+    }
+
+    #[inline]
+    fn copied_slice_token<A: MemAllocator>(t: &[Self], alloc: A) -> (AllocToken<A>, A)
+    where
+        Self: Sized,
+    {
+        PBox::copy_from_slice(t, alloc).token_with()
+    }
+
+    #[inline]
+    fn slice_token<A: MemAllocator, F: FnMut(usize) -> Self>(
+        len: usize,
+        f: F,
+        alloc: A,
+    ) -> (AllocToken<A>, A)
+    where
+        Self: Sized,
+    {
+        PBox::new_slice_in(len, f, alloc).token_with()
+    }
+
+    #[inline]
+    fn detoken<A: MemAllocator>(t: AllocToken<A>, alloc: A) -> Option<PBox<Self, A>>
+    where
+        Self: Sized,
+    {
+        PBox::<Self, A>::detoken(t, alloc)
+    }
+
+    #[inline]
+    fn slice_detoken<A: MemAllocator>(t: AllocToken<A>, alloc: A) -> Option<PBox<[Self], A>>
+    where
+        Self: Sized,
+    {
+        PBox::<[Self], A>::detoken(t, alloc)
+    }
+}
+
+impl<T: Message<Semantics = Move>> MoveMessage for T {}
+
 impl<T: MoveMessage> MoveMessage for [T] {}
 
-type AToken<A> = Token<MetaSpanOf<A>>;
-struct Token<M> {
+type AllocToken<A> = Token<MetaSpanOf<A>>;
+pub struct Token<M> {
     span: M,
     metadata: Metadata,
     id: TypeId,
 }
 
+impl<M> core::fmt::Debug for Token<M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Token")
+            .field("metadata", &self.metadata)
+            .field("id", &self.id)
+            .finish()
+    }
+}
+
 impl<M> Token<M> {
+    #[inline(always)]
+    pub fn pack<H: Envelope>(self) -> PackToken<H, M> {
+        PackToken::from_token(self)
+    }
+
     #[inline]
     pub fn recall<T: Message + ?Sized>(token: Self) -> Option<TokenOf<T, M>> {
         let Self { span, metadata, id } = token;
@@ -339,50 +399,7 @@ impl<M> Token<M> {
     }
 }
 
-impl Move {
-    pub fn token<T: MoveMessage, A: MemAllocator>(t: T, alloc: A) -> AToken<A> {
-        let b = PBox::new_in(t, alloc);
-        let token = Token::erase(b.token());
-        token
-    }
-
-    pub fn copied_slice_token<T: MoveMessage, A: MemAllocator>(t: &[T], alloc: A) -> AToken<A> {
-        let b = PBox::copy_from_slice(t, alloc);
-        let token = Token::erase(b.token());
-        token
-    }
-
-    pub fn slice_token<T: MoveMessage, A: MemAllocator, F: FnMut(usize) -> T>(
-        len: usize,
-        f: F,
-        alloc: A,
-    ) -> AToken<A> {
-        let b = PBox::new_slice_in(len, f, alloc);
-        let token = Token::erase(b.token());
-        token
-    }
-
-    pub fn detoken<T: MoveMessage, A: MemAllocator>(t: AToken<A>, alloc: A) -> Option<PBox<T, A>> {
-        let Some(token_of) = Token::recall::<T>(t) else {
-            return None;
-        };
-        let b = PBox::<T, A>::detoken(token_of, alloc);
-        Some(b)
-    }
-
-    pub fn slice_detoken<T: MoveMessage, A: MemAllocator>(
-        t: AToken<A>,
-        alloc: A,
-    ) -> Option<PBox<[T], A>> {
-        let Some(token_of) = Token::recall::<[T]>(t) else {
-            return None;
-        };
-        let b = PBox::<[T], A>::detoken(token_of, alloc);
-        Some(b)
-    }
-}
-
-pub(crate) trait Envelope {
+pub(crate) trait Envelope: core::fmt::Debug {
     fn init_by<M>(t: &Token<M>) -> Self;
 }
 
@@ -396,12 +413,30 @@ pub struct PackToken<H: Envelope, M> {
     h: H,
     token: Token<M>,
 }
-pub type SpanPackToken<H, A> = PackToken<H, MetaSpanOf<A>>;
-pub type ThinPackToken<M> = PackToken<(), M>;
+
+impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PackToken")
+            .field("header", &self.h)
+            .field("token", &self.token)
+            .finish()
+    }
+}
 
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]
-    pub fn from_token(t: Token<M>) -> Self {
+    pub fn unpack_with(self) -> (Token<M>, H) {
+        let Self { h, token } = self;
+        (token, h)
+    }
+
+    #[inline]
+    pub fn unpack(self) -> Token<M> {
+        self.token
+    }
+
+    #[inline]
+    fn from_token(t: Token<M>) -> Self {
         Self {
             h: H::init_by(&t),
             token: t,
@@ -409,7 +444,7 @@ impl<H: Envelope, M> PackToken<H, M> {
     }
 
     #[inline]
-    pub fn from_token_of<T: Message + ?Sized>(t: TokenOf<T, M>) -> Self {
+    fn from_token_of<T: Message + ?Sized>(t: TokenOf<T, M>) -> Self {
         let t = Token::erase(t);
         Self::from_token(t)
     }

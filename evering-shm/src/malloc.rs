@@ -34,6 +34,7 @@ pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
     fn erase(meta: MetaOf<A>) -> Self;
     unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A>;
 }
+
 impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
     fn erase(meta: MetaOf<A>) -> Self {
         meta.erase()

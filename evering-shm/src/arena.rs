@@ -778,6 +778,18 @@ impl<S: Strategy> Clone for Arena<'_, S> {
     }
 }
 
+impl<S: Strategy> core::fmt::Debug for Arena<'_, S> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Arena")
+            .field("h", &self.h)
+            .field("start", &self.start)
+            .field("size", &self.size)
+            .field("read_only", &self.read_only)
+            .field("max_retries", &self.max_retries)
+            .finish()
+    }
+}
+
 unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
     #[inline]
     fn start_ptr(&self) -> *const u8 {

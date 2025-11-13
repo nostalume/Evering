@@ -356,21 +356,25 @@ trait QueueDrop: Queue {
 impl<T: Queue> QueueDrop for T {}
 
 use crate::boxed::PBox;
-use crate::malloc::MemAllocator;
-use crate::msg::{Envelope, SpanPackToken, SpanTokenOf};
+use crate::malloc::{MemAllocator, MetaSpanOf};
+use crate::msg::{Envelope, PackToken, TokenOf};
 use crate::reg::{EntryView, Project, Resource};
-// Token needs to be transferred
-type Tokens<H, A> = Slots<SpanPackToken<H, A>>;
-// Token of the token slots
-type TokenOfTokens<H, A> = SpanTokenOf<Tokens<H, A>, A>;
+
+type Token<H,A> = PackToken<H,MetaSpanOf<A>>;
+type Tokens<H, A> = Slots<Token<H,A>>;
+type TokenOfTokens<H, A> = TokenOf<Tokens<H, A>, MetaSpanOf<A>>;
+
 type ViewOfSlots<H, A> = ptr::NonNull<Tokens<H, A>>;
 type QueueView<'a, H, A> = EntryView<'a, TokenQueue<H, A>>;
+
 pub struct TokenQueue<H: Envelope, A: MemAllocator> {
     header: Header,
     buf: TokenOfTokens<H, A>,
 }
+
 unsafe impl<H: Send + Envelope, A: MemAllocator> Send for TokenQueue<H, A> {}
 unsafe impl<H: Send + Envelope, A: MemAllocator> Sync for TokenQueue<H, A> {}
+
 impl<H: Envelope, A: MemAllocator> UnwindSafe for TokenQueue<H, A> {}
 impl<H: Envelope, A: MemAllocator> RefUnwindSafe for TokenQueue<H, A> {}
 
@@ -380,7 +384,7 @@ impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
     fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
         let cap = cfg;
         let alloc = ctx;
-        let h = Header::new(cap);
+        let header = Header::new(cap);
         let buffer: PBox<_, A> = PBox::new_slice_in(
             cap,
             |i| Slot {
@@ -389,8 +393,8 @@ impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
             },
             alloc,
         );
-        let (buf, alloc) = buffer.token_with();
-        (TokenQueue { header: h, buf }, alloc)
+        let (buf, alloc) = buffer.token_of_with();
+        (TokenQueue { header, buf }, alloc)
     }
 
     fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx {
@@ -433,7 +437,7 @@ impl<H: Envelope, A: MemAllocator> Project for TokenQueue<H, A> {
 }
 
 impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A> {
-    type Item = SpanPackToken<H, A>;
+    type Item = Token<H, A>;
 
     #[inline]
     fn header(&self) -> &Header {
@@ -446,23 +450,23 @@ impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A> {
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Channel for QueueView<'a, H, A> {}
+impl<'a, H: Envelope, A: MemAllocator> Endpoint for QueueView<'a, H, A> {}
 
-type ChannelView<'a, H, A> = EntryView<'a, TokenChannel<H, A>>;
-pub struct TokenChannel<H: Envelope, A: MemAllocator> {
+type DuplexView<'a, H, A> = EntryView<'a, TokenDuplex<H, A>>;
+pub struct TokenDuplex<H: Envelope, A: MemAllocator> {
     l: TokenQueue<H, A>,
     r: TokenQueue<H, A>,
 }
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct LQueue<T>(T);
+pub struct LEndpoint<T>(T);
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct RQueue<T>(T);
+pub struct REndpoint<T>(T);
 
-impl<H: Envelope, A: MemAllocator> Resource for TokenChannel<H, A> {
+impl<H: Envelope, A: MemAllocator> Resource for TokenDuplex<H, A> {
     type Config = usize;
     type Ctx = A;
 
@@ -481,7 +485,7 @@ impl<H: Envelope, A: MemAllocator> Resource for TokenChannel<H, A> {
     }
 }
 
-impl<H: Envelope, A: MemAllocator> Project for TokenChannel<H, A> {
+impl<H: Envelope, A: MemAllocator> Project for TokenDuplex<H, A> {
     type View = (ViewOfSlots<H, A>, ViewOfSlots<H, A>);
 
     fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
@@ -492,47 +496,51 @@ impl<H: Envelope, A: MemAllocator> Project for TokenChannel<H, A> {
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Queue for LQueue<ChannelView<'a, H, A>> {
-    type Item = SpanPackToken<H, A>;
+impl<'a, H: Envelope, A: MemAllocator> Queue for LEndpoint<DuplexView<'a, H, A>> {
+    type Item = Token<H, A>;
 
+    #[inline]
     fn header(&self) -> &Header {
         &self.0.guard.as_ref().l.header
     }
 
+    #[inline]
     fn buf(&self) -> &Slots<Self::Item> {
         unsafe { self.0.view.0.as_ref() }
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Channel for LQueue<ChannelView<'a, H, A>> {}
+impl<'a, H: Envelope, A: MemAllocator> Endpoint for LEndpoint<DuplexView<'a, H, A>> {}
 
-impl<'a, H: Envelope, A: MemAllocator> Queue for RQueue<ChannelView<'a, H, A>> {
-    type Item = SpanPackToken<H, A>;
+impl<'a, H: Envelope, A: MemAllocator> Queue for REndpoint<DuplexView<'a, H, A>> {
+    type Item = Token<H, A>;
 
+    #[inline]
     fn header(&self) -> &Header {
         &self.0.guard.as_ref().r.header
     }
 
+    #[inline]
     fn buf(&self) -> &Slots<Self::Item> {
         unsafe { self.0.view.1.as_ref() }
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Channel for RQueue<ChannelView<'a, H, A>> {}
+impl<'a, H: Envelope, A: MemAllocator> Endpoint for REndpoint<DuplexView<'a, H, A>> {}
 
-impl<'a, H: Envelope, A: MemAllocator> ChannelView<'a, H, A> {
-    fn lchannel(self) -> Duplex<LQueue<Self>, RQueue<Self>> {
-        let lq = LQueue(self.clone());
-        let rq = RQueue(self.clone());
+impl<'a, H: Envelope, A: MemAllocator> DuplexView<'a, H, A> {
+    pub fn sr_duplex(self) -> Duplex<LEndpoint<Self>, REndpoint<Self>> {
+        let lq = LEndpoint(self.clone());
+        let rq = REndpoint(self);
         Duplex {
             s: lq.sender(),
             r: rq.receiver(),
         }
     }
 
-    fn rchannel(self) -> Duplex<RQueue<Self>, LQueue<Self>> {
-        let lq = LQueue(self.clone());
-        let rq = RQueue(self.clone());
+    pub fn rs_duplex(self) -> Duplex<REndpoint<Self>, LEndpoint<Self>> {
+        let lq = LEndpoint(self.clone());
+        let rq = REndpoint(self);
         Duplex {
             s: rq.sender(),
             r: lq.receiver(),
@@ -540,9 +548,12 @@ impl<'a, H: Envelope, A: MemAllocator> ChannelView<'a, H, A> {
     }
 }
 
-pub trait Channel: Clone {
+trait Endpoint: Sized {
     #[inline(always)]
-    fn channel(self) -> (Sender<Self>, Receiver<Self>) {
+    fn channel(self) -> (Sender<Self>, Receiver<Self>)
+    where
+        Self: Clone,
+    {
         (Sender(self.clone()), Receiver(self))
     }
 
@@ -620,19 +631,19 @@ impl<S: Queue> Receiver<S> {
 }
 
 #[derive(Clone)]
-struct Duplex<S, R> {
+pub struct Duplex<S, R> {
     s: Sender<S>,
     r: Receiver<R>,
 }
 
 impl<S: Queue, R: Queue> Duplex<S, R> {
     #[inline(always)]
-    fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
+    pub fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
         self.s.try_send(value)
     }
 
     #[inline(always)]
-    fn try_recv(&self) -> Option<R::Item> {
+    pub fn try_recv(&self) -> Option<R::Item> {
         self.r.try_recv()
     }
 }
