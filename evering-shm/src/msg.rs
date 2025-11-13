@@ -180,7 +180,7 @@ impl Metadata {
     }
 }
 
-pub type ATokenOf<T, A> = TokenOf<T, MetaSpanOf<A>>;
+pub type SpanTokenOf<T, A> = TokenOf<T, MetaSpanOf<A>>;
 
 pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
     span: M,
@@ -190,7 +190,7 @@ pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
 
 impl<T, M> TokenOf<T, M> {
     #[inline]
-    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> NonNull<T>
+    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> (NonNull<T>, A)
     where
         M: IsMetaSpanOf<A> + Clone,
     {
@@ -198,7 +198,7 @@ impl<T, M> TokenOf<T, M> {
         match self.metadata {
             Metadata::Sized => {
                 let ptr = unsafe { meta.as_ptr::<T>() };
-                unsafe { NonNull::new_unchecked(ptr) }
+                unsafe { (NonNull::new_unchecked(ptr), alloc) }
             }
             _ => unreachable!(),
         }
@@ -243,7 +243,7 @@ impl<T, M> TokenOf<T, M> {
 
 impl<T, M> TokenOf<[T], M> {
     #[inline]
-    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> NonNull<[T]>
+    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> (NonNull<[T]>, A)
     where
         M: IsMetaSpanOf<A> + Clone,
     {
@@ -251,7 +251,7 @@ impl<T, M> TokenOf<[T], M> {
         match self.metadata {
             Metadata::Slice(len) => {
                 let ptr = unsafe { meta.as_slice::<T>(len) };
-                unsafe { NonNull::new_unchecked(ptr) }
+                unsafe { (NonNull::new_unchecked(ptr), alloc) }
             }
             _ => unreachable!(),
         }
@@ -396,8 +396,8 @@ pub struct PackToken<H: Envelope, M> {
     h: H,
     token: Token<M>,
 }
-pub type PAToken<H, A> = PackToken<H, MetaSpanOf<A>>;
-pub type ThinPToken<M> = PackToken<(), M>;
+pub type SpanPackToken<H, A> = PackToken<H, MetaSpanOf<A>>;
+pub type ThinPackToken<M> = PackToken<(), M>;
 
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]

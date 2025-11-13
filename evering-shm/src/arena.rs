@@ -14,7 +14,7 @@ use crate::{
     numeric::{Alignable, CastInto, Packable},
 };
 
-type UInt = u32;
+pub type UInt = u32;
 type PackedUInt = u64;
 type AtomicUInt = AtomicU32;
 type AtomicPackedUInt = AtomicU64;
@@ -25,21 +25,21 @@ type Offset = UInt;
 type Size = UInt;
 type AddrSpan = crate::area::AddrSpan<UInt>;
 
-const fn max_bound(n: usize) -> Option<UInt> {
+pub const fn max_bound(n: usize) -> Option<UInt> {
     let n = UInt::try_from(n).ok()?;
     Some(n)
 }
 
-const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
+pub const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
     max_bound(n).ok_or(Error::OutofBounds { requested: n })
 }
 
-const fn bound(n: usize, available: UInt) -> Option<UInt> {
+pub const fn bound(n: usize, available: UInt) -> Option<UInt> {
     let n = UInt::try_from(n).ok()?;
     if n < available { Some(n) } else { None }
 }
 
-const ARENA_MAX_CAPACITY: Size = UInt::MAX;
+pub const ARENA_MAX_CAPACITY: Size = UInt::MAX;
 const SENTINEL_OFFSET: Offset = UInt::MAX;
 const SENTINEL_SIZE: Size = UInt::MAX;
 const SEGMENT_NODE_SIZE: Size = UInt::size_of::<SegmentNode>();
@@ -279,7 +279,7 @@ impl<S: Strategy> crate::header::Layout for Header<S> {
 }
 
 impl<S: Strategy> Header<S> {
-    const MIN_SEGMENT_SIZE: UInt = 20;
+    pub const MIN_SEGMENT_SIZE: UInt = 20;
     #[inline]
     fn new(min_seg_size: UInt) -> Self {
         Self {
@@ -716,7 +716,7 @@ impl Config {
 pub trait Strategy: Sized {
     /// Check ordering relation between segment sizes.
     fn order(val: Size, next_node_size: Size) -> bool;
-    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error>;
+    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error>;
 }
 
 pub struct Arena<'a, S: Strategy> {
@@ -739,9 +739,9 @@ impl Strategy for Optimistic {
         val >= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
         let cur = &arena.header().sentinel;
-        arena.alloc_slow_by(&cur, size,align)
+        arena.alloc_slow_by(&cur, size, align)
     }
 }
 
@@ -751,7 +751,7 @@ impl Strategy for Pessimistic {
         val <= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size,align:Offset) -> Result<Meta, Error> {
+    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
             return Err(Error::UnenoughSpace {
                 requested: size,
@@ -759,7 +759,7 @@ impl Strategy for Pessimistic {
             });
         };
 
-        arena.alloc_slow_by(&cur, size,align)
+        arena.alloc_slow_by(&cur, size, align)
     }
 }
 
@@ -1131,7 +1131,7 @@ impl<S: Strategy> Arena<'_, S> {
             }
         }
     }
-    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size,align: Offset) -> Result<Meta, Error> {
+    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size, align: Offset) -> Result<Meta, Error> {
         let backoff = Backoff::new();
 
         let want = size + align - 1;
@@ -1198,70 +1198,13 @@ impl<S: Strategy> Arena<'_, S> {
             return Ok(meta);
         } else {
             for i in 0..self.max_retries {
-                match S::alloc_slow(self, size,align) {
+                match S::alloc_slow(self, size, align) {
                     Ok(m) => return Ok(m),
                     Err(e) if i + 1 == self.max_retries => return Err(e),
                     Err(_) => { /* retry */ }
                 }
             }
             unreachable!()
-        }
-    }
-}
-
-use crate::area::{self, AddrSpec, MemBlk, Mmap};
-
-pub struct ArenaMemBlk<S: AddrSpec, M: Mmap<S>, G: Strategy> {
-    m: MemBlk<S, M>,
-    header: NonNull<crate::area::Header>,
-    alloc: NonNull<Header<G>>,
-    size: UInt,
-    marker: PhantomData<Header<G>>,
-}
-
-impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
-    pub fn header(&self) -> &crate::area::Header {
-        unsafe { self.header.as_ref() }
-    }
-
-    fn alloc_header(&self) -> &Header<G> {
-        unsafe { self.alloc.as_ref() }
-    }
-
-    pub fn arena(&self) -> Arena<'_, G> {
-        let cfg = Config::default();
-        Arena::from_header(self.alloc_header(), self.size, cfg)
-    }
-
-    pub fn init(
-        bk: M,
-        start: Option<S::Addr>,
-        size: usize,
-        flags: S::Flags,
-        mcfg: M::Config,
-    ) -> Result<Self, area::Error<S, M>> {
-        max_bound(size).ok_or(area::Error::OutofSize {
-            requested: size,
-            bound: ARENA_MAX_CAPACITY.cast_into(),
-        })?;
-
-        let area = bk
-            .map(start, size, flags, mcfg)
-            .map_err(area::Error::MapError)?;
-        unsafe {
-            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
-            let (alloc, aoffset) =
-                area.init_header::<Header<G>>(hoffset, Header::<G>::MIN_SEGMENT_SIZE)?;
-            let size = (area.size() - aoffset) as UInt;
-
-            Ok(Self {
-                m: area.into(),
-                header,
-                alloc,
-                // Safety: Previous arithmetic check
-                size,
-                marker: PhantomData,
-            })
         }
     }
 }

@@ -1,14 +1,14 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::panic::{RefUnwindSafe, UnwindSafe};
+use core::ptr;
 use core::sync::atomic::{self, AtomicUsize, Ordering};
-use core::{fmt, ptr};
 
 use crossbeam_utils::{Backoff, CachePadded};
 
 type Slots<T> = [Slot<T>];
 /// A slot in a queue.
-struct Slot<T> {
+pub struct Slot<T> {
     /// The current stamp.
     ///
     /// If the stamp equals the tail, this node will be next written to. If it equals head + 1,
@@ -19,7 +19,7 @@ struct Slot<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
-struct Header {
+pub struct Header {
     /// The head of the queue.
     ///
     /// This value is a "stamp" consisting of an index into the buffer and a lap, but packed into a
@@ -38,6 +38,9 @@ struct Header {
 
     /// A stamp with the value of `{ lap: 1, index: 0 }`.
     one_lap: usize,
+
+    /// The queue capacity.
+    cap: usize,
 }
 
 impl Header {
@@ -53,148 +56,20 @@ impl Header {
             head: CachePadded::new(AtomicUsize::new(head)),
             tail: CachePadded::new(AtomicUsize::new(tail)),
             one_lap,
+            cap,
         };
         header
     }
 }
 
-struct BoxQueue<T> {
-    h: Header,
-    buf: Box<Slots<T>>,
-}
-unsafe impl<T: Send> Send for BoxQueue<T> {}
-unsafe impl<T: Send> Sync for BoxQueue<T> {}
-impl<T> UnwindSafe for BoxQueue<T> {}
-impl<T> RefUnwindSafe for BoxQueue<T> {}
-
-struct BoxQueueHandle<'a, T> {
-    h: &'a Header,
-    buf: &'a Slots<T>,
-}
-
-impl<T> fmt::Debug for BoxQueueHandle<'_, T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.pad("QueueHandle { .. }")
-    }
-}
-
-unsafe impl<T: Send> Send for BoxQueueHandle<'_, T> {}
-unsafe impl<T: Send> Sync for BoxQueueHandle<'_, T> {}
-impl<T> UnwindSafe for BoxQueueHandle<'_, T> {}
-impl<T> RefUnwindSafe for BoxQueueHandle<'_, T> {}
-
-use crate::boxed::PBox;
-pub(crate) use crate::malloc::MemAllocator;
-pub(crate) use crate::msg::{ATokenOf, Envelope, PAToken};
-pub(crate) use crate::reg::{EntryView, Project, Resource};
-type TokenSlots<H, A> = Slots<PAToken<H, A>>;
-type TokenOfSlots<H, A> = ATokenOf<TokenSlots<H, A>, A>;
-type QEntryView<'a, H, A> = EntryView<'a, TokenQueue<H, A>>;
-struct TokenQueue<H: Envelope, A: MemAllocator> {
-    h: Header,
-    buf: TokenOfSlots<H, A>,
-}
-unsafe impl<H: Send + Envelope, A: MemAllocator> Send for TokenQueue<H, A> {}
-unsafe impl<H: Send + Envelope, A: MemAllocator> Sync for TokenQueue<H, A> {}
-impl<H: Envelope, A: MemAllocator> UnwindSafe for TokenQueue<H, A> {}
-impl<H: Envelope, A: MemAllocator> RefUnwindSafe for TokenQueue<H, A> {}
-
-impl<T> BoxQueue<T> {
-    fn new(cap: usize) -> Self {
-        let h = Header::new(cap);
-        // Allocate a buffer of `cap` slots initialized
-        // with stamps.
-        let buf: Box<[Slot<T>]> = (0..cap)
-            .map(|i| {
-                // Set the stamp to `{ lap: 0, index: i }`.
-                Slot {
-                    stamp: AtomicUsize::new(i),
-                    value: UnsafeCell::new(MaybeUninit::uninit()),
-                }
-            })
-            .collect();
-
-        Self { h, buf }
-    }
-    fn handle(&self) -> BoxQueueHandle<'_, T> {
-        BoxQueueHandle {
-            h: &self.h,
-            buf: &self.buf,
-        }
-    }
-}
-
-impl<T> QueueOps for BoxQueueHandle<'_, T> {
-    type Item = T;
-
-    #[inline]
-    fn header(&self) -> &Header {
-        self.h
-    }
-
-    #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
-        self.buf
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
-    type Config = usize;
-    type Ctx = A;
-    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
-        let cap = cfg;
-        let alloc = ctx;
-        let h = Header::new(cap);
-        let buffer: PBox<_, A> = PBox::new_slice_in(
-            cap,
-            |i| Slot {
-                stamp: AtomicUsize::new(i),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            },
-            alloc,
-        );
-        let (buf, alloc) = buffer.token_with();
-        (TokenQueue { h, buf }, alloc)
-    }
-
-    fn drop_in(self, ctx: Self::Ctx) {
-        let alloc = ctx;
-        let Self { h: _, buf } = self;
-        let b = PBox::<[_], A>::detoken(buf, alloc);
-        drop(b)
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> Project for TokenQueue<H, A> {
-    type View = ptr::NonNull<TokenSlots<H, A>>;
-
-    fn project(&self, ctx: Self::Ctx) -> Self::View {
-        let alloc = ctx;
-        let buf = ATokenOf::<[_], A>::as_ptr(&self.buf, alloc);
-        buf
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> QueueOps for QEntryView<'_, H, A> {
-    type Item = PAToken<H, A>;
-
-    #[inline]
-    fn header(&self) -> &Header {
-        &self.g.h
-    }
-
-    #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.v.as_ref() }
-    }
-}
-
-trait QueueOps {
+pub trait Queue {
     type Item;
 
     fn header(&self) -> &Header;
     fn buf(&self) -> &Slots<Self::Item>;
+}
 
+pub trait QueueOps: Queue {
     /// Attempts to push an element into the queue.
     fn push(&self, value: Self::Item) -> Result<(), Self::Item> {
         let header = self.header();
@@ -435,83 +310,494 @@ trait QueueOps {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{BoxQueue, QueueOps};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::thread::scope;
+impl<T: Queue> QueueOps for T {}
 
-    #[test]
-    fn smoke() {
-        let q = BoxQueue::new(1);
-        let handle = q.handle();
+trait QueueDrop: Queue {
+    unsafe fn drop_in(&self) {
+        if core::mem::needs_drop::<Self::Item>() {
+            let header = self.header();
+            let buf = self.buf();
+            // Get the index of the head.
+            let head = header.head.load(Ordering::Relaxed);
+            let tail = header.tail.load(Ordering::Relaxed);
 
-        handle.push(7).unwrap();
-        assert_eq!(handle.pop(), Some(7));
+            let hix = head & (header.one_lap - 1);
+            let tix = tail & (header.one_lap - 1);
 
-        handle.push(8).unwrap();
-        assert_eq!(handle.pop(), Some(8));
-        assert!(handle.pop().is_none())
+            let len = if hix < tix {
+                tix - hix
+            } else if hix > tix {
+                header.cap - hix + tix
+            } else if tail == head {
+                0
+            } else {
+                header.cap
+            };
+
+            // Loop over all slots that hold a message and drop them.
+            for i in 0..len {
+                // Compute the index of the next slot holding a message.
+                let index = if hix + i < header.cap {
+                    hix + i
+                } else {
+                    hix + i - header.cap
+                };
+
+                unsafe {
+                    debug_assert!(index < buf.len());
+                    let slot = buf.get_unchecked(index);
+                    (*slot.value.get()).assume_init_drop();
+                }
+            }
+        }
+    }
+}
+
+impl<T: Queue> QueueDrop for T {}
+
+use crate::boxed::PBox;
+use crate::malloc::MemAllocator;
+use crate::msg::{Envelope, SpanPackToken, SpanTokenOf};
+use crate::reg::{EntryView, Project, Resource};
+// Token needs to be transferred
+type Tokens<H, A> = Slots<SpanPackToken<H, A>>;
+// Token of the token slots
+type TokenOfTokens<H, A> = SpanTokenOf<Tokens<H, A>, A>;
+type ViewOfSlots<H, A> = ptr::NonNull<Tokens<H, A>>;
+type QueueView<'a, H, A> = EntryView<'a, TokenQueue<H, A>>;
+pub struct TokenQueue<H: Envelope, A: MemAllocator> {
+    header: Header,
+    buf: TokenOfTokens<H, A>,
+}
+unsafe impl<H: Send + Envelope, A: MemAllocator> Send for TokenQueue<H, A> {}
+unsafe impl<H: Send + Envelope, A: MemAllocator> Sync for TokenQueue<H, A> {}
+impl<H: Envelope, A: MemAllocator> UnwindSafe for TokenQueue<H, A> {}
+impl<H: Envelope, A: MemAllocator> RefUnwindSafe for TokenQueue<H, A> {}
+
+impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
+    type Config = usize;
+    type Ctx = A;
+    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
+        let cap = cfg;
+        let alloc = ctx;
+        let h = Header::new(cap);
+        let buffer: PBox<_, A> = PBox::new_slice_in(
+            cap,
+            |i| Slot {
+                stamp: AtomicUsize::new(i),
+                value: UnsafeCell::new(MaybeUninit::uninit()),
+            },
+            alloc,
+        );
+        let (buf, alloc) = buffer.token_with();
+        (TokenQueue { header: h, buf }, alloc)
     }
 
-    #[test]
-    fn capacity() {
-        for i in 1..10 {
-            let q = BoxQueue::<i32>::new(i);
-            assert_eq!(q.handle().capacity(), i)
+    fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx {
+        let alloc = ctx;
+        // let (view, alloc) = self.project(alloc);
+        // struct DropView<'a, H: Envelope, A: MemAllocator> {
+        //     h: &'a Header,
+        //     view: ptr::NonNull<Tokens<H, A>>,
+        // }
+
+        // impl<H: Envelope, A: MemAllocator> Queue for DropView<'_, H, A> {
+        //     type Item = SpanPackToken<H, A>;
+
+        //     fn header(&self) -> &Header {
+        //         self.h
+        //     }
+
+        //     fn buf(&self) -> &Slots<Self::Item> {
+        //         unsafe { self.view.as_ref() }
+        //     }
+        // }
+
+        // let drop_view = DropView::<'_, _, A> { h: &self.h, view };
+        // unsafe { drop_view.drop_in() };
+        let Self { header: _, buf } = s;
+        let b = buf.detoken(alloc);
+        PBox::drop_in(b)
+    }
+}
+
+impl<H: Envelope, A: MemAllocator> Project for TokenQueue<H, A> {
+    type View = ViewOfSlots<H, A>;
+
+    #[inline]
+    fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
+        let alloc = ctx;
+        let (buf, alloc) = self.buf.as_ptr(alloc);
+        (buf, alloc)
+    }
+}
+
+impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A> {
+    type Item = SpanPackToken<H, A>;
+
+    #[inline]
+    fn header(&self) -> &Header {
+        &self.guard.as_ref().header
+    }
+
+    #[inline]
+    fn buf(&self) -> &Slots<Self::Item> {
+        unsafe { self.view.as_ref() }
+    }
+}
+
+impl<'a, H: Envelope, A: MemAllocator> Channel for QueueView<'a, H, A> {}
+
+type ChannelView<'a, H, A> = EntryView<'a, TokenChannel<H, A>>;
+pub struct TokenChannel<H: Envelope, A: MemAllocator> {
+    l: TokenQueue<H, A>,
+    r: TokenQueue<H, A>,
+}
+
+#[repr(transparent)]
+#[derive(Clone)]
+struct LQueue<T>(T);
+
+#[repr(transparent)]
+#[derive(Clone)]
+struct RQueue<T>(T);
+
+impl<H: Envelope, A: MemAllocator> Resource for TokenChannel<H, A> {
+    type Config = usize;
+    type Ctx = A;
+
+    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
+        let alloc = ctx;
+        let (l, alloc) = TokenQueue::new(cfg, alloc);
+        let (r, alloc) = TokenQueue::new(cfg, alloc);
+        (Self { l, r }, alloc)
+    }
+
+    fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx {
+        let alloc = ctx;
+        let Self { l, r } = s;
+        let alloc = TokenQueue::free(l, alloc);
+        TokenQueue::free(r, alloc)
+    }
+}
+
+impl<H: Envelope, A: MemAllocator> Project for TokenChannel<H, A> {
+    type View = (ViewOfSlots<H, A>, ViewOfSlots<H, A>);
+
+    fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
+        let alloc = ctx;
+        let (l, alloc) = self.l.project(alloc);
+        let (r, alloc) = self.r.project(alloc);
+        ((l, r), alloc)
+    }
+}
+
+impl<'a, H: Envelope, A: MemAllocator> Queue for LQueue<ChannelView<'a, H, A>> {
+    type Item = SpanPackToken<H, A>;
+
+    fn header(&self) -> &Header {
+        &self.0.guard.as_ref().l.header
+    }
+
+    fn buf(&self) -> &Slots<Self::Item> {
+        unsafe { self.0.view.0.as_ref() }
+    }
+}
+
+impl<'a, H: Envelope, A: MemAllocator> Channel for LQueue<ChannelView<'a, H, A>> {}
+
+impl<'a, H: Envelope, A: MemAllocator> Queue for RQueue<ChannelView<'a, H, A>> {
+    type Item = SpanPackToken<H, A>;
+
+    fn header(&self) -> &Header {
+        &self.0.guard.as_ref().r.header
+    }
+
+    fn buf(&self) -> &Slots<Self::Item> {
+        unsafe { self.0.view.1.as_ref() }
+    }
+}
+
+impl<'a, H: Envelope, A: MemAllocator> Channel for RQueue<ChannelView<'a, H, A>> {}
+
+impl<'a, H: Envelope, A: MemAllocator> ChannelView<'a, H, A> {
+    fn lchannel(self) -> Duplex<LQueue<Self>, RQueue<Self>> {
+        let lq = LQueue(self.clone());
+        let rq = RQueue(self.clone());
+        Duplex {
+            s: lq.sender(),
+            r: rq.receiver(),
         }
     }
 
-    #[test]
-    #[should_panic]
-    fn zero_capacity() {
-        let _ = BoxQueue::<i32>::new(0);
+    fn rchannel(self) -> Duplex<RQueue<Self>, LQueue<Self>> {
+        let lq = LQueue(self.clone());
+        let rq = RQueue(self.clone());
+        Duplex {
+            s: rq.sender(),
+            r: lq.receiver(),
+        }
+    }
+}
+
+pub trait Channel: Clone {
+    #[inline(always)]
+    fn channel(self) -> (Sender<Self>, Receiver<Self>) {
+        (Sender(self.clone()), Receiver(self))
     }
 
-    #[test]
-    fn mpmc_ring_buffer() {
-        #[cfg(miri)]
-        const COUNT: usize = 50;
-        #[cfg(not(miri))]
-        const COUNT: usize = 25_000;
-        const THREADS: usize = 4;
+    #[inline(always)]
+    fn sender(self) -> Sender<Self> {
+        Sender(self)
+    }
 
-        let t = AtomicUsize::new(THREADS);
-        let q = BoxQueue::<usize>::new(3);
-        let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+    #[inline(always)]
+    fn receiver(self) -> Receiver<Self> {
+        Receiver(self)
+    }
+}
 
-        scope(|scope| {
-            for _ in 0..THREADS {
-                scope.spawn(|| {
-                    loop {
-                        match t.load(Ordering::SeqCst) {
-                            0 if q.handle().is_empty() => break,
+#[repr(transparent)]
+#[derive(Clone)]
+struct Sender<S>(S);
 
-                            _ => {
-                                while let Some(n) = q.handle().pop() {
-                                    v[n].fetch_add(1, Ordering::SeqCst);
+#[repr(transparent)]
+#[derive(Clone)]
+struct Receiver<R>(R);
+
+impl<S: Queue> Sender<S> {
+    #[inline(always)]
+    fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
+        self.0.push(value)
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.0.is_full()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl<S: Queue> Receiver<S> {
+    #[inline(always)]
+    fn try_recv(&self) -> Option<S::Item> {
+        self.0.pop()
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.0.capacity()
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.0.is_full()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+#[derive(Clone)]
+struct Duplex<S, R> {
+    s: Sender<S>,
+    r: Receiver<R>,
+}
+
+impl<S: Queue, R: Queue> Duplex<S, R> {
+    #[inline(always)]
+    fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
+        self.s.try_send(value)
+    }
+
+    #[inline(always)]
+    fn try_recv(&self) -> Option<R::Item> {
+        self.r.try_recv()
+    }
+}
+
+mod local {
+    use core::{
+        cell::UnsafeCell,
+        mem::MaybeUninit,
+        panic::{RefUnwindSafe, UnwindSafe},
+        sync::atomic::AtomicUsize,
+    };
+
+    use crate::queue::{Header, Slot, Slots};
+
+    struct Queue<T> {
+        h: Header,
+        buf: Box<Slots<T>>,
+    }
+    unsafe impl<T: Send> Send for Queue<T> {}
+    unsafe impl<T: Send> Sync for Queue<T> {}
+    impl<T> UnwindSafe for Queue<T> {}
+    impl<T> RefUnwindSafe for Queue<T> {}
+
+    struct QueueHandle<'a, T> {
+        h: &'a Header,
+        buf: &'a Slots<T>,
+    }
+
+    impl<T> core::fmt::Debug for QueueHandle<'_, T> {
+        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+            f.pad("QueueHandle { .. }")
+        }
+    }
+
+    unsafe impl<T: Send> Send for QueueHandle<'_, T> {}
+    unsafe impl<T: Send> Sync for QueueHandle<'_, T> {}
+    impl<T> UnwindSafe for QueueHandle<'_, T> {}
+    impl<T> RefUnwindSafe for QueueHandle<'_, T> {}
+
+    impl<T> Drop for Queue<T> {
+        fn drop(&mut self) {
+            use crate::queue::QueueDrop;
+            let handle = self.handle();
+            unsafe { handle.drop_in() };
+        }
+    }
+
+    impl<T> Queue<T> {
+        fn new(cap: usize) -> Self {
+            let h = Header::new(cap);
+            // Allocate a buffer of `cap` slots initialized
+            // with stamps.
+            let buf: Box<Slots<T>> = (0..cap)
+                .map(|i| {
+                    // Set the stamp to `{ lap: 0, index: i }`.
+                    Slot {
+                        stamp: AtomicUsize::new(i),
+                        value: UnsafeCell::new(MaybeUninit::uninit()),
+                    }
+                })
+                .collect();
+
+            Self { h, buf }
+        }
+        fn handle(&self) -> QueueHandle<'_, T> {
+            QueueHandle {
+                h: &self.h,
+                buf: &self.buf,
+            }
+        }
+    }
+
+    impl<T> super::Queue for QueueHandle<'_, T> {
+        type Item = T;
+
+        #[inline]
+        fn header(&self) -> &Header {
+            self.h
+        }
+
+        #[inline]
+        fn buf(&self) -> &Slots<Self::Item> {
+            self.buf
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::super::QueueOps;
+        use super::Queue;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::thread::scope;
+
+        #[test]
+        fn smoke() {
+            let q = Queue::new(1);
+            let handle = q.handle();
+
+            handle.push(7).unwrap();
+            assert_eq!(handle.pop(), Some(7));
+
+            handle.push(8).unwrap();
+            assert_eq!(handle.pop(), Some(8));
+            assert!(handle.pop().is_none())
+        }
+
+        #[test]
+        fn capacity() {
+            for i in 1..10 {
+                let q = Queue::<i32>::new(i);
+                assert_eq!(q.handle().capacity(), i)
+            }
+        }
+
+        #[test]
+        #[should_panic]
+        fn zero_capacity() {
+            let _ = Queue::<i32>::new(0);
+        }
+
+        #[test]
+        fn mpmc_ring_buffer() {
+            #[cfg(miri)]
+            const COUNT: usize = 50;
+            #[cfg(not(miri))]
+            const COUNT: usize = 25_000;
+            const THREADS: usize = 4;
+
+            let t = AtomicUsize::new(THREADS);
+            let q = Queue::<usize>::new(3);
+            let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
+
+            scope(|scope| {
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        loop {
+                            match t.load(Ordering::SeqCst) {
+                                0 if q.handle().is_empty() => break,
+
+                                _ => {
+                                    while let Some(n) = q.handle().pop() {
+                                        v[n].fetch_add(1, Ordering::SeqCst);
+                                    }
                                 }
                             }
                         }
-                    }
-                });
-            }
+                    });
+                }
 
-            for _ in 0..THREADS {
-                scope.spawn(|| {
-                    for i in 0..COUNT {
-                        if let Some(n) = q.handle().force_push(i) {
-                            v[n].fetch_add(1, Ordering::SeqCst);
+                for _ in 0..THREADS {
+                    scope.spawn(|| {
+                        for i in 0..COUNT {
+                            if let Some(n) = q.handle().force_push(i) {
+                                v[n].fetch_add(1, Ordering::SeqCst);
+                            }
                         }
-                    }
 
-                    t.fetch_sub(1, Ordering::SeqCst);
-                });
+                        t.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            });
+
+            for c in v {
+                assert_eq!(c.load(Ordering::SeqCst), THREADS);
             }
-        });
-
-        for c in v {
-            assert_eq!(c.load(Ordering::SeqCst), THREADS);
         }
     }
 }

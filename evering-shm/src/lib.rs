@@ -17,6 +17,16 @@
     unsafe_cell_access
 )]
 
+use core::ptr::NonNull;
+
+pub use crate::arena::{Optimistic, Pessimistic};
+
+use crate::{
+    area::{AddrSpec, MemBlkHandle, Mmap},
+    arena::{ARENA_MAX_CAPACITY, Strategy, UInt, max_bound},
+    numeric::CastInto,
+};
+
 extern crate alloc;
 
 #[cfg(feature = "tracing")]
@@ -32,6 +42,12 @@ pub mod os;
 mod queue;
 mod reg;
 mod tests;
+
+fn tracing_init() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+}
 
 mod seal {
     pub trait Sealed {}
@@ -201,4 +217,99 @@ mod numeric {
     pack_bits!(unpack:u16, pack:u32);
     pack_bits!(unpack:u32, pack:u64);
     pack_bits!(unpack:u64, pack:u128);
+}
+
+#[derive(Clone)]
+pub struct ArenaMemBlk<S: AddrSpec, M: Mmap<S>, G: Strategy> {
+    m: MemBlkHandle<S, M>,
+    header: NonNull<crate::area::Header>,
+    alloc: NonNull<crate::arena::Header<G>>,
+    size: UInt,
+}
+
+impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
+    pub fn header(&self) -> &crate::area::Header {
+        unsafe { self.header.as_ref() }
+    }
+
+    fn alloc_header(&self) -> &crate::arena::Header<G> {
+        unsafe { self.alloc.as_ref() }
+    }
+
+    pub fn arena(&self) -> crate::arena::Arena<'_, G> {
+        let cfg = crate::arena::Config::default();
+        crate::arena::Arena::from_header(self.alloc_header(), self.size, cfg)
+    }
+
+    pub fn init(
+        bk: M,
+        start: Option<S::Addr>,
+        size: usize,
+        flags: S::Flags,
+        mcfg: M::Config,
+    ) -> Result<Self, area::Error<S, M>> {
+        max_bound(size).ok_or(area::Error::OutofSize {
+            requested: size,
+            bound: ARENA_MAX_CAPACITY.cast_into(),
+        })?;
+
+        let area = bk
+            .map(start, size, flags, mcfg)
+            .map_err(area::Error::MapError)?;
+        unsafe {
+            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
+                hoffset,
+                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
+            )?;
+            let size = (area.size() - aoffset) as UInt;
+
+            Ok(Self {
+                m: area.into(),
+                header,
+                alloc,
+                // Safety: Previous arithmetic check
+                size,
+            })
+        }
+    }
+}
+
+#[derive(Clone)]
+struct RegMemBlk<S: AddrSpec, M: Mmap<S>, T, const N: usize> {
+    m: MemBlkHandle<S, M>,
+    header: NonNull<crate::area::Header>,
+    reg: NonNull<crate::reg::Registry<T, N>>,
+}
+
+impl<S: AddrSpec, M: Mmap<S>, T, const N: usize> RegMemBlk<S, M, T, N> {
+    pub fn header(&self) -> &crate::area::Header {
+        unsafe { self.header.as_ref() }
+    }
+
+    pub fn reg(&self) -> &crate::reg::Registry<T, N> {
+        unsafe { self.reg.as_ref() }
+    }
+
+    pub fn init(
+        bk: M,
+        start: Option<S::Addr>,
+        size: usize,
+        flags: S::Flags,
+        mcfg: M::Config,
+    ) -> Result<Self, area::Error<S, M>> {
+        let area = bk
+            .map(start, size, flags, mcfg)
+            .map_err(area::Error::MapError)?;
+        unsafe {
+            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (reg, _) = area.init_header::<crate::reg::Registry<T, N>>(hoffset, ())?;
+
+            Ok(Self {
+                m: area.into(),
+                header,
+                reg,
+            })
+        }
+    }
 }

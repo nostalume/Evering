@@ -4,25 +4,18 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::{
-    area::MemBlkHandle,
-    malloc::{MemAlloc, MemAllocInfo},
-    queue::MemAllocator,
-};
-
-use super::super::{
-    area::{AddrSpec, MemBlk, Mmap, Mprotect, RawMemBlk},
-    arena::{ArenaMemBlk, Optimistic},
-};
-use super::tracing_init;
+use crate::tracing_init;
+use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk};
+use crate::malloc::{MemAllocInfo, MemAllocator};
+use crate::{ArenaMemBlk, Optimistic, RegMemBlk};
 
 const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
-type MockMemBlk<'a> = MemBlk<MockAddr, MockBackend<'a>>;
 type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
 type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
+type MockReg<'a, T, const N: usize> = RegMemBlk<MockAddr, MockBackend<'a>, T, N>;
 
 struct MockAddr;
 
@@ -115,18 +108,22 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
     }
 }
 
-fn mock_area(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockMemBlk<'_> {
-    let a = MemBlk::init(bk, start, size, 0, ()).unwrap();
+fn mock_handle(bk: MockBackend<'_>, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
+    let a = MemBlkHandle::init(bk, start, size, 0, ()).unwrap();
+    a.into()
+}
+
+fn mock_arena(bk: MockBackend<'_>, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
+    let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
-fn mock_handle(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
-    let a = mock_area(bk, start, size);
-    MockMemHandle::from_blk(a)
-}
-
-fn mock_arena(bk: MockBackend, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
-    let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
+fn mock_reg<T, const N: usize>(
+    bk: MockBackend<'_>,
+    start: Option<VirtAddr>,
+    size: usize,
+) -> MockReg<'_, T, N> {
+    let a = RegMemBlk::init(bk, start, size, 0, ()).unwrap();
     a
 }
 
@@ -279,9 +276,10 @@ fn pbox_droppy() {
     use crate::boxed::PBox;
 
     tracing_init();
-    // It should be clarified that the heap allocation
-    // context shouldn't exist in allocator allocation
-    // if you want a process-invairant data.
+    // It should be clarified that
+    // to share process-invariant data
+    // the heap allocation context is not allowed
+    // It's only test-oriented.
     let counter = Arc::new(AtomicUsize::new(0));
     struct Droppy(Arc<AtomicUsize>);
     impl Drop for Droppy {

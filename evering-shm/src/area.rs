@@ -8,7 +8,7 @@ pub trait AddrSpec {
     type Flags: Copy;
 }
 
-pub(crate) trait Mmap<S: AddrSpec>: Sized {
+pub trait Mmap<S: AddrSpec>: Sized {
     type Config;
     type Error: core::fmt::Debug;
 
@@ -631,7 +631,21 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
             &*ptr
         }
     }
+}
 
+impl<S: AddrSpec, M: Mmap<S>> From<MemBlk<S, M>> for MemBlkHandle<S, M> {
+    fn from(value: MemBlk<S, M>) -> Self {
+        Self(alloc::sync::Arc::new(value))
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> From<RawMemBlk<S, M>> for MemBlkHandle<S, M> {
+    fn from(value: RawMemBlk<S, M>) -> Self {
+        Self(alloc::sync::Arc::new(value.into()))
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>>  MemBlkHandle<S, M> {
     pub fn init(
         bk: M,
         start: Option<S::Addr>,
@@ -645,11 +659,5 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
         }
 
         Ok(area.into())
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>> MemBlkHandle<S, M> {
-    pub fn from_blk(blk: MemBlk<S, M>) -> Self {
-        Self(alloc::sync::Arc::new(blk))
     }
 }
