@@ -1,10 +1,12 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::panic::{RefUnwindSafe, UnwindSafe};
-use core::ptr;
 use core::sync::atomic::{self, AtomicUsize, Ordering};
 
 use crossbeam_utils::{Backoff, CachePadded};
+
+pub mod cross;
+pub mod driver;
+mod local;
 
 type Slots<T> = [Slot<T>];
 /// A slot in a queue.
@@ -355,460 +357,110 @@ trait QueueDrop: Queue {
 
 impl<T: Queue> QueueDrop for T {}
 
-use crate::boxed::PBox;
-use crate::malloc::{MemAllocator, MetaSpanOf};
-use crate::msg::{Envelope, PackToken, TokenOf};
-use crate::reg::{EntryView, Project, Resource};
-
-type Token<H,A> = PackToken<H,MetaSpanOf<A>>;
-type Tokens<H, A> = Slots<Token<H,A>>;
-type TokenOfTokens<H, A> = TokenOf<Tokens<H, A>, MetaSpanOf<A>>;
-
-type ViewOfSlots<H, A> = ptr::NonNull<Tokens<H, A>>;
-type QueueView<'a, H, A> = EntryView<'a, TokenQueue<H, A>>;
-
-pub struct TokenQueue<H: Envelope, A: MemAllocator> {
-    header: Header,
-    buf: TokenOfTokens<H, A>,
-}
-
-unsafe impl<H: Send + Envelope, A: MemAllocator> Send for TokenQueue<H, A> {}
-unsafe impl<H: Send + Envelope, A: MemAllocator> Sync for TokenQueue<H, A> {}
-
-impl<H: Envelope, A: MemAllocator> UnwindSafe for TokenQueue<H, A> {}
-impl<H: Envelope, A: MemAllocator> RefUnwindSafe for TokenQueue<H, A> {}
-
-impl<H: Envelope, A: MemAllocator> Resource for TokenQueue<H, A> {
-    type Config = usize;
-    type Ctx = A;
-    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
-        let cap = cfg;
-        let alloc = ctx;
-        let header = Header::new(cap);
-        let buffer: PBox<_, A> = PBox::new_slice_in(
-            cap,
-            |i| Slot {
-                stamp: AtomicUsize::new(i),
-                value: UnsafeCell::new(MaybeUninit::uninit()),
-            },
-            alloc,
-        );
-        let (buf, alloc) = buffer.token_of_with();
-        (TokenQueue { header, buf }, alloc)
-    }
-
-    fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx {
-        let alloc = ctx;
-        // let (view, alloc) = self.project(alloc);
-        // struct DropView<'a, H: Envelope, A: MemAllocator> {
-        //     h: &'a Header,
-        //     view: ptr::NonNull<Tokens<H, A>>,
-        // }
-
-        // impl<H: Envelope, A: MemAllocator> Queue for DropView<'_, H, A> {
-        //     type Item = SpanPackToken<H, A>;
-
-        //     fn header(&self) -> &Header {
-        //         self.h
-        //     }
-
-        //     fn buf(&self) -> &Slots<Self::Item> {
-        //         unsafe { self.view.as_ref() }
-        //     }
-        // }
-
-        // let drop_view = DropView::<'_, _, A> { h: &self.h, view };
-        // unsafe { drop_view.drop_in() };
-        let Self { header: _, buf } = s;
-        let b = buf.detoken(alloc);
-        PBox::drop_in(b)
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> Project for TokenQueue<H, A> {
-    type View = ViewOfSlots<H, A>;
-
-    #[inline]
-    fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
-        let alloc = ctx;
-        let (buf, alloc) = self.buf.as_ptr(alloc);
-        (buf, alloc)
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A> {
-    type Item = Token<H, A>;
-
-    #[inline]
-    fn header(&self) -> &Header {
-        &self.guard.as_ref().header
-    }
-
-    #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.view.as_ref() }
-    }
-}
-
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for QueueView<'a, H, A> {}
-
-type DuplexView<'a, H, A> = EntryView<'a, TokenDuplex<H, A>>;
-pub struct TokenDuplex<H: Envelope, A: MemAllocator> {
-    l: TokenQueue<H, A>,
-    r: TokenQueue<H, A>,
-}
-
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct LEndpoint<T>(T);
-
-#[repr(transparent)]
-#[derive(Clone)]
-pub struct REndpoint<T>(T);
-
-impl<H: Envelope, A: MemAllocator> Resource for TokenDuplex<H, A> {
-    type Config = usize;
-    type Ctx = A;
-
-    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
-        let alloc = ctx;
-        let (l, alloc) = TokenQueue::new(cfg, alloc);
-        let (r, alloc) = TokenQueue::new(cfg, alloc);
-        (Self { l, r }, alloc)
-    }
-
-    fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx {
-        let alloc = ctx;
-        let Self { l, r } = s;
-        let alloc = TokenQueue::free(l, alloc);
-        TokenQueue::free(r, alloc)
-    }
-}
-
-impl<H: Envelope, A: MemAllocator> Project for TokenDuplex<H, A> {
-    type View = (ViewOfSlots<H, A>, ViewOfSlots<H, A>);
-
-    fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
-        let alloc = ctx;
-        let (l, alloc) = self.l.project(alloc);
-        let (r, alloc) = self.r.project(alloc);
-        ((l, r), alloc)
-    }
-}
-
-impl<'a, H: Envelope, A: MemAllocator> Queue for LEndpoint<DuplexView<'a, H, A>> {
-    type Item = Token<H, A>;
-
-    #[inline]
-    fn header(&self) -> &Header {
-        &self.0.guard.as_ref().l.header
-    }
-
-    #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.0.view.0.as_ref() }
-    }
-}
-
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for LEndpoint<DuplexView<'a, H, A>> {}
-
-impl<'a, H: Envelope, A: MemAllocator> Queue for REndpoint<DuplexView<'a, H, A>> {
-    type Item = Token<H, A>;
-
-    #[inline]
-    fn header(&self) -> &Header {
-        &self.0.guard.as_ref().r.header
-    }
-
-    #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.0.view.1.as_ref() }
-    }
-}
-
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for REndpoint<DuplexView<'a, H, A>> {}
-
-impl<'a, H: Envelope, A: MemAllocator> DuplexView<'a, H, A> {
-    pub fn sr_duplex(self) -> Duplex<LEndpoint<Self>, REndpoint<Self>> {
-        let lq = LEndpoint(self.clone());
-        let rq = REndpoint(self);
-        Duplex {
-            s: lq.sender(),
-            r: rq.receiver(),
-        }
-    }
-
-    pub fn rs_duplex(self) -> Duplex<REndpoint<Self>, LEndpoint<Self>> {
-        let lq = LEndpoint(self.clone());
-        let rq = REndpoint(self);
-        Duplex {
-            s: rq.sender(),
-            r: lq.receiver(),
-        }
-    }
-}
-
 trait Endpoint: Sized {
     #[inline(always)]
-    fn channel(self) -> (Sender<Self>, Receiver<Self>)
+    fn channel(self) -> (Tx<Self>, Rx<Self>)
     where
         Self: Clone,
     {
-        (Sender(self.clone()), Receiver(self))
+        (Tx(self.clone()), Rx(self))
     }
 
     #[inline(always)]
-    fn sender(self) -> Sender<Self> {
-        Sender(self)
+    fn sender(self) -> Tx<Self> {
+        Tx(self)
     }
 
     #[inline(always)]
-    fn receiver(self) -> Receiver<Self> {
-        Receiver(self)
+    fn receiver(self) -> Rx<Self> {
+        Rx(self)
     }
+}
+
+trait Sender {
+    type Item;
+    type TryError;
+
+    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError>;
+}
+
+trait AsyncSender: Sender {
+    type Error;
+
+    fn send(&self, item: Self::Item) -> impl Future<Output = Result<(), Self::Error>>;
+}
+
+trait Receiver {
+    type Item;
+    type TryError;
+
+    fn try_recv(&self) -> Result<Self::Item, Self::TryError>;
+}
+
+trait AsyncReceiver: Receiver {
+    type Error;
+
+    fn recv(&self) -> impl Future<Output = Result<Self::Item, Self::Error>>;
 }
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct Sender<S>(S);
+pub struct Tx<S>(S);
 
 #[repr(transparent)]
 #[derive(Clone)]
-struct Receiver<R>(R);
+pub struct Rx<R>(R);
 
-impl<S: Queue> Sender<S> {
+impl<S: Queue> Tx<S> {
     #[inline(always)]
-    fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
+    pub fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
         self.0.push(value)
     }
 
     #[inline(always)]
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.0.capacity()
     }
 
     #[inline(always)]
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     #[inline(always)]
-    fn is_full(&self) -> bool {
+    pub fn is_full(&self) -> bool {
         self.0.is_full()
     }
 
     #[inline(always)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
     }
 }
 
-impl<S: Queue> Receiver<S> {
+impl<S: Queue> Rx<S> {
     #[inline(always)]
-    fn try_recv(&self) -> Option<S::Item> {
+    pub fn try_recv(&self) -> Option<S::Item> {
         self.0.pop()
     }
 
     #[inline(always)]
-    fn capacity(&self) -> usize {
+    pub fn capacity(&self) -> usize {
         self.0.capacity()
     }
 
     #[inline(always)]
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
     #[inline(always)]
-    fn is_full(&self) -> bool {
+    pub fn is_full(&self) -> bool {
         self.0.is_full()
     }
 
     #[inline(always)]
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.0.len()
-    }
-}
-
-#[derive(Clone)]
-pub struct Duplex<S, R> {
-    s: Sender<S>,
-    r: Receiver<R>,
-}
-
-impl<S: Queue, R: Queue> Duplex<S, R> {
-    #[inline(always)]
-    pub fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
-        self.s.try_send(value)
-    }
-
-    #[inline(always)]
-    pub fn try_recv(&self) -> Option<R::Item> {
-        self.r.try_recv()
-    }
-}
-
-mod local {
-    use core::{
-        cell::UnsafeCell,
-        mem::MaybeUninit,
-        panic::{RefUnwindSafe, UnwindSafe},
-        sync::atomic::AtomicUsize,
-    };
-
-    use crate::queue::{Header, Slot, Slots};
-
-    struct Queue<T> {
-        h: Header,
-        buf: Box<Slots<T>>,
-    }
-    unsafe impl<T: Send> Send for Queue<T> {}
-    unsafe impl<T: Send> Sync for Queue<T> {}
-    impl<T> UnwindSafe for Queue<T> {}
-    impl<T> RefUnwindSafe for Queue<T> {}
-
-    struct QueueHandle<'a, T> {
-        h: &'a Header,
-        buf: &'a Slots<T>,
-    }
-
-    impl<T> core::fmt::Debug for QueueHandle<'_, T> {
-        fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-            f.pad("QueueHandle { .. }")
-        }
-    }
-
-    unsafe impl<T: Send> Send for QueueHandle<'_, T> {}
-    unsafe impl<T: Send> Sync for QueueHandle<'_, T> {}
-    impl<T> UnwindSafe for QueueHandle<'_, T> {}
-    impl<T> RefUnwindSafe for QueueHandle<'_, T> {}
-
-    impl<T> Drop for Queue<T> {
-        fn drop(&mut self) {
-            use crate::queue::QueueDrop;
-            let handle = self.handle();
-            unsafe { handle.drop_in() };
-        }
-    }
-
-    impl<T> Queue<T> {
-        fn new(cap: usize) -> Self {
-            let h = Header::new(cap);
-            // Allocate a buffer of `cap` slots initialized
-            // with stamps.
-            let buf: Box<Slots<T>> = (0..cap)
-                .map(|i| {
-                    // Set the stamp to `{ lap: 0, index: i }`.
-                    Slot {
-                        stamp: AtomicUsize::new(i),
-                        value: UnsafeCell::new(MaybeUninit::uninit()),
-                    }
-                })
-                .collect();
-
-            Self { h, buf }
-        }
-        fn handle(&self) -> QueueHandle<'_, T> {
-            QueueHandle {
-                h: &self.h,
-                buf: &self.buf,
-            }
-        }
-    }
-
-    impl<T> super::Queue for QueueHandle<'_, T> {
-        type Item = T;
-
-        #[inline]
-        fn header(&self) -> &Header {
-            self.h
-        }
-
-        #[inline]
-        fn buf(&self) -> &Slots<Self::Item> {
-            self.buf
-        }
-    }
-
-    #[cfg(test)]
-    mod tests {
-        use super::super::QueueOps;
-        use super::Queue;
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::thread::scope;
-
-        #[test]
-        fn smoke() {
-            let q = Queue::new(1);
-            let handle = q.handle();
-
-            handle.push(7).unwrap();
-            assert_eq!(handle.pop(), Some(7));
-
-            handle.push(8).unwrap();
-            assert_eq!(handle.pop(), Some(8));
-            assert!(handle.pop().is_none())
-        }
-
-        #[test]
-        fn capacity() {
-            for i in 1..10 {
-                let q = Queue::<i32>::new(i);
-                assert_eq!(q.handle().capacity(), i)
-            }
-        }
-
-        #[test]
-        #[should_panic]
-        fn zero_capacity() {
-            let _ = Queue::<i32>::new(0);
-        }
-
-        #[test]
-        fn mpmc_ring_buffer() {
-            #[cfg(miri)]
-            const COUNT: usize = 50;
-            #[cfg(not(miri))]
-            const COUNT: usize = 25_000;
-            const THREADS: usize = 4;
-
-            let t = AtomicUsize::new(THREADS);
-            let q = Queue::<usize>::new(3);
-            let v = (0..COUNT).map(|_| AtomicUsize::new(0)).collect::<Vec<_>>();
-
-            scope(|scope| {
-                for _ in 0..THREADS {
-                    scope.spawn(|| {
-                        loop {
-                            match t.load(Ordering::SeqCst) {
-                                0 if q.handle().is_empty() => break,
-
-                                _ => {
-                                    while let Some(n) = q.handle().pop() {
-                                        v[n].fetch_add(1, Ordering::SeqCst);
-                                    }
-                                }
-                            }
-                        }
-                    });
-                }
-
-                for _ in 0..THREADS {
-                    scope.spawn(|| {
-                        for i in 0..COUNT {
-                            if let Some(n) = q.handle().force_push(i) {
-                                v[n].fetch_add(1, Ordering::SeqCst);
-                            }
-                        }
-
-                        t.fetch_sub(1, Ordering::SeqCst);
-                    });
-                }
-            });
-
-            for c in v {
-                assert_eq!(c.load(Ordering::SeqCst), THREADS);
-            }
-        }
     }
 }

@@ -15,15 +15,12 @@ unix = ["std", "dep:nix"]
 windows = ["std"]
 
 [dependencies]
-allocator-api2 = "0.3.0"
-
 # memory control
 spin.workspace = true
 crossbeam-utils.workspace = true
-bytemuck = "1.24.0"
 memory_addr = "0.4.0"
 
-# code aid
+# helper
 tracing = { version = "0.1", optional = true }
 paste = "1"
 

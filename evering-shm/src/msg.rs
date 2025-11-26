@@ -399,7 +399,7 @@ impl<M> Token<M> {
     }
 }
 
-pub(crate) trait Envelope: core::fmt::Debug {
+pub trait Envelope: core::fmt::Debug {
     fn init_by<M>(t: &Token<M>) -> Self;
 }
 
@@ -425,13 +425,13 @@ impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
 
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]
-    pub fn unpack_with(self) -> (Token<M>, H) {
+    pub fn into_parts(self) -> (Token<M>, H) {
         let Self { h, token } = self;
         (token, h)
     }
 
     #[inline]
-    pub fn unpack(self) -> Token<M> {
+    pub unsafe fn into_token(self) -> Token<M> {
         self.token
     }
 

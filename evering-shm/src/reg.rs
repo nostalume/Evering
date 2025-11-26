@@ -54,7 +54,7 @@ pub struct EntryGuard<'a, T> {
     id: Id,
 }
 
-pub struct EntryView<'a, T: Project> {
+pub struct EntryView<'a, C, T: Project<C>> {
     pub guard: EntryGuard<'a, T>,
     pub view: T::View,
 }
@@ -242,7 +242,7 @@ impl<T> Entry<T> {
 
 impl<T> Clone for EntryGuard<'_, T> {
     fn clone(&self) -> Self {
-        self.entry.rc.fetch_add(1, Ordering::AcqRel);
+        self.entry.rc.fetch_add(1, Ordering::Relaxed);
         Self {
             entry: self.entry,
             id: self.id,
@@ -301,7 +301,7 @@ impl<T> EntryGuard<'_, T> {
     }
 }
 
-impl<T: Project> Clone for EntryView<'_, T>
+impl<C, T: Project<C>> Clone for EntryView<'_, C, T>
 where
     T::View: Clone,
 {
@@ -314,7 +314,7 @@ where
     }
 }
 
-impl<T: Project> core::fmt::Debug for EntryView<'_, T>
+impl<C, T: Project<C>> core::fmt::Debug for EntryView<'_, C, T>
 where
     T::View: core::fmt::Debug,
 {
@@ -477,21 +477,23 @@ impl<T, const N: usize> Registry<T, N> {
     }
 }
 
-pub trait Resource: Sized {
-    type Config: Clone;
-    type Ctx;
-    fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx);
-    fn free(s: Self, ctx: Self::Ctx) -> Self::Ctx;
+pub trait Resource<Ctx>: Sized {
+    type Config;
+    fn new(cfg: Self::Config, ctx: Ctx) -> (Self, Ctx);
+    fn free(s: Self, ctx: Ctx) -> Ctx;
 }
 
-pub trait Project: Resource {
+pub trait Project<Ctx>: Resource<Ctx> {
     type View;
-    fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx);
+    fn project(&self, ctx: Ctx) -> (Self::View, Ctx);
 }
 
-impl<T: Resource, const N: usize> Registry<T, N> {
-    pub fn prepare(&self, cfg: T::Config, ctx: T::Ctx) -> Result<(Id, T::Ctx), T::Ctx> {
-        let (value, ctx) = T::new(cfg.clone(), ctx);
+impl<T, const N: usize> Registry<T, N> {
+    pub fn prepare<C>(&self, cfg: T::Config, ctx: C) -> Result<(Id, C), C>
+    where
+        T: Resource<C>,
+    {
+        let (value, ctx) = T::new(cfg, ctx);
         let id = match Self::alloc(self, value) {
             Ok(id) => id,
             Err(value) => return Err(T::free(value, ctx)),
@@ -499,7 +501,10 @@ impl<T: Resource, const N: usize> Registry<T, N> {
         Ok((id, ctx))
     }
 
-    pub fn clear(&self, id: Id, ctx: T::Ctx) -> T::Ctx {
+    pub fn clear<C>(&self, id: Id, ctx: C) -> C
+    where
+        T: Resource<C>,
+    {
         if let Some(value) = Self::free(self, id) {
             T::free(value, ctx)
         } else {
@@ -508,8 +513,11 @@ impl<T: Resource, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T: Project, const N: usize> Registry<T, N> {
-    pub fn view<'a>(&'a self, id: Id, ctx: T::Ctx) -> (Option<EntryView<'a, T>>, T::Ctx) {
+impl<T, const N: usize> Registry<T, N> {
+    pub fn view<'a, C>(&'a self, id: Id, ctx: C) -> (Option<EntryView<'a, C, T>>, C)
+    where
+        T: Project<C>,
+    {
         let Some(g) = Registry::acquire(self, id) else {
             return (None, ctx);
         };
@@ -550,11 +558,11 @@ mod tests {
         }
     }
 
-    impl Resource for MockResource {
+    type Ctx = (Arc<AtomicUsize>, Arc<AtomicUsize>);
+    impl Resource<Ctx> for MockResource {
         type Config = usize;
-        type Ctx = (Arc<AtomicUsize>, Arc<AtomicUsize>);
 
-        fn new(cfg: Self::Config, ctx: Self::Ctx) -> (Self, Self::Ctx) {
+        fn new(cfg: Self::Config, ctx: Ctx) -> (Self, Ctx) {
             use core::sync::atomic::Ordering;
             ctx.0.fetch_add(1, Ordering::SeqCst);
             (
@@ -567,16 +575,16 @@ mod tests {
             )
         }
 
-        fn free(_s: Self, ctx: Self::Ctx) -> Self::Ctx {
+        fn free(_s: Self, ctx: Ctx) -> Ctx {
             use core::sync::atomic::Ordering;
             ctx.1.fetch_add(1, Ordering::SeqCst);
             ctx
         }
     }
 
-    impl Project for MockResource {
+    impl Project<Ctx> for MockResource {
         type View = usize;
-        fn project(&self, ctx: Self::Ctx) -> (Self::View, Self::Ctx) {
+        fn project(&self, ctx: Ctx) -> (Self::View, Ctx) {
             (self.id, ctx)
         }
     }

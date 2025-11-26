@@ -16,7 +16,7 @@ type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
 type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
 type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
-type MockConn<'a, const N: usize> = Conn<'a, MockAddr, MockBackend<'a>, Optimistic, (), N>;
+type MockConn<'a, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, (), N>;
 
 struct MockAddr;
 
@@ -542,11 +542,11 @@ fn conn() {
 
     let (token_of, alloc) = Info::mock().token(alloc);
     let token = token_of.pack();
-    let sr = q.clone().sr_duplex();
-    let rs = q.rs_duplex();
+    let (ls, lr) = q.clone().sr_duplex();
+    let (rs, rr) = q.rs_duplex();
 
-    sr.try_send(token).expect("send ok");
-    let t = rs.try_recv().expect("recv ok");
-    let t = Info::detoken(t.unpack(), alloc).expect("detoken ok");
+    ls.try_send(token).expect("send ok");
+    let t = rr.try_recv().expect("recv ok");
+    let t = Info::detoken(t.into_parts().0, alloc).expect("detoken ok");
     tracing::debug!("{:?}", t);
 }

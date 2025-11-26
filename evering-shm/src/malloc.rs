@@ -36,17 +36,18 @@ pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
 }
 
 impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
+    #[inline(always)]
     fn erase(meta: MetaOf<A>) -> Self {
         meta.erase()
     }
 
+    #[inline(always)]
     unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A> {
         unsafe { Meta::recall(self, base_ptr) }
     }
 }
 
-#[const_trait]
-pub unsafe trait Meta: Clone {
+pub const unsafe trait Meta: Clone {
     type SpanMeta: Clone;
     fn null() -> Self;
     fn is_null(&self) -> bool;

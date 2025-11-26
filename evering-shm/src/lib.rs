@@ -24,9 +24,9 @@ pub use crate::arena::{Optimistic, Pessimistic};
 use crate::{
     area::{AddrSpec, MemBlkHandle, Mmap},
     arena::{ARENA_MAX_CAPACITY, Arena, Strategy, UInt, max_bound},
+    channel::cross::TokenDuplex,
     msg::Envelope,
     numeric::CastInto,
-    queue::TokenDuplex,
 };
 
 extern crate alloc;
@@ -37,11 +37,11 @@ extern crate tracing;
 mod area;
 mod arena;
 pub mod boxed;
+mod channel;
 mod header;
 mod malloc;
 mod msg;
 pub mod os;
-mod queue;
 mod reg;
 mod tests;
 
@@ -56,13 +56,11 @@ mod seal {
 }
 
 mod numeric {
-    #[const_trait]
-    pub trait CastFrom<T> {
+    pub const trait CastFrom<T> {
         fn cast_from(t: T) -> Self;
     }
 
-    #[const_trait]
-    pub trait CastInto<T> {
+    pub const trait CastInto<T> {
         fn cast_into(self) -> T;
     }
 
@@ -110,8 +108,7 @@ mod numeric {
         cast!(from:u32, to:u64);
     }
 
-    #[const_trait]
-    pub trait Alignable {
+    pub const trait Alignable {
         fn size_of<T>() -> Self;
         fn align_of<T>() -> Self;
         fn align_down(self, other: Self) -> Self;
@@ -188,8 +185,7 @@ mod numeric {
     align!(u16);
     align!(u8);
 
-    #[const_trait]
-    pub trait Packable: Sized {
+    pub const trait Packable: Sized {
         type Packed;
 
         fn pack(first: Self, second: Self) -> Self::Packed;
@@ -277,27 +273,26 @@ impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
     }
 }
 
+type Duplex<H> = TokenDuplex<H, crate::arena::SpanMeta>;
 #[derive(Clone)]
-struct Conn<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> {
+struct Conn<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> {
     m: MemBlkHandle<S, M>,
-    header: NonNull<crate::area::Header>,
     alloc: NonNull<crate::arena::Header<G>>,
-    reg: NonNull<crate::reg::Registry<TokenDuplex<H, Arena<'a, G>>, N>>,
+    reg: NonNull<crate::reg::Registry<Duplex<H>, N>>,
     size: UInt,
 }
 
-impl<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize>
-    Conn<'a, S, M, G, H, N>
-{
+impl<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> Conn<S, M, G, H, N> {
+    #[inline(always)]
     pub fn header(&self) -> &crate::area::Header {
-        unsafe { self.header.as_ref() }
+        self.m.header()
     }
 
-    pub fn reg(&self) -> &crate::reg::Registry<TokenDuplex<H, Arena<'a, G>>, N> {
+    pub fn reg(&self) -> &crate::reg::Registry<Duplex<H>, N> {
         unsafe { self.reg.as_ref() }
     }
 
-    pub fn arena(&self) -> crate::arena::Arena<'a, G> {
+    pub fn arena<'a>(&'a self) -> crate::arena::Arena<'a, G> {
         let config = crate::arena::Config::default();
         Arena::from_header(unsafe { self.alloc.as_ref() }, self.size, config)
     }
@@ -313,7 +308,7 @@ impl<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize>
     pub fn acquire(
         &self,
         id: crate::reg::Id,
-    ) -> Option<crate::reg::EntryView<'_, TokenDuplex<H, Arena<'a, G>>>> {
+    ) -> Option<crate::reg::EntryView<'_, crate::arena::Arena<'_, G>, Duplex<H>>> {
         let (duplex, _) = self.reg().view(id, self.arena());
         duplex
     }
@@ -329,7 +324,7 @@ impl<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize>
             .map(start, size, flags, mcfg)
             .map_err(area::Error::MapError)?;
         unsafe {
-            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (_, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
             let (reg, roffset) = area.init_header::<crate::reg::Registry<_, N>>(hoffset, ())?;
             let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
                 roffset,
@@ -339,7 +334,6 @@ impl<'a, S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize>
 
             Ok(Self {
                 m: area.into(),
-                header,
                 alloc,
                 reg,
                 size,
