@@ -45,6 +45,7 @@ pub mod os;
 mod reg;
 mod tests;
 
+#[cfg(test)]
 fn tracing_init() {
     let _ = tracing_subscriber::fmt()
         .with_max_level(tracing::Level::DEBUG)

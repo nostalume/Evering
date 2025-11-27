@@ -411,6 +411,17 @@ pub struct Tx<S>(S);
 #[derive(Clone)]
 pub struct Rx<R>(R);
 
+impl<S: Queue> Sender for Tx<S> {
+    type Item = S::Item;
+
+    type TryError = S::Item;
+
+    #[inline(always)]
+    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError> {
+        self.try_send(item)
+    }
+}
+
 impl<S: Queue> Tx<S> {
     #[inline(always)]
     pub fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
@@ -435,6 +446,17 @@ impl<S: Queue> Tx<S> {
     #[inline(always)]
     pub fn len(&self) -> usize {
         self.0.len()
+    }
+}
+
+impl<S: Queue> Receiver for Rx<S> {
+    type Item = S::Item;
+
+    type TryError = ();
+
+    #[inline(always)]
+    fn try_recv(&self) -> Result<Self::Item, Self::TryError> {
+        self.try_recv().ok_or(())
     }
 }
 

@@ -199,6 +199,7 @@ impl<T> Entry<T> {
                 .compare_exchange_weak(rc, rc + 1, Ordering::AcqRel, Ordering::Relaxed)
                 .is_ok()
             {
+                // recheck
                 if self.live.load(Ordering::Acquire) != id.live {
                     self.rc.fetch_sub(1, Ordering::AcqRel);
                     return None;
