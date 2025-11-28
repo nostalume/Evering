@@ -38,6 +38,7 @@ mod area;
 mod arena;
 pub mod boxed;
 mod channel;
+mod counter;
 mod header;
 mod malloc;
 mod msg;

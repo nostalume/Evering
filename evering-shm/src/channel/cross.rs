@@ -110,11 +110,11 @@ pub struct TokenDuplex<H: Envelope, M> {
 }
 
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct LEndpoint<T>(T);
 
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 pub struct REndpoint<T>(T);
 
 impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplex<H, MetaSpanOf<A>> {

@@ -371,8 +371,19 @@ impl<M> core::fmt::Debug for Token<M> {
 
 impl<M> Token<M> {
     #[inline(always)]
-    pub fn pack<H: Envelope>(self) -> PackToken<H, M> {
-        PackToken::from_token(self)
+    pub fn pack_default<H: Envelope + Default>(self) -> PackToken<H, M> {
+        PackToken {
+            header: H::default(),
+            token: self,
+        }
+    }
+
+    #[inline(always)]
+    pub fn pack<H: Envelope>(self, header: H) -> PackToken<H, M> {
+        PackToken {
+            header,
+            token: self,
+        }
     }
 
     #[inline]
@@ -399,25 +410,27 @@ impl<M> Token<M> {
     }
 }
 
-pub trait Envelope: core::fmt::Debug {
-    fn init_by<M>(t: &Token<M>) -> Self;
-}
+pub trait Envelope: core::fmt::Debug {}
 
-impl Envelope for () {
-    fn init_by<M>(_t: &Token<M>) -> Self {
-        ()
-    }
+impl Envelope for () {}
+
+pub trait Tag<T>: Envelope {
+    fn tag(&self) -> T;
+    fn with_tag_in(&mut self, value: T);
+    fn with_tag(self, value: T) -> Self
+    where
+        Self: Sized;
 }
 
 pub struct PackToken<H: Envelope, M> {
-    h: H,
+    header: H,
     token: Token<M>,
 }
 
 impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PackToken")
-            .field("header", &self.h)
+            .field("header", &self.header)
             .field("token", &self.token)
             .finish()
     }
@@ -426,26 +439,52 @@ impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]
     pub fn into_parts(self) -> (Token<M>, H) {
-        let Self { h, token } = self;
-        (token, h)
+        let Self { header, token } = self;
+        (token, header)
     }
 
     #[inline]
-    pub unsafe fn into_token(self) -> Token<M> {
-        self.token
+    pub fn map_header_in<F: FnOnce(&mut H, &Token<M>)>(&mut self, f: F) {
+        f(&mut self.header, &self.token)
     }
 
     #[inline]
-    fn from_token(t: Token<M>) -> Self {
-        Self {
-            h: H::init_by(&t),
-            token: t,
+    pub fn map_header<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M>
+    where
+        H: Tag<T>,
+    {
+        let (token, header) = self.into_parts();
+        PackToken {
+            header: f(header, &token),
+            token,
         }
     }
 
     #[inline]
-    fn from_token_of<T: Message + ?Sized>(t: TokenOf<T, M>) -> Self {
-        let t = Token::erase(t);
-        Self::from_token(t)
+    pub fn with_tag<T>(self, value: T) -> Self
+    where
+        H: Tag<T>,
+    {
+        let header = self.header.with_tag(value);
+        PackToken {
+            header,
+            token: self.token,
+        }
+    }
+
+    #[inline]
+    pub fn with_tag_in<T>(&mut self, value: T)
+    where
+        H: Tag<T>,
+    {
+        self.header.with_tag_in(value);
+    }
+
+    #[inline]
+    pub fn tag<T>(&self) -> T
+    where
+        H: Tag<T>,
+    {
+        self.header.tag()
     }
 }

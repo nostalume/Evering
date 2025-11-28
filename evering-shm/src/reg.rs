@@ -286,6 +286,12 @@ impl<T: core::fmt::Debug> core::fmt::Display for EntryGuard<'_, T> {
     }
 }
 
+impl<T> PartialEq for EntryGuard<'_, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry as *const Entry<T> == other.entry && self.id == other.id
+    }
+}
+
 impl<T> EntryGuard<'_, T> {
     pub fn rc(e: &Self) -> usize {
         e.entry.rc.load(Ordering::Relaxed)
@@ -299,6 +305,12 @@ impl<T> EntryGuard<'_, T> {
     #[inline(always)]
     pub unsafe fn as_mut(&self) -> &mut T {
         unsafe { self.entry.as_mut() }
+    }
+}
+
+impl<C, T: Project<C>> PartialEq for EntryView<'_, C, T> {
+    fn eq(&self, other: &Self) -> bool {
+        self.guard == other.guard
     }
 }
 

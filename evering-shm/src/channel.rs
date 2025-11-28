@@ -404,11 +404,11 @@ trait AsyncReceiver: Receiver {
 }
 
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone,PartialEq)]
 pub struct Tx<S>(S);
 
 #[repr(transparent)]
-#[derive(Clone)]
+#[derive(Clone,PartialEq)]
 pub struct Rx<R>(R);
 
 impl<S: Queue> Sender for Tx<S> {

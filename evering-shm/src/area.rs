@@ -587,19 +587,7 @@ pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
     bk: M,
 }
 
-pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(alloc::sync::Arc<MemBlk<S, M>>);
-
-impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlk<S, M>
-where
-    M: Clone,
-{
-    fn clone(&self) -> Self {
-        Self {
-            a: self.a.clone(),
-            bk: self.bk.clone(),
-        }
-    }
-}
+pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(crate::counter::CounterOf<MemBlk<S, M>>);
 
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
@@ -655,7 +643,13 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
 
 impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlkHandle<S, M> {
     fn clone(&self) -> Self {
-        Self(self.0.clone())
+        Self(self.0.acquire())
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlkHandle<S, M> {
+    fn drop(&mut self) {
+        unsafe { self.0.release_of() }
     }
 }
 
@@ -678,6 +672,6 @@ impl<S: AddrSpec, M: Mmap<S>> TryFrom<RawMemBlk<S, M>> for MemBlkHandle<S, M> {
 
 impl<S: AddrSpec, M: Mmap<S>> From<MemBlk<S, M>> for MemBlkHandle<S, M> {
     fn from(value: MemBlk<S, M>) -> Self {
-        Self(alloc::sync::Arc::new(value))
+        Self(crate::counter::CounterOf::suspend(value))
     }
 }

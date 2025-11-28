@@ -9,6 +9,8 @@ use core::{
 
 use crossbeam_utils::Backoff;
 
+use crate::msg::{Envelope, PackToken, Tag};
+
 mod state {
     // FREE -> WAKER -> COMPLETED -> FREE
     /// FREE: at initiation
@@ -337,6 +339,78 @@ impl<T, const N: usize> CachePool<T, N> {
             return None;
         }
         Some(e.complete(payload))
+    }
+}
+
+pub struct CachePoolHandle<T, const N: usize>(crate::counter::CounterOf<CachePool<T, N>>);
+
+impl<T, const N: usize> Clone for CachePoolHandle<T, N> {
+    fn clone(&self) -> Self {
+        Self(self.0.acquire())
+    }
+}
+
+impl<T, const N: usize> Drop for CachePoolHandle<T, N> {
+    fn drop(&mut self) {
+        unsafe { self.0.release_of() };
+    }
+}
+
+impl<T, const N: usize> CachePoolHandle<T, N> {
+    fn new() -> Self {
+        let pool = CachePool::new();
+        Self(crate::counter::CounterOf::suspend(pool))
+    }
+
+    fn bind<S: super::Sender, R: super::Receiver>(
+        self,
+        sender: S,
+        receiver: R,
+    ) -> (Submitter<S, T, N>, Completer<R, T, N>) {
+        let s = Submitter {
+            sender,
+            pool: self.clone(),
+        };
+        let c = Completer {
+            receiver,
+            pool: self.clone(),
+        };
+        (s, c)
+    }
+}
+
+struct Submitter<S: super::Sender, T, const N: usize> {
+    sender: S,
+    pool: CachePoolHandle<T, N>,
+}
+
+impl<H, M, S, T, const N: usize> Submitter<S, T, N>
+where
+    S: super::Sender<Item = PackToken<H, M>>,
+    H: Envelope + Tag<Id>,
+{
+    fn try_submit(&self, item: S::Item) -> Option<Op<'_, T, N>> {
+        let (id, op) = self.pool.0.register()?;
+        let item = item.with_tag(id);
+        self.sender.try_send(item).ok()?;
+        Some(op)
+    }
+}
+
+struct Completer<R: super::Receiver, T, const N: usize> {
+    receiver: R,
+    pool: CachePoolHandle<T, N>,
+}
+
+impl<H, M, R, const N: usize> Completer<R, PackToken<H, M>, N>
+where
+    R: super::Receiver<Item = PackToken<H, M>>,
+    H: Envelope + Tag<Id>,
+{
+    fn try_complete(&self) {
+        if let Ok(token) = self.receiver.try_recv() {
+            self.pool.0.complete(token.tag(), token);
+        }
     }
 }
 

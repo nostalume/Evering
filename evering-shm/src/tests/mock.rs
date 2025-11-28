@@ -543,7 +543,7 @@ fn conn() {
     let q = conn.acquire(h).expect("view ok");
 
     let (token_of, alloc) = Info::mock().token(alloc);
-    let token = token_of.pack();
+    let token = token_of.pack_default();
     let (ls, lr) = q.clone().sr_duplex();
     let (rs, rr) = q.rs_duplex();
 
