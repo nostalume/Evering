@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk};
+use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk, SharedMmap};
 use crate::malloc::{MemAllocInfo, MemAllocator};
 use crate::msg::MoveMessage;
 use crate::tracing_init;
@@ -53,28 +53,28 @@ impl MockBackend<'_> {
 }
 
 impl<'a> Mmap<MockAddr> for MockBackend<'a> {
-    type Config = ();
+    // Due to mock addr, start is not real addr.
+    // We take handle as offset from ptr of array.
+    type Handle = usize;
+    type MapFlags = ();
     type Error = ();
 
     fn map(
         self,
-        start: Option<<MockAddr as AddrSpec>::Addr>,
+        _start: Option<<MockAddr as AddrSpec>::Addr>,
         size: usize,
-        flags: <MockAddr as AddrSpec>::Flags,
-        _cfg: (),
+        _mflags: (),
+        pflags: <MockAddr as AddrSpec>::Flags,
+        handle: usize,
     ) -> Result<RawMemBlk<MockAddr, Self>, Self::Error> {
-        let start = match start {
-            Some(start) => start,
-            None => 0.into(),
-        };
-        for entry in self.0.iter_mut().skip(start.as_usize()).take(size) {
+        for entry in self.0.iter_mut().skip(handle).take(size) {
             if *entry != 0 {
                 return Err(());
             }
-            *entry = flags;
+            *entry = pflags;
         }
-        let start = self.start().add(start.as_usize());
-        Ok(RawMemBlk::from_raw(start, size, flags, self))
+        let start = self.start().add(handle);
+        Ok(unsafe { RawMemBlk::from_raw(start, size, pflags, self) })
     }
 
     fn unmap(area: &mut RawMemBlk<MockAddr, Self>) -> Result<(), Self::Error> {
@@ -109,23 +109,25 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
     }
 }
 
-fn mock_handle(bk: MockBackend<'_>, start: Option<VirtAddr>, size: usize) -> MockMemHandle<'_> {
-    let a = MemBlkHandle::init(bk, start, size, 0, ()).unwrap();
-    a.into()
+impl MockBackend<'_> {
+    fn shared(self, start: usize, size: usize) -> Result<RawMemBlk<MockAddr, Self>, ()> {
+        self.map(None, size, (), 0, start)
+    }
 }
 
-fn mock_arena(bk: MockBackend<'_>, start: Option<VirtAddr>, size: usize) -> MockArena<'_> {
-    let a = ArenaMemBlk::init(bk, start, size, 0, ()).unwrap();
-    a
+fn mock_handle(bk: MockBackend<'_>, start: usize, size: usize) -> MockMemHandle<'_> {
+    let raw = bk.shared(start, size).unwrap();
+    MemBlkHandle::try_from(raw).unwrap()
 }
 
-fn mock_conn<const N: usize>(
-    bk: MockBackend<'_>,
-    start: Option<VirtAddr>,
-    size: usize,
-) -> MockConn<'_, N> {
-    let a = Conn::init(bk, start, size, 0, ()).unwrap();
-    a
+fn mock_arena(bk: MockBackend<'_>, start: usize, size: usize) -> MockArena<'_> {
+    let raw = bk.shared(start, size).unwrap();
+    MockArena::try_from(raw).unwrap()
+}
+
+fn mock_conn<const N: usize>(bk: MockBackend<'_>, start: usize, size: usize) -> MockConn<'_, N> {
+    let raw = bk.shared(start, size).unwrap();
+    MockConn::try_from(raw).unwrap()
 }
 
 #[test]
@@ -134,7 +136,7 @@ fn area_init() {
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
         let bk = MockBackend(&mut pt);
-        let a = mock_handle(bk, Some(start.into()), STEP);
+        let a = mock_handle(bk, start, STEP);
         tracing::debug!("{}", a.header());
     }
 }
@@ -154,7 +156,7 @@ fn arena_exceed() {
     tracing_init();
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -202,7 +204,7 @@ fn arena_frag() {
     tracing_init();
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -237,7 +239,7 @@ fn arena_dealloc() {
     tracing_init();
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -294,7 +296,7 @@ fn pbox_droppy() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -352,7 +354,7 @@ fn pbox_dyn() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -412,7 +414,7 @@ fn parc_stress() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
     let droppy = Droppy(PArc::new_in(AtomicUsize::new(0), &a));
 
@@ -464,7 +466,7 @@ fn token_of_pbox() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, Some(0.into()), MAX_ADDR);
+    let mem = mock_arena(bk, 0, MAX_ADDR);
     let a = mem.arena();
 
     let bar = Barrier::new(NUM);
@@ -534,7 +536,7 @@ fn conn() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let conn = mock_conn::<N>(bk, Some(0.into()), MAX_ADDR);
+    let conn = mock_conn::<N>(bk, 0, MAX_ADDR);
     let alloc = conn.arena();
 
     let h = conn.prepare(SIZE).expect("alloc ok");

@@ -10,7 +10,7 @@ use evering::uring::{IReceiver, ISender, UringSpec};
 use evering_shm::alloc::tlsf::SpinTlsf;
 use evering_shm::boxed::{ShmBox, ShmSized, ShmSlice, ShmToken};
 use evering_shm::os::FdBackend;
-use evering_shm::os::unix::{MFdFlags, ProtFlags, UnixAddrSpec, UnixFdConf};
+use evering_shm::os::unix::{MFdFlags, ProtFlags, AddrSpec, UnixFdConf};
 use tokio::task::yield_now;
 use tokio::time;
 
@@ -31,7 +31,7 @@ type MyPoolDriver<I> = PoolDriver<Bsl<I>>;
 struct MyIpcSpec<F>(PhantomData<F>);
 impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
     type A = SpinTlsf;
-    type S = UnixAddrSpec;
+    type S = AddrSpec;
     type M = FdBackend<F>;
 }
 

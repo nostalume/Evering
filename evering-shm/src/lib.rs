@@ -22,7 +22,7 @@ use core::ptr::NonNull;
 pub use crate::arena::{Optimistic, Pessimistic};
 
 use crate::{
-    area::{AddrSpec, MemBlkHandle, Mmap},
+    area::{AddrSpec, MemBlk, MemBlkHandle, Mmap, RawMemBlk},
     arena::{ARENA_MAX_CAPACITY, Arena, Strategy, UInt, max_bound},
     channel::cross::TokenDuplex,
     msg::Envelope,
@@ -226,6 +226,35 @@ pub struct ArenaMemBlk<S: AddrSpec, M: Mmap<S>, G: Strategy> {
     size: UInt,
 }
 
+impl<S: AddrSpec, M: Mmap<S>, G: Strategy> TryFrom<RawMemBlk<S, M>> for ArenaMemBlk<S, M, G> {
+    type Error = area::Error<S, M>;
+
+    fn try_from(area: RawMemBlk<S, M>) -> Result<Self, Self::Error> {
+        let size = area.size();
+        max_bound(size).ok_or(area::Error::OutofSize {
+            requested: size,
+            bound: ARENA_MAX_CAPACITY.cast_into(),
+        })?;
+
+        unsafe {
+            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
+                hoffset,
+                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
+            )?;
+            let size = (area.size() - aoffset) as UInt;
+
+            Ok(Self {
+                m: MemBlk::from_raw(area).into(),
+                header,
+                alloc,
+                // Safety: Previous arithmetic check
+                size,
+            })
+        }
+    }
+}
+
 impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
     pub fn header(&self) -> &crate::area::Header {
         unsafe { self.header.as_ref() }
@@ -239,39 +268,6 @@ impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMemBlk<S, M, G> {
         let cfg = crate::arena::Config::default();
         crate::arena::Arena::from_header(self.alloc_header(), self.size, cfg)
     }
-
-    pub fn init(
-        bk: M,
-        start: Option<S::Addr>,
-        size: usize,
-        flags: S::Flags,
-        mcfg: M::Config,
-    ) -> Result<Self, area::Error<S, M>> {
-        max_bound(size).ok_or(area::Error::OutofSize {
-            requested: size,
-            bound: ARENA_MAX_CAPACITY.cast_into(),
-        })?;
-
-        let area = bk
-            .map(start, size, flags, mcfg)
-            .map_err(area::Error::MapError)?;
-        unsafe {
-            let (header, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
-            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
-                hoffset,
-                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
-            )?;
-            let size = (area.size() - aoffset) as UInt;
-
-            Ok(Self {
-                m: area.into(),
-                header,
-                alloc,
-                // Safety: Previous arithmetic check
-                size,
-            })
-        }
-    }
 }
 
 type Duplex<H> = TokenDuplex<H, crate::arena::SpanMeta>;
@@ -281,6 +277,30 @@ struct Conn<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> {
     alloc: NonNull<crate::arena::Header<G>>,
     reg: NonNull<crate::reg::Registry<Duplex<H>, N>>,
     size: UInt,
+}
+
+impl<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> TryFrom<RawMemBlk<S, M>>
+    for Conn<S, M, G, H, N>
+{
+    type Error = area::Error<S, M>;
+    fn try_from(area: RawMemBlk<S, M>) -> Result<Self, Self::Error> {
+        unsafe {
+            let (_, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
+            let (reg, roffset) = area.init_header::<crate::reg::Registry<_, N>>(hoffset, ())?;
+            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
+                roffset,
+                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
+            )?;
+            let size = (area.size() - aoffset) as UInt;
+
+            Ok(Self {
+                m: MemBlk::from_raw(area).into(),
+                alloc,
+                reg,
+                size,
+            })
+        }
+    }
 }
 
 impl<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> Conn<S, M, G, H, N> {
@@ -312,33 +332,5 @@ impl<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> Conn<S, 
     ) -> Option<crate::reg::EntryView<'_, crate::arena::Arena<'_, G>, Duplex<H>>> {
         let (duplex, _) = self.reg().view(id, self.arena());
         duplex
-    }
-
-    pub fn init(
-        bk: M,
-        start: Option<S::Addr>,
-        size: usize,
-        flags: S::Flags,
-        mcfg: M::Config,
-    ) -> Result<Self, area::Error<S, M>> {
-        let area = bk
-            .map(start, size, flags, mcfg)
-            .map_err(area::Error::MapError)?;
-        unsafe {
-            let (_, hoffset) = area.init_header::<crate::area::Header>(0, ())?;
-            let (reg, roffset) = area.init_header::<crate::reg::Registry<_, N>>(hoffset, ())?;
-            let (alloc, aoffset) = area.init_header::<crate::arena::Header<G>>(
-                roffset,
-                crate::arena::Header::<G>::MIN_SEGMENT_SIZE,
-            )?;
-            let size = (area.size() - aoffset) as UInt;
-
-            Ok(Self {
-                m: area.into(),
-                alloc,
-                reg,
-                size,
-            })
-        }
     }
 }

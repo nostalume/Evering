@@ -12,7 +12,7 @@ use crate::driver::unlocked::PoolDriver;
 use crate::shm::boxed::{ShmBox, ShmSlice, ShmToken};
 use crate::shm::os::{
     FdBackend,
-    unix::{MFdFlags, ProtFlags, UnixAddrSpec, UnixFdConf},
+    unix::{MFdFlags, ProtFlags, AddrSpec, UnixFdConf},
 };
 use crate::shm::tlsf::SpinTlsf;
 use crate::tests::*;
@@ -71,7 +71,7 @@ type MyPoolDriver<I> = PoolDriver<IpcInfo<I>>;
 struct MyIpcSpec<F>(PhantomData<F>);
 impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
     type A = SpinTlsf;
-    type S = UnixAddrSpec;
+    type S = AddrSpec;
     type M = FdBackend<F>;
 }
 

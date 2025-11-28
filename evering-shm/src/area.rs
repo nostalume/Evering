@@ -9,21 +9,39 @@ pub trait AddrSpec {
 }
 
 pub trait Mmap<S: AddrSpec>: Sized {
-    type Config;
+    type Handle;
+    type MapFlags: Copy;
     type Error: core::fmt::Debug;
 
     fn map(
         self,
         start: Option<S::Addr>,
         size: usize,
-        flags: S::Flags,
-        cfg: Self::Config,
+        mflags: Self::MapFlags,
+        pflags: S::Flags,
+        handle: Self::Handle,
     ) -> Result<RawMemBlk<S, Self>, Self::Error>;
     fn unmap(area: &mut RawMemBlk<S, Self>) -> Result<(), Self::Error>;
 }
 
-pub(crate) trait Mprotect<S: AddrSpec>: Mmap<S> {
+pub trait Mprotect<S: AddrSpec>: Mmap<S> {
     fn protect(area: &mut RawMemBlk<S, Self>, new_flags: S::Flags) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Access {
+    Write,
+    Read,
+    ReadWrite,
+}
+
+pub trait SharedMmap<S: AddrSpec>: Mmap<S> {
+    fn shared(
+        self,
+        size: usize,
+        access: Access,
+        handle: Self::Handle,
+    ) -> Result<RawMemBlk<S, Self>, Self::Error>;
 }
 
 macro_rules! addr_span {
@@ -494,21 +512,26 @@ impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
 }
 
 /// Area without certainty on map, unmap
-pub(crate) struct RawMemBlk<S: AddrSpec, M: Mmap<S>> {
+pub struct RawMemBlk<S: AddrSpec, M: Mmap<S>> {
     pub a: MemBlkSpec<S>,
     pub bk: M,
 }
 
 impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
+    pub unsafe fn from_ptr<T>(start: NonNull<T>, size: usize, flags: S::Flags, bk: M) -> Self {
+        unsafe { Self::from_raw(start.addr().get().into(), size, flags, bk) }
+    }
+
     /// Create a hallow memory area without any map operation.
     ///
     /// You should only use in `Mmap` trait.
-    pub(crate) fn from_raw(start: S::Addr, size: usize, flags: S::Flags, bk: M) -> Self {
+    #[inline]
+    pub unsafe fn from_raw(start: S::Addr, size: usize, flags: S::Flags, bk: M) -> Self {
         let a = MemBlkSpec::new(start, size, flags);
         Self { a, bk }
     }
 
-    pub(crate) unsafe fn init_header<T: Layout>(
+    pub unsafe fn init_header<T: Layout>(
         &self,
         offset: usize,
         cfg: T::Config,
@@ -566,13 +589,6 @@ pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
 
 pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(alloc::sync::Arc<MemBlk<S, M>>);
 
-impl<S: AddrSpec, M: Mmap<S>> Into<MemBlk<S, M>> for RawMemBlk<S, M> {
-    fn into(self) -> MemBlk<S, M> {
-        let Self { a, bk } = self;
-        MemBlk { a, bk }
-    }
-}
-
 impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlk<S, M>
 where
     M: Clone,
@@ -585,17 +601,20 @@ where
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlkHandle<S, M> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
-    }
-}
-
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
         self.header().read().dec_rc();
         let blk = self.as_raw();
         let _ = M::unmap(blk);
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> TryFrom<RawMemBlk<S, M>> for MemBlk<S, M> {
+    type Error = Error<S, M>;
+
+    fn try_from(area: RawMemBlk<S, M>) -> Result<Self, Self::Error> {
+        unsafe { area.init_header::<Header>(0, ())? };
+        Ok(unsafe { MemBlk::from_raw(area) })
     }
 }
 
@@ -613,18 +632,19 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for MemBlk<S, M> {
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> Deref for MemBlkHandle<S, M> {
-    type Target = MemBlk<S, M>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
 impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
-    pub(crate) fn as_raw(&mut self) -> &mut RawMemBlk<S, M> {
+    #[inline(always)]
+    pub unsafe fn from_raw(raw: RawMemBlk<S, M>) -> MemBlk<S, M> {
+        let RawMemBlk { a, bk } = raw;
+        Self { a, bk }
+    }
+
+    #[inline(always)]
+    fn as_raw(&mut self) -> &mut RawMemBlk<S, M> {
         unsafe { &mut *(self as *mut _ as *mut _) }
     }
+
+    #[inline(always)]
     pub fn header(&self) -> &Header {
         unsafe {
             let ptr = self.start_ptr() as *const Header;
@@ -633,31 +653,31 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
     }
 }
 
+impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlkHandle<S, M> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> Deref for MemBlkHandle<S, M> {
+    type Target = MemBlk<S, M>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> TryFrom<RawMemBlk<S, M>> for MemBlkHandle<S, M> {
+    type Error = Error<S, M>;
+
+    fn try_from(area: RawMemBlk<S, M>) -> Result<Self, Self::Error> {
+        let blk = MemBlk::try_from(area)?;
+        Ok(MemBlkHandle::from(blk))
+    }
+}
+
 impl<S: AddrSpec, M: Mmap<S>> From<MemBlk<S, M>> for MemBlkHandle<S, M> {
     fn from(value: MemBlk<S, M>) -> Self {
         Self(alloc::sync::Arc::new(value))
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>> From<RawMemBlk<S, M>> for MemBlkHandle<S, M> {
-    fn from(value: RawMemBlk<S, M>) -> Self {
-        Self(alloc::sync::Arc::new(value.into()))
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>>  MemBlkHandle<S, M> {
-    pub fn init(
-        bk: M,
-        start: Option<S::Addr>,
-        size: usize,
-        flags: S::Flags,
-        mcfg: M::Config,
-    ) -> Result<Self, Error<S, M>> {
-        let area = bk.map(start, size, flags, mcfg).map_err(Error::MapError)?;
-        unsafe {
-            area.init_header::<Header>(0, ())?;
-        }
-
-        Ok(area.into())
     }
 }
