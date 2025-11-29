@@ -45,14 +45,14 @@ impl<T> CounterOf<T> {
         }
     }
 
-    pub unsafe fn release<F: FnOnce(*mut T)>(&self, dispose: F) {
+    pub unsafe fn release_in<F: FnOnce(*mut T)>(&self, dispose: F) {
         if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
             dispose(self.as_raw());
             drop(unsafe { Box::from_raw(self.counter) });
         }
     }
     
-    pub unsafe fn release_of(&self) {
+    pub unsafe fn release(&self) {
         if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
             unsafe { core::ptr::drop_in_place(self.as_raw()) };
             drop(unsafe { Box::from_raw(self.counter) });

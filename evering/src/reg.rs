@@ -112,7 +112,7 @@ impl<T> Entry<T> {
     }
 
     #[inline]
-    unsafe fn as_mut(&self) -> &mut T {
+    unsafe fn as_mut(& self) -> &mut T {
         unsafe { (*self.data.get()).assume_init_mut() }
     }
 
@@ -308,6 +308,9 @@ impl<T> EntryGuard<'_, T> {
     }
 }
 
+unsafe impl<C, T: Project<C>> Send for EntryView<'_, C, T> {}
+unsafe impl<C, T: Project<C> + Sync> Sync for EntryView<'_, C, T> {}
+
 impl<C, T: Project<C>> PartialEq for EntryView<'_, C, T> {
     fn eq(&self, other: &Self) -> bool {
         self.guard == other.guard
@@ -341,7 +344,7 @@ where
 
 #[repr(C)]
 pub struct Registry<T, const N: usize> {
-    magic: crate::header::MAGIC,
+    magic: crate::header::Magic,
     inits: AtomicUsize,
     free_head: AtomicUsize,
     entries: [Entry<T>; N],
@@ -378,7 +381,7 @@ impl<T, const N: usize> crate::header::Layout for Registry<T, N> {
 }
 
 impl<T, const N: usize> crate::header::Metadata for Registry<T, N> {
-    const MAGIC_VALUE: crate::header::MAGIC = 0x1234;
+    const MAGIC_VALUE: crate::header::Magic = 0x1234;
 
     #[inline]
     fn valid_magic(&self) -> bool {
@@ -464,7 +467,7 @@ impl<T, const N: usize> Registry<T, N> {
     }
 
     #[inline]
-    fn lookup(&self, idx: usize) -> Option<Id> {
+    pub fn lookup(&self, idx: usize) -> Option<Id> {
         if idx >= N {
             return None;
         }

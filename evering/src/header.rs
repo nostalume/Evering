@@ -13,20 +13,20 @@ impl Layout for () {
     }
 }
 
-pub(crate) trait Layout: core::fmt::Debug + Sized {
+pub trait Layout: core::fmt::Debug + Sized {
     type Config: Clone;
     #[inline]
     unsafe fn from_raw<'a>(ptr: *mut Self) -> &'a mut Self {
         unsafe { &mut *(ptr.cast()) }
     }
-    fn init(&mut self, cfg: Self::Config) -> HeaderStatus;
+    fn init(&mut self, conf: Self::Config) -> HeaderStatus;
     fn attach(&self) -> HeaderStatus;
     #[inline]
-    fn attach_or_init(&mut self, cfg: Self::Config) -> HeaderStatus {
+    fn attach_or_init(&mut self, conf: Self::Config) -> HeaderStatus {
         match self.attach() {
             HeaderStatus::Initialized => HeaderStatus::Initialized,
             HeaderStatus::Corrupted | HeaderStatus::Uninitialized => {
-                if self.init(cfg).is_ok() {
+                if self.init(conf).is_ok() {
                     HeaderStatus::Initialized
                 } else {
                     HeaderStatus::Corrupted
@@ -37,9 +37,9 @@ pub(crate) trait Layout: core::fmt::Debug + Sized {
     }
 }
 
-pub(crate) type MAGIC = u16;
+pub(crate) type Magic = u16;
 pub(crate) trait Metadata: Layout {
-    const MAGIC_VALUE: MAGIC;
+    const MAGIC_VALUE: Magic;
     fn valid_magic(&self) -> bool;
     fn with_magic(&mut self);
 }
@@ -136,7 +136,7 @@ impl<T: Metadata> Layout for Header<T> {
             match read.status() {
                 HeaderStatus::Initialized => {
                     read.inner.attach();
-                    return HeaderStatus::Initialized;
+                     HeaderStatus::Initialized
                 }
                 HeaderStatus::Initializing => {
                     drop(read);
@@ -150,12 +150,12 @@ impl<T: Metadata> Layout for Header<T> {
                             _ => core::hint::spin_loop(),
                         }
                     }
-                    return HeaderStatus::Initializing;
+                    HeaderStatus::Initializing
                 }
-                _ => return HeaderStatus::Corrupted,
+                _ => HeaderStatus::Corrupted,
             }
         } else {
-            return HeaderStatus::Uninitialized;
+            HeaderStatus::Uninitialized
         }
     }
 }

@@ -9,8 +9,6 @@ use core::{
 
 use crossbeam_utils::Backoff;
 
-use crate::msg::{Envelope, PackToken, Tag};
-
 mod state {
     // FREE -> WAKER -> COMPLETED -> FREE
     /// FREE: at initiation
@@ -90,7 +88,7 @@ impl<T> Cache<T> {
     }
 
     unsafe fn read_waker(&self) -> &Waker {
-        unsafe { &(*self.waker.get()).assume_init_ref() }
+        unsafe { (*self.waker.get()).assume_init_ref() }
     }
 
     unsafe fn replace_payload(&self, value: T) -> MaybeUninit<T> {
@@ -99,8 +97,7 @@ impl<T> Cache<T> {
 
     unsafe fn take_payload(&self) -> T {
         let val = unsafe { self.payload.replace(MaybeUninit::uninit()) };
-        let val = unsafe { val.assume_init() };
-        val
+        unsafe { val.assume_init() }
     }
 
     unsafe fn drop_payload(&self) {
@@ -120,15 +117,15 @@ impl<T> Cache<T> {
                 let waker = unsafe { self.read_waker() };
                 waker.wake_by_ref();
                 unsafe { self.drop_waker() };
-                return true;
+                true
             }
             state::UPDATING => {
                 // overwrite UPDATING to COMPLETED
                 // poll() will loop and detect failture to handle payload
-                return true;
+                true
             }
             // state::FREE: no waker therefore false.
-            _ => return false,
+            _ => false,
         }
     }
 
@@ -352,7 +349,7 @@ impl<T, const N: usize> Clone for CachePoolHandle<T, N> {
 
 impl<T, const N: usize> Drop for CachePoolHandle<T, N> {
     fn drop(&mut self) {
-        unsafe { self.0.release_of() };
+        unsafe { self.0.release() };
     }
 }
 
@@ -378,6 +375,9 @@ impl<T, const N: usize> CachePoolHandle<T, N> {
         (s, c)
     }
 }
+
+use crate::msg::{Envelope, Tag};
+use crate::token::PackToken;
 
 struct Submitter<S: super::Sender, T, const N: usize> {
     sender: S,

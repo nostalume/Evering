@@ -171,8 +171,8 @@ impl const From<Access> for ProtFlags {
     }
 }
 
-impl<F: AsFd> Mmap<AddrSpec> for FdBackend<F> {
-    type Handle = UnixFd<F>;
+impl Mmap<AddrSpec> for FdBackend {
+    type Handle = UnixFd<OwnedFd>;
 
     type MapFlags = MapFlags;
 
@@ -212,8 +212,8 @@ impl<F: AsFd> Mmap<AddrSpec> for FdBackend<F> {
     }
 }
 
-impl<F: AsFd> Mprotect<AddrSpec> for FdBackend<F> {
-    fn protect(
+impl Mprotect<AddrSpec> for FdBackend {
+    unsafe fn protect(
         area: &mut RawMemBlk<AddrSpec, Self>,
         pflags: <AddrSpec as crate::area::AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
@@ -223,7 +223,7 @@ impl<F: AsFd> Mprotect<AddrSpec> for FdBackend<F> {
     }
 }
 
-impl<F: AsFd> SharedMmap<AddrSpec> for FdBackend<F> {
+impl SharedMmap<AddrSpec> for FdBackend {
     fn shared(
         self,
         size: usize,
@@ -233,5 +233,202 @@ impl<F: AsFd> SharedMmap<AddrSpec> for FdBackend<F> {
         let pflags = access.into();
         let mflags = MapFlags::MAP_SHARED;
         self.map(None, size, mflags, pflags, handle)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![cfg(target_os = "linux")]
+
+    use super::super::FdBackend;
+    use super::UnixFd;
+
+    use crate::area::{Access, Mmap, SharedMmap};
+    use crate::tests::MemBlkTestIO;
+
+    use nix::libc::off_t;
+    use nix::unistd;
+
+    #[test]
+    fn memfd_rw() {
+        const SIZE: usize = 4096;
+        const NAME: &str = "fd";
+        const VALUE: &[u8] = b"hello";
+
+        let fd = UnixFd::memfd(NAME, SIZE, false).expect("should create");
+        let mut blk = FdBackend
+            .shared(SIZE, Access::ReadWrite, fd)
+            .expect("should create");
+
+        unsafe {
+            blk.write(VALUE);
+            let buf = blk.read(VALUE.len());
+            assert_eq!(buf, VALUE)
+        }
+
+        let _ = Mmap::unmap(&mut blk);
+    }
+
+    #[test]
+    fn memfd_resize() {
+        const SIZE: usize = 1024;
+        const GROW_SIZE: usize = SIZE * 4;
+        const NAME: &str = "grow";
+        const VALUE: &[u8] = b"hello";
+
+        let fd = UnixFd::memfd(NAME, SIZE, false).expect("should create");
+        let bk = FdBackend;
+
+        unistd::ftruncate(fd.as_fd(), GROW_SIZE as off_t).unwrap();
+
+        let mut blk = bk
+            .shared(GROW_SIZE, Access::ReadWrite, fd)
+            .expect("should create");
+
+        unsafe {
+            blk.write(VALUE);
+            let buf = blk.read(VALUE.len());
+            assert_eq!(buf, VALUE)
+        }
+
+        let _ = Mmap::unmap(&mut blk);
+    }
+
+    #[test]
+    fn memfd_dup() {
+        const SIZE: usize = 4096;
+        const NAME: &str = "dup";
+        const VALUE: &[u8] = b"hello";
+
+        let fd1 = UnixFd::memfd(NAME, SIZE, false).expect("should create");
+        let fd2 = fd1.dup().expect("should dup");
+
+        let bk = FdBackend;
+        let mut blk1 = bk
+            .shared(SIZE, Access::ReadWrite, fd1)
+            .expect("should create");
+
+        unsafe {
+            blk1.write(VALUE);
+        }
+
+        let _ = Mmap::unmap(&mut blk1);
+
+        let bk2 = FdBackend;
+        let mut blk2 = bk2
+            .shared(SIZE, Access::ReadWrite, fd2)
+            .expect("should create");
+
+        unsafe {
+            let buf = blk2.read(VALUE.len());
+            assert_eq!(&buf, VALUE)
+        }
+
+        let _ = Mmap::unmap(&mut blk2);
+    }
+
+    #[test]
+    fn shm_persist() {
+        const NAME: &str = "shm_persist";
+        const SIZE: usize = 4096;
+        const VALUE: &[u8] = b"hello";
+
+        let fd1 = UnixFd::shm_create(NAME, SIZE).expect("should create");
+        let bk = FdBackend;
+        let mut blk1 = bk
+            .shared(SIZE, Access::ReadWrite, fd1)
+            .expect("should create");
+        unsafe {
+            blk1.write(VALUE);
+        }
+        let _ = Mmap::unmap(&mut blk1).unwrap();
+
+        let fd2 = UnixFd::shm_open(NAME).expect("should open");
+        let bk2 = FdBackend;
+        let mut blk2 = bk2
+            .shared(SIZE, Access::ReadWrite, fd2)
+            .expect("should create");
+        unsafe {
+            let buf = blk2.read(VALUE.len());
+            assert_eq!(buf, VALUE)
+        }
+        let _ = Mmap::unmap(&mut blk2);
+
+        UnixFd::shm_unlink(NAME).expect("should unlink")
+    }
+
+    #[test]
+    fn shm_unlink() {
+        const NAME: &str = "shm_unlink";
+        const SIZE: usize = 4096;
+        const VALUE: &[u8] = b"hello";
+
+        let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
+        let bk = FdBackend;
+        let mut blk = bk
+            .shared(SIZE, Access::ReadWrite, fd)
+            .expect("should create");
+        unsafe {
+            blk.write(VALUE);
+        }
+        let _ = Mmap::unmap(&mut blk);
+
+        UnixFd::shm_unlink(NAME).expect("should unlink");
+        assert!(UnixFd::shm_open(NAME).is_err())
+    }
+
+    #[test]
+    fn zero_size() {
+        const NAME: &str = "zero_size";
+        const SIZE: usize = 1;
+
+        let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
+        let bk = FdBackend;
+        let res = bk.shared(0, Access::ReadWrite, fd);
+        assert!(res.is_err());
+
+        UnixFd::shm_unlink(NAME).expect("should unlink");
+    }
+
+    #[test]
+    fn multiple_map() {
+        const NAME: &str = "multi";
+        const SIZE: usize = 1024;
+        const VALUE: &[u8] = b"hello";
+        const VALUE2: &[u8] = b"hello2";
+
+        let fd1 = UnixFd::shm_create(NAME, SIZE).expect("should create");
+        let fd2 = fd1.dup().expect("should dup");
+        let mut blk1 = FdBackend.shared(SIZE, Access::ReadWrite, fd1).unwrap();
+        let mut blk2 = FdBackend.shared(SIZE, Access::ReadWrite, fd2).unwrap();
+
+        unsafe {
+            blk1.write_in(VALUE, 0);
+            blk2.write_in(VALUE2, VALUE.len());
+
+            let buf1 = blk1.read_in(VALUE.len(), 0);
+            let buf2 = blk2.read_in(VALUE2.len(), VALUE.len());
+            assert_eq!(buf1, VALUE);
+            assert_eq!(buf2, VALUE2);
+        }
+
+        let _ = Mmap::unmap(&mut blk1);
+        let _ = Mmap::unmap(&mut blk2);
+        let _ = UnixFd::shm_unlink(NAME);
+    }
+
+    #[test]
+    fn perm_change() {
+        use nix::sys::mman::ProtFlags;
+        const NAME: &str = "perm";
+        const SIZE: usize = 1024;
+
+        let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
+        let mut blk = FdBackend.shared(SIZE, Access::ReadWrite, fd).unwrap();
+
+        unsafe { blk.protect(ProtFlags::PROT_READ).unwrap() };
+
+        let _ = Mmap::unmap(&mut blk);
+        let _ = UnixFd::shm_unlink(NAME);
     }
 }

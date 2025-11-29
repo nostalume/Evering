@@ -1,32 +1,37 @@
 [package]
 name = "evering"
-license.workspace = true
-authors = [
-	"Loi Chyan <loichyan@foxmail.com>",
-	"Nostalgia <Nostalume@outlook.com>",
-]
 version.workspace = true
+authors.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [features]
-default = ["nightly"]
+default = ["unix"]
 
 std = []
-nightly = []
+unix = ["std", "dep:nix"]
+windows = ["std"]
 
 [dependencies]
-evering-shm = { path = "../evering-shm" }
-
-lfqueue = { version = "0.8.1", default-features = false }
-async-channel = "2.5.0"
-crossbeam-channel = "0.5"
-
-lock_api.workspace = true
+# memory control
 spin.workspace = true
-parking_lot = "0.12" 
+crossbeam-utils.workspace = true
+memory_addr = "0.4.0"
 
-slab = "0.4.11"
-objectpool = { version = "0.1", default-features = false, features = ["alloc"] }
+# helper
+tracing = { version = "0.1", optional = true }
+paste = "1"
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true, optional = true, features = ["fs", "mman"] }
 
 [dev-dependencies]
 fastrand.workspace = true
+crossbeam-queue = "0.3"
+
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]

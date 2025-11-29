@@ -4,19 +4,21 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk, SharedMmap};
+use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk};
+use crate::arena::Optimistic;
 use crate::malloc::{MemAllocInfo, MemAllocator};
-use crate::msg::MoveMessage;
+use crate::msg::Envelope;
+use crate::perlude::{ArenaMem, Conn};
+
 use crate::tracing_init;
-use crate::{ArenaMemBlk, Conn, Optimistic};
 
 const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags; MAX_ADDR];
 type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
-type MockArena<'a> = ArenaMemBlk<MockAddr, MockBackend<'a>, Optimistic>;
-type MockConn<'a, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, (), N>;
+type MockArena<'a> = ArenaMem<MockAddr, MockBackend<'a>, Optimistic>;
+type MockConn<'a, H, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, H, N>;
 
 struct MockAddr;
 
@@ -92,7 +94,7 @@ impl<'a> Mmap<MockAddr> for MockBackend<'a> {
 }
 
 impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
-    fn protect(
+    unsafe fn protect(
         area: &mut RawMemBlk<MockAddr, Self>,
         new_flags: <MockAddr as AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
@@ -125,7 +127,11 @@ fn mock_arena(bk: MockBackend<'_>, start: usize, size: usize) -> MockArena<'_> {
     MockArena::try_from(raw).unwrap()
 }
 
-fn mock_conn<const N: usize>(bk: MockBackend<'_>, start: usize, size: usize) -> MockConn<'_, N> {
+fn mock_conn<H: Envelope, const N: usize>(
+    bk: MockBackend<'_>,
+    start: usize,
+    size: usize,
+) -> MockConn<'_, H, N> {
     let raw = bk.shared(start, size).unwrap();
     MockConn::try_from(raw).unwrap()
 }
@@ -510,10 +516,13 @@ fn token_of_pbox() {
 
 #[test]
 fn conn() {
-    use crate::msg::{Message, Move, TypeTag, type_id};
+    use std::thread;
+
+    use crate::msg::{Envelope, Message, Move, MoveMessage, Tag, TypeTag, type_id};
+    use crate::perlude::channel::{MsgReceiver, MsgSender, Token};
 
     const N: usize = 1;
-    const SIZE: usize = 20;
+    const SIZE: usize = 256;
 
     #[derive(Debug)]
     struct Info(u32);
@@ -525,30 +534,120 @@ fn conn() {
     }
 
     impl TypeTag for Info {
-        const TYPE_ID: crate::msg::TypeId = type_id::type_id("My");
+        const TYPE_ID: crate::msg::TypeId = type_id::type_id("Info");
     }
 
     impl Message for Info {
         type Semantics = Move;
     }
 
+    #[derive(Clone, Copy, Debug, PartialEq)]
+    enum Exit {
+        Exit,
+        None,
+    }
+
+    #[derive(Debug)]
+    struct Head {
+        pub exit: Exit,
+    }
+
+    impl Envelope for Head {}
+
+    impl Tag<Exit> for Head {
+        fn tag(&self) -> Exit {
+            self.exit
+        }
+
+        fn with_tag(self, exit: Exit) -> Self
+        where
+            Self: Sized,
+        {
+            Self { exit }
+        }
+    }
+
+    fn stress<S: MsgSender<Head>, R: MsgReceiver<Head>, F: FnMut(Token) -> Option<Token>>(
+        s: S,
+        r: R,
+        mut handler: F,
+    ) {
+        let mut alive = true;
+
+        while alive {
+            if !fastrand::bool() {
+                thread::yield_now();
+            }
+            let Ok(p) = r.try_recv() else {
+                continue;
+            };
+
+            if p.tag::<Exit>() == Exit::Exit {
+                break;
+            }
+
+            let (t, h) = p.into_parts();
+            assert!(h.exit == Exit::None, "header corrupted");
+
+            tracing::debug!("header {:?}", h);
+
+            match handler(t) {
+                None => {
+                    let exit = Token::empty().pack(Head { exit: Exit::Exit });
+                    let _ = s.try_send(exit);
+                    alive = false;
+                }
+                Some(reply) => {
+                    let pack = reply.pack(Head { exit: Exit::None });
+                    let _ = s.try_send(pack);
+                }
+            }
+        }
+    }
+
     tracing_init();
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let conn = mock_conn::<N>(bk, 0, MAX_ADDR);
+    let conn = mock_conn::<Head, N>(bk, 0, MAX_ADDR);
     let alloc = conn.arena();
 
     let h = conn.prepare(SIZE).expect("alloc ok");
     let q = conn.acquire(h).expect("view ok");
 
-    let (token_of, alloc) = Info::mock().token(alloc);
-    let token = token_of.pack_default();
     let (ls, lr) = q.clone().sr_duplex();
-    let (rs, rr) = q.rs_duplex();
+    let (rs, rr) = q.clone().rs_duplex();
 
-    ls.try_send(token).expect("send ok");
-    let t = rr.try_recv().expect("recv ok");
-    let t = Info::detoken(t.into_parts().0, alloc).expect("detoken ok");
-    tracing::debug!("{:?}", t);
+    thread::scope(|s| {
+        let ls = ls.clone();
+        let lr = lr.clone();
+        s.spawn(move || {
+            ls.try_send(
+                Info::mock()
+                    .token(alloc.clone())
+                    .0
+                    .pack(Head { exit: Exit::None }),
+            )
+            .unwrap();
+            stress(ls, lr, move |token| {
+                if fastrand::bool() {
+                    let (new, alloc) = Info::mock().token(alloc.clone());
+                    Some(new)
+                } else {
+                    None
+                }
+            })
+        });
+
+        let rs = rs.clone();
+        let rr = rr.clone();
+        s.spawn(move || {
+            stress(rs, rr, |token| {
+                if fastrand::u32(0..10000) == 11 {
+                    return None;
+                }
+                Some(token)
+            });
+        });
+    });
 }

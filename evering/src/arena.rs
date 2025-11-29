@@ -136,6 +136,19 @@ unsafe impl const malloc::Meta for Meta {
     }
 }
 
+unsafe impl const malloc::Span for SpanMeta {
+    fn null() -> Self {
+        Self {
+            raw: AddrSpan::null(),
+            view: AddrSpan::null(),
+        }
+    }
+
+    fn is_null(&self) -> bool {
+        self.raw.is_null() || self.view.is_null()
+    }
+}
+
 impl SpanMeta {
     #[inline]
     const fn raw(raw_offset: Offset, raw_size: Size) -> Self {
@@ -741,7 +754,7 @@ impl Strategy for Optimistic {
 
     fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
         let cur = &arena.header().sentinel;
-        arena.alloc_slow_by(&cur, size, align)
+        arena.alloc_slow_by(cur, size, align)
     }
 }
 
@@ -759,7 +772,7 @@ impl Strategy for Pessimistic {
             });
         };
 
-        arena.alloc_slow_by(&cur, size, align)
+        arena.alloc_slow_by(cur, size, align)
     }
 }
 
@@ -770,10 +783,10 @@ impl<S: Strategy> Clone for Arena<'_, S> {
     fn clone(&self) -> Self {
         Self {
             h: self.h,
-            start: self.start.clone(),
-            size: self.size.clone(),
-            read_only: self.read_only.clone(),
-            max_retries: self.max_retries.clone(),
+            start: self.start,
+            size: self.size,
+            read_only: self.read_only,
+            max_retries: self.max_retries,
         }
     }
 }
@@ -876,9 +889,8 @@ impl<'a, S: Strategy> Arena<'a, S> {
 impl<S: Strategy> Arena<'_, S> {
     #[inline]
     fn meta(&self, seg: ReqSegment) -> Meta {
-        let meta = Meta::from_req_seg(self.start_ptr(), seg);
+        Meta::from_req_seg(self.start_ptr(), seg)
         // unsafe { meta.clear(self) }
-        meta
     }
 
     #[inline]
@@ -1207,7 +1219,7 @@ impl<S: Strategy> Arena<'_, S> {
 
         let header = self.header();
         if let Some(meta) = header.alloc(self, size, align) {
-            return Ok(meta);
+            Ok(meta)
         } else {
             for i in 0..self.max_retries {
                 match S::alloc_slow(self, size, align) {

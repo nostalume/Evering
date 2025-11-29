@@ -54,13 +54,12 @@ impl Header {
         let tail = 0;
         // One lap is the smallest power of two greater than `cap`.
         let one_lap = (cap + 1).next_power_of_two();
-        let header = Header {
+        Header {
             head: CachePadded::new(AtomicUsize::new(head)),
             tail: CachePadded::new(AtomicUsize::new(tail)),
             one_lap,
             cap,
-        };
-        header
+        }
     }
 }
 
@@ -377,38 +376,38 @@ trait Endpoint: Sized {
     }
 }
 
-trait Sender {
+pub trait Sender {
     type Item;
     type TryError;
 
     fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError>;
 }
 
-trait AsyncSender: Sender {
+pub trait AsyncSender: Sender {
     type Error;
 
     fn send(&self, item: Self::Item) -> impl Future<Output = Result<(), Self::Error>>;
 }
 
-trait Receiver {
+pub trait Receiver {
     type Item;
     type TryError;
 
     fn try_recv(&self) -> Result<Self::Item, Self::TryError>;
 }
 
-trait AsyncReceiver: Receiver {
+pub trait AsyncReceiver: Receiver {
     type Error;
 
     fn recv(&self) -> impl Future<Output = Result<Self::Item, Self::Error>>;
 }
 
 #[repr(transparent)]
-#[derive(Clone,PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Tx<S>(S);
 
 #[repr(transparent)]
-#[derive(Clone,PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Rx<R>(R);
 
 impl<S: Queue> Sender for Tx<S> {

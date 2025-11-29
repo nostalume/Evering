@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
 
 use crate::malloc::{AllocError, IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf, handle_alloc_error};
-use crate::msg::{Token, TokenOf};
+use crate::token::{Token, TokenOf};
 
 const fn is_zst<T>() -> bool {
     size_of::<T>() == 0
@@ -64,9 +64,7 @@ impl<T: crate::msg::Message, A: MemAllocator> PBox<T, A> {
 
     #[inline]
     pub fn detoken(token: Token<MetaSpanOf<A>>, alloc: A) -> Option<Self> {
-        let Some(token_of) = Token::recall::<T>(token) else {
-            return None;
-        };
+        let token_of = Token::recall::<T>(token)?;
         let b = PBox::<T, A>::detoken_of(token_of, alloc);
         Some(b)
     }
@@ -224,9 +222,7 @@ impl<T: crate::msg::Message, A: MemAllocator> PBox<[T], A> {
 
     #[inline]
     pub fn detoken<M: IsMetaSpanOf<A>>(token: Token<M>, alloc: A) -> Option<Self> {
-        let Some(token_of) = Token::recall::<[T]>(token) else {
-            return None;
-        };
+        let token_of = Token::recall::<[T]>(token)?;
         let b = PBox::<[T], A>::detoken_of(token_of, alloc);
         Some(b)
     }
@@ -403,7 +399,7 @@ impl<T: ?Sized, A: MemAllocator> Deref for PArc<T, A> {
 
 impl<T: ?Sized, A: MemAllocator> AsRef<T> for PArc<T, A> {
     fn as_ref(&self) -> &T {
-        &**self
+        self
     }
 }
 

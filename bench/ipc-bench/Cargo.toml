@@ -11,7 +11,7 @@ fastrand.workspace = true
 bytes.workspace = true
 bytesize.workspace = true
 
-evering-ipc = { workspace = true, features = ["unix"] }
+evering = { workspace = true, features = ["unix"] }
 tokio.workspace = true
 monoio = { version = "0.2.4", features = ["sync"] }
 

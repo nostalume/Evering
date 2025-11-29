@@ -8,8 +8,9 @@ use core::sync::atomic::AtomicUsize;
 use crate::boxed::PBox;
 use crate::channel::{Endpoint, Header, Queue, Rx, Slot, Slots, Tx};
 use crate::malloc::{MemAllocator, MetaSpanOf};
-use crate::msg::{Envelope, PackToken, TokenOf};
+use crate::msg::Envelope;
 use crate::reg::{EntryView, Project, Resource};
+use crate::token::{PackToken, TokenOf};
 
 type Token<H, M> = PackToken<H, M>;
 type Tokens<H, M> = Slots<Token<H, M>>;
@@ -103,7 +104,7 @@ impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A, MetaSpanOf<A>> 
 
 impl<'a, H: Envelope, A: MemAllocator> Endpoint for QueueView<'a, H, A, MetaSpanOf<A>> {}
 
-type DuplexView<'a, H, A, M> = EntryView<'a, A, TokenDuplex<H, M>>;
+pub type DuplexView<'a, H, A, M> = EntryView<'a, A, TokenDuplex<H, M>>;
 pub struct TokenDuplex<H: Envelope, M> {
     l: TokenQueue<H, M>,
     r: TokenQueue<H, M>,

@@ -25,7 +25,10 @@ pub trait Mmap<S: AddrSpec>: Sized {
 }
 
 pub trait Mprotect<S: AddrSpec>: Mmap<S> {
-    fn protect(area: &mut RawMemBlk<S, Self>, new_flags: S::Flags) -> Result<(), Self::Error>;
+    unsafe fn protect(
+        area: &mut RawMemBlk<S, Self>,
+        new_flags: S::Flags,
+    ) -> Result<(), Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -332,8 +335,8 @@ pub struct MemBlkSpec<S: AddrSpec> {
 impl<S: AddrSpec> Clone for MemBlkSpec<S> {
     fn clone(&self) -> Self {
         Self {
-            range: self.range.clone(),
-            flags: self.flags.clone(),
+            range: self.range,
+            flags: self.flags,
         }
     }
 }
@@ -352,13 +355,6 @@ impl<S: AddrSpec> MemBlkSpec<S> {
             flags,
         }
     }
-
-    // #[inline]
-    // pub(crate) fn as_addr(&self, offset: usize) -> Option<(S::Addr, usize)> {
-    //     let addr = self.start().add(offset);
-    //     let size = self.end().checked_sub_addr(addr)?;
-    //     Some((addr, size))
-    // }
 }
 
 impl<S: AddrSpec> MemBlkSpec<S> {
@@ -372,6 +368,11 @@ impl<S: AddrSpec> MemBlkSpec<S> {
     #[inline]
     pub const fn flags(&self) -> S::Flags {
         self.flags
+    }
+
+    #[inline]
+    pub const fn with_flags(&mut self, flags: S::Flags) {
+        self.flags = flags
     }
 
     /// Returns the start address of the memory area.
@@ -395,7 +396,7 @@ impl<S: AddrSpec> MemBlkSpec<S> {
 
 #[repr(C, align(8))]
 pub struct Metadata {
-    magic: MAGIC,
+    magic: Magic,
     // own counts
     rc: AtomicU32,
 }
@@ -443,7 +444,7 @@ impl crate::header::Layout for Metadata {
 }
 
 impl crate::header::Metadata for Metadata {
-    const MAGIC_VALUE: MAGIC = 0x7203;
+    const MAGIC_VALUE: Magic = 0x7203;
     #[inline]
     fn valid_magic(&self) -> bool {
         self.magic == Self::MAGIC_VALUE
@@ -511,10 +512,24 @@ impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
     }
 }
 
-/// Area without certainty on map, unmap
 pub struct RawMemBlk<S: AddrSpec, M: Mmap<S>> {
     pub a: MemBlkSpec<S>,
     pub bk: M,
+}
+
+impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
+    pub fn drop_in(area: Self) -> Result<(), M::Error> {
+        let mut area = area;
+        M::unmap(&mut area)
+    }
+}
+
+impl<S: AddrSpec, M: Mprotect<S>> RawMemBlk<S, M> {
+    pub unsafe fn protect(&mut self, flags: S::Flags) -> Result<(), M::Error> {
+        (unsafe { M::protect(self, flags) })?;
+        self.a.flags = flags;
+        Ok(())
+    }
 }
 
 impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
@@ -547,8 +562,8 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
             let header_ref = Layout::from_raw(header);
             match header_ref.attach_or_init(cfg) {
                 HeaderStatus::Initialized => Ok((NonNull::new_unchecked(header), hoffset)),
-                HeaderStatus::Initializing => return Err(Error::Contention),
-                _ => return Err(Error::InvalidHeader),
+                HeaderStatus::Initializing => Err(Error::Contention),
+                _ => Err(Error::InvalidHeader),
             }
         }
     }
@@ -580,7 +595,7 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemBlkOps for RawMemBlk<S, M> {
 }
 
 use crate::header::Layout;
-use crate::header::MAGIC;
+use crate::header::Magic;
 /// A handle of **mapped** memory block.
 pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
     a: MemBlkSpec<S>,
@@ -649,7 +664,7 @@ impl<S: AddrSpec, M: Mmap<S>> Clone for MemBlkHandle<S, M> {
 
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlkHandle<S, M> {
     fn drop(&mut self) {
-        unsafe { self.0.release_of() }
+        unsafe { self.0.release() }
     }
 }
 

@@ -1,12 +1,6 @@
 [workspace]
 resolver = "3"
-members = [
-	"evering",
-	"evering-ipc",
-	"evering-shm",
-	"examples/evering-tokio",
-	"bench/ipc-bench",
-]
+members = ["evering", "bench/ipc-bench"]
 
 [workspace.package]
 version = "0.1.0"
@@ -28,5 +22,3 @@ bytesize = "2.1.0"
 nix = "0.30.1"
 
 evering = { path = "evering" }
-evering-shm = { path = "evering-shm" }
-evering-ipc = { path = "evering-ipc" }
