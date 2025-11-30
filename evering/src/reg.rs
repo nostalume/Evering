@@ -112,7 +112,7 @@ impl<T> Entry<T> {
     }
 
     #[inline]
-    unsafe fn as_mut(& self) -> &mut T {
+    unsafe fn as_mut(&self) -> &mut T {
         unsafe { (*self.data.get()).assume_init_mut() }
     }
 
@@ -547,7 +547,7 @@ mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::{reg::EntryGuard, tracing_init};
+    use crate::{reg::EntryGuard, tests::tracing_init};
 
     use super::{Project, Registry, Resource};
 

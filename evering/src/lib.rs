@@ -35,13 +35,6 @@ mod reg;
 mod tests;
 mod token;
 
-#[cfg(test)]
-fn tracing_init() {
-    let _ = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::DEBUG)
-        .try_init();
-}
-
 mod seal {
     pub trait Sealed {}
 }

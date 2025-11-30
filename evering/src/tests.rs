@@ -1,9 +1,24 @@
 #![cfg(test)]
 
-use crate::mem::{AddrSpec, Mmap, RawMemBlk};
+use crate::{
+    mem::{AddrSpec, Mmap, RawMemBlk},
+    msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
+};
 
 mod mock;
 mod unix;
+
+#[inline]
+pub(crate) fn tracing_init() {
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
+}
+
+#[inline]
+pub(crate) fn prob(prob: f32) -> bool {
+    fastrand::f32() < prob
+}
 
 pub(crate) trait MemBlkTestIO {
     unsafe fn write_bytes(&self, data: &[u8], len: usize, offset: usize);
@@ -49,5 +64,49 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkTestIO for RawMemBlk<S, M> {
             use crate::mem::MemBlkOps;
             core::ptr::copy_nonoverlapping(self.start_ptr().add(offset), buf.as_mut_ptr(), len)
         };
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Info {
+    version: u32,
+    data: u32,
+}
+
+impl Info {
+    #[inline]
+    pub fn mock() -> Self {
+        Self {
+            version: fastrand::u32(0..100),
+            data: fastrand::u32(0..100),
+        }
+    }
+}
+
+impl TypeTag for Info {
+    const TYPE_ID: crate::msg::TypeId = type_id::type_id("Info");
+}
+
+impl Message for Info {
+    type Semantics = Move;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Exit {
+    Exit,
+    None,
+}
+
+impl Envelope for Exit {}
+
+impl Tag<Exit> for Exit {
+    fn with_tag(self, value: Exit) -> Self
+    where
+        Self: Sized {
+            value
+    }
+
+    fn tag(&self) -> Exit {
+        self.clone()
     }
 }

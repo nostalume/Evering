@@ -221,6 +221,14 @@ impl<T: Message<Semantics = Move>> MoveMessage for T {}
 
 impl<T: MoveMessage> MoveMessage for [T] {}
 
+pub trait TransitMove: MoveMessage {
+    type Portable<A: MemAllocator>;
+    fn tokens<A: MemAllocator>(self, alloc: A) -> (Self::Portable<A>, A);
+    fn detokens<A: MemAllocator>(repr: Self::Portable<A>, alloc: A) -> Option<(Self, A)>
+    where
+        Self: Sized;
+}
+
 pub trait Envelope: core::fmt::Debug {}
 
 impl Envelope for () {}

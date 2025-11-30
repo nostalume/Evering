@@ -10,7 +10,7 @@ use crate::mem::{MemAllocInfo, MemAllocator};
 use crate::msg::Envelope;
 use crate::perlude::{ArenaMem, Conn};
 
-use crate::tracing_init;
+use crate::tests::{prob, tracing_init};
 
 const MAX_ADDR: usize = 0x10000;
 
@@ -516,56 +516,15 @@ fn token_of_pbox() {
 fn conn() {
     use std::thread;
 
-    use crate::msg::{Envelope, Message, Move, MoveMessage, Tag, TypeTag, type_id};
+    use super::{Exit, Info};
+    use crate::msg::MoveMessage;
     use crate::perlude::channel::{MsgReceiver, MsgSender, Token};
 
     const N: usize = 1;
     const SIZE: usize = 256;
+    const FUZZ_PROB: f32 = 0.001;
 
-    #[derive(Debug)]
-    struct Info(u32);
-
-    impl Info {
-        fn mock() -> Self {
-            Self(fastrand::u32(0..100))
-        }
-    }
-
-    impl TypeTag for Info {
-        const TYPE_ID: crate::msg::TypeId = type_id::type_id("Info");
-    }
-
-    impl Message for Info {
-        type Semantics = Move;
-    }
-
-    #[derive(Clone, Copy, Debug, PartialEq)]
-    enum Exit {
-        Exit,
-        None,
-    }
-
-    #[derive(Debug)]
-    struct Head {
-        pub exit: Exit,
-    }
-
-    impl Envelope for Head {}
-
-    impl Tag<Exit> for Head {
-        fn tag(&self) -> Exit {
-            self.exit
-        }
-
-        fn with_tag(self, exit: Exit) -> Self
-        where
-            Self: Sized,
-        {
-            Self { exit }
-        }
-    }
-
-    fn stress<S: MsgSender<Head>, R: MsgReceiver<Head>, F: FnMut(Token) -> Option<Token>>(
+    fn stress<S: MsgSender<Exit>, R: MsgReceiver<Exit>, F: FnMut(Token) -> Option<Token>>(
         s: S,
         r: R,
         mut handler: F,
@@ -573,9 +532,10 @@ fn conn() {
         let mut alive = true;
 
         while alive {
-            if !fastrand::bool() {
+            if !prob(FUZZ_PROB) {
                 thread::yield_now();
             }
+
             let Ok(p) = r.try_recv() else {
                 continue;
             };
@@ -585,18 +545,16 @@ fn conn() {
             }
 
             let (t, h) = p.into_parts();
-            assert!(h.exit == Exit::None, "header corrupted");
-
-            tracing::debug!("header {:?}", h);
+            assert!(h == Exit::None, "header corrupted");
 
             match handler(t) {
                 None => {
-                    let exit = Token::empty().pack(Head { exit: Exit::Exit });
+                    let exit = Token::empty().pack(Exit::Exit);
                     let _ = s.try_send(exit);
                     alive = false;
                 }
                 Some(reply) => {
-                    let pack = reply.pack(Head { exit: Exit::None });
+                    let pack = reply.pack(Exit::None);
                     let _ = s.try_send(pack);
                 }
             }
@@ -607,7 +565,7 @@ fn conn() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let conn = mock_conn::<Head, N>(bk, 0, MAX_ADDR);
+    let conn = mock_conn::<Exit, N>(bk, 0, MAX_ADDR);
     let alloc = conn.arena();
 
     let h = conn.prepare(SIZE).expect("alloc ok");
@@ -616,36 +574,24 @@ fn conn() {
     let (ls, lr) = q.clone().sr_duplex();
     let (rs, rr) = q.clone().rs_duplex();
 
-    thread::scope(|s| {
-        let ls = ls.clone();
-        let lr = lr.clone();
-        s.spawn(move || {
-            ls.try_send(
-                Info::mock()
-                    .token(alloc.clone())
-                    .0
-                    .pack(Head { exit: Exit::None }),
-            )
-            .unwrap();
-            stress(ls, lr, move |_| {
-                if fastrand::bool() {
-                    let (new, _) = Info::mock().token(alloc.clone());
-                    Some(new)
-                } else {
-                    None
-                }
-            })
-        });
+    let (msg, alloc) = Info::mock().token(alloc);
+    let _ = ls.try_send(msg.pack(Exit::None));
 
-        let rs = rs.clone();
-        let rr = rr.clone();
-        s.spawn(move || {
-            stress(rs, rr, |token| {
-                if fastrand::u32(0..10000) == 11 {
-                    return None;
-                }
-                Some(token)
-            });
+    let handler = |token: Token, label: &'static str| {
+        if prob(FUZZ_PROB) {
+            None
+        } else {
+            let info = Info::detoken(token, &alloc).expect("should work");
+            tracing::debug!("[{}] receive: {:?}", label, info);
+            let (new, _) = Info::mock().token(&alloc);
+            Some(new)
+        }
+    };
+    thread::scope(|s| {
+        s.spawn(|| stress(ls, lr, |token| handler(token, "Left")));
+
+        s.spawn(|| {
+            stress(rs, rr, |token| handler(token, "right"));
         });
     });
 }

@@ -507,7 +507,8 @@ mod tests {
 
     #[test]
     fn pool() {
-        use crate::tracing_init;
+        use crate::tests::tracing_init;
+
         use std::sync::Barrier;
         use std::thread;
 
