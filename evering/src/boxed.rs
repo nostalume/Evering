@@ -4,7 +4,7 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
 
-use crate::malloc::{AllocError, IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf, handle_alloc_error};
+use crate::mem::{AllocError, IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf, handle_alloc_error};
 use crate::token::{Token, TokenOf};
 
 const fn is_zst<T>() -> bool {

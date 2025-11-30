@@ -1,0 +1,491 @@
+use core::alloc::Layout;
+use core::marker::PhantomData;
+use core::mem::MaybeUninit;
+use core::ptr::{self, NonNull};
+
+mod area;
+
+pub use self::area::{Error, Header, MemBlkHandle, MemBlkLayout, RawMemBlk};
+pub use alloc::alloc::{AllocError, handle_alloc_error};
+
+pub trait AddrSpec {
+    type Addr: memory_addr::MemoryAddr;
+    type Flags: Copy;
+}
+
+pub trait Mmap<S: AddrSpec>: Sized {
+    type Handle;
+    type MapFlags: Copy;
+    type Error: core::fmt::Debug;
+
+    fn map(
+        self,
+        start: Option<S::Addr>,
+        size: usize,
+        mflags: Self::MapFlags,
+        pflags: S::Flags,
+        handle: Self::Handle,
+    ) -> Result<RawMemBlk<S, Self>, Self::Error>;
+    fn unmap(area: &mut RawMemBlk<S, Self>) -> Result<(), Self::Error>;
+}
+
+pub trait Mprotect<S: AddrSpec>: Mmap<S> {
+    unsafe fn protect(
+        area: &mut RawMemBlk<S, Self>,
+        new_flags: S::Flags,
+    ) -> Result<(), Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum Access {
+    Write,
+    Read,
+    ReadWrite,
+}
+
+pub trait SharedMmap<S: AddrSpec>: Mmap<S> {
+    fn shared(
+        self,
+        size: usize,
+        access: Access,
+        handle: Self::Handle,
+    ) -> Result<RawMemBlk<S, Self>, Self::Error>;
+}
+
+pub struct MemBlkBuilder<S: AddrSpec, M: Mmap<S>> {
+    bk: M,
+    _marker: PhantomData<S>,
+}
+
+impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
+    pub const fn from_backend(bk: M) -> Self {
+        MemBlkBuilder {
+            bk,
+            _marker: PhantomData,
+        }
+    }
+
+    pub fn map<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
+        self,
+        start: Option<S::Addr>,
+        size: usize,
+        mflags: M::MapFlags,
+        pflags: S::Flags,
+        handle: M::Handle,
+    ) -> Result<T, Error<S, M>> {
+        let Self { bk, _marker } = self;
+        let raw = bk
+            .map(start, size, mflags, pflags, handle)
+            .map_err(|e| Error::MapError(e))?;
+        let layout = MemBlkLayout::new(raw);
+        T::try_from(layout)
+    }
+}
+
+impl<S: AddrSpec, M: SharedMmap<S>> MemBlkBuilder<S, M> {
+    pub fn shared<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
+        self,
+        size: usize,
+        access: Access,
+        handle: M::Handle,
+    ) -> Result<T, Error<S, M>> {
+        let Self { bk, _marker } = self;
+        let raw = bk
+            .shared(size, access, handle)
+            .map_err(|e| Error::MapError(e))?;
+        let layout = MemBlkLayout::new(raw);
+        T::try_from(layout)
+    }
+}
+
+pub type MetaOf<A> = <A as MemAlloc>::Meta;
+pub type SpanOf<M> = <M as Meta>::SpanMeta;
+pub type MetaSpanOf<A> = SpanOf<MetaOf<A>>;
+
+/// Marker trait for constraint of `MetaSpanOf<A>` for `A: MemAllocator`
+pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
+    fn erase(meta: MetaOf<A>) -> Self;
+    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A>;
+}
+
+impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
+    #[inline(always)]
+    fn erase(meta: MetaOf<A>) -> Self {
+        meta.erase()
+    }
+
+    #[inline(always)]
+    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A> {
+        unsafe { Meta::recall(self, base_ptr) }
+    }
+}
+
+pub const unsafe trait Span: Clone {
+    fn null() -> Self;
+    fn is_null(&self) -> bool;
+}
+
+pub const unsafe trait Meta: Clone {
+    type SpanMeta: Span;
+    fn null() -> Self;
+    fn is_null(&self) -> bool;
+
+    fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>>;
+    unsafe fn as_ptr<T>(&self) -> *mut T {
+        self.as_uninit::<T>().as_ptr().cast()
+    }
+
+    fn as_uninit_slice<T>(&self, len: usize) -> NonNull<[MaybeUninit<T>]> {
+        let ptr = self.as_uninit::<T>();
+        NonNull::slice_from_raw_parts(ptr, len)
+    }
+    unsafe fn as_slice<T>(&self, len: usize) -> *mut [T] {
+        let ptr = unsafe { self.as_ptr::<T>() };
+        ptr::slice_from_raw_parts_mut(ptr, len)
+    }
+
+    fn erase(self) -> Self::SpanMeta;
+    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
+}
+
+pub trait MemAllocator: MemAlloc + MemDealloc {}
+impl<A: MemAllocator> MemAllocator for &A {}
+pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
+impl<A: MemAllocator2> MemAllocator2 for &A {}
+
+/// Allocate or deallocate raw type `T` in persistence.
+pub unsafe trait MemAlloc {
+    type Meta: Meta;
+    type Error;
+    fn base_ptr(&self) -> *const u8;
+    fn malloc_by(&self, layout: Layout) -> Result<Self::Meta, Self::Error>;
+    fn malloc_of<H>(&self) -> Result<Self::Meta, Self::Error> {
+        let layout = Layout::new::<H>();
+        self.malloc_by(layout)
+    }
+    fn malloc_bytes(&self, size: usize) -> Result<Self::Meta, Self::Error> {
+        let layout = Layout::array::<u8>(size).unwrap();
+        self.malloc_by(layout)
+    }
+}
+
+pub unsafe trait MemDealloc: MemAlloc {
+    // deallocate meta `T` in persistence.
+    fn demalloc(&self, meta: Self::Meta) -> bool;
+}
+
+pub unsafe trait MemDeallocBy: MemAlloc {
+    fn demalloc_by(&self, meta: Self::Meta, layout: Layout) -> bool;
+}
+
+pub trait MemAllocInfo: MemAlloc {
+    // type Header;
+    // fn header(&self) -> &Self::Header;
+    fn allocated(&self) -> usize;
+    fn remained(&self) -> usize;
+    fn discarded(&self) -> usize;
+}
+
+unsafe impl<A: MemAlloc> MemAlloc for &A {
+    type Meta = A::Meta;
+    type Error = A::Error;
+
+    fn base_ptr(&self) -> *const u8 {
+        (*self).base_ptr()
+    }
+    fn malloc_by(&self, layout: Layout) -> Result<Self::Meta, Self::Error> {
+        (*self).malloc_by(layout)
+    }
+}
+
+unsafe impl<A: MemDealloc> MemDealloc for &A {
+    fn demalloc(&self, meta: Self::Meta) -> bool {
+        (*self).demalloc(meta)
+    }
+}
+
+unsafe impl<A: MemDeallocBy> MemDeallocBy for &A {
+    fn demalloc_by(&self, meta: Self::Meta, layout: Layout) -> bool {
+        (*self).demalloc_by(meta, layout)
+    }
+}
+
+pub unsafe trait MemBlkOps {
+    #[inline]
+    fn start<Addr: memory_addr::MemoryAddr>(&self) -> Addr {
+        self.start_ptr().addr().into()
+    }
+
+    /// Returns the start pointer of the memory block.
+    fn start_ptr(&self) -> *const u8;
+
+    #[inline]
+    fn end<Addr: memory_addr::MemoryAddr>(&self) -> Addr {
+        self.end_ptr().addr().into()
+    }
+
+    fn end_ptr(&self) -> *const u8;
+
+    /// Returns the byte size of the memory block.
+    fn size(&self) -> usize;
+
+    /// Returns the start pointer of the memory block.
+    ///
+    /// ## Safety
+    /// The `ptr` should be correctly modified.
+    #[inline]
+    unsafe fn start_mut_ptr(&self) -> *mut u8 {
+        self.start_ptr().cast_mut()
+    }
+
+    /// Returns the offset to the start of the memory block.
+    ///
+    /// ## Safety
+    /// - `ptr` must be allocated in the memory.
+    #[inline]
+    unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> usize {
+        // Safety: `ptr` must has address greater than `self.start_ptr()`.
+        unsafe { ptr.byte_offset_from_unsigned(self.start_ptr()) }
+    }
+
+    /// Returns a pointer to the memory at the given offset.
+    #[inline]
+    fn get_ptr(&self, offset: usize) -> *const u8 {
+        unsafe { self.start_ptr().add(offset) }
+    }
+
+    /// Returns a pointer to the memory at the given offset.
+    #[inline]
+    fn get_mut_ptr(&self, offset: usize) -> *mut u8 {
+        unsafe { self.start_mut_ptr().add(offset) }
+    }
+
+    /// Given a offset related to start, acquire the `Sized` instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut T`, `next_offset`)
+    /// - `*mut T`: the pointer to the instance.
+    /// - `next_offset`: `offset + size_of<T>()`
+    #[inline]
+    unsafe fn obtain_by_offset<T>(&self, offset: usize) -> Result<(*mut T, usize), usize> {
+        use memory_addr::MemoryAddr;
+        let t_size = core::mem::size_of::<T>();
+        let t_align = core::mem::align_of::<T>();
+
+        let start = self.start_ptr().addr();
+        let t_start = start.add(offset).align_up(t_align);
+        let new_offset = t_start.add(t_size) - start;
+        if new_offset > self.size() {
+            return Err(new_offset);
+        }
+        let ptr = (t_start as *const u8).cast::<T>().cast_mut();
+        Ok((ptr, new_offset))
+    }
+
+    /// Given a absolute addr, acquire the `Sized` instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut T`, `next_offset`)
+    /// - `*mut T`: the pointer to the instance.
+    /// - `next_offset`: `offset + size_of<T>()`
+    #[inline]
+    unsafe fn obtain_by_addr<T, Addr: memory_addr::MemoryAddr>(
+        &self,
+        start: Addr,
+    ) -> Result<(*mut T, usize), Option<usize>> {
+        if start < self.start() {
+            return Err(None);
+        }
+        let offset = start.sub_addr(self.start());
+        unsafe { self.obtain_by_offset(offset).map_err(Option::Some) }
+    }
+
+    /// Given a offset related to start, acquire the slice instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut [T]`, `next_offset`)
+    /// - `*mut [T]`: the pointer to the slice.
+    /// - `next_offset`: `offset + size_of<T>() * len`
+    #[inline]
+    unsafe fn obtain_slice_by_offset<T>(
+        &self,
+        offset: usize,
+        len: usize,
+    ) -> Result<(*mut [T], usize), Option<usize>> {
+        use alloc::alloc::Layout;
+        use memory_addr::MemoryAddr;
+
+        let layout = Layout::array::<T>(len).map_err(|_| Option::None)?;
+        let arr_size = layout.size();
+        let arr_align = layout.align();
+
+        unsafe {
+            let start = self.start_ptr().addr();
+            let t_start = start.add(offset).align_up(arr_align);
+            let new_offset = t_start.add(arr_size) - start;
+            if new_offset > self.size() {
+                return Err(Some(new_offset));
+            }
+            let ptr = (t_start as *const u8).cast::<T>().cast_mut();
+            let ptr = core::slice::from_raw_parts_mut(ptr, len);
+            Ok((ptr, new_offset))
+        }
+    }
+
+    /// Given a offset related to start, acquire the slice instance.
+    /// from the area.
+    ///
+    /// ## Panics
+    /// `start.add(size_of<T>())` overflows.
+    ///
+    /// ## Safety
+    /// User should ensure the validity of memory area and instance.
+    ///
+    /// ## Returns
+    /// (`*mut [T]`, `next_offset`)
+    /// - `*mut [T]`: the pointer to the slice.
+    /// - `next_offset`: `offset + size_of<T>() * len`
+    #[inline]
+    unsafe fn obtain_slice_by_addr<T, Addr: memory_addr::MemoryAddr>(
+        &self,
+        start: Addr,
+        len: usize,
+    ) -> Result<(*mut [T], usize), Option<usize>> {
+        if start < self.start() {
+            return Err(None);
+        }
+        let offset = start.sub_addr(self.start());
+        unsafe { self.obtain_slice_by_offset(offset, len) }
+    }
+}
+
+unsafe impl<M: MemBlkOps> MemBlkOps for &M {
+    fn start_ptr(&self) -> *const u8 {
+        (*self).start_ptr()
+    }
+
+    fn end_ptr(&self) -> *const u8 {
+        (*self).end_ptr()
+    }
+
+    fn size(&self) -> usize {
+        (*self).size()
+    }
+}
+
+macro_rules! addr_span {
+    ($ty:ty) => {
+        impl AddrSpan<$ty> {
+            #[inline]
+            pub const fn null() -> Self {
+                Self {
+                    start_offset: 0,
+                    size: 0,
+                }
+            }
+
+            #[inline]
+            pub const fn is_null(&self) -> bool {
+                self.start_offset == 0 || self.size == 0
+            }
+
+            #[inline]
+            pub const fn end_offset(&self) -> $ty {
+                self.start_offset + self.size
+            }
+
+            #[inline]
+            pub const fn align_of<T>(&self) -> Self {
+                use crate::numeric::Alignable;
+                Self {
+                    start_offset: self.start_offset.align_up_of::<T>(),
+                    size: <$ty>::size_of::<T>(),
+                }
+            }
+
+            #[inline]
+            pub const fn align_to(&self, align: $ty) -> Self {
+                use crate::numeric::Alignable;
+                let aligned_offset = self.start_offset.align_up(align);
+                let new_size = self.end_offset() - aligned_offset;
+
+                Self {
+                    start_offset: aligned_offset,
+                    size: new_size,
+                }
+            }
+
+            #[inline]
+            pub const fn align_to_of<T>(&self) -> Self {
+                use crate::numeric::Alignable;
+                let aligned_offset = self.start_offset.align_up_of::<T>();
+                let new_size = self.end_offset() - aligned_offset;
+
+                Self {
+                    start_offset: aligned_offset,
+                    size: new_size,
+                }
+            }
+
+            #[inline]
+            pub const fn shift(&self, delta: $ty) -> Self {
+                Self {
+                    start_offset: self.start_offset.saturating_add(delta),
+                    size: self.size,
+                }
+            }
+
+            #[inline]
+            pub const unsafe fn as_ptr(&self, base_ptr: *const u8) -> *const u8 {
+                use crate::numeric::CastInto;
+                unsafe { base_ptr.add(self.start_offset.cast_into()) }
+            }
+
+            #[inline]
+            pub const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
+                use crate::numeric::CastInto;
+                unsafe { base_ptr.add(self.start_offset.cast_into()) }
+            }
+        }
+    };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AddrSpan<T> {
+    pub start_offset: T,
+    pub size: T,
+}
+
+impl<T> AddrSpan<T> {
+    #[inline]
+    pub const fn new(offset: T, size: T) -> Self {
+        Self {
+            start_offset: offset,
+            size,
+        }
+    }
+}
+
+addr_span!(u32);
+addr_span!(usize);

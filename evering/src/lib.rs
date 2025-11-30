@@ -22,13 +22,12 @@ extern crate alloc;
 #[cfg(feature = "tracing")]
 extern crate tracing;
 
-mod area;
 mod arena;
 pub mod boxed;
 mod channel;
 mod counter;
 mod header;
-mod malloc;
+mod mem;
 pub mod msg;
 pub mod os;
 pub mod perlude;

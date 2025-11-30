@@ -1,6 +1,6 @@
 #![cfg(test)]
 
-use crate::area::{AddrSpec, Mmap, RawMemBlk};
+use crate::mem::{AddrSpec, Mmap, RawMemBlk};
 
 mod mock;
 mod unix;
@@ -36,7 +36,7 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkTestIO for RawMemBlk<S, M> {
         debug_assert!(self.size() >= data.len() + offset);
         debug_assert!(data.len() >= len);
         unsafe {
-            use crate::area::MemBlkOps;
+            use crate::mem::MemBlkOps;
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.start_mut_ptr().add(offset), len)
         };
     }
@@ -46,7 +46,7 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkTestIO for RawMemBlk<S, M> {
         debug_assert!(self.size() >= buf.len() + offset);
         debug_assert!(buf.len() >= len);
         unsafe {
-            use crate::area::MemBlkOps;
+            use crate::mem::MemBlkOps;
             core::ptr::copy_nonoverlapping(self.start_ptr().add(offset), buf.as_mut_ptr(), len)
         };
     }

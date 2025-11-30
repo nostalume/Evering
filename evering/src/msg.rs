@@ -1,4 +1,4 @@
-use crate::{boxed::PBox, malloc::MemAllocator, token::AllocToken};
+use crate::{boxed::PBox, mem::MemAllocator, token::AllocToken};
 
 pub mod type_id {
     pub type TypeId = u64;

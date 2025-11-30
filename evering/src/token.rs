@@ -1,9 +1,8 @@
-use core::default;
 use core::marker::PhantomData;
 use core::ptr::{self, NonNull};
 
 use crate::boxed::PBox;
-use crate::malloc::{IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf};
+use crate::mem::{IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf};
 use crate::msg::{Envelope, Message, Tag, TagRef, TypeId, TypeTag};
 
 #[derive(Clone, Copy, Debug)]
@@ -156,7 +155,7 @@ impl<M> Token<M> {
     #[inline]
     pub const fn empty() -> Self
     where
-        M: [const] crate::malloc::Span,
+        M: [const] crate::mem::Span,
     {
         Self {
             span: M::null(),

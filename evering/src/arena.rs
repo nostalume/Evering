@@ -9,8 +9,7 @@ use core::{
 use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{
-    area::MemBlkOps,
-    malloc::{self, MemAllocInfo},
+    mem,
     numeric::{Alignable, CastInto, Packable},
 };
 
@@ -23,7 +22,7 @@ type PAtomicPackedUInt = CachePadded<AtomicPackedUInt>;
 
 type Offset = UInt;
 type Size = UInt;
-type AddrSpan = crate::area::AddrSpan<UInt>;
+type AddrSpan = crate::mem::AddrSpan<UInt>;
 
 pub const fn max_bound(n: usize) -> Option<UInt> {
     let n = UInt::try_from(n).ok()?;
@@ -92,7 +91,7 @@ pub struct SpanMeta {
 
 unsafe impl Send for Meta {}
 
-unsafe impl const malloc::Meta for Meta {
+unsafe impl const mem::Meta for Meta {
     type SpanMeta = SpanMeta;
     #[inline]
     fn null() -> Self {
@@ -136,7 +135,7 @@ unsafe impl const malloc::Meta for Meta {
     }
 }
 
-unsafe impl const malloc::Span for SpanMeta {
+unsafe impl const mem::Span for SpanMeta {
     fn null() -> Self {
         Self {
             raw: AddrSpan::null(),
@@ -336,7 +335,7 @@ impl<S: Strategy> Header<S> {
                             raw_size,
                             allocated
                         );
-                        let meta = Meta::raw(a.start_ptr(), allocated, raw_size).align_to(align);
+                        let meta = Meta::raw(a.base_ptr(), allocated, raw_size).align_to(align);
                         // unsafe { meta.clear(a) }
                         Some(meta)
                     };
@@ -708,17 +707,18 @@ impl Config {
     const MIN_SEGMENT_SIZE: Size = 20;
     const MAX_RETRIES: u32 = 5;
 
-    fn with_read_only(self, read_only: bool) -> Self {
+    pub const fn with_read_only(self, read_only: bool) -> Self {
         Self { read_only, ..self }
     }
 
-    fn with_min_segment_size(self, seg_size: Size) -> Self {
+    pub const fn with_min_segment_size(self, seg_size: Size) -> Self {
         Self {
             min_segment_size: seg_size,
             ..self
         }
     }
-    fn with_max_retries(self, retries: u32) -> Self {
+
+    pub const fn with_max_retries(self, retries: u32) -> Self {
         Self {
             max_retries: retries,
             ..self
@@ -734,7 +734,6 @@ pub trait Strategy: Sized {
 
 pub struct Arena<'a, S: Strategy> {
     h: &'a Header<S>,
-    start: *const u8,
     size: Size,
     read_only: bool,
     max_retries: u32,
@@ -765,6 +764,7 @@ impl Strategy for Pessimistic {
     }
 
     fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
+        use mem::MemAllocInfo;
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
             return Err(Error::UnenoughSpace {
                 requested: size,
@@ -783,7 +783,6 @@ impl<S: Strategy> Clone for Arena<'_, S> {
     fn clone(&self) -> Self {
         Self {
             h: self.h,
-            start: self.start,
             size: self.size,
             read_only: self.read_only,
             max_retries: self.max_retries,
@@ -795,7 +794,6 @@ impl<S: Strategy> core::fmt::Debug for Arena<'_, S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Arena")
             .field("h", &self.h)
-            .field("start", &self.start)
             .field("size", &self.size)
             .field("read_only", &self.read_only)
             .field("max_retries", &self.max_retries)
@@ -803,29 +801,16 @@ impl<S: Strategy> core::fmt::Debug for Arena<'_, S> {
     }
 }
 
-unsafe impl<S: Strategy> MemBlkOps for Arena<'_, S> {
-    #[inline]
-    fn start_ptr(&self) -> *const u8 {
-        self.start
-    }
-
-    #[inline]
-    fn end_ptr(&self) -> *const u8 {
-        unsafe { self.start.add(self.size.cast_into()) }
-    }
-
-    #[inline]
-    fn size(&self) -> usize {
-        self.size.cast_into()
-    }
-}
-
-unsafe impl<S: Strategy> malloc::MemAlloc for Arena<'_, S> {
+unsafe impl<S: Strategy> mem::MemAlloc for Arena<'_, S> {
     type Meta = Meta;
     type Error = Error;
+
+    #[inline]
     fn base_ptr(&self) -> *const u8 {
-        self.start_ptr()
+        self.base_ptr()
     }
+
+    #[inline]
     fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
         let size = layout.size();
         let size = max_bound_ok(size)?;
@@ -836,29 +821,23 @@ unsafe impl<S: Strategy> malloc::MemAlloc for Arena<'_, S> {
     }
 }
 
-unsafe impl<S: Strategy> malloc::MemDealloc for Arena<'_, S> {
+unsafe impl<S: Strategy> mem::MemDealloc for Arena<'_, S> {
     fn demalloc(&self, meta: Meta) -> bool {
         self.dealloc(meta)
     }
 }
 
-impl<S: Strategy> malloc::MemAllocator for Arena<'_, S> {}
+impl<S: Strategy> mem::MemAllocator for Arena<'_, S> {}
 
-impl<S: Strategy> malloc::MemAllocInfo for Arena<'_, S> {
-    type Header = Header<S>;
-
-    #[inline]
-    fn header(&self) -> &Self::Header {
-        self.h
-    }
-
+impl<S: Strategy> mem::MemAllocInfo for Arena<'_, S> {
     fn allocated(&self) -> usize {
         self.header().allocated().cast_into()
     }
 
     fn remained(&self) -> usize {
-        self.size()
-            .saturating_sub(self.header().allocated().cast_into())
+        self.size
+            .saturating_sub(self.header().allocated())
+            .cast_into()
     }
 
     fn discarded(&self) -> usize {
@@ -868,17 +847,26 @@ impl<S: Strategy> malloc::MemAllocInfo for Arena<'_, S> {
 
 impl<'a, S: Strategy> Arena<'a, S> {
     #[inline]
+    const fn header(&self) -> &Header<S> {
+        self.h
+    }
+
+    #[inline]
+    const fn base_ptr(&self) -> *const u8 {
+        (self.h as *const Header<S>).cast()
+    }
+
+    #[inline]
     pub fn from_header(h: &'a Header<S>, size: Size, cfg: Config) -> Self {
         let Config {
             min_segment_size,
             max_retries,
             read_only,
         } = cfg;
+
         h.with_min_segment_size(min_segment_size);
-        let start = (h as *const Header<S>).cast();
         Self {
             h,
-            start,
             size,
             read_only,
             max_retries,
@@ -889,7 +877,7 @@ impl<'a, S: Strategy> Arena<'a, S> {
 impl<S: Strategy> Arena<'_, S> {
     #[inline]
     fn meta(&self, seg: ReqSegment) -> Meta {
-        Meta::from_req_seg(self.start_ptr(), seg)
+        Meta::from_req_seg(self.base_ptr(), seg)
         // unsafe { meta.clear(self) }
     }
 
@@ -899,7 +887,7 @@ impl<S: Strategy> Arena<'_, S> {
             return None;
         }
         Segment::new(
-            self.start_ptr(),
+            self.base_ptr(),
             offset,
             size,
             self.header().min_segment_size(),
@@ -909,7 +897,7 @@ impl<S: Strategy> Arena<'_, S> {
     #[inline]
     unsafe fn raw_segment(&self, offset: Offset, data_size: Size) -> Segment {
         // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
-        unsafe { Segment::raw(self.start_ptr(), offset, data_size) }
+        unsafe { Segment::raw(self.base_ptr(), offset, data_size) }
     }
 
     #[inline]
@@ -956,7 +944,7 @@ impl<S: Strategy> Arena<'_, S> {
     fn segment_node(&self, offset: Offset) -> &SegmentNode {
         // Safety: the offset is in bounds and well aligned.
         unsafe {
-            let ptr = self.start_ptr().add(offset.cast_into());
+            let ptr = self.base_ptr().add(offset.cast_into());
             &*ptr.cast()
         }
     }
@@ -1156,6 +1144,8 @@ impl<S: Strategy> Arena<'_, S> {
         }
     }
     fn alloc_slow_by(&self, cur: &SegmentNode, size: Size, align: Offset) -> Result<Meta, Error> {
+        use mem::MemAllocInfo;
+
         let backoff = Backoff::new();
 
         let want = size + align - 1;
@@ -1213,7 +1203,7 @@ impl<S: Strategy> Arena<'_, S> {
             return Err(Error::ReadOnly);
         }
         if size == 0 {
-            use malloc::Meta;
+            use mem::Meta;
             return Ok(Meta::null());
         }
 

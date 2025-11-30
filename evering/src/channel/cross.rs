@@ -7,7 +7,7 @@ use core::sync::atomic::AtomicUsize;
 
 use crate::boxed::PBox;
 use crate::channel::{Endpoint, Header, Queue, Rx, Slot, Slots, Tx};
-use crate::malloc::{MemAllocator, MetaSpanOf};
+use crate::mem::{MemAllocator, MetaSpanOf};
 use crate::msg::Envelope;
 use crate::reg::{EntryView, Project, Resource};
 use crate::token::{PackToken, TokenOf};

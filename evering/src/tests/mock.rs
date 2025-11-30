@@ -4,9 +4,9 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::area::{AddrSpec, MemBlkHandle, Mmap, Mprotect, RawMemBlk};
 use crate::arena::Optimistic;
-use crate::malloc::{MemAllocInfo, MemAllocator};
+use crate::mem::{AddrSpec, MemBlkHandle, MemBlkLayout, Mmap, Mprotect, RawMemBlk};
+use crate::mem::{MemAllocInfo, MemAllocator};
 use crate::msg::Envelope;
 use crate::perlude::{ArenaMem, Conn};
 
@@ -15,10 +15,7 @@ use crate::tracing_init;
 const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
-type MockPageTable = [MockFlags; MAX_ADDR];
-type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
-type MockArena<'a> = ArenaMem<MockAddr, MockBackend<'a>, Optimistic>;
-type MockConn<'a, H, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, H, N>;
+type MockPageTable = [MockFlags];
 
 struct MockAddr;
 
@@ -80,9 +77,9 @@ impl<'a> Mmap<MockAddr> for MockBackend<'a> {
     }
 
     fn unmap(area: &mut RawMemBlk<MockAddr, Self>) -> Result<(), Self::Error> {
-        let start = area.a.start();
+        let start = area.spec.start();
         let arr_start = area.bk.arr_addr(start);
-        let size = area.a.size();
+        let size = area.spec.size();
         for entry in area.bk.iter_mut().skip(arr_start).take(size) {
             if *entry == 0 {
                 return Err(());
@@ -112,19 +109,21 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
 }
 
 impl MockBackend<'_> {
-    fn shared(self, start: usize, size: usize) -> Result<RawMemBlk<MockAddr, Self>, ()> {
-        self.map(None, size, (), 0, start)
+    fn shared(self, start: usize, size: usize) -> MemBlkLayout<MockAddr, Self> {
+        MemBlkLayout::new(self.map(None, size, (), 0, start).unwrap())
     }
 }
 
+type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
+type MockArena<'a> = ArenaMem<MockAddr, MockBackend<'a>, Optimistic>;
+type MockConn<'a, H, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, H, N>;
+
 fn mock_handle(bk: MockBackend<'_>, start: usize, size: usize) -> MockMemHandle<'_> {
-    let raw = bk.shared(start, size).unwrap();
-    MemBlkHandle::try_from(raw).unwrap()
+    bk.shared(start, size).try_into().unwrap()
 }
 
 fn mock_arena(bk: MockBackend<'_>, start: usize, size: usize) -> MockArena<'_> {
-    let raw = bk.shared(start, size).unwrap();
-    MockArena::try_from(raw).unwrap()
+    bk.shared(start, size).try_into().unwrap()
 }
 
 fn mock_conn<H: Envelope, const N: usize>(
@@ -132,8 +131,7 @@ fn mock_conn<H: Envelope, const N: usize>(
     start: usize,
     size: usize,
 ) -> MockConn<'_, H, N> {
-    let raw = bk.shared(start, size).unwrap();
-    MockConn::try_from(raw).unwrap()
+    bk.shared(start, size).try_into().unwrap()
 }
 
 #[test]
@@ -152,7 +150,7 @@ fn arena_exceed() {
     use std::sync::Barrier;
     use std::thread;
 
-    use crate::malloc::MemAlloc;
+    use crate::mem::MemAlloc;
 
     const BYTES_SIZE: usize = 50;
     const REDUCED_SIZE: usize = 35;
@@ -201,7 +199,7 @@ fn arena_frag() {
     use std::sync::Barrier;
     use std::thread;
 
-    use crate::malloc::MemAlloc;
+    use crate::mem::MemAlloc;
 
     const BYTES_SIZE: usize = 4;
     const ALLOC_NUM: usize = 1000;
@@ -236,7 +234,7 @@ fn arena_dealloc() {
     use std::sync::Barrier;
     use std::thread;
 
-    use crate::malloc::MemAlloc;
+    use crate::mem::MemAlloc;
 
     const BYTES_SIZE: usize = 8;
     const ALLOC_NUM: usize = 1000;
@@ -629,9 +627,9 @@ fn conn() {
                     .pack(Head { exit: Exit::None }),
             )
             .unwrap();
-            stress(ls, lr, move |token| {
+            stress(ls, lr, move |_| {
                 if fastrand::bool() {
-                    let (new, alloc) = Info::mock().token(alloc.clone());
+                    let (new, _) = Info::mock().token(alloc.clone());
                     Some(new)
                 } else {
                     None

@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    area::{Access, Mmap, Mprotect, RawMemBlk, SharedMmap},
+    mem::{self, Access, RawMemBlk},
     os::FdBackend,
 };
 
@@ -156,7 +156,7 @@ impl<F: AsFd> UnixFd<F> {
 
 pub struct AddrSpec;
 
-impl crate::area::AddrSpec for AddrSpec {
+impl mem::AddrSpec for AddrSpec {
     type Addr = Addr;
     type Flags = ProtFlags;
 }
@@ -171,7 +171,7 @@ impl const From<Access> for ProtFlags {
     }
 }
 
-impl Mmap<AddrSpec> for FdBackend {
+impl mem::Mmap<AddrSpec> for FdBackend {
     type Handle = UnixFd<OwnedFd>;
 
     type MapFlags = MapFlags;
@@ -180,10 +180,10 @@ impl Mmap<AddrSpec> for FdBackend {
 
     fn map(
         self,
-        start: Option<<AddrSpec as crate::area::AddrSpec>::Addr>,
+        start: Option<<AddrSpec as mem::AddrSpec>::Addr>,
         size: usize,
         mflags: Self::MapFlags,
-        pflags: <AddrSpec as crate::area::AddrSpec>::Flags,
+        pflags: <AddrSpec as mem::AddrSpec>::Flags,
         conf: Self::Handle,
     ) -> Result<RawMemBlk<AddrSpec, Self>, Self::Error> {
         use core::num::NonZeroUsize;
@@ -206,30 +206,31 @@ impl Mmap<AddrSpec> for FdBackend {
     }
 
     fn unmap(area: &mut RawMemBlk<AddrSpec, Self>) -> Result<(), Self::Error> {
-        let start = unsafe { as_c_void(area.a.start()) };
-        let size = area.a.size();
+        let start = unsafe { as_c_void(area.spec.start()) };
+        let size = area.spec.size();
         unsafe { nix::sys::mman::munmap(start, size) }
     }
 }
 
-impl Mprotect<AddrSpec> for FdBackend {
+impl mem::Mprotect<AddrSpec> for FdBackend {
     unsafe fn protect(
         area: &mut RawMemBlk<AddrSpec, Self>,
-        pflags: <AddrSpec as crate::area::AddrSpec>::Flags,
+        pflags: <AddrSpec as mem::AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
-        let start = unsafe { as_c_void(area.a.start()) };
-        let size = area.a.size();
+        let start = unsafe { as_c_void(area.spec.start()) };
+        let size = area.spec.size();
         unsafe { nix::sys::mman::mprotect(start, size, pflags) }
     }
 }
 
-impl SharedMmap<AddrSpec> for FdBackend {
+impl mem::SharedMmap<AddrSpec> for FdBackend {
     fn shared(
         self,
         size: usize,
-        access: crate::area::Access,
+        access: Access,
         handle: Self::Handle,
     ) -> Result<RawMemBlk<AddrSpec, Self>, Self::Error> {
+        use mem::Mmap;
         let pflags = access.into();
         let mflags = MapFlags::MAP_SHARED;
         self.map(None, size, mflags, pflags, handle)
@@ -243,7 +244,7 @@ mod tests {
     use super::super::FdBackend;
     use super::UnixFd;
 
-    use crate::area::{Access, Mmap, SharedMmap};
+    use crate::mem::{Access, Mmap, SharedMmap};
     use crate::tests::MemBlkTestIO;
 
     use nix::libc::off_t;
