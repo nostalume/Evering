@@ -1,4 +1,11 @@
-use crate::{boxed::PBox, mem::MemAllocator, token::AllocToken};
+use core::ops::Deref;
+
+use crate::{
+    boxed::PBox,
+    mem::MemAllocator,
+    numeric::Id,
+    token::{AllocToken, PackToken},
+};
 
 pub mod type_id {
     pub type TypeId = u64;
@@ -229,7 +236,7 @@ pub trait TransitMove: MoveMessage {
         Self: Sized;
 }
 
-pub trait Envelope: core::fmt::Debug {}
+pub trait Envelope {}
 
 impl Envelope for () {}
 
@@ -240,7 +247,74 @@ pub trait Tag<T>: Envelope {
     fn tag(&self) -> T;
 }
 
+pub trait TagId: Envelope {
+    fn with_id(self, value: Id) -> Self
+    where
+        Self: Sized;
+    fn id(&self) -> Id;
+}
+
 pub trait TagRef<T>: Envelope {
     fn with_tag_in(&mut self, value: T);
     fn tag_ref(&self) -> &T;
+}
+
+pub struct Operation<T: Envelope> {
+    id: Id,
+    header: T,
+}
+
+impl<T: Envelope> Deref for Operation<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.header
+    }
+}
+
+impl<T: Envelope> Envelope for Operation<T> {}
+
+impl<T: Envelope> TagId for Operation<T> {
+    fn with_id(self, value: Id) -> Self
+    where
+        Self: Sized,
+    {
+        Self { id: value, ..self }
+    }
+    fn id(&self) -> Id {
+        self.id
+    }
+}
+
+impl<T: Tag<H>, H> Tag<H> for Operation<T> {
+    fn with_tag(self, value: H) -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            id: self.id,
+            header: self.header.with_tag(value),
+        }
+    }
+
+    fn tag(&self) -> H {
+        self.header.tag()
+    }
+}
+
+impl<T: Envelope> Operation<T> {
+    pub fn header(&self) -> &T {
+        &self.header
+    }
+
+    pub fn compose<M>(id: Id, token: PackToken<T, M>) -> PackToken<Operation<T>, M> {
+        let (token, header) = token.into_parts();
+        let header = Self { header, id };
+        token.pack(header)
+    }
+    pub fn decompose<M>(token: PackToken<Operation<T>, M>) -> (Id, PackToken<T, M>) {
+        let (token, header) = token.into_parts();
+        let Self { id, header } = header;
+        (id, token.pack(header))
+    }
 }

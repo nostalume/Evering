@@ -12,6 +12,9 @@ pub struct CounterOf<T> {
     counter: *mut Counter<T>,
 }
 
+unsafe impl<T: Send> Send for CounterOf<T> {}
+unsafe impl<T: Sync> Sync for CounterOf<T> {}
+
 impl<T> CounterOf<T> {
     pub fn suspend(data: T) -> Self {
         let counter = Box::into_raw(Box::new(Counter {
@@ -51,7 +54,7 @@ impl<T> CounterOf<T> {
             drop(unsafe { Box::from_raw(self.counter) });
         }
     }
-    
+
     pub unsafe fn release(&self) {
         if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
             unsafe { core::ptr::drop_in_place(self.as_raw()) };

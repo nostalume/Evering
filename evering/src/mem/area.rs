@@ -1,8 +1,8 @@
+use core::ops::Deref;
 use core::ptr::NonNull;
-use core::{ops::Deref, sync::atomic::AtomicU32};
 
 use super::{AddrSpec, MemBlkOps, Mmap, Mprotect};
-use crate::header::{HeaderStatus, Layout, Magic};
+use crate::header::{self, Layout, Status};
 
 pub struct MemBlkSpec<S: AddrSpec> {
     range: memory_addr::AddrRange<S::Addr>,
@@ -71,85 +71,6 @@ impl<S: AddrSpec> MemBlkSpec<S> {
     }
 }
 
-#[repr(C, align(8))]
-pub struct Metadata {
-    magic: Magic,
-    // own counts
-    rc: AtomicU32,
-}
-
-pub type Header = crate::header::Header<Metadata>;
-
-impl alloc::fmt::Debug for Metadata {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Metadata of Header")
-            .field("magic", &self.magic)
-            .field(
-                "reference count",
-                &self.rc.load(core::sync::atomic::Ordering::Relaxed),
-            )
-            .finish()
-    }
-}
-
-impl core::fmt::Display for Metadata {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        alloc::fmt::Debug::fmt(self, f)
-    }
-}
-
-impl crate::header::Layout for Metadata {
-    type Config = ();
-    #[inline]
-    fn init(&mut self, _cfg: ()) -> HeaderStatus {
-        use crate::header::Metadata;
-        self.with_magic();
-        self.rc.store(1, core::sync::atomic::Ordering::Relaxed);
-        HeaderStatus::Initialized
-    }
-
-    #[inline]
-    fn attach(&self) -> HeaderStatus {
-        use crate::header::Metadata;
-        if self.valid_magic() {
-            self.inc_rc();
-            HeaderStatus::Initialized
-        } else {
-            HeaderStatus::Uninitialized
-        }
-    }
-}
-
-impl crate::header::Metadata for Metadata {
-    const MAGIC_VALUE: Magic = 0x7203;
-    #[inline]
-    fn valid_magic(&self) -> bool {
-        self.magic == Self::MAGIC_VALUE
-    }
-
-    #[inline]
-    fn with_magic(&mut self) {
-        self.magic = Self::MAGIC_VALUE
-    }
-}
-
-impl Metadata {
-    #[inline]
-    pub fn inc_rc(&self) -> u32 {
-        self.rc.fetch_add(1, core::sync::atomic::Ordering::AcqRel)
-    }
-
-    #[inline]
-    pub fn dec_rc(&self) -> Option<u32> {
-        use core::sync::atomic::Ordering;
-        self.rc
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |cur| {
-                if cur == 0 { None } else { Some(cur - 1) }
-            })
-            .ok()
-    }
-}
-
 pub enum Error<S: AddrSpec, M: Mmap<S>> {
     OutofSize { requested: usize, bound: usize },
     UnenoughSpace { requested: usize, allocated: usize },
@@ -160,7 +81,7 @@ pub enum Error<S: AddrSpec, M: Mmap<S>> {
 
 impl<S: AddrSpec, M: Mmap<S>> core::error::Error for Error<S, M> {}
 
-impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for Error<S, M> {
+impl<S: AddrSpec, M: Mmap<S>> core::fmt::Debug for Error<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::UnenoughSpace {
@@ -185,7 +106,7 @@ impl<S: AddrSpec, M: Mmap<S>> alloc::fmt::Debug for Error<S, M> {
 
 impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        alloc::fmt::Debug::fmt(self, f)
+        core::fmt::Debug::fmt(self, f)
     }
 }
 
@@ -223,25 +144,44 @@ impl<S: AddrSpec, M: Mmap<S>> RawMemBlk<S, M> {
         Self { spec: a, bk }
     }
 
-    unsafe fn init_header<T: Layout>(
-        &self,
-        offset: usize,
-        cfg: T::Config,
-    ) -> Result<(NonNull<T>, usize), Error<S, M>> {
-        use crate::header::Layout;
+    #[inline]
+    unsafe fn reserve<T: Layout>(&self, offset: usize) -> Result<(*mut T, usize), Error<S, M>> {
         unsafe {
-            let (header, hoffset) =
+            let (ptr, hoffset) =
                 self.obtain_by_offset::<T>(offset)
                     .map_err(|new_offset| Error::UnenoughSpace {
                         requested: new_offset,
                         allocated: self.size(),
                     })?;
+            Ok((ptr, hoffset))
+        }
+    }
+
+    #[inline]
+    unsafe fn commit<T: Layout>(
+        &self,
+        header: *mut T,
+        conf: T::Config,
+    ) -> Result<NonNull<T>, Error<S, M>> {
+        unsafe {
             let header_ref = Layout::from_raw(header);
-            match header_ref.attach_or_init(cfg) {
-                HeaderStatus::Initialized => Ok((NonNull::new_unchecked(header), hoffset)),
-                HeaderStatus::Initializing => Err(Error::Contention),
+            match header_ref.attach_or_init(conf) {
+                Status::Initialized => Ok(NonNull::new_unchecked(header)),
+                Status::Initializing => Err(Error::Contention),
                 _ => Err(Error::InvalidHeader),
             }
+        }
+    }
+
+    unsafe fn push<T: Layout>(
+        &self,
+        offset: usize,
+        conf: T::Config,
+    ) -> Result<(NonNull<T>, usize), Error<S, M>> {
+        unsafe {
+            let (ptr, next) = self.reserve::<T>(offset)?;
+            let ptr = self.commit(ptr, conf)?;
+            Ok((ptr, next))
         }
     }
 }
@@ -276,17 +216,51 @@ pub struct MemBlkLayout<S: AddrSpec, M: Mmap<S>> {
     offset: usize,
 }
 
+pub struct Reserve<T> {
+    ptr: *mut T,
+    next: usize,
+}
+
 impl<S: AddrSpec, M: Mmap<S>> MemBlkLayout<S, M> {
-    pub const fn from_raw(area: RawMemBlk<S, M>, offset: usize) -> Self {
-        Self { area, offset }
+    #[inline]
+    pub fn new(area: RawMemBlk<S, M>) -> Result<Self, Error<S, M>> {
+        let (_, offset) = unsafe { area.push::<RcHeader>(0, ()) }?;
+        Ok(Self { area, offset })
     }
 
-    pub const fn new(area: RawMemBlk<S, M>) -> Self {
-        Self::from_raw(area, 0)
+    #[inline]
+    pub fn forward(self, forward: usize) -> Self {
+        Self {
+            area: self.area,
+            offset: self.offset + forward,
+        }
     }
 
+    #[inline]
+    pub const fn offset(&self) -> usize {
+        self.offset
+    }
+
+    #[inline]
+    pub fn reserve<T: Layout>(&mut self) -> Result<Reserve<T>, Error<S, M>> {
+        let (ptr, next) = unsafe { self.area.reserve::<T>(self.offset) }?;
+        let reserve = Reserve { ptr, next };
+        Ok(reserve)
+    }
+
+    #[inline]
+    pub fn commit<T: Layout>(
+        &mut self,
+        reserve: Reserve<T>,
+        conf: T::Config,
+    ) -> Result<NonNull<T>, Error<S, M>> {
+        let ptr = unsafe { self.area.commit(reserve.ptr, conf) }?;
+        Ok(ptr)
+    }
+
+    #[inline]
     pub fn push<T: Layout>(&mut self, conf: T::Config) -> Result<NonNull<T>, Error<S, M>> {
-        let (ptr, next) = unsafe { self.area.init_header::<T>(self.offset, conf) }?;
+        let (ptr, next) = unsafe { self.area.push::<T>(self.offset, conf) }?;
         self.offset = next;
         Ok(ptr)
     }
@@ -297,17 +271,43 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkLayout<S, M> {
     }
 }
 
+impl<T: Layout> Reserve<T> {
+    #[inline]
+    pub const fn next(&self) -> usize {
+        self.next
+    }
+
+    #[inline]
+    pub const fn as_ptr(&self) -> *mut T {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn as_offset(&self) -> usize {
+        self.ptr.addr()
+    }
+
+    #[inline]
+    pub const fn size(&self) -> usize {
+        use core::mem;
+        mem::size_of::<T>()
+    }
+}
+
 /// A handle of **mapped** memory block.
 pub struct MemBlk<S: AddrSpec, M: Mmap<S>> {
     spec: MemBlkSpec<S>,
     bk: M,
 }
 
+pub type RcHeader = header::Header<header::RcMeta>;
+
 pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(crate::counter::CounterOf<MemBlk<S, M>>);
 
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
-        self.header().read().dec_rc();
+        // Safety: finalize only once and always true!
+        let _ = self.header().finalize();
         let blk = self.as_raw();
         let _ = M::unmap(blk);
     }
@@ -318,7 +318,7 @@ impl<S: AddrSpec, M: Mmap<S>> TryFrom<MemBlkLayout<S, M>> for MemBlk<S, M> {
 
     fn try_from(area: MemBlkLayout<S, M>) -> Result<Self, Self::Error> {
         let mut area = area;
-        area.push::<Header>(())?;
+        area.push::<RcHeader>(())?;
         let (area, _) = area.finish();
         Ok(area)
     }
@@ -351,9 +351,9 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
     }
 
     #[inline(always)]
-    pub fn header(&self) -> &Header {
+    pub fn header(&self) -> &RcHeader {
         unsafe {
-            let ptr = self.start_ptr() as *const Header;
+            let ptr = self.start_ptr() as *const RcHeader;
             &*ptr
         }
     }
@@ -391,5 +391,49 @@ impl<S: AddrSpec, M: Mmap<S>> TryFrom<MemBlkLayout<S, M>> for MemBlkHandle<S, M>
 impl<S: AddrSpec, M: Mmap<S>> From<MemBlk<S, M>> for MemBlkHandle<S, M> {
     fn from(value: MemBlk<S, M>) -> Self {
         Self(crate::counter::CounterOf::suspend(value))
+    }
+}
+
+pub struct MemRef<T: ?Sized, S: AddrSpec, M: Mmap<S>> {
+    handle: MemBlkHandle<S, M>,
+    ptr: NonNull<T>,
+}
+
+impl<T: ?Sized + core::fmt::Debug, S: AddrSpec, M: Mmap<S>> Clone for MemRef<T, S, M> {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle.clone(),
+            ptr: self.ptr,
+        }
+    }
+}
+
+impl<T: ?Sized + core::fmt::Debug, S: AddrSpec, M: Mmap<S>> core::fmt::Debug for MemRef<T, S, M> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ptr = unsafe { self.ptr.as_ref() };
+        core::fmt::Debug::fmt(ptr, f)
+    }
+}
+
+impl<T: ?Sized, S: AddrSpec, M: Mmap<S>> const Deref for MemRef<T, S, M> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: ?Sized, S: AddrSpec, M: Mmap<S>> MemRef<T, S, M> {
+    pub unsafe fn from_raw(handle: MemBlkHandle<S, M>, ptr: NonNull<T>) -> Self {
+        Self { handle, ptr }
+    }
+
+    pub fn map<U>(&self, f: impl FnOnce(&T) -> &U) -> MemRef<U, S, M> {
+        let u = f(self);
+        let ptr = NonNull::from(u);
+        MemRef {
+            handle: self.handle.clone(),
+            ptr,
+        }
     }
 }

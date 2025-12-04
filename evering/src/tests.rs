@@ -2,7 +2,7 @@
 
 use crate::{
     mem::{AddrSpec, Mmap, RawMemBlk},
-    msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
+    msg::{Envelope, Message, Move, Operation, Tag, TypeTag, type_id},
 };
 
 mod mock;
@@ -102,11 +102,14 @@ impl Envelope for Exit {}
 impl Tag<Exit> for Exit {
     fn with_tag(self, value: Exit) -> Self
     where
-        Self: Sized {
-            value
+        Self: Sized,
+    {
+        value
     }
 
     fn tag(&self) -> Exit {
         self.clone()
     }
 }
+
+type IdExit = Operation<Exit>;

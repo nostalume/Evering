@@ -8,12 +8,13 @@ use core::{
 use crossbeam_utils::Backoff;
 
 use crate::{
-    header::Metadata,
+    header,
+    numeric::Id,
     reg::state::{ACTIVE, INACTIVE},
 };
 
-const HEAD: usize = 0;
-const NONE: usize = usize::MAX;
+const HEAD: usize = Id::HEAD;
+const NONE: usize = Id::NONE;
 
 pub mod state {
     pub const FREE: u8 = 0;
@@ -21,23 +22,6 @@ pub mod state {
     pub const ACTIVE: u8 = 2;
     pub const INACTIVE: u8 = 3;
     pub const DEINITIALIZING: u8 = 4;
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct Id {
-    idx: usize,
-    live: u32,
-}
-
-impl Id {
-    pub const fn null() -> Self {
-        Self { idx: NONE, live: 0 }
-    }
-
-    pub const fn is_null(&self) -> bool {
-        self.idx == NONE
-    }
 }
 
 #[repr(C)]
@@ -102,22 +86,17 @@ impl<T> Entry<T> {
     }
 
     #[inline]
-    unsafe fn take(&self) -> T {
+    const unsafe fn take(&self) -> T {
         unsafe { self.data.replace(MaybeUninit::uninit()).assume_init() }
     }
 
     #[inline]
-    unsafe fn as_ref(&self) -> &T {
+    const unsafe fn as_ref(&self) -> &T {
         unsafe { (*self.data.get()).assume_init_ref() }
     }
 
     #[inline]
-    unsafe fn as_mut(&self) -> &mut T {
-        unsafe { (*self.data.get()).assume_init_mut() }
-    }
-
-    #[inline]
-    unsafe fn write(&self, value: T) {
+    const unsafe fn write(&self, value: T) {
         unsafe { (*self.data.get()).write(value) };
     }
 
@@ -147,7 +126,7 @@ impl<T> Entry<T> {
     }
 
     #[inline]
-    fn initiated(state: u8) -> bool {
+    const fn initiated(state: u8) -> bool {
         state == INACTIVE || state == ACTIVE
     }
 
@@ -261,7 +240,7 @@ impl<T> Drop for EntryGuard<'_, T> {
     }
 }
 
-impl<T> Deref for EntryGuard<'_, T> {
+impl<T> const Deref for EntryGuard<'_, T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -298,13 +277,8 @@ impl<T> EntryGuard<'_, T> {
     }
 
     #[inline(always)]
-    pub fn as_ref(&self) -> &T {
+    pub const fn as_ref(&self) -> &T {
         unsafe { self.entry.as_ref() }
-    }
-
-    #[inline(always)]
-    pub unsafe fn as_mut(&self) -> &mut T {
-        unsafe { self.entry.as_mut() }
     }
 }
 
@@ -344,11 +318,12 @@ where
 
 #[repr(C)]
 pub struct Registry<T, const N: usize> {
-    magic: crate::header::Magic,
     inits: AtomicUsize,
     free_head: AtomicUsize,
     entries: [Entry<T>; N],
 }
+
+pub type Header<T, const N: usize> = header::Header<Registry<T, N>>;
 
 impl<T, const N: usize> core::fmt::Debug for Registry<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -360,44 +335,31 @@ impl<T, const N: usize> core::fmt::Debug for Registry<T, N> {
     }
 }
 
-impl<T, const N: usize> crate::header::Layout for Registry<T, N> {
+impl<T, const N: usize> header::Layout for Registry<T, N> {
+    const MAGIC: header::Magic = 0xABCD;
     type Config = ();
+
     #[inline]
-    fn init(&mut self, _cfg: ()) -> crate::header::HeaderStatus {
+    fn init(&mut self, _cfg: ()) -> header::Status {
         let ptr = self as *mut Self;
         unsafe { ptr.write(Self::new()) };
 
-        crate::header::HeaderStatus::Initialized
+        header::Status::Initialized
     }
 
     #[inline]
-    fn attach(&self) -> crate::header::HeaderStatus {
-        if self.valid_magic() {
-            crate::header::HeaderStatus::Initialized
-        } else {
-            crate::header::HeaderStatus::Uninitialized
-        }
-    }
-}
-
-impl<T, const N: usize> crate::header::Metadata for Registry<T, N> {
-    const MAGIC_VALUE: crate::header::Magic = 0x1234;
-
-    #[inline]
-    fn valid_magic(&self) -> bool {
-        self.magic == Self::MAGIC_VALUE
+    fn attach(&self) -> header::Status {
+        header::Status::Initialized
     }
 
-    #[inline]
-    fn with_magic(&mut self) {
-        self.magic = Self::MAGIC_VALUE
+    fn finalize(&self) -> bool {
+        true
     }
 }
 
 impl<T, const N: usize> Registry<T, N> {
     pub const fn new() -> Self {
         Self {
-            magic: Self::MAGIC_VALUE,
             inits: AtomicUsize::new(0),
             free_head: AtomicUsize::new(HEAD),
             entries: const { Entry::array() },

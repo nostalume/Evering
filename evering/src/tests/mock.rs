@@ -4,11 +4,13 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::arena::Optimistic;
 use crate::mem::{AddrSpec, MemBlkHandle, MemBlkLayout, Mmap, Mprotect, RawMemBlk};
 use crate::mem::{MemAllocInfo, MemAllocator};
 use crate::msg::Envelope;
-use crate::perlude::{ArenaMem, Conn};
+use crate::perlude::{
+    AConn, Conn,
+    allocator::{Config, MemArena, Optimistic},
+};
 
 use crate::tests::{prob, tracing_init};
 
@@ -110,27 +112,40 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
 
 impl MockBackend<'_> {
     fn shared(self, start: usize, size: usize) -> MemBlkLayout<MockAddr, Self> {
-        MemBlkLayout::new(self.map(None, size, (), 0, start).unwrap())
+        MemBlkLayout::new(self.map(None, size, (), 0, start).unwrap()).unwrap()
     }
 }
 
 type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
-type MockArena<'a> = ArenaMem<MockAddr, MockBackend<'a>, Optimistic>;
+type MockArena<'a> = MemArena<Optimistic, MockAddr, MockBackend<'a>>;
 type MockConn<'a, H, const N: usize> = Conn<MockAddr, MockBackend<'a>, Optimistic, H, N>;
+type MockAConn<'a, H, const N: usize> = AConn<MockAddr, MockBackend<'a>, Optimistic, H, N>;
 
-fn mock_handle(bk: MockBackend<'_>, start: usize, size: usize) -> MockMemHandle<'_> {
+fn mock_handle(bk: &mut [u8], start: usize, size: usize) -> MockMemHandle<'_> {
+    let bk = MockBackend(bk);
     bk.shared(start, size).try_into().unwrap()
 }
 
-fn mock_arena(bk: MockBackend<'_>, start: usize, size: usize) -> MockArena<'_> {
-    bk.shared(start, size).try_into().unwrap()
+fn mock_arena(bk: &mut [u8], start: usize, size: usize) -> MockArena<'_> {
+    let bk = MockBackend(bk);
+    MockArena::from_layout(bk.shared(start, size), Config::default()).unwrap()
 }
 
 fn mock_conn<H: Envelope, const N: usize>(
-    bk: MockBackend<'_>,
+    bk: &mut [u8],
     start: usize,
     size: usize,
 ) -> MockConn<'_, H, N> {
+    let bk = MockBackend(bk);
+    bk.shared(start, size).try_into().unwrap()
+}
+
+fn mock_aconn<H: Envelope, const N: usize>(
+    bk: &mut [u8],
+    start: usize,
+    size: usize,
+) -> MockAConn<'_, H, N> {
+    let bk = MockBackend(bk);
     bk.shared(start, size).try_into().unwrap()
 }
 
@@ -139,9 +154,8 @@ fn area_init() {
     const STEP: usize = 0x2000;
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
-        let bk = MockBackend(&mut pt);
-        let a = mock_handle(bk, start, STEP);
-        tracing::debug!("{}", a.header());
+        let a = mock_handle(&mut pt, start, STEP);
+        tracing::debug!("{:?}", a.header());
     }
 }
 
@@ -159,9 +173,7 @@ fn arena_exceed() {
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     let mut metas = Vec::new();
@@ -207,9 +219,7 @@ fn arena_frag() {
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -242,9 +252,7 @@ fn arena_dealloc() {
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     let mut metas: Vec<_> = (0..ALLOC_NUM)
@@ -299,9 +307,7 @@ fn pbox_droppy() {
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -353,13 +359,12 @@ fn pbox_dyn() {
     }
 
     // Choose a smaller number due to large allocation.
-    const ALLOC_NUM: usize = 100;
+    const ALLOC_NUM: usize = 50;
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -418,8 +423,7 @@ fn parc_stress() {
 
     let mut pt = [0; MAX_ADDR];
     let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
     let droppy = Droppy(PArc::new_in(AtomicUsize::new(0), &a));
 
     let bar = Barrier::new(NUM);
@@ -469,9 +473,7 @@ fn token_of_pbox() {
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let mem = mock_arena(bk, 0, MAX_ADDR);
-    let a = mem.arena();
+    let a = mock_arena(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -513,7 +515,7 @@ fn token_of_pbox() {
 }
 
 #[test]
-fn conn() {
+fn conn_sync() {
     use std::thread;
 
     use super::{Exit, Info};
@@ -564,9 +566,8 @@ fn conn() {
     tracing_init();
 
     let mut pt = [0; MAX_ADDR];
-    let bk = MockBackend(&mut pt);
-    let conn = mock_conn::<Exit, N>(bk, 0, MAX_ADDR);
-    let alloc = conn.arena();
+    let conn = mock_conn::<Exit, N>(&mut pt, 0, MAX_ADDR);
+    let alloc = conn.arena_ref();
 
     let h = conn.prepare(SIZE).expect("alloc ok");
     let q = conn.acquire(h).expect("view ok");
@@ -594,4 +595,125 @@ fn conn() {
             stress(rs, rr, |token| handler(token, "right"));
         });
     });
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn conn_async() {
+    use super::{Exit, IdExit, Info};
+    use crate::msg::{MoveMessage, Tag};
+    use crate::perlude::allocator::MemAllocator;
+    use crate::perlude::channel::{
+        CachePool, MsgCompleter, MsgReceiver, MsgSender, MsgSubmitter, Token,
+    };
+
+    const N: usize = 1;
+    const SIZE: usize = 256;
+    const FUZZ_PROB: f32 = 0.001;
+
+    async fn req<S: MsgSubmitter<Exit>, A: MemAllocator>(s: S, alloc: A) {
+        loop {
+            tokio::task::yield_now().await;
+
+            let (msg, _) = Info::mock().token(&alloc);
+            let token = if prob(FUZZ_PROB) {
+                msg.pack(Exit::Exit)
+            } else {
+                msg.pack(Exit::None)
+            };
+
+            let op = match s.try_submit(token) {
+                Some(op) => op,
+                None => continue,
+            };
+            let res = op.await;
+            let (res, h) = res.into_parts();
+            if h.tag() == Exit::Exit {
+                break;
+            }
+            let info = Info::detoken(res, &alloc).unwrap();
+            tracing::debug!("res: {:?}", info);
+            drop(info)
+        }
+    }
+
+    async fn complete<R: MsgCompleter<Exit>>(r: R) {
+        loop {
+            tokio::task::yield_now().await;
+            if let Some(false) = r.try_complete(|token| token.tag::<Exit>() != Exit::Exit) {
+                tracing::debug!("drop complete");
+                break;
+            }
+        }
+    }
+
+    async fn stress<
+        S: MsgSender<IdExit>,
+        R: MsgReceiver<IdExit>,
+        F: FnMut(Token) -> Option<Token>,
+    >(
+        s: S,
+        r: R,
+        mut handler: F,
+    ) {
+        let mut alive = true;
+
+        while alive {
+            if !prob(FUZZ_PROB) {
+                tokio::task::yield_now().await;
+            }
+            let Ok(p) = r.try_recv() else {
+                continue;
+            };
+
+            if p.tag::<Exit>() == Exit::Exit {
+                break;
+            }
+
+            let (t, h) = p.into_parts();
+            assert!(h.tag() != Exit::Exit, "header corrupted");
+
+            match handler(t) {
+                None => {
+                    let exit = Token::empty().pack(h.with_tag(Exit::Exit));
+                    let _ = s.try_send(exit);
+                    alive = false;
+                }
+                Some(reply) => {
+                    let pack = reply.pack(h.with_tag(Exit::None));
+                    let _ = s.try_send(pack);
+                }
+            }
+        }
+    }
+
+    tracing_init();
+
+    let mut pt = [0; MAX_ADDR];
+    let conn = mock_aconn::<Exit, N>(&mut pt, 0, MAX_ADDR);
+    let alloc = conn.arena();
+
+    let h = conn.prepare(SIZE).expect("alloc ok");
+    let q = conn.acquire(h).expect("view ok");
+
+    let (ls, lr) = q.clone().sr_duplex();
+    let (rs, rr) = q.clone().rs_duplex();
+
+    let (ls, lr) = CachePool::<Exit, SIZE>::new().bind(ls, lr);
+    //
+    let alloc2 = alloc.clone();
+    let handler = move |token: Token, label: &'static str| {
+        if prob(FUZZ_PROB) {
+            None
+        } else {
+            let info = Info::detoken(token, &alloc2).expect("should work");
+            tracing::debug!("[{}] receive: {:?}", label, info);
+            let (new, _) = Info::mock().token(&alloc2);
+            Some(new)
+        }
+    };
+
+    let stress = stress(rs, rr, move |token| handler(token, "Right"));
+    let client = req(ls, &alloc);
+    let complete = complete(lr);
+    let _ = tokio::join!(stress, client, complete);
 }

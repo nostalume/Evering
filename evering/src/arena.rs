@@ -9,7 +9,8 @@ use core::{
 use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{
-    mem,
+    header::{self, Magic},
+    mem::{self, AddrSpec, MemBlkLayout, Mmap},
     numeric::{Alignable, CastInto, Packable},
 };
 
@@ -250,57 +251,99 @@ impl Meta {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct MetaConfig {
+    min_segment_size: Size,
+    allocated: Size,
+}
+
+impl MetaConfig {
+    pub const fn default<S: Strategy>() -> Self {
+        use core::mem;
+        Self {
+            min_segment_size: ArenaMeta::<S>::MIN_SEGMENT_SIZE,
+            allocated: mem::size_of::<Header<S>>() as Size,
+        }
+    }
+
+    pub const fn with_min_segment_size(self, min_segment_size: Size) -> Self {
+        Self {
+            min_segment_size,
+            ..self
+        }
+    }
+
+    pub const fn with_allocated(self, allocated: Size) -> Self {
+        Self { allocated, ..self }
+    }
+}
+
 #[repr(C)]
-pub struct Header<S: Strategy> {
+pub struct ArenaMeta<S: Strategy> {
     sentinel: SegmentNode,
+    // hot path
     allocated: PAtomicUInt,
     discarded: PAtomicUInt,
-    min_segment_size: PAtomicUInt,
+    min_segment_size: AtomicUInt,
     strategy: PhantomData<S>,
 }
 
-impl<S: Strategy> core::fmt::Debug for Header<S> {
+pub type Header<S> = header::Header<ArenaMeta<S>>;
+pub type MemHeader<S, A, M> = mem::MemRef<Header<S>, A, M>;
+
+impl<S: Strategy> core::fmt::Debug for ArenaMeta<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let allocated = self.allocated();
-        let discarded = self.discarded();
-        f.debug_struct("Header")
+        let allocated = self.allocated.load(Ordering::Relaxed);
+        let discarded = self.discarded.load(Ordering::Relaxed);
+        f.debug_struct("Arena Header")
             .field("allocated", &allocated)
             .field("discarded", &discarded)
             .finish()
     }
 }
 
-impl<S: Strategy> crate::header::Layout for Header<S> {
-    type Config = Size;
+impl<S: Strategy> header::Layout for ArenaMeta<S> {
+    const MAGIC: Magic = 0xABCD;
+    type Config = MetaConfig;
+
     #[inline]
-    fn init(&mut self, cfg: Self::Config) -> crate::header::HeaderStatus {
-        let data = Self::new(cfg);
+    fn init(&mut self, conf: Self::Config) -> header::Status {
+        let data = Self::from_config(conf);
         let ptr = self as *mut Self;
         unsafe { ptr.write(data) };
-        crate::header::HeaderStatus::Initialized
+        header::Status::Initialized
     }
 
     #[inline]
-    fn attach(&self) -> crate::header::HeaderStatus {
-        if self.allocated.load(Ordering::Relaxed) == 0 {
-            crate::header::HeaderStatus::Uninitialized
-        } else {
-            crate::header::HeaderStatus::Initialized
-        }
+    fn attach(&self) -> header::Status {
+        header::Status::Initialized
+    }
+
+    #[inline]
+    fn finalize(&self) -> bool {
+        true
     }
 }
 
-impl<S: Strategy> Header<S> {
-    pub const MIN_SEGMENT_SIZE: UInt = 20;
+impl<S: Strategy> ArenaMeta<S> {
+    pub const MIN_SEGMENT_SIZE: Size = 20;
+
     #[inline]
-    fn new(min_seg_size: UInt) -> Self {
+    const fn from_config(conf: MetaConfig) -> Self {
+        let MetaConfig {
+            min_segment_size,
+            allocated,
+        } = conf;
+        Self::new(min_segment_size, allocated)
+    }
+
+    #[inline]
+    const fn new(min_segment_size: Size, allocated: Size) -> Self {
         Self {
             sentinel: SegmentNode::sentinel(),
-            allocated: CachePadded::new(AtomicUInt::new(
-                UInt::size_of::<Self>().align_up_of::<Self>(),
-            )),
+            allocated: CachePadded::new(AtomicUInt::new(allocated)),
             discarded: CachePadded::new(AtomicUInt::new(0)),
-            min_segment_size: CachePadded::new(AtomicUInt::new(min_seg_size)),
+            min_segment_size: AtomicUInt::new(min_segment_size),
             strategy: PhantomData,
         }
     }
@@ -311,7 +354,12 @@ impl<S: Strategy> Header<S> {
     }
 
     #[inline]
-    fn alloc(&self, a: &Arena<S>, size: UInt, align: UInt) -> Option<Meta> {
+    fn alloc_fast<H: const Deref<Target = Header<S>>>(
+        &self,
+        a: &Arena<H, S>,
+        size: UInt,
+        align: UInt,
+    ) -> Option<Meta> {
         let mut allocated = self.allocated();
         loop {
             let want = allocated.align_up(align) + size;
@@ -350,7 +398,7 @@ impl<S: Strategy> Header<S> {
 
     #[inline]
     // remove the last node: `offset+size` or return false
-    fn dealloc(&self, offset: Offset, size: Size) -> bool {
+    fn dealloc_last(&self, offset: Offset, size: Size) -> bool {
         if self
             .allocated
             .compare_exchange(offset + size, offset, Ordering::SeqCst, Ordering::Relaxed)
@@ -565,6 +613,7 @@ impl SegmentNode {
             Err(word) => Err(word),
         }
     }
+
     #[inline]
     fn advance(&self, next_to: &SegmentNode) -> Result<(), SegmentNodeData> {
         let cur = self.load();
@@ -678,7 +727,7 @@ struct ReqSegment {
     req_size: Size,
 }
 
-impl Deref for ReqSegment {
+impl const Deref for ReqSegment {
     type Target = Segment;
 
     fn deref(&self) -> &Self::Target {
@@ -689,33 +738,21 @@ impl Deref for ReqSegment {
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     read_only: bool,
-    min_segment_size: Size,
     max_retries: u32,
 }
 
-impl Default for Config {
-    fn default() -> Self {
+impl Config {
+    const MAX_RETRIES: u32 = 5;
+
+    pub const fn default() -> Self {
         Self {
-            min_segment_size: Self::MIN_SEGMENT_SIZE,
+            read_only: true,
             max_retries: Self::MAX_RETRIES,
-            read_only: false,
         }
     }
-}
-
-impl Config {
-    const MIN_SEGMENT_SIZE: Size = 20;
-    const MAX_RETRIES: u32 = 5;
 
     pub const fn with_read_only(self, read_only: bool) -> Self {
         Self { read_only, ..self }
-    }
-
-    pub const fn with_min_segment_size(self, seg_size: Size) -> Self {
-        Self {
-            min_segment_size: seg_size,
-            ..self
-        }
     }
 
     pub const fn with_max_retries(self, retries: u32) -> Self {
@@ -726,24 +763,29 @@ impl Config {
     }
 }
 
-pub trait Strategy: Sized {
-    /// Check ordering relation between segment sizes.
-    fn order(val: Size, next_node_size: Size) -> bool;
-    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error>;
-}
-
-pub struct Arena<'a, S: Strategy> {
-    h: &'a Header<S>,
+#[derive(Debug)]
+pub struct Arena<H: const Deref<Target = Header<S>>, S: Strategy> {
+    header: H,
     size: Size,
     read_only: bool,
     max_retries: u32,
 }
 
+pub type ArenaRef<'a, S> = Arena<&'a Header<S>, S>;
+pub type MemArena<S, A, M> = Arena<MemHeader<S, A, M>, S>;
+
 pub struct Pessimistic;
 pub struct Optimistic;
 
-type OArena<'a> = Arena<'a, Pessimistic>;
-type PArena<'a> = Arena<'a, Optimistic>;
+pub trait Strategy: Sized {
+    /// Check ordering relation between segment sizes.
+    fn order(val: Size, next_node_size: Size) -> bool;
+    fn alloc_slow<H: const Deref<Target = Header<Self>>>(
+        arena: &Arena<H, Self>,
+        size: Size,
+        align: Offset,
+    ) -> Result<Meta, Error>;
+}
 
 impl Strategy for Optimistic {
     #[inline]
@@ -751,7 +793,11 @@ impl Strategy for Optimistic {
         val >= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
+    fn alloc_slow<H: const Deref<Target = Header<Optimistic>>>(
+        arena: &Arena<H, Self>,
+        size: Size,
+        align: Offset,
+    ) -> Result<Meta, Error> {
         let cur = &arena.header().sentinel;
         arena.alloc_slow_by(cur, size, align)
     }
@@ -763,7 +809,11 @@ impl Strategy for Pessimistic {
         val <= next_node_size
     }
 
-    fn alloc_slow(arena: &Arena<Self>, size: Size, align: Offset) -> Result<Meta, Error> {
+    fn alloc_slow<H: const Deref<Target = Header<Pessimistic>>>(
+        arena: &Arena<H, Self>,
+        size: Size,
+        align: Offset,
+    ) -> Result<Meta, Error> {
         use mem::MemAllocInfo;
         let Some(cur) = arena.find_by(size).ok().map(|(cur, _)| cur) else {
             return Err(Error::UnenoughSpace {
@@ -776,13 +826,13 @@ impl Strategy for Pessimistic {
     }
 }
 
-unsafe impl<S: Strategy> Sync for Arena<'_, S> {}
-unsafe impl<S: Strategy> Send for Arena<'_, S> {}
+unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> Send for Arena<H, S> {}
+unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> Sync for Arena<H, S> {}
 
-impl<S: Strategy> Clone for Arena<'_, S> {
+impl<H: const Deref<Target = Header<S>> + Clone, S: Strategy> Clone for Arena<H, S> {
     fn clone(&self) -> Self {
         Self {
-            h: self.h,
+            header: self.header.clone(),
             size: self.size,
             read_only: self.read_only,
             max_retries: self.max_retries,
@@ -790,18 +840,7 @@ impl<S: Strategy> Clone for Arena<'_, S> {
     }
 }
 
-impl<S: Strategy> core::fmt::Debug for Arena<'_, S> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("Arena")
-            .field("h", &self.h)
-            .field("size", &self.size)
-            .field("read_only", &self.read_only)
-            .field("max_retries", &self.max_retries)
-            .finish()
-    }
-}
-
-unsafe impl<S: Strategy> mem::MemAlloc for Arena<'_, S> {
+unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for Arena<H, S> {
     type Meta = Meta;
     type Error = Error;
 
@@ -821,15 +860,15 @@ unsafe impl<S: Strategy> mem::MemAlloc for Arena<'_, S> {
     }
 }
 
-unsafe impl<S: Strategy> mem::MemDealloc for Arena<'_, S> {
+unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemDealloc for Arena<H, S> {
     fn demalloc(&self, meta: Meta) -> bool {
         self.dealloc(meta)
     }
 }
 
-impl<S: Strategy> mem::MemAllocator for Arena<'_, S> {}
+impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAllocator for Arena<H, S> {}
 
-impl<S: Strategy> mem::MemAllocInfo for Arena<'_, S> {
+impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAllocInfo for Arena<H, S> {
     fn allocated(&self) -> usize {
         self.header().allocated().cast_into()
     }
@@ -845,28 +884,21 @@ impl<S: Strategy> mem::MemAllocInfo for Arena<'_, S> {
     }
 }
 
-impl<'a, S: Strategy> Arena<'a, S> {
+impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
     #[inline]
-    const fn header(&self) -> &Header<S> {
-        self.h
+    pub const fn header(&self) -> &Header<S> {
+        &self.header
     }
 
     #[inline]
-    const fn base_ptr(&self) -> *const u8 {
-        (self.h as *const Header<S>).cast()
-    }
-
-    #[inline]
-    pub fn from_header(h: &'a Header<S>, size: Size, cfg: Config) -> Self {
+    pub const fn from_conf(header: H, size: Size, conf: Config) -> Self {
         let Config {
-            min_segment_size,
             max_retries,
             read_only,
-        } = cfg;
+        } = conf;
 
-        h.with_min_segment_size(min_segment_size);
         Self {
-            h,
+            header,
             size,
             read_only,
             max_retries,
@@ -874,7 +906,43 @@ impl<'a, S: Strategy> Arena<'a, S> {
     }
 }
 
-impl<S: Strategy> Arena<'_, S> {
+impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MemArena<S, A, M> {
+    #[inline]
+    pub fn as_ref(&self) -> ArenaRef<'_, S> {
+        ArenaRef {
+            header: self.header(),
+            size: self.size,
+            max_retries: self.max_retries,
+            read_only: self.read_only,
+        }
+    }
+
+    #[inline]
+    pub fn from_layout(area: MemBlkLayout<A, M>, conf: Config) -> Result<Self, mem::Error<A, M>> {
+        use mem::MemBlkOps;
+        let mut area = area;
+        let offset = area.offset();
+        let mconf = MetaConfig::default::<S>();
+        let ptr = area.push::<Header<S>>(mconf)?;
+        let (area, _) = area.finish();
+
+        let size = area.size() - offset;
+        let size = max_bound(size).ok_or(mem::Error::OutofSize {
+            requested: size,
+            bound: ARENA_MAX_CAPACITY.cast_into(),
+        })?;
+
+        let header = unsafe { MemHeader::from_raw(area.into(), ptr) };
+        Ok(Self::from_conf(header, size, conf))
+    }
+}
+
+impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
+    #[inline]
+    const fn base_ptr(&self) -> *const u8 {
+        (self.header() as *const Header<S>).cast()
+    }
+
     #[inline]
     fn meta(&self, seg: ReqSegment) -> Meta {
         Meta::from_req_seg(self.base_ptr(), seg)
@@ -1033,15 +1101,15 @@ impl<S: Strategy> Arena<'_, S> {
         }
     }
 
-    fn discard_freelist(&self) -> Result<Size, Error> {
+    fn discard(&self) -> Result<Size, Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
         }
 
-        Ok(self.discard_freelist_in())
+        Ok(self.discard_in())
     }
 
-    fn discard_freelist_in(&self) -> Size {
+    fn discard_in(&self) -> Size {
         let header = self.header();
         let backoff = Backoff::new();
 
@@ -1091,7 +1159,7 @@ impl<S: Strategy> Arena<'_, S> {
 
     unsafe fn dealloc_by(&self, offset: UInt, size: UInt) -> bool {
         let header = self.header();
-        if header.dealloc(offset, size) {
+        if header.dealloc_last(offset, size) {
             return true;
         }
 
@@ -1208,7 +1276,7 @@ impl<S: Strategy> Arena<'_, S> {
         }
 
         let header = self.header();
-        if let Some(meta) = header.alloc(self, size, align) {
+        if let Some(meta) = header.alloc_fast(self, size, align) {
             Ok(meta)
         } else {
             for i in 0..self.max_retries {

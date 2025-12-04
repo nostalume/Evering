@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 mod area;
 
-pub use self::area::{Error, Header, MemBlkHandle, MemBlkLayout, RawMemBlk};
+pub use self::area::{Error, MemBlkHandle, MemBlkLayout, MemRef, RawMemBlk, RcHeader};
 pub use alloc::alloc::{AllocError, handle_alloc_error};
 
 pub trait AddrSpec {

@@ -58,7 +58,7 @@ impl<T: crate::msg::Message, A: MemAllocator> PBox<T, A> {
     #[inline]
     pub fn token_with(self) -> (Token<MetaSpanOf<A>>, A) {
         let (token_of, alloc) = self.token_of_with();
-        let token = Token::erase(token_of);
+        let token = Token::forget(token_of);
         (token, alloc)
     }
 
@@ -216,7 +216,7 @@ impl<T: crate::msg::Message, A: MemAllocator> PBox<[T], A> {
     #[inline]
     pub fn token_with(self) -> (Token<MetaSpanOf<A>>, A) {
         let (token_of, alloc) = self.token_of_with();
-        let token = Token::erase(token_of);
+        let token = Token::forget(token_of);
         (token, alloc)
     }
 

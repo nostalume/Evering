@@ -7,6 +7,12 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
+use crate::{
+    msg::{Envelope, Operation},
+    numeric::Id,
+    token::PackToken,
+};
+
 use crossbeam_utils::Backoff;
 
 mod state {
@@ -21,25 +27,8 @@ mod state {
     pub const COMPLETED: u8 = 3;
 }
 
-const HEAD: usize = 0;
-const NONE: usize = usize::MAX;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-#[repr(C)]
-pub struct Id {
-    idx: usize,
-    live: u32,
-}
-
-impl Id {
-    pub const fn null() -> Self {
-        Self { idx: NONE, live: 0 }
-    }
-
-    pub const fn is_null(&self) -> bool {
-        self.idx == NONE
-    }
-}
+const HEAD: usize = Id::HEAD;
+const NONE: usize = Id::NONE;
 
 #[repr(C)]
 struct Cache<T> {
@@ -247,7 +236,7 @@ impl<'a, T, const N: usize> Drop for Op<'a, T, N> {
     }
 }
 
-pub struct CachePool<T, const N: usize> {
+struct CachePool<T, const N: usize> {
     inits: AtomicUsize,
     free_head: AtomicUsize,
     entries: [Cache<T>; N],
@@ -354,21 +343,21 @@ impl<T, const N: usize> Drop for CachePoolHandle<T, N> {
 }
 
 impl<T, const N: usize> CachePoolHandle<T, N> {
-    fn new() -> Self {
+    pub fn new() -> Self {
         let pool = CachePool::new();
         Self(crate::counter::CounterOf::suspend(pool))
     }
 
-    fn bind<S: super::Sender, R: super::Receiver>(
+    pub fn bind<S: super::Sender, R: super::Receiver>(
         self,
         sender: S,
         receiver: R,
-    ) -> (Submitter<S, T, N>, Completer<R, T, N>) {
-        let s = Submitter {
+    ) -> (Sx<S, T, N>, Cx<R, T, N>) {
+        let s = Sx {
             sender,
             pool: self.clone(),
         };
-        let c = Completer {
+        let c = Cx {
             receiver,
             pool: self.clone(),
         };
@@ -376,40 +365,83 @@ impl<T, const N: usize> CachePoolHandle<T, N> {
     }
 }
 
-use crate::msg::{Envelope, Tag};
-use crate::token::PackToken;
-
-struct Submitter<S: super::Sender, T, const N: usize> {
+pub struct Sx<S: super::Sender, T, const N: usize> {
     sender: S,
     pool: CachePoolHandle<T, N>,
 }
 
-impl<H, M, S, T, const N: usize> Submitter<S, T, N>
+impl<H: Envelope, M, S, T, const N: usize> Sx<S, T, N>
 where
-    S: super::Sender<Item = PackToken<H, M>>,
-    H: Envelope + Tag<Id>,
+    S: super::Sender<Item = PackToken<Operation<H>, M>>,
 {
-    fn try_submit(&self, item: S::Item) -> Option<Op<'_, T, N>> {
+    pub fn try_submit(&self, item: PackToken<H, M>) -> Option<Op<'_, T, N>> {
         let (id, op) = self.pool.0.register()?;
-        let item = item.with_tag(id);
+        let item = Operation::compose(id, item);
         self.sender.try_send(item).ok()?;
         Some(op)
     }
 }
 
-struct Completer<R: super::Receiver, T, const N: usize> {
+pub struct Cx<R: super::Receiver, T, const N: usize> {
     receiver: R,
     pool: CachePoolHandle<T, N>,
 }
 
-impl<H, M, R, const N: usize> Completer<R, PackToken<H, M>, N>
+impl<H: Envelope, M, R, const N: usize> Cx<R, PackToken<H, M>, N>
 where
-    R: super::Receiver<Item = PackToken<H, M>>,
-    H: Envelope + Tag<Id>,
+    R: super::Receiver<Item = PackToken<Operation<H>, M>>,
 {
-    fn try_complete(&self) {
+    pub fn try_complete(&self) {
         if let Ok(token) = self.receiver.try_recv() {
-            self.pool.0.complete(token.tag(), token);
+            let (id, token) = Operation::decompose(token);
+            self.pool.0.complete(id, token);
+        }
+    }
+}
+
+pub trait Submitter<H: Envelope, M> {
+    type Op<'a>: Future<Output = PackToken<H, M>>
+    where
+        Self: 'a;
+    fn try_submit(&self, item: PackToken<H, M>) -> Option<Self::Op<'_>>;
+}
+
+pub trait Completer<H: Envelope, M> {
+    fn try_complete<F: FnOnce(&PackToken<H, M>) -> bool>(&self, f: F) -> Option<bool>;
+}
+
+impl<H, M, S, const N: usize> Submitter<H, M> for Sx<S, PackToken<H, M>, N>
+where
+    H: Envelope,
+    S: super::Sender<Item = PackToken<Operation<H>, M>>,
+{
+    type Op<'a>
+        = Op<'a, PackToken<H, M>, N>
+    where
+        S: 'a,
+        H: 'a,
+        M: 'a;
+    fn try_submit(&self, item: PackToken<H, M>) -> Option<Op<'_, PackToken<H, M>, N>> {
+        let (id, op) = self.pool.0.register()?;
+        let item = Operation::compose(id, item);
+        self.sender.try_send(item).ok()?;
+        Some(op)
+    }
+}
+
+impl<H, M, R, const N: usize> Completer<H, M> for Cx<R, PackToken<H, M>, N>
+where
+    H: Envelope,
+    R: super::Receiver<Item = PackToken<Operation<H>, M>>,
+{
+    fn try_complete<F: FnOnce(&PackToken<H, M>) -> bool>(&self, f: F) -> Option<bool> {
+        if let Ok(token) = self.receiver.try_recv() {
+            let (id, token) = Operation::decompose(token);
+            let exit = f(&token);
+            self.pool.0.complete(id, token);
+            Some(exit)
+        } else {
+            None
         }
     }
 }

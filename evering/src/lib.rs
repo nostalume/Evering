@@ -40,6 +40,25 @@ mod seal {
 }
 
 mod numeric {
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    #[repr(C)]
+    pub struct Id {
+        pub idx: usize,
+        pub live: u32,
+    }
+
+    impl Id {
+        pub const HEAD: usize = 0;
+        pub const NONE: usize = usize::MAX;
+        pub const fn null() -> Self {
+            Self { idx: Self::NONE, live: 0 }
+        }
+
+        pub const fn is_null(&self) -> bool {
+            self.idx == Self::NONE
+        }
+    }
+
     pub const trait CastFrom<T> {
         fn cast_from(t: T) -> Self;
     }

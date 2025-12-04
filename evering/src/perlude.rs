@@ -4,77 +4,26 @@ mod root {
     use super::channel::{MsgDuplex, MsgDuplexView};
     use crate::{
         arena::{self, ARENA_MAX_CAPACITY, Strategy, UInt, max_bound},
-        mem::{self, AddrSpec, MemBlkHandle, MemBlkLayout, MemBlkOps, Mmap},
-        msg::Envelope,
-        numeric::CastInto,
+        mem::{self, AddrSpec, MemBlkHandle, MemBlkLayout, MemBlkOps, MemRef, Mmap},
+        msg::{Envelope, Operation},
+        numeric::{CastInto, Id},
         reg,
     };
 
-    pub use crate::arena::{Config, Optimistic, Pessimistic};
+    pub use crate::arena::{ArenaRef, Config, MemArena, Optimistic, Pessimistic};
 
+    pub type Meta = arena::Meta;
     pub type Span = arena::SpanMeta;
-    pub type Allocator<'a, S> = arena::Arena<'a, S>;
+    pub type Allocator<H, S> = arena::Arena<H, S>;
     pub type AllocHeader<S> = arena::Header<S>;
 
-    #[derive(Clone)]
-    pub struct ArenaMem<S: AddrSpec, M: Mmap<S>, G: Strategy> {
-        m: MemBlkHandle<S, M>,
-        alloc: NonNull<AllocHeader<G>>,
-        size: UInt,
-    }
-
-    impl<S: AddrSpec, M: Mmap<S>, G: Strategy> TryFrom<MemBlkLayout<S, M>> for ArenaMem<S, M, G> {
-        type Error = mem::Error<S, M>;
-
-        fn try_from(area: MemBlkLayout<S, M>) -> Result<Self, Self::Error> {
-            let mut area = area;
-            let _ = area.push::<mem::Header>(())?;
-            let alloc = area.push::<AllocHeader<G>>(AllocHeader::<G>::MIN_SEGMENT_SIZE)?;
-            let (area, offset) = area.finish();
-
-            let size = area.size() - offset;
-            let size = max_bound(size).ok_or(mem::Error::OutofSize {
-                requested: size,
-                bound: ARENA_MAX_CAPACITY.cast_into(),
-            })?;
-
-            Ok(Self {
-                m: area.into(),
-                alloc,
-                // Safety: Previous arithmetic check
-                size,
-            })
-        }
-    }
-
-    impl<S: AddrSpec, M: Mmap<S>, G: Strategy> ArenaMem<S, M, G> {
-        #[inline(always)]
-        pub fn header(&self) -> &mem::Header {
-            self.m.header()
-        }
-
-        #[inline(always)]
-        fn alloc_header(&self) -> &AllocHeader<G> {
-            unsafe { self.alloc.as_ref() }
-        }
-
-        #[inline(always)]
-        pub fn arena_with(&self, conf: Config) -> Allocator<'_, G> {
-            Allocator::from_header(self.alloc_header(), self.size, conf)
-        }
-
-        #[inline(always)]
-        pub fn arena(&self) -> Allocator<'_, G> {
-            let conf = Config::default();
-            Allocator::from_header(self.alloc_header(), self.size, conf)
-        }
-    }
+    pub type AConn<S, M, G, H, const N: usize> = Conn<S, M, G, Operation<H>, N>;
 
     #[derive(Clone)]
     pub struct Conn<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> {
         m: MemBlkHandle<S, M>,
         alloc: NonNull<AllocHeader<G>>,
-        reg: NonNull<reg::Registry<MsgDuplex<H>, N>>,
+        reg: NonNull<reg::Header<MsgDuplex<H>, N>>,
         size: UInt,
     }
 
@@ -84,9 +33,9 @@ mod root {
         type Error = mem::Error<S, M>;
         fn try_from(area: MemBlkLayout<S, M>) -> Result<Self, Self::Error> {
             let mut area = area;
-            let _ = area.push::<mem::Header>(())?;
-            let reg = area.push::<reg::Registry<_, N>>(())?;
-            let alloc = area.push::<AllocHeader<G>>(AllocHeader::<G>::MIN_SEGMENT_SIZE)?;
+            let reg = area.push::<reg::Header<_, N>>(())?;
+            let conf = arena::MetaConfig::default::<G>();
+            let alloc = area.push::<AllocHeader<G>>(conf)?;
             let (area, offset) = area.finish();
 
             let size = area.size() - offset;
@@ -107,33 +56,27 @@ mod root {
 
     impl<S: AddrSpec, M: Mmap<S>, G: Strategy, H: Envelope, const N: usize> Conn<S, M, G, H, N> {
         #[inline(always)]
-        pub fn header(&self) -> &mem::Header {
+        pub fn header(&self) -> &mem::RcHeader {
             self.m.header()
         }
 
         #[inline(always)]
-        pub fn reg(&self) -> &reg::Registry<MsgDuplex<H>, N> {
+        pub fn reg(&self) -> &reg::Header<MsgDuplex<H>, N> {
             unsafe { self.reg.as_ref() }
         }
 
-        #[inline(always)]
-        fn alloc_header(&self) -> &AllocHeader<G> {
+        #[inline]
+        fn arena_header_ref(&self) -> &AllocHeader<G> {
             unsafe { self.alloc.as_ref() }
         }
 
-        #[inline(always)]
-        pub fn arena_with(&self, conf: Config) -> Allocator<'_, G> {
-            Allocator::from_header(self.alloc_header(), self.size, conf)
+        #[inline]
+        fn arena_header(&self) -> MemRef<AllocHeader<G>, S, M> {
+            unsafe { MemRef::from_raw(self.m.clone(), self.alloc) }
         }
 
         #[inline(always)]
-        pub fn arena(&self) -> Allocator<'_, G> {
-            let conf = Config::default();
-            Allocator::from_header(self.alloc_header(), self.size, conf)
-        }
-
-        #[inline(always)]
-        pub fn lookup(&self, idx: usize) -> Option<reg::Id> {
+        pub fn lookup(&self, idx: usize) -> Option<Id> {
             self.reg().lookup(idx)
         }
 
@@ -142,7 +85,7 @@ mod root {
         //     self.reg().clear(id, self.arena())
         // }
 
-        pub fn prepare(&self, cap: usize) -> Option<reg::Id> {
+        pub fn prepare(&self, cap: usize) -> Option<Id> {
             let Ok((id, _)) = self.reg().prepare(cap, self.arena()) else {
                 return None;
             };
@@ -150,21 +93,28 @@ mod root {
             Some(id)
         }
 
-        pub fn acquire(&self, id: reg::Id) -> Option<MsgDuplexView<'_, H, G>> {
-            let (duplex, _) = self.reg().view(id, self.arena());
+        pub fn acquire(&self, id: Id) -> Option<MsgDuplexView<'_, H, &AllocHeader<G>, G>> {
+            let (duplex, _) = self.reg().view(id, self.arena_ref());
             duplex
         }
     }
 }
 
 pub mod allocator {
-    pub use super::root::{Allocator, Config, Optimistic, Pessimistic};
-    pub use crate::mem::{MemAlloc, MemAllocInfo, MemAllocator, MemBlkBuilder, MemDealloc};
+    use super::root::Meta;
+    use crate::mem;
+
+    pub use super::root::{ArenaRef, Config, MemArena, Optimistic, Pessimistic};
+    pub use crate::mem::{MemAllocInfo, MemBlkBuilder};
+
+    pub trait MemAllocator: mem::MemAllocator<Meta = Meta> {}
+    impl<T: mem::MemAllocator<Meta = Meta>> MemAllocator for T {}
 }
 
 pub mod channel {
     use super::root::{Allocator, Span};
     use crate::channel::cross;
+    use crate::channel::driver;
     use crate::channel::{Receiver, Sender};
     use crate::msg::Envelope;
     use crate::token;
@@ -174,7 +124,7 @@ pub mod channel {
 
     pub type MsgQueue<H> = cross::TokenQueue<H, Span>;
     pub type MsgDuplex<H> = cross::TokenDuplex<H, Span>;
-    pub type MsgDuplexView<'a, H, G> = cross::DuplexView<'a, H, Allocator<'a, G>, Span>;
+    pub type MsgDuplexView<'a, H, A, G> = cross::DuplexView<'a, H, Allocator<A, G>, Span>;
 
     pub trait MsgSender<H: Envelope>: Sender<Item = MsgToken<H>> {}
 
@@ -182,6 +132,16 @@ pub mod channel {
     pub trait MsgReceiver<H: Envelope>: Receiver<Item = MsgToken<H>> {}
 
     impl<H: Envelope, T: Receiver<Item = MsgToken<H>>> MsgReceiver<H> for T {}
+
+    pub type CachePool<H, const N: usize> = driver::CachePoolHandle<MsgToken<H>, N>;
+
+    pub trait MsgSubmitter<H: Envelope>: driver::Submitter<H, Span> {}
+
+    impl<H: Envelope, T: driver::Submitter<H, Span>> MsgSubmitter<H> for T {}
+
+    pub trait MsgCompleter<H: Envelope>: driver::Completer<H, Span> {}
+
+    impl<H: Envelope, T: driver::Completer<H, Span>> MsgCompleter<H> for T {}
 }
 
-pub use root::{ArenaMem, Conn};
+pub use root::{AConn, Conn};

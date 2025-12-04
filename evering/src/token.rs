@@ -173,7 +173,7 @@ impl<M> Token<M> {
     }
 
     #[inline(always)]
-    pub fn pack<H: Envelope>(self, header: H) -> PackToken<H, M> {
+    pub const fn pack<H: Envelope>(self, header: H) -> PackToken<H, M> {
         PackToken {
             header,
             token: self,
@@ -196,7 +196,7 @@ impl<M> Token<M> {
     }
 
     #[inline]
-    pub fn erase<T: Message + ?Sized>(token_of: TokenOf<T, M>) -> Self {
+    pub fn forget<T: Message + ?Sized>(token_of: TokenOf<T, M>) -> Self {
         let TokenOf { span, metadata, .. } = token_of;
         let id = T::TYPE_ID;
 
@@ -209,14 +209,14 @@ pub struct PackToken<H: Envelope, M> {
     token: Token<M>,
 }
 
-impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PackToken")
-            .field("header", &self.header)
-            .field("token", &self.token)
-            .finish()
-    }
-}
+// impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
+//     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+//         f.debug_struct("PackToken")
+//             .field("header", &self.header)
+//             .field("token", &self.token)
+//             .finish()
+//     }
+// }
 
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]
@@ -232,8 +232,6 @@ impl<H: Envelope, M> PackToken<H, M> {
 
     #[inline]
     pub fn map_header<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M>
-    where
-        H: Tag<T>,
     {
         let (token, header) = self.into_parts();
         PackToken {
