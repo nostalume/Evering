@@ -2,7 +2,7 @@ use core::ops::Deref;
 use core::ptr::NonNull;
 
 use super::{AddrSpec, MemBlkOps, Mmap, Mprotect};
-use crate::header::{self, Layout, Status};
+use crate::{header::{self, Layout, Status}, mem::Error};
 
 pub struct MemBlkSpec<S: AddrSpec> {
     range: memory_addr::AddrRange<S::Addr>,
@@ -68,45 +68,6 @@ impl<S: AddrSpec> MemBlkSpec<S> {
     #[inline]
     pub fn size(&self) -> usize {
         self.range.size()
-    }
-}
-
-pub enum Error<S: AddrSpec, M: Mmap<S>> {
-    OutofSize { requested: usize, bound: usize },
-    UnenoughSpace { requested: usize, allocated: usize },
-    Contention,
-    InvalidHeader,
-    MapError(M::Error),
-}
-
-impl<S: AddrSpec, M: Mmap<S>> core::error::Error for Error<S, M> {}
-
-impl<S: AddrSpec, M: Mmap<S>> core::fmt::Debug for Error<S, M> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::UnenoughSpace {
-                requested,
-                allocated,
-            } => write!(
-                f,
-                "Not enough space available, requested {}, allocated {}",
-                requested, allocated
-            ),
-            Self::OutofSize { requested, bound } => write!(
-                f,
-                "Out of upper bounded size, requested {}, upper bound {}",
-                requested, bound
-            ),
-            Self::Contention => write!(f, "Contention"),
-            Self::InvalidHeader => write!(f, "Header initialization failed"),
-            Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
-        }
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(self, f)
     }
 }
 
@@ -245,6 +206,7 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkLayout<S, M> {
     pub fn reserve<T: Layout>(&mut self) -> Result<Reserve<T>, Error<S, M>> {
         let (ptr, next) = unsafe { self.area.reserve::<T>(self.offset) }?;
         let reserve = Reserve { ptr, next };
+        self.offset = next;
         Ok(reserve)
     }
 
@@ -306,9 +268,10 @@ pub struct MemBlkHandle<S: AddrSpec, M: Mmap<S>>(crate::counter::CounterOf<MemBl
 
 impl<S: AddrSpec, M: Mmap<S>> Drop for MemBlk<S, M> {
     fn drop(&mut self) {
+        use header::Finalize;
         // Safety: finalize only once and always true!
-        let _ = self.header().finalize();
-        let blk = self.as_raw();
+        let _ = unsafe { self.header().finalize() };
+        let blk = unsafe { self.as_raw() };
         let _ = M::unmap(blk);
     }
 }
@@ -346,7 +309,7 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlk<S, M> {
     }
 
     #[inline(always)]
-    fn as_raw(&mut self) -> &mut RawMemBlk<S, M> {
+    unsafe fn as_raw(&mut self) -> &mut RawMemBlk<S, M> {
         unsafe { &mut *(self as *mut _ as *mut _) }
     }
 
@@ -430,10 +393,25 @@ impl<T: ?Sized, S: AddrSpec, M: Mmap<S>> MemRef<T, S, M> {
 
     pub fn map<U>(&self, f: impl FnOnce(&T) -> &U) -> MemRef<U, S, M> {
         let u = f(self);
-        let ptr = NonNull::from(u);
         MemRef {
             handle: self.handle.clone(),
-            ptr,
+            ptr: u.into(),
         }
+    }
+
+    pub fn try_map<E, U>(&self, f: impl FnOnce(&T) -> Result<&U, E>) -> Result<MemRef<U, S, M>, E> {
+        let u = f(self)?;
+        Ok(MemRef {
+            handle: self.handle.clone(),
+            ptr: u.into(),
+        })
+    }
+
+    pub fn may_map<U>(&self, f: impl FnOnce(&T) -> Option<&U>) -> Option<MemRef<U, S, M>> {
+        let u = f(self)?;
+        Some(MemRef {
+            handle: self.handle.clone(),
+            ptr: u.into(),
+        })
     }
 }

@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 mod area;
 
-pub use self::area::{Error, MemBlkHandle, MemBlkLayout, MemRef, RawMemBlk, RcHeader};
+pub use self::area::{MemBlkHandle, MemBlkLayout, MemRef, RawMemBlk};
 pub use alloc::alloc::{AllocError, handle_alloc_error};
 
 pub trait AddrSpec {
@@ -36,6 +36,45 @@ pub trait Mprotect<S: AddrSpec>: Mmap<S> {
     ) -> Result<(), Self::Error>;
 }
 
+pub enum Error<S: AddrSpec, M: Mmap<S>> {
+    OutofSize { requested: usize, bound: usize },
+    UnenoughSpace { requested: usize, allocated: usize },
+    Contention,
+    InvalidHeader,
+    MapError(M::Error),
+}
+
+impl<S: AddrSpec, M: Mmap<S>> core::error::Error for Error<S, M> {}
+
+impl<S: AddrSpec, M: Mmap<S>> core::fmt::Debug for Error<S, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::UnenoughSpace {
+                requested,
+                allocated,
+            } => write!(
+                f,
+                "Not enough space available, requested {}, allocated {}",
+                requested, allocated
+            ),
+            Self::OutofSize { requested, bound } => write!(
+                f,
+                "Out of upper bounded size, requested {}, upper bound {}",
+                requested, bound
+            ),
+            Self::Contention => write!(f, "Contention"),
+            Self::InvalidHeader => write!(f, "Header initialization failed"),
+            Self::MapError(err) => write!(f, "Mapping error: {:?}", err),
+        }
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(self, f)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub enum Access {
     Write,
@@ -58,6 +97,7 @@ pub struct MemBlkBuilder<S: AddrSpec, M: Mmap<S>> {
 }
 
 impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
+    #[inline]
     pub const fn from_backend(bk: M) -> Self {
         MemBlkBuilder {
             bk,
@@ -65,6 +105,23 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
         }
     }
 
+    #[inline]
+    pub fn map_layout(
+        self,
+        start: Option<S::Addr>,
+        size: usize,
+        mflags: M::MapFlags,
+        pflags: S::Flags,
+        handle: M::Handle,
+    ) -> Result<MemBlkLayout<S, M>, Error<S, M>> {
+        let Self { bk, _marker } = self;
+        let raw = bk
+            .map(start, size, mflags, pflags, handle)
+            .map_err(|e| Error::MapError(e))?;
+        MemBlkLayout::new(raw)
+    }
+
+    #[inline]
     pub fn map<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
         self,
         start: Option<S::Addr>,
@@ -73,28 +130,33 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
         pflags: S::Flags,
         handle: M::Handle,
     ) -> Result<T, Error<S, M>> {
-        let Self { bk, _marker } = self;
-        let raw = bk
-            .map(start, size, mflags, pflags, handle)
-            .map_err(|e| Error::MapError(e))?;
-        let layout = MemBlkLayout::new(raw);
-        T::try_from(layout)
+        T::try_from(self.map_layout(start, size, mflags, pflags, handle)?)
     }
 }
 
 impl<S: AddrSpec, M: SharedMmap<S>> MemBlkBuilder<S, M> {
+    #[inline]
+    pub fn shared_layout(
+        self,
+        size: usize,
+        access: Access,
+        handle: M::Handle,
+    ) -> Result<MemBlkLayout<S, M>, Error<S, M>> {
+        let Self { bk, _marker } = self;
+        let raw = bk
+            .shared(size, access, handle)
+            .map_err(|e| Error::MapError(e))?;
+        MemBlkLayout::new(raw)
+    }
+
+    #[inline]
     pub fn shared<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
         self,
         size: usize,
         access: Access,
         handle: M::Handle,
     ) -> Result<T, Error<S, M>> {
-        let Self { bk, _marker } = self;
-        let raw = bk
-            .shared(size, access, handle)
-            .map_err(|e| Error::MapError(e))?;
-        let layout = MemBlkLayout::new(raw);
-        T::try_from(layout)
+        T::try_from(self.shared_layout(size, access, handle)?)
     }
 }
 

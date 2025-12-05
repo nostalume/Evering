@@ -52,8 +52,10 @@ pub trait Layout: Sized {
             Status::Initializing => Status::Initializing,
         }
     }
-    /// Modify state sucessfully or not in unmap
-    fn finalize(&self) -> bool;
+}
+
+pub trait Finalize: Layout {
+    unsafe fn finalize(&self) -> bool;
 }
 
 #[repr(C)]
@@ -150,9 +152,12 @@ impl<T: Layout> Layout for Header<T> {
             _ => Status::Corrupted,
         }
     }
+}
 
-    fn finalize(&self) -> bool {
-        self.inner.finalize()
+impl<T: Finalize> Finalize for Header<T> {
+    #[inline]
+    unsafe fn finalize(&self) -> bool {
+        unsafe { self.inner.finalize() }
     }
 }
 
@@ -167,10 +172,6 @@ impl Layout for () {
 
     fn attach(&self) -> Status {
         Status::Initialized
-    }
-
-    fn finalize(&self) -> bool {
-        true
     }
 }
 
@@ -196,9 +197,11 @@ impl Layout for RcMeta {
         self.rc.fetch_add(1, Ordering::Relaxed);
         Status::Initialized
     }
+}
 
+impl Finalize for RcMeta {
     #[inline]
-    fn finalize(&self) -> bool {
+    unsafe fn finalize(&self) -> bool {
         // Safety: It shouldn't be smaller than 0.
         self.rc.fetch_sub(1, Ordering::Acquire);
         true

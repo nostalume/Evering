@@ -80,7 +80,7 @@ pub mod type_id {
 
     #[cfg(test)]
     mod tests {
-        use super::{TypeId, TypeTag, combine, type_id};
+        use super::{TypeTag, combine, type_id};
 
         #[test]
         fn hash_consistent() {

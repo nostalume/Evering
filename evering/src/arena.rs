@@ -25,21 +25,31 @@ type Offset = UInt;
 type Size = UInt;
 type AddrSpan = crate::mem::AddrSpan<UInt>;
 
-pub const fn max_bound(n: usize) -> Option<UInt> {
-    let n = UInt::try_from(n).ok()?;
-    Some(n)
+#[inline]
+pub const fn bound(n: usize, bound: UInt) -> UInt {
+    n.min(bound.cast_into()) as UInt
 }
 
-pub const fn max_bound_ok(n: usize) -> Result<UInt, Error> {
-    max_bound(n).ok_or(Error::OutofBounds { requested: n })
+#[inline]
+pub const fn cap_bound(n: usize) -> UInt {
+    bound(n, ARENA_MAX_CAPACITY)
 }
 
-pub const fn bound(n: usize, available: UInt) -> Option<UInt> {
-    let n = UInt::try_from(n).ok()?;
-    if n < available { Some(n) } else { None }
+#[inline]
+pub const fn bound_ok(n: usize, bound: UInt) -> Result<UInt, Error> {
+    if n > bound as usize {
+        Err(Error::OutofBounds { requested: n })
+    } else {
+        Ok(n as UInt)
+    }
 }
 
-pub const ARENA_MAX_CAPACITY: Size = UInt::MAX;
+#[inline]
+pub const fn cap_bound_ok(n: usize) -> Result<UInt, Error> {
+    bound_ok(n, ARENA_MAX_CAPACITY)
+}
+
+const ARENA_MAX_CAPACITY: Size = UInt::MAX;
 const SENTINEL_OFFSET: Offset = UInt::MAX;
 const SENTINEL_SIZE: Size = UInt::MAX;
 const SEGMENT_NODE_SIZE: Size = UInt::size_of::<SegmentNode>();
@@ -289,7 +299,7 @@ pub struct ArenaMeta<S: Strategy> {
 }
 
 pub type Header<S> = header::Header<ArenaMeta<S>>;
-pub type MemHeader<S, A, M> = mem::MemRef<Header<S>, A, M>;
+pub type MemArenaMeta<S, A, M> = mem::MemRef<Header<S>, A, M>;
 
 impl<S: Strategy> core::fmt::Debug for ArenaMeta<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -317,11 +327,6 @@ impl<S: Strategy> header::Layout for ArenaMeta<S> {
     #[inline]
     fn attach(&self) -> header::Status {
         header::Status::Initialized
-    }
-
-    #[inline]
-    fn finalize(&self) -> bool {
-        true
     }
 }
 
@@ -746,7 +751,7 @@ impl Config {
 
     pub const fn default() -> Self {
         Self {
-            read_only: true,
+            read_only: false,
             max_retries: Self::MAX_RETRIES,
         }
     }
@@ -771,8 +776,8 @@ pub struct Arena<H: const Deref<Target = Header<S>>, S: Strategy> {
     max_retries: u32,
 }
 
-pub type ArenaRef<'a, S> = Arena<&'a Header<S>, S>;
-pub type MemArena<S, A, M> = Arena<MemHeader<S, A, M>, S>;
+pub type RefArena<'a, S> = Arena<&'a Header<S>, S>;
+pub type MemArena<S, A, M> = Arena<MemArenaMeta<S, A, M>, S>;
 
 pub struct Pessimistic;
 pub struct Optimistic;
@@ -852,9 +857,9 @@ unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for A
     #[inline]
     fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
         let size = layout.size();
-        let size = max_bound_ok(size)?;
+        let size = cap_bound_ok(size)?;
         let align = layout.align();
-        let align = max_bound_ok(align)?;
+        let align = cap_bound_ok(align)?;
 
         self.alloc(size, align)
     }
@@ -906,10 +911,18 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
     }
 }
 
+impl<S: Strategy, A: AddrSpec, M: Mmap<A>> TryFrom<MemBlkLayout<A, M>> for MemArena<S, A, M> {
+    type Error = mem::Error<A, M>;
+
+    fn try_from(area: MemBlkLayout<A, M>) -> Result<Self, Self::Error> {
+        Self::from_layout(area, Config::default())
+    }
+}
+
 impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MemArena<S, A, M> {
     #[inline]
-    pub fn as_ref(&self) -> ArenaRef<'_, S> {
-        ArenaRef {
+    pub fn as_ref(&self) -> RefArena<'_, S> {
+        RefArena {
             header: self.header(),
             size: self.size,
             max_retries: self.max_retries,
@@ -926,13 +939,9 @@ impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MemArena<S, A, M> {
         let ptr = area.push::<Header<S>>(mconf)?;
         let (area, _) = area.finish();
 
-        let size = area.size() - offset;
-        let size = max_bound(size).ok_or(mem::Error::OutofSize {
-            requested: size,
-            bound: ARENA_MAX_CAPACITY.cast_into(),
-        })?;
+        let size = cap_bound(area.size() - offset);
 
-        let header = unsafe { MemHeader::from_raw(area.into(), ptr) };
+        let header = unsafe { MemArenaMeta::from_raw(area.into(), ptr) };
         Ok(Self::from_conf(header, size, conf))
     }
 }

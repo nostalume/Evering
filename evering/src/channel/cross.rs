@@ -9,17 +9,21 @@ use crate::boxed::PBox;
 use crate::channel::{Endpoint, Header, Queue, Rx, Slot, Slots, Tx};
 use crate::mem::{MemAllocator, MetaSpanOf};
 use crate::msg::Envelope;
-use crate::reg::{EntryView, Project, Resource};
+use crate::reg::{AsEntry, EntryGuard, Project, Resource};
 use crate::token::{PackToken, TokenOf};
 
 type Token<H, M> = PackToken<H, M>;
 type Tokens<H, M> = Slots<Token<H, M>>;
 
 type TokenOfTokens<H, M> = TokenOf<Tokens<H, M>, M>;
-type ViewOfSlots<H, M> = ptr::NonNull<Tokens<H, M>>;
+type ViewOfQueue<H, M> = ptr::NonNull<Tokens<H, M>>;
+type ViewOfDuplex<H, M> = (ViewOfQueue<H, M>, ViewOfQueue<H, M>);
 
-type QueueView<'a, H, Alloc, M> = EntryView<'a, Alloc, TokenQueue<H, M>>;
+pub trait AsTokenQueue<H: Envelope, M>: AsEntry<TokenQueue<H, M>> {}
+impl<H: Envelope, M, T: AsEntry<TokenQueue<H, M>>> AsTokenQueue<H, M> for T {}
 
+type QueueView<H, M, E> = EntryGuard<E, TokenQueue<H, M>, ViewOfQueue<H, M>>;
+type TokenQueueOf<H, A> = TokenQueue<H, MetaSpanOf<A>>;
 pub struct TokenQueue<H: Envelope, M> {
     header: Header,
     buf: TokenOfTokens<H, M>,
@@ -31,7 +35,7 @@ unsafe impl<H: Send + Envelope, M> Sync for TokenQueue<H, M> {}
 impl<H: Envelope, M> UnwindSafe for TokenQueue<H, M> {}
 impl<H: Envelope, M> RefUnwindSafe for TokenQueue<H, M> {}
 
-impl<H: Envelope, A: MemAllocator> Resource<A> for TokenQueue<H, MetaSpanOf<A>> {
+impl<H: Envelope, A: MemAllocator> Resource<A> for TokenQueueOf<H, A> {
     type Config = usize;
     fn new(cfg: Self::Config, ctx: A) -> (Self, A) {
         let cap = cfg;
@@ -77,8 +81,8 @@ impl<H: Envelope, A: MemAllocator> Resource<A> for TokenQueue<H, MetaSpanOf<A>> 
     }
 }
 
-impl<H: Envelope, A: MemAllocator> Project<A> for TokenQueue<H, MetaSpanOf<A>> {
-    type View = ViewOfSlots<H, MetaSpanOf<A>>;
+impl<H: Envelope, A: MemAllocator> Project<A> for TokenQueueOf<H, A> {
+    type View = ViewOfQueue<H, MetaSpanOf<A>>;
 
     #[inline]
     fn project(&self, ctx: A) -> (Self::View, A) {
@@ -88,12 +92,12 @@ impl<H: Envelope, A: MemAllocator> Project<A> for TokenQueue<H, MetaSpanOf<A>> {
     }
 }
 
-impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A, MetaSpanOf<A>> {
-    type Item = Token<H, MetaSpanOf<A>>;
+impl<E: AsTokenQueue<H, M>, H: Envelope, M> Queue for QueueView<H, M, E> {
+    type Item = Token<H, M>;
 
     #[inline]
     fn header(&self) -> &Header {
-        &self.guard.as_ref().header
+        &self.as_ref().header
     }
 
     #[inline]
@@ -102,9 +106,13 @@ impl<H: Envelope, A: MemAllocator> Queue for QueueView<'_, H, A, MetaSpanOf<A>> 
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for QueueView<'a, H, A, MetaSpanOf<A>> {}
+impl<E: AsTokenQueue<H, M>, H: Envelope, M> Endpoint for QueueView<H, M, E> {}
 
-pub type DuplexView<'a, H, A, M> = EntryView<'a, A, TokenDuplex<H, M>>;
+pub trait AsTokenDuplex<H: Envelope, M>: AsEntry<TokenDuplex<H, M>> {}
+impl<H: Envelope, M, T: AsEntry<TokenDuplex<H, M>>> AsTokenDuplex<H, M> for T {}
+
+pub type DuplexView<H, M, E> = EntryGuard<E, TokenDuplex<H, M>, ViewOfDuplex<H, M>>;
+pub type TokenDuplexOf<H, A> = TokenDuplex<H, MetaSpanOf<A>>;
 pub struct TokenDuplex<H: Envelope, M> {
     l: TokenQueue<H, M>,
     r: TokenQueue<H, M>,
@@ -118,7 +126,7 @@ pub struct LEndpoint<T>(T);
 #[derive(Clone, PartialEq)]
 pub struct REndpoint<T>(T);
 
-impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplex<H, MetaSpanOf<A>> {
+impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplexOf<H,A> {
     type Config = usize;
 
     fn new(cfg: Self::Config, ctx: A) -> (Self, A) {
@@ -136,8 +144,8 @@ impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplex<H, MetaSpanOf<A>>
     }
 }
 
-impl<H: Envelope, A: MemAllocator> Project<A> for TokenDuplex<H, MetaSpanOf<A>> {
-    type View = (ViewOfSlots<H, MetaSpanOf<A>>, ViewOfSlots<H, MetaSpanOf<A>>);
+impl<H: Envelope, A: MemAllocator> Project<A> for TokenDuplexOf<H, A> {
+    type View = ViewOfDuplex<H, MetaSpanOf<A>>;
 
     fn project(&self, ctx: A) -> (Self::View, A) {
         let alloc = ctx;
@@ -147,7 +155,7 @@ impl<H: Envelope, A: MemAllocator> Project<A> for TokenDuplex<H, MetaSpanOf<A>> 
     }
 }
 
-impl<T> Deref for LEndpoint<T> {
+impl<T> const Deref for LEndpoint<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -155,12 +163,12 @@ impl<T> Deref for LEndpoint<T> {
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Queue for LEndpoint<DuplexView<'a, H, A, MetaSpanOf<A>>> {
-    type Item = Token<H, MetaSpanOf<A>>;
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for LEndpoint<DuplexView<H, M, E>> {
+    type Item = Token<H, M>;
 
     #[inline]
     fn header(&self) -> &Header {
-        &self.guard.as_ref().l.header
+        &self.as_ref().l.header
     }
 
     #[inline]
@@ -169,9 +177,9 @@ impl<'a, H: Envelope, A: MemAllocator> Queue for LEndpoint<DuplexView<'a, H, A, 
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for LEndpoint<DuplexView<'a, H, A, MetaSpanOf<A>>> {}
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for LEndpoint<DuplexView<H, M, E>> {}
 
-impl<T> Deref for REndpoint<T> {
+impl<T> const Deref for REndpoint<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -179,12 +187,12 @@ impl<T> Deref for REndpoint<T> {
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Queue for REndpoint<DuplexView<'a, H, A, MetaSpanOf<A>>> {
-    type Item = Token<H, MetaSpanOf<A>>;
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for REndpoint<DuplexView<H, M, E>> {
+    type Item = Token<H, M>;
 
     #[inline]
     fn header(&self) -> &Header {
-        &self.guard.as_ref().r.header
+        &self.as_ref().r.header
     }
 
     #[inline]
@@ -193,9 +201,9 @@ impl<'a, H: Envelope, A: MemAllocator> Queue for REndpoint<DuplexView<'a, H, A, 
     }
 }
 
-impl<'a, H: Envelope, A: MemAllocator> Endpoint for REndpoint<DuplexView<'a, H, A, MetaSpanOf<A>>> {}
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for REndpoint<DuplexView<H, M, E>> {}
 
-impl<'a, H: Envelope, A: MemAllocator> DuplexView<'a, H, A, MetaSpanOf<A>> {
+impl<E: AsTokenDuplex<H, M> + Clone, H: Envelope, M> DuplexView<H, M, E> {
     pub fn sr_duplex(self) -> (Tx<LEndpoint<Self>>, Rx<REndpoint<Self>>) {
         let lq = LEndpoint(self.clone());
         let rq = REndpoint(self);

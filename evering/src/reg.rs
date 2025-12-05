@@ -9,6 +9,7 @@ use crossbeam_utils::Backoff;
 
 use crate::{
     header,
+    mem::{self, AddrSpec, MemBlkLayout, MemRef, Mmap},
     numeric::Id,
     reg::state::{ACTIVE, INACTIVE},
 };
@@ -24,8 +25,11 @@ pub mod state {
     pub const DEINITIALIZING: u8 = 4;
 }
 
+pub trait AsEntry<T>: const Deref<Target = Entry<T>> {}
+impl<H: const Deref<Target = Entry<T>>, T> AsEntry<T> for H {}
+
 #[repr(C)]
-struct Entry<T> {
+pub struct Entry<T> {
     data: UnsafeCell<MaybeUninit<T>>,
     rc: AtomicUsize,
     next_free: AtomicUsize,
@@ -33,15 +37,18 @@ struct Entry<T> {
     state: AtomicU8,
 }
 
-pub struct EntryGuard<'a, T> {
-    entry: &'a Entry<T>,
+pub type MemEntry<T, S, M> = MemRef<Entry<T>, S, M>;
+
+pub struct EntryGuard<E: const Deref<Target = Entry<T>>, T, V> {
+    entry: E,
     id: Id,
+    pub view: V,
 }
 
-pub struct EntryView<'a, C, T: Project<C>> {
-    pub guard: EntryGuard<'a, T>,
-    pub view: T::View,
-}
+pub type RefEntry<'a, T> = EntryGuard<&'a Entry<T>, T, ()>;
+pub type HoldEntry<T, S, M> = EntryGuard<MemEntry<T, S, M>, T, ()>;
+pub type PeekEntry<'a, T, V> = EntryGuard<&'a Entry<T>, T, V>;
+pub type ViewEntry<T, V, S, M> = EntryGuard<MemEntry<T, S, M>, T, V>;
 
 unsafe impl<T: Send> Send for Entry<T> {}
 unsafe impl<T: Sync> Sync for Entry<T> {}
@@ -139,7 +146,7 @@ impl<T> Entry<T> {
         Some(live)
     }
 
-    fn acquire<'a>(&'a self, id: Id) -> Option<EntryGuard<'a, T>> {
+    fn acquire<'a>(&'a self, id: &Id) -> Option<&'a Entry<T>> {
         let backoff = Backoff::new();
 
         let live = self.live.load(Ordering::Acquire);
@@ -188,7 +195,7 @@ impl<T> Entry<T> {
                     self.rc.fetch_sub(1, Ordering::AcqRel);
                     return None;
                 }
-                return Some(EntryGuard { entry: self, id });
+                return Some(self);
             }
             backoff.snooze();
         }
@@ -220,17 +227,18 @@ impl<T> Entry<T> {
     }
 }
 
-impl<T> Clone for EntryGuard<'_, T> {
+impl<H: const Deref<Target = Entry<T>> + Clone, T, V: Clone> Clone for EntryGuard<H, T, V> {
     fn clone(&self) -> Self {
         self.entry.rc.fetch_add(1, Ordering::Relaxed);
         Self {
-            entry: self.entry,
+            entry: self.entry.clone(),
             id: self.id,
+            view: self.view.clone(),
         }
     }
 }
 
-impl<T> Drop for EntryGuard<'_, T> {
+impl<E: const Deref<Target = Entry<T>>, T, V> Drop for EntryGuard<E, T, V> {
     fn drop(&mut self) {
         let prev = self.entry.rc.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
@@ -240,7 +248,7 @@ impl<T> Drop for EntryGuard<'_, T> {
     }
 }
 
-impl<T> const Deref for EntryGuard<'_, T> {
+impl<E: const Deref<Target = Entry<T>>, T, V> Deref for EntryGuard<E, T, V> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -248,30 +256,32 @@ impl<T> const Deref for EntryGuard<'_, T> {
     }
 }
 
-impl<T> core::fmt::Debug for EntryGuard<'_, T> {
+impl<E: const Deref<Target = Entry<T>>, T: core::fmt::Debug, V: core::fmt::Debug> core::fmt::Debug
+    for EntryGuard<E, T, V>
+{
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EntryGuard")
-            .field("entry", self.entry)
-            .finish()
-    }
-}
-
-impl<T: core::fmt::Debug> core::fmt::Display for EntryGuard<'_, T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("EntryGuard")
-            .field("entry", self.entry)
+            .field("entry", &*self.entry)
             .field("value", self.as_ref())
             .finish()
     }
 }
 
-impl<T> PartialEq for EntryGuard<'_, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.entry as *const Entry<T> == other.entry && self.id == other.id
+impl<E: const Deref<Target = Entry<T>>, T: core::fmt::Debug, V> core::fmt::Display
+    for EntryGuard<E, T, V>
+{
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
     }
 }
 
-impl<T> EntryGuard<'_, T> {
+impl<E: const Deref<Target = Entry<T>>, T, V> PartialEq for EntryGuard<E, T, V> {
+    fn eq(&self, other: &Self) -> bool {
+        &*self.entry as *const Entry<T> == &*other.entry && self.id == other.id
+    }
+}
+
+impl<E: const Deref<Target = Entry<T>>, T, V> EntryGuard<E, T, V> {
     pub fn rc(e: &Self) -> usize {
         e.entry.rc.load(Ordering::Relaxed)
     }
@@ -282,39 +292,8 @@ impl<T> EntryGuard<'_, T> {
     }
 }
 
-unsafe impl<C, T: Project<C>> Send for EntryView<'_, C, T> {}
-unsafe impl<C, T: Project<C> + Sync> Sync for EntryView<'_, C, T> {}
-
-impl<C, T: Project<C>> PartialEq for EntryView<'_, C, T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.guard == other.guard
-    }
-}
-
-impl<C, T: Project<C>> Clone for EntryView<'_, C, T>
-where
-    T::View: Clone,
-{
-    #[inline]
-    fn clone(&self) -> Self {
-        Self {
-            guard: self.guard.clone(),
-            view: self.view.clone(),
-        }
-    }
-}
-
-impl<C, T: Project<C>> core::fmt::Debug for EntryView<'_, C, T>
-where
-    T::View: core::fmt::Debug,
-{
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("EntryView")
-            .field("entry", &self.guard)
-            .field("view", &self.view)
-            .finish()
-    }
-}
+unsafe impl<E: const Deref<Target = Entry<T>>, T, V> Send for EntryGuard<E, T, V> {}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Sync, V> Sync for EntryGuard<E, T, V> {}
 
 #[repr(C)]
 pub struct Registry<T, const N: usize> {
@@ -324,6 +303,7 @@ pub struct Registry<T, const N: usize> {
 }
 
 pub type Header<T, const N: usize> = header::Header<Registry<T, N>>;
+pub type MemRegistry<T, const N: usize, S, M> = mem::MemRef<Header<T, N>, S, M>;
 
 impl<T, const N: usize> core::fmt::Debug for Registry<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -350,10 +330,6 @@ impl<T, const N: usize> header::Layout for Registry<T, N> {
     #[inline]
     fn attach(&self) -> header::Status {
         header::Status::Initialized
-    }
-
-    fn finalize(&self) -> bool {
-        true
     }
 }
 
@@ -440,9 +416,19 @@ impl<T, const N: usize> Registry<T, N> {
     }
 
     #[inline]
-    fn acquire<'a>(r: &'a Self, id: Id) -> Option<EntryGuard<'a, T>> {
-        let e = &r.entries[id.idx];
-        e.acquire(id)
+    fn reserve<'a>(r: &'a Self, id: &Id) -> Option<&'a Entry<T>> {
+        let entry = &r.entries[id.idx];
+        entry.acquire(id)
+    }
+
+    #[inline]
+    pub fn borrow<'a>(r: &'a Self, id: Id) -> Option<RefEntry<'a, T>> {
+        let entry = Self::reserve(r, &id)?;
+        Some(RefEntry {
+            entry,
+            id,
+            view: (),
+        })
     }
 
     #[inline]
@@ -452,6 +438,27 @@ impl<T, const N: usize> Registry<T, N> {
         let data = e.free(id)?;
         r.push_free(idx);
         Some(data)
+    }
+}
+
+impl<T, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
+    pub fn from_layout(area: MemBlkLayout<S, M>) -> Result<Self, mem::Error<S, M>> {
+        let mut area = area;
+        let reg = area.push::<Header<T, N>>(())?;
+        let (area, _) = area.finish();
+
+        let header = unsafe { Self::from_raw(area.into(), reg) };
+        Ok(header)
+    }
+
+    pub fn acquire(r: &Self, id: Id) -> Option<HoldEntry<T, S, M>> {
+        let entry = r.may_map(|r| Registry::reserve(r, &id))?;
+
+        Some(HoldEntry {
+            entry,
+            id,
+            view: (),
+        })
     }
 }
 
@@ -492,15 +499,28 @@ impl<T, const N: usize> Registry<T, N> {
 }
 
 impl<T, const N: usize> Registry<T, N> {
-    pub fn view<'a, C>(&'a self, id: Id, ctx: C) -> (Option<EntryView<'a, C, T>>, C)
+    pub fn peek<'a, C>(&'a self, id: Id, ctx: C) -> (Option<PeekEntry<'a, T, T::View>>, C)
     where
         T: Project<C>,
     {
-        let Some(g) = Registry::acquire(self, id) else {
+        let Some(entry) = Self::reserve(self, &id) else {
             return (None, ctx);
         };
-        let (v, ctx) = g.as_ref().project(ctx);
-        (Some(EntryView { guard: g, view: v }), ctx)
+        let (view, ctx) = unsafe { entry.as_ref().project(ctx) };
+        (Some(PeekEntry { entry, id, view }), ctx)
+    }
+}
+
+impl<T, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
+    pub fn view<C>(&self, id: Id, ctx: C) -> (Option<ViewEntry<T, T::View, S, M>>, C)
+    where
+        T: Project<C>,
+    {
+        let Some(entry) = self.may_map(|r| Registry::reserve(r, &id)) else {
+            return (None, ctx);
+        };
+        let (view, ctx) = unsafe { entry.as_ref().project(ctx) };
+        (Some(ViewEntry { entry, id, view }), ctx)
     }
 }
 
@@ -517,6 +537,7 @@ mod tests {
         Registry::new().into()
     }
 
+    #[derive(Debug)]
     struct MockResource {
         id: usize,
         // It should be clarified that
@@ -582,7 +603,7 @@ mod tests {
         assert_eq!(reg.len(), 1);
 
         // acquire
-        let (Some(g), ctx) = reg.view(h, ctx) else {
+        let (Some(g), ctx) = reg.peek(h, ctx) else {
             panic!("acquire ok")
         };
         tracing::debug!("Acquired: {:?}", g);
@@ -611,13 +632,13 @@ mod tests {
             .expect_err("alloc failed");
 
         for id in ids {
-            let g = Registry::acquire(&reg, id).expect("acquire ok");
+            let g = Registry::borrow(&reg, id).expect("acquire ok");
             assert_eq!(EntryGuard::rc(&g), 1);
             tracing::debug!("Acquired: {:?}", g);
 
             let len = reg.len();
 
-            let g2 = Registry::acquire(&reg, id).expect("acquire ok");
+            let g2 = Registry::borrow(&reg, id).expect("acquire ok");
             assert_eq!(EntryGuard::rc(&g2), 2);
             tracing::debug!("Acquired 2: {:?}", g2);
 
@@ -671,7 +692,7 @@ mod tests {
                             }
                         };
                         for _ in 0..N / 2 {
-                            if let Some(g) = Registry::acquire(&reg, h) {
+                            if let Some(g) = Registry::borrow(&reg, h) {
                                 assert_eq!(g.as_ref().id, cfg);
                                 tracing::debug!("Guard: {:?}", g);
                                 // small work
@@ -719,7 +740,7 @@ mod tests {
                     .expect("resource should exists");
                 thread::spawn(move || {
                     for _ in 0..ACQUIRE_NUM {
-                        if let Some(g) = Registry::acquire(&reg, h) {
+                        if let Some(g) = Registry::borrow(&reg, h) {
                             // small work
                             tracing::debug!("Guard: {:?}", g);
                             core::hint::black_box(&*g);
@@ -761,8 +782,8 @@ mod tests {
         assert_eq!(reg.len(), 1);
 
         // aba
-        assert!(Registry::acquire(&reg, h1).is_none());
-        assert!(Registry::acquire(&reg, h2).is_some());
+        assert!(Registry::borrow(&reg, h1).is_none());
+        assert!(Registry::borrow(&reg, h2).is_some());
 
         let _ = reg.clear(h2, ctx);
         assert_eq!(reg.len(), 0);

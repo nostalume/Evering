@@ -6,7 +6,8 @@
     const_try,
     const_index,
     const_result_trait_fn,
-    const_option_ops
+    const_option_ops,
+    const_cmp,
 )]
 #![feature(
     sized_type_properties,
