@@ -296,8 +296,11 @@ impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> EntryGuard<E, T, V> {
     }
 }
 
-unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> Send for EntryGuard<E, T, V> {}
-unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize + Sync, V> Sync for EntryGuard<E, T, V> {}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V: Send> Send for EntryGuard<E, T, V> {}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V: Send> Sync
+    for EntryGuard<E, T, V>
+{
+}
 
 pub trait Finalize {
     fn finalize(&self);

@@ -7,7 +7,7 @@
     const_index,
     const_result_trait_fn,
     const_option_ops,
-    const_cmp,
+    const_cmp
 )]
 #![feature(
     sized_type_properties,
@@ -26,7 +26,6 @@ extern crate tracing;
 mod arena;
 pub mod boxed;
 mod channel;
-mod counter;
 mod header;
 mod mem;
 pub mod msg;
@@ -52,7 +51,10 @@ mod numeric {
         pub const HEAD: usize = 0;
         pub const NONE: usize = usize::MAX;
         pub const fn null() -> Self {
-            Self { idx: Self::NONE, live: 0 }
+            Self {
+                idx: Self::NONE,
+                live: 0,
+            }
         }
 
         pub const fn is_null(&self) -> bool {
@@ -219,4 +221,91 @@ mod numeric {
     pack_bits!(unpack:u16, pack:u32);
     pack_bits!(unpack:u32, pack:u64);
     pack_bits!(unpack:u64, pack:u128);
+}
+
+mod counter {
+    use core::{
+        ops::Deref,
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+
+    struct Counter<T> {
+        counts: AtomicUsize,
+        data: T,
+    }
+
+    pub struct CounterOf<T> {
+        counter: *mut Counter<T>,
+    }
+
+    unsafe impl<T: Send> Send for CounterOf<T> {}
+    unsafe impl<T: Sync> Sync for CounterOf<T> {}
+
+    impl<T> CounterOf<T> {
+        pub fn suspend(data: T) -> Self {
+            let counter = Box::into_raw(Box::new(Counter {
+                counts: AtomicUsize::new(1),
+                data,
+            }));
+            Self { counter }
+        }
+
+        const fn counter(&self) -> &Counter<T> {
+            unsafe { &*self.counter }
+        }
+
+        const fn as_raw(&self) -> *mut T {
+            let counter = unsafe { &mut *self.counter };
+            &mut counter.data as *mut T
+        }
+
+        pub fn acquire(&self) -> Self {
+            let count = self.counter().counts.fetch_add(1, Ordering::Relaxed);
+
+            // Cloning senders and calling `mem::forget` on the clones could potentially overflow the
+            // counter. It's very difficult to recover sensibly from such degenerate scenarios so we
+            // just abort when the count becomes very large.
+            if count > isize::MAX as usize {
+                core::panic!("counts exceed `isize::MAX`")
+            }
+
+            Self {
+                counter: self.counter,
+            }
+        }
+
+        pub unsafe fn release_in<F: FnOnce(*mut T)>(&self, dispose: F) {
+            if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
+                dispose(self.as_raw());
+                drop(unsafe { Box::from_raw(self.counter) });
+            }
+        }
+
+        pub unsafe fn release(&self) {
+            if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
+                unsafe { core::ptr::drop_in_place(self.as_raw()) };
+                drop(unsafe { Box::from_raw(self.counter) });
+            }
+        }
+    }
+
+    impl<T: core::fmt::Debug> core::fmt::Debug for CounterOf<T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            core::fmt::Debug::fmt(&**self, f)
+        }
+    }
+
+    impl<T> const Deref for CounterOf<T> {
+        type Target = T;
+
+        fn deref(&self) -> &T {
+            &self.counter().data
+        }
+    }
+
+    impl<T> PartialEq for CounterOf<T> {
+        fn eq(&self, other: &CounterOf<T>) -> bool {
+            self.counter == other.counter
+        }
+    }
 }

@@ -4,28 +4,24 @@
 // use std::os::fd::OwnedFd;
 // use std::path::Path;
 
-// use crate::boxed::ShmBox;
-// use crate::os::FdBackend;
-// use crate::os::unix::{MFdFlags, ProtFlags, UnixFdConf};
-// use crate::perlude::{AsShmAlloc, AsShmAllocError, ShmAllocError, ShmHeader};
+use crate::mem::{Access, MemBlkBuilder, MemBlkHandle};
+use crate::os::FdBackend;
+use crate::os::unix::{AddrSpec, ProtFlags, UnixFd};
+use crate::perlude::Session;
+use crate::perlude::allocator::{MemAlloc, Optimistic};
+use crate::tests::{prob, tracing_init};
 
-// type TestShm = AsShmAlloc<FdBackend<OwnedFd>>;
-// type Error = AsShmAllocError<FdBackend<OwnedFd>>;
+type UnixMemHandle = MemBlkHandle<AddrSpec, FdBackend>;
+type UnixAlloc = MemAlloc<Optimistic, AddrSpec, FdBackend>;
+type UnixSession<'a, H, const N: usize> = Session<Optimistic, H, N, AddrSpec, FdBackend>;
 
-// const SIZE: usize = 0x20000;
+const SIZE: usize = 0x20000;
 // const CHECK: u8 = 42;
-
-// fn create_named<P: AsRef<Path> + ?Sized>(name: &P, size: usize) -> Result<TestShm, Error> {
-//     let cfg = UnixFdConf::named(name, size).map_err(ShmAllocError::MapError)?;
-//     let m = TestShm::init_or_load(
-//         FdBackend::new(),
-//         None,
-//         size,
-//         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-//         cfg,
-//     )?;
-//     Ok(m)
-// }
+fn mock_handle(name: &str, size: usize) -> UnixMemHandle {
+    let fd = UnixFd::memfd(name, size, false).expect("should create");
+    let builder = MemBlkBuilder::from_backend(FdBackend);
+    builder.shared(size, Access::ReadWrite, fd).unwrap()
+}
 
 // fn create_mem<P: nix::NixPath + ?Sized>(path: &P, size: usize) -> Result<TestShm, Error> {
 //     let cfg =

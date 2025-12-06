@@ -6,7 +6,7 @@ pub mod unix;
 use self::unix::AddrSpec;
 use crate::mem::MemBlkBuilder;
 
-struct FdBackend;
+pub struct FdBackend;
 
 impl MemBlkBuilder<AddrSpec, FdBackend> {
     fn fd() -> Self {

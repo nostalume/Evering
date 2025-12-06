@@ -101,15 +101,19 @@ pub mod allocator {
 
 pub mod channel {
     use super::root::Span;
-    use crate::channel::cross;
-    use crate::channel::{QueueReceiver, QueueSender};
+    use crate::channel::driver::{CachePoolHandle, Completer, Submitter};
+    use crate::channel::{QueueChannel, Receiver, Sender};
+    use crate::channel::{cross, driver};
     use crate::msg::Envelope;
     use crate::reg::{Entry, MemEntry};
     use crate::token;
 
-    pub use crate::channel::{TryRecvError,TrySendError};
+    pub use crate::channel::driver::TryCompState;
+    pub use crate::channel::{TryRecvError, TrySendError};
+    pub use crate::token::{ReqId, ReqNull};
     pub type Token = token::Token<Span>;
     pub type MsgToken<H> = token::PackToken<H, Span>;
+    pub type OpMsgToken<H> = token::ReqToken<H, Span>;
 
     pub type MsgQueue<H> = cross::TokenQueue<H, Span>;
     pub type MsgDuplex<H> = cross::TokenDuplex<H, Span>;
@@ -118,37 +122,70 @@ pub mod channel {
 
     pub type SenderPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
     pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
-    pub type SenderView<'a, H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
-    pub type ReceiverView<'a, H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
+    pub type SenderView<H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
+    pub type ReceiverView<H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
+
+    pub type SubmitterPeek<'a, H, const N: usize, R> =
+        driver::Sx<SenderPeek<'a, H, R>, MsgToken<H>, N>;
+    pub type CompleterPeek<'a, H, const N: usize, R> =
+        driver::Cx<ReceiverPeek<'a, H, R>, MsgToken<H>, N>;
+    pub type SubmitterView<H, const N: usize, R, S, M> =
+        driver::Sx<SenderView<H, R, S, M>, MsgToken<H>, N>;
+    pub type CompleterView<H, const N: usize, R, S, M> =
+        driver::Cx<ReceiverView<H, R, S, M>, MsgToken<H>, N>;
+    pub type TrySubmitError<H> = driver::TrySubmitError<TrySendError<OpMsgToken<H>>>;
+    pub type RefOp<'a, H, const N: usize> = driver::RefOp<'a, MsgToken<H>, N>;
+    pub type OwnOp<H, const N: usize> = driver::OwnOp<MsgToken<H>, N>;
 
     pub trait MsgSender<H: Envelope>:
-        QueueSender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>>
+        Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel
     {
     }
 
-    impl<H: Envelope, T: QueueSender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>>>
-        MsgSender<H> for T
+    impl<
+        H: Envelope,
+        T: Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel,
+    > MsgSender<H> for T
     {
     }
+
     pub trait MsgReceiver<H: Envelope>:
-        QueueReceiver<Item = MsgToken<H>, TryError = TryRecvError>
+        Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel
     {
     }
 
-    impl<H: Envelope, T: QueueReceiver<Item = MsgToken<H>, TryError = TryRecvError>> MsgReceiver<H>
-        for T
+    impl<H: Envelope, T: Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel>
+        MsgReceiver<H> for T
     {
     }
 
-    // pub type CachePool<H, const N: usize> = driver::CachePoolHandle<MsgToken<H>, N>;
+    pub type CachePool<H, const N: usize> = CachePoolHandle<MsgToken<H>, N>;
 
-    // pub trait MsgSubmitter<H: Envelope>: driver::Submitter<H, Span> {}
+    pub trait MsgSubmitter<H: Envelope, const N: usize>:
+        Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel
+    {
+    }
 
-    // impl<H: Envelope, T: driver::Submitter<H, Span>> MsgSubmitter<H> for T {}
+    impl<
+        H: Envelope,
+        const N: usize,
+        T: Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel,
+    > MsgSubmitter<H, N> for T
+    {
+    }
 
-    // pub trait MsgCompleter<H: Envelope>: driver::Completer<H, Span> {}
+    pub trait MsgCompleter<H: Envelope, const N: usize>:
+        Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel
+    {
+    }
 
-    // impl<H: Envelope, T: driver::Completer<H, Span>> MsgCompleter<H> for T {}
+    impl<
+        H: Envelope,
+        const N: usize,
+        T: Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel,
+    > MsgCompleter<H, N> for T
+    {
+    }
 }
 
 pub use root::{Session, SessionBy};

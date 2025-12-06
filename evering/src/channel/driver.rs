@@ -3,14 +3,15 @@ use core::{
     clone::Clone,
     future::Future,
     mem::MaybeUninit,
+    ops::Deref,
+    ptr,
     sync::atomic::{AtomicU8, AtomicU32, AtomicUsize, Ordering, fence},
     task::{Context, Poll, Waker},
 };
 
 use crate::{
-    msg::{Envelope, Operation},
+    channel::{QueueChannel, Sender},
     numeric::Id,
-    token::PackToken,
 };
 
 use crossbeam_utils::Backoff;
@@ -95,6 +96,7 @@ impl<T> Cache<T> {
         }
     }
 
+    /// return complete successfully or not.
     pub fn complete(&self, payload: T) -> bool {
         unsafe { self.replace_payload(payload) };
         // AcqRel ensures visible
@@ -215,31 +217,58 @@ impl<T> Cache<T> {
     }
 }
 
-pub struct Op<'a, T, const N: usize> {
-    pool: &'a CachePool<T, N>,
-    entry: &'a Cache<T>,
+pub struct Op<T, const N: usize, P: const Deref<Target = CachePool<T, N>>> {
+    pool: P,
+    entry: ptr::NonNull<Cache<T>>,
     idx: usize,
 }
 
-impl<'a, T, const N: usize> Future for Op<'a, T, N> {
+unsafe impl<T: Send, const N: usize, P: const Deref<Target = CachePool<T, N>>> Send
+    for Op<T, N, P>
+{
+}
+unsafe impl<T, const N: usize, P: const Deref<Target = CachePool<T, N>>> Sync for Op<T, N, P> {}
+
+pub type RefOp<'a, T, const N: usize> = Op<T, N, &'a CachePool<T, N>>;
+pub type OwnOp<T, const N: usize> = Op<T, N, CachePoolHandle<T, N>>;
+
+impl<T, const N: usize, P: const Deref<Target = CachePool<T, N>>> Future for Op<T, N, P> {
     type Output = T;
 
     fn poll(self: core::pin::Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        self.entry.poll(cx)
+        // Safety: ensured by `pool` field
+        unsafe { self.entry.as_ref().poll(cx) }
     }
 }
 
-impl<'a, T, const N: usize> Drop for Op<'a, T, N> {
+impl<T, const N: usize, P: const Deref<Target = CachePool<T, N>>> Drop for Op<T, N, P> {
     fn drop(&mut self) {
-        unsafe { self.entry.clean() };
+        // Safety: ensured by `pool` field
+        unsafe { self.entry.as_ref().clean() };
         self.pool.push_free(self.idx)
     }
 }
 
-struct CachePool<T, const N: usize> {
+impl<T, const N: usize, P: const Deref<Target = CachePool<T, N>>> PartialEq for Op<T, N, P> {
+    fn eq(&self, other: &Self) -> bool {
+        self.entry == other.entry && self.idx == other.idx
+    }
+}
+
+pub struct CachePool<T, const N: usize> {
     inits: AtomicUsize,
     free_head: AtomicUsize,
     entries: [Cache<T>; N],
+}
+
+impl<T, const N: usize> core::fmt::Debug for CachePool<T, N> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inits = self.inits.load(Ordering::Relaxed);
+        f.debug_struct("CachePool")
+            .field("inits", &inits)
+            .field("entries", &"{ .. }")
+            .finish()
+    }
 }
 
 impl<T, const N: usize> CachePool<T, N> {
@@ -298,37 +327,62 @@ impl<T, const N: usize> CachePool<T, N> {
             backoff.snooze();
         }
     }
-}
 
-impl<T, const N: usize> CachePool<T, N> {
-    pub fn register(&self) -> Option<(Id, Op<'_, T, N>)> {
+    fn prepare(&self) -> Option<(&Cache<T>, Id)> {
         let idx = self.pop_free();
         if idx == NONE {
             return None;
         }
         let entry = &self.entries[idx];
         let live = entry.live.load(Ordering::Relaxed);
-        Some((
-            Id { idx, live },
-            Op {
-                entry,
-                pool: self,
-                idx,
-            },
-        ))
+        Some((entry, Id { idx, live }))
     }
 
-    pub fn complete(&self, id: Id, payload: T) -> Option<bool> {
-        // id must be bounded
+    fn lookup(&self, id: Id) -> Option<&Cache<T>> {
         let e = &self.entries[id.idx];
-        if e.live.load(Ordering::Relaxed) != id.live {
+        if e.live.load(Ordering::Acquire) != id.live {
             return None;
         }
-        Some(e.complete(payload))
+        Some(e)
     }
 }
 
+impl<T, const N: usize> CachePool<T, N> {
+    pub fn probe(&self) -> Option<(RefOp<'_, T, N>, Id)> {
+        let (entry, id) = self.prepare()?;
+        Some((
+            RefOp {
+                pool: self,
+                entry: entry.into(),
+                idx: id.idx,
+            },
+            id,
+        ))
+    }
+
+    fn complete(&self, id: Id, payload: T) -> TryCompState {
+        // id must be bounded
+        let Some(e) = self.lookup(id) else {
+            return TryCompState::Outdated;
+        };
+        if e.complete(payload) {
+            TryCompState::Success
+        } else {
+            TryCompState::Prefilled
+        }
+    }
+}
+
+#[derive(Debug)]
 pub struct CachePoolHandle<T, const N: usize>(crate::counter::CounterOf<CachePool<T, N>>);
+
+impl<T, const N: usize> const Deref for CachePoolHandle<T, N> {
+    type Target = CachePool<T, N>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
 
 impl<T, const N: usize> Clone for CachePoolHandle<T, N> {
     fn clone(&self) -> Self {
@@ -348,11 +402,27 @@ impl<T, const N: usize> CachePoolHandle<T, N> {
         Self(crate::counter::CounterOf::suspend(pool))
     }
 
+    pub fn claim(&self) -> Option<(OwnOp<T, N>, Id)> {
+        let (entry, id) = self.0.prepare()?;
+        Some((
+            OwnOp {
+                pool: self.clone(),
+                entry: entry.into(),
+                idx: id.idx,
+            },
+            id,
+        ))
+    }
+
     pub fn bind<S: super::Sender, R: super::Receiver>(
         self,
         sender: S,
         receiver: R,
-    ) -> (Sx<S, T, N>, Cx<R, T, N>) {
+    ) -> (Sx<S, T, N>, Cx<R, T, N>)
+    where
+        S::Item: Identifier<T>,
+        R::Item: Identifier<T>,
+    {
         let s = Sx {
             sender,
             pool: self.clone(),
@@ -365,84 +435,140 @@ impl<T, const N: usize> CachePoolHandle<T, N> {
     }
 }
 
-pub struct Sx<S: super::Sender, T, const N: usize> {
+#[derive(Debug)]
+pub enum TrySubmitError<E> {
+    SendError(E),
+    CacheFull,
+}
+
+#[derive(Debug, PartialEq)]
+pub enum TryCompState {
+    Success,
+    Prefilled,
+    Outdated,
+}
+
+pub trait Identified<U>: Sized {
+    fn compose(self, id: Id) -> U;
+    fn decompose(output: U) -> (Self, Id);
+}
+
+pub trait Identifier<T>: Sized {
+    fn decompose(self) -> (T, Id);
+    fn compose(origin: T, id: Id) -> Self;
+}
+
+impl<T: Identified<U>, U> Identifier<T> for U {
+    fn decompose(self) -> (T, Id) {
+        T::decompose(self)
+    }
+
+    fn compose(origin: T, id: Id) -> Self {
+        T::compose(origin, id)
+    }
+}
+
+pub trait Submitter<Op: Future, U> {
+    type Item: Identifier<U>;
+    type Error;
+    fn try_submit(&self, item: U) -> Result<Op, Self::Error>;
+}
+
+pub trait Completer<U> {
+    type Item: Identifier<U>;
+    type Error;
+    fn complete(&self) -> Result<TryCompState, Self::Error>;
+}
+
+#[derive(Clone, Debug)]
+pub struct Sx<S: super::Sender, U, const N: usize>
+where
+    S::Item: Identifier<U>,
+{
     sender: S,
-    pool: CachePoolHandle<T, N>,
+    pool: CachePoolHandle<U, N>,
 }
 
-impl<H: Envelope, M, S, T, const N: usize> Sx<S, T, N>
+impl<S: super::Sender, U, const N: usize> Sx<S, U, N>
 where
-    S: super::Sender<Item = PackToken<Operation<H>, M>>,
+    S::Item: Identifier<U>,
 {
-    pub fn try_submit(&self, item: PackToken<H, M>) -> Option<Op<'_, T, N>> {
-        let (id, op) = self.pool.0.register()?;
-        let item = Operation::compose(id, item);
-        self.sender.try_send(item).ok()?;
-        Some(op)
+    pub fn try_submit_ref<'a>(
+        &'a self,
+        item: U,
+    ) -> Result<RefOp<'a, U, N>, TrySubmitError<S::TryError>> {
+        let (op, id) = self.pool.0.probe().ok_or(TrySubmitError::CacheFull)?;
+        let msg = S::Item::compose(item, id);
+        self.sender
+            .try_send(msg)
+            .map_err(TrySubmitError::SendError)?;
+        Ok(op)
     }
 }
 
-pub struct Cx<R: super::Receiver, T, const N: usize> {
+impl<S: super::Sender + QueueChannel, U, const N: usize> super::QueueChannel for Sx<S, U, N>
+where
+    S::Item: Identifier<U>,
+{
+    type Handle = S::Handle;
+
+    #[inline]
+    fn handle(&self) -> &Self::Handle {
+        self.sender.handle()
+    }
+}
+
+impl<'a, S: super::Sender, U, const N: usize> Submitter<OwnOp<U, N>, U> for Sx<S, U, N>
+where
+    S::Item: Identifier<U>,
+{
+    type Item = S::Item;
+
+    type Error = TrySubmitError<S::TryError>;
+
+    fn try_submit(&self, item: U) -> Result<OwnOp<U, N>, Self::Error> {
+        let (op, id) = self.pool.claim().ok_or(TrySubmitError::CacheFull)?;
+        let msg = S::Item::compose(item, id);
+        self.sender
+            .try_send(msg)
+            .map_err(TrySubmitError::SendError)?;
+        Ok(op)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct Cx<R: super::Receiver, U, const N: usize>
+where
+    R::Item: Identifier<U>,
+{
     receiver: R,
-    pool: CachePoolHandle<T, N>,
+    pool: CachePoolHandle<U, N>,
 }
 
-impl<H: Envelope, M, R, const N: usize> Cx<R, PackToken<H, M>, N>
+impl<R: super::Receiver + QueueChannel, U, const N: usize> super::QueueChannel for Cx<R, U, N>
 where
-    R: super::Receiver<Item = PackToken<Operation<H>, M>>,
+    R::Item: Identifier<U>,
 {
-    pub fn try_complete(&self) {
-        if let Ok(token) = self.receiver.try_recv() {
-            let (id, token) = Operation::decompose(token);
-            self.pool.0.complete(id, token);
-        }
+    type Handle = R::Handle;
+
+    #[inline]
+    fn handle(&self) -> &Self::Handle {
+        self.receiver.handle()
     }
 }
 
-pub trait Submitter<H: Envelope, M> {
-    type Op<'a>: Future<Output = PackToken<H, M>>
-    where
-        Self: 'a;
-    fn try_submit(&self, item: PackToken<H, M>) -> Option<Self::Op<'_>>;
-}
-
-pub trait Completer<H: Envelope, M> {
-    fn try_complete<F: FnOnce(&PackToken<H, M>) -> bool>(&self, f: F) -> Option<bool>;
-}
-
-impl<H, M, S, const N: usize> Submitter<H, M> for Sx<S, PackToken<H, M>, N>
+impl<'a, R: super::Receiver, U, const N: usize> Completer<U> for Cx<R, U, N>
 where
-    H: Envelope,
-    S: super::Sender<Item = PackToken<Operation<H>, M>>,
+    R::Item: Identifier<U>,
 {
-    type Op<'a>
-        = Op<'a, PackToken<H, M>, N>
-    where
-        S: 'a,
-        H: 'a,
-        M: 'a;
-    fn try_submit(&self, item: PackToken<H, M>) -> Option<Op<'_, PackToken<H, M>, N>> {
-        let (id, op) = self.pool.0.register()?;
-        let item = Operation::compose(id, item);
-        self.sender.try_send(item).ok()?;
-        Some(op)
-    }
-}
+    type Item = R::Item;
 
-impl<H, M, R, const N: usize> Completer<H, M> for Cx<R, PackToken<H, M>, N>
-where
-    H: Envelope,
-    R: super::Receiver<Item = PackToken<Operation<H>, M>>,
-{
-    fn try_complete<F: FnOnce(&PackToken<H, M>) -> bool>(&self, f: F) -> Option<bool> {
-        if let Ok(token) = self.receiver.try_recv() {
-            let (id, token) = Operation::decompose(token);
-            let exit = f(&token);
-            self.pool.0.complete(id, token);
-            Some(exit)
-        } else {
-            None
-        }
+    type Error = R::TryError;
+
+    fn complete(&self) -> Result<TryCompState, Self::Error> {
+        let msg = self.receiver.try_recv()?;
+        let (payload, id) = msg.decompose();
+        Ok(self.pool.0.complete(id, payload))
     }
 }
 
@@ -555,7 +681,7 @@ mod tests {
             let mut ops = Vec::with_capacity(N);
 
             for _ in 0..N {
-                let (id, op) = pool.register().expect("should allocate");
+                let (op, id) = pool.probe().expect("should allocate");
                 ids.push(id);
                 ops.push(op);
             }
@@ -602,7 +728,7 @@ mod tests {
             }
         });
 
-        let (id, _) = pool.register().expect("should allocate");
+        let (_, id) = pool.probe().expect("should allocate");
         assert_ne!(id.live, 0)
     }
 }

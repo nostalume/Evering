@@ -1,9 +1,12 @@
 use core::marker::PhantomData;
+use core::ops::Deref;
 use core::ptr::{self, NonNull};
 
 use crate::boxed::PBox;
+use crate::channel::driver::Identified;
 use crate::mem::{IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf};
-use crate::msg::{Envelope, Message, Tag, TagRef, TypeId, TypeTag};
+use crate::msg::{Envelope, Message, Tag, TagId, TagRef, TypeId, TypeTag};
+use crate::numeric::Id;
 
 #[derive(Clone, Copy, Debug)]
 enum Metadata {
@@ -204,19 +207,20 @@ impl<M> Token<M> {
     }
 }
 
+pub type ReqToken<T, M> = PackToken<ReqId<T>, M>;
 pub struct PackToken<H: Envelope, M> {
     header: H,
     token: Token<M>,
 }
 
-// impl<H: Envelope, M> core::fmt::Debug for PackToken<H, M> {
-//     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-//         f.debug_struct("PackToken")
-//             .field("header", &self.header)
-//             .field("token", &self.token)
-//             .finish()
-//     }
-// }
+impl<H: Envelope + core::fmt::Debug, M> core::fmt::Debug for PackToken<H, M> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("PackToken")
+            .field("header", &self.header)
+            .field("token", &self.token)
+            .finish()
+    }
+}
 
 impl<H: Envelope, M> PackToken<H, M> {
     #[inline]
@@ -231,8 +235,7 @@ impl<H: Envelope, M> PackToken<H, M> {
     }
 
     #[inline]
-    pub fn map_header<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M>
-    {
+    pub fn map_header<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M> {
         let (token, header) = self.into_parts();
         PackToken {
             header: f(header, &token),
@@ -274,5 +277,69 @@ impl<H: Envelope, M> PackToken<H, M> {
         H: TagRef<T>,
     {
         self.header.tag_ref()
+    }
+}
+
+pub type ReqNull = ReqId<()>;
+pub struct ReqId<T: Envelope> {
+    id: Id,
+    header: T,
+}
+
+impl<T: Envelope> const Deref for ReqId<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        &self.header
+    }
+}
+
+impl<T: Envelope> Envelope for ReqId<T> {}
+
+impl<T: Envelope> TagId for ReqId<T> {
+    fn with_id(self, value: Id) -> Self
+    where
+        Self: Sized,
+    {
+        Self { id: value, ..self }
+    }
+    fn id(&self) -> Id {
+        self.id
+    }
+}
+
+impl<T: Tag<H>, H> Tag<H> for ReqId<T> {
+    fn with_tag(self, value: H) -> Self
+    where
+        Self: Sized,
+    {
+        Self {
+            id: self.id,
+            header: self.header.with_tag(value),
+        }
+    }
+
+    fn tag(&self) -> H {
+        self.header.tag()
+    }
+}
+
+impl<T: Envelope> ReqId<T> {
+    pub fn header(&self) -> &T {
+        &self.header
+    }
+}
+
+impl<T: Envelope, M> Identified<ReqToken<T, M>> for PackToken<T, M> {
+    fn compose(self, id: Id) -> ReqToken<T, M> {
+        let (token, header) = self.into_parts();
+        let header = ReqId { header, id };
+        token.pack(header)
+    }
+
+    fn decompose(token: ReqToken<T, M>) -> (Self, Id) {
+        let (token, header) = token.into_parts();
+        let ReqId { id, header } = header;
+        (token.pack(header), id)
     }
 }

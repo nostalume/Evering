@@ -3,7 +3,7 @@ use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::panic::{RefUnwindSafe, UnwindSafe};
-use core::ptr;
+use core::ptr::{self};
 use core::sync::atomic::AtomicUsize;
 
 use crate::boxed::PBox;
@@ -17,8 +17,43 @@ type Token<H, M> = PackToken<H, M>;
 type Tokens<H, M> = Slots<Token<H, M>>;
 
 type TokenOfTokens<H, M> = TokenOf<Tokens<H, M>, M>;
-type ViewOfQueue<H, M> = ptr::NonNull<Tokens<H, M>>;
-type ViewOfDuplex<H, M> = (ViewOfQueue<H, M>, ViewOfQueue<H, M>);
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct ViewOfQueue<H: Envelope, M> {
+    ptr: ptr::NonNull<Tokens<H, M>>,
+}
+
+unsafe impl<H: Envelope, M> Send for ViewOfQueue<H, M> {}
+
+impl<H: Envelope, M> const Deref for ViewOfQueue<H, M> {
+    type Target = Tokens<H, M>;
+    fn deref(&self) -> &Self::Target {
+        // Safety: only view in TokenQueue context.
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<H: Envelope, M> Clone for ViewOfQueue<H, M> {
+    fn clone(&self) -> Self {
+        Self { ptr: self.ptr }
+    }
+}
+
+#[derive(Debug)]
+pub struct ViewOfDuplex<H: Envelope, M> {
+    left: ViewOfQueue<H, M>,
+    right: ViewOfQueue<H, M>,
+}
+
+impl<H: Envelope, M> Clone for ViewOfDuplex<H, M> {
+    fn clone(&self) -> Self {
+        Self {
+            left: self.left.clone(),
+            right: self.right.clone(),
+        }
+    }
+}
 
 pub trait AsTokenQueue<H: Envelope, M>: AsEntry<TokenQueue<H, M>> {}
 impl<H: Envelope, M, T: AsEntry<TokenQueue<H, M>>> AsTokenQueue<H, M> for T {}
@@ -76,7 +111,7 @@ impl<H: Envelope, A: MemAllocator> Project<A> for TokenQueueOf<H, A> {
     fn project(&self, ctx: A) -> (Self::View, A) {
         let alloc = ctx;
         let (buf, alloc) = self.buf.as_ptr(alloc);
-        (buf, alloc)
+        (ViewOfQueue { ptr: buf }, alloc)
     }
 }
 
@@ -90,7 +125,7 @@ impl<E: AsTokenQueue<H, M>, H: Envelope, M> Queue for QueueView<H, M, E> {
 
     #[inline]
     fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.view.as_ref() }
+        &self.view
     }
 }
 
@@ -107,8 +142,8 @@ pub type Receiver<H, M, E, R> = QueueRx<Split<DuplexView<H, M, E>, R>>;
 
 pub type TokenDuplexOf<H, A> = TokenDuplex<H, MetaSpanOf<A>>;
 pub struct TokenDuplex<H: Envelope, M> {
-    l: TokenQueue<H, M>,
-    r: TokenQueue<H, M>,
+    left: TokenQueue<H, M>,
+    right: TokenQueue<H, M>,
 }
 
 pub struct Left;
@@ -122,7 +157,7 @@ pub struct Split<T, Role> {
 
 impl<H: Envelope, M> Finalize for TokenDuplex<H, M> {
     fn finalize(&self) {
-        self.l.header.close()
+        self.left.header.close()
     }
 }
 
@@ -133,12 +168,12 @@ impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplexOf<H, A> {
         let alloc = ctx;
         let (l, alloc) = TokenQueue::new(cfg, alloc);
         let (r, alloc) = TokenQueue::new(cfg, alloc);
-        (Self { l, r }, alloc)
+        (Self { left: l, right: r }, alloc)
     }
 
     fn free(s: Self, ctx: A) -> A {
         let alloc = ctx;
-        let Self { l, r } = s;
+        let Self { left: l, right: r } = s;
         let alloc = TokenQueue::free(l, alloc);
         TokenQueue::free(r, alloc)
     }
@@ -149,9 +184,9 @@ impl<H: Envelope, A: MemAllocator> Project<A> for TokenDuplexOf<H, A> {
 
     fn project(&self, ctx: A) -> (Self::View, A) {
         let alloc = ctx;
-        let (l, alloc) = self.l.project(alloc);
-        let (r, alloc) = self.r.project(alloc);
-        ((l, r), alloc)
+        let (left, alloc) = self.left.project(alloc);
+        let (right, alloc) = self.right.project(alloc);
+        (ViewOfDuplex { left, right }, alloc)
     }
 }
 
@@ -168,12 +203,12 @@ impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for Split<DuplexView<H, M, E>
 
     #[inline]
     fn header(&self) -> &Header {
-        &self.as_ref().l.header
+        &self.as_ref().left.header
     }
 
     #[inline]
     fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.view.0.as_ref() }
+        &self.view.left
     }
 }
 
@@ -184,19 +219,19 @@ impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for Split<DuplexView<H, M, E>
 
     #[inline]
     fn header(&self) -> &Header {
-        &self.as_ref().r.header
+        &self.as_ref().right.header
     }
 
     #[inline]
     fn buf(&self) -> &Slots<Self::Item> {
-        unsafe { self.view.1.as_ref() }
+        &self.view.right
     }
 }
 
 impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for Split<DuplexView<H, M, E>, Right> {}
 
 impl<E: AsTokenDuplex<H, M> + Clone, H: Envelope, M> DuplexView<H, M, E> {
-    fn split(duplex:Self)->(LDuplexView<H, M, E>, RDuplexView<H, M, E>) {
+    fn split(duplex: Self) -> (LDuplexView<H, M, E>, RDuplexView<H, M, E>) {
         (
             LDuplexView {
                 inner: duplex.clone(),
@@ -209,12 +244,12 @@ impl<E: AsTokenDuplex<H, M> + Clone, H: Envelope, M> DuplexView<H, M, E> {
         )
     }
     pub fn lsplit(self) -> (Sender<H, M, E, Left>, Receiver<H, M, E, Right>) {
-        let (l,r) = Self::split(self);
+        let (l, r) = Self::split(self);
         (l.sender(), r.receiver())
     }
 
-    pub fn rsplit(self) -> (Sender<H,M,E,Right>,Receiver<H,M,E,Left>) {
-        let (l,r) = Self::split(self);
+    pub fn rsplit(self) -> (Sender<H, M, E, Right>, Receiver<H, M, E, Left>) {
+        let (l, r) = Self::split(self);
         (r.sender(), l.receiver())
     }
 }

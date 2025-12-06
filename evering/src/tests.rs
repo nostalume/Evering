@@ -2,7 +2,7 @@
 
 use crate::{
     mem::{AddrSpec, Mmap, RawMemBlk},
-    msg::{Envelope, Message, Move, Operation, Tag, TypeTag, type_id},
+    msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
 };
 
 mod mock;
@@ -111,5 +111,3 @@ impl Tag<Exit> for Exit {
         self.clone()
     }
 }
-
-type IdExit = Operation<Exit>;

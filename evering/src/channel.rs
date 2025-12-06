@@ -424,7 +424,7 @@ pub trait AsyncReceiver: Receiver {
     fn recv(&self) -> impl Future<Output = Result<Self::Item, Self::Error>>;
 }
 
-pub trait QueueSender: Sender {
+pub trait QueueChannel {
     type Handle: Queue;
 
     fn handle(&self) -> &Self::Handle;
@@ -435,44 +435,8 @@ pub trait QueueSender: Sender {
     }
 
     #[inline(always)]
-    fn is_close(&self) {
-        self.handle().close()
-    }
-
-    #[inline(always)]
-    fn capacity(&self) -> usize {
-        self.handle().capacity()
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.handle().is_empty()
-    }
-
-    #[inline(always)]
-    fn is_full(&self) -> bool {
-        self.handle().is_full()
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.handle().len()
-    }
-}
-
-pub trait QueueReceiver: Receiver {
-    type Handle: Queue;
-
-    fn handle(&self) -> &Self::Handle;
-
-    #[inline(always)]
-    fn close(&self) {
-        self.handle().close()
-    }
-
-    #[inline(always)]
-    fn is_close(&self) {
-        self.handle().close()
+    fn is_close(&self) -> bool {
+        self.handle().is_close()
     }
 
     #[inline(always)]
@@ -531,7 +495,7 @@ impl<T: Queue> Sender for QueueTx<T> {
     }
 }
 
-impl<T: Queue> QueueSender for QueueTx<T> {
+impl<T: Queue> QueueChannel for QueueTx<T> {
     type Handle = T;
 
     #[inline(always)]
@@ -581,7 +545,7 @@ impl<T: Queue> Receiver for QueueRx<T> {
     }
 }
 
-impl<T: Queue> QueueReceiver for QueueRx<T> {
+impl<T: Queue> QueueChannel for QueueRx<T> {
     type Handle = T;
 
     #[inline(always)]
@@ -593,10 +557,13 @@ impl<T: Queue> QueueReceiver for QueueRx<T> {
 impl<T: Queue> QueueRx<T> {
     #[inline(always)]
     pub fn try_recv(&self) -> Result<T::Item, TryRecvError> {
-        if self.rx.header().is_close() {
-            return Err(TryRecvError::Disconnected);
-        }
-        self.rx.pop().ok_or(TryRecvError::Empty)
+        self.rx.pop().ok_or_else(|| {
+            if self.is_close() {
+                TryRecvError::Disconnected
+            } else {
+                TryRecvError::Empty
+            }
+        })
     }
 
     // #[inline(always)]
