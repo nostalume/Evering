@@ -517,13 +517,13 @@ fn conn_sync() {
 
     use super::{Exit, Info};
     use crate::msg::MoveMessage;
-    use crate::perlude::channel::{MsgReceiver, MsgSender, Token};
+    use crate::perlude::channel::{MsgReceiver, MsgSender, Token, TryRecvError, TrySendError};
 
     const N: usize = 1;
     const SIZE: usize = 256;
-    const FUZZ_PROB: f32 = 0.001;
+    const FUZZ_PROB: f32 = 0.01;
 
-    fn stress<S: MsgSender<Exit>, R: MsgReceiver<Exit>, F: FnMut(Token) -> Option<Token>>(
+    fn stress<S: MsgSender<()>, R: MsgReceiver<()>, F: FnMut(Token) -> Option<Token>>(
         s: S,
         r: R,
         mut handler: F,
@@ -535,25 +535,26 @@ fn conn_sync() {
                 thread::yield_now();
             }
 
-            let Ok(p) = r.try_recv() else {
-                continue;
+            let p = match r.try_recv() {
+                Ok(p) => p,
+                Err(e) => match e {
+                    TryRecvError::Empty => continue,
+                    TryRecvError::Disconnected => break,
+                },
             };
 
-            if p.tag::<Exit>() == Exit::Exit {
-                break;
-            }
-
-            let (t, h) = p.into_parts();
-            assert!(h == Exit::None, "header corrupted");
+            let (t, _) = p.into_parts();
+            // assert!(h == Exit::None, "header corrupted");
 
             match handler(t) {
                 None => {
-                    let exit = Token::empty().pack(Exit::Exit);
-                    let _ = s.try_send(exit);
+                    // let exit = Token::empty().pack(Exit::Exit);
+                    // let _ = s.try_send(exit);
+                    s.close();
                     alive = false;
                 }
                 Some(reply) => {
-                    let pack = reply.pack(Exit::None);
+                    let pack = reply.pack_default();
                     let _ = s.try_send(pack);
                 }
             }
@@ -563,17 +564,17 @@ fn conn_sync() {
     tracing_init();
 
     let mut pt = [0; MAX_ADDR];
-    let conn = mock_conn::<Exit, N>(&mut pt, 0, MAX_ADDR);
+    let conn = mock_conn::<(), N>(&mut pt, 0, MAX_ADDR);
     let alloc = conn.alloc.clone();
 
     let h = conn.prepare(SIZE).expect("alloc ok");
     let q = conn.acquire(h).expect("view ok");
 
-    let (ls, lr) = q.clone().sr_duplex();
-    let (rs, rr) = q.clone().rs_duplex();
+    let (ls, lr) = q.clone().lsplit();
+    let (rs, rr) = q.clone().rsplit();
 
     let (msg, alloc) = Info::mock().token(alloc);
-    let _ = ls.try_send(msg.pack(Exit::None));
+    let _ = ls.try_send(msg.pack_default());
 
     let handler = |token: Token, label: &'static str| {
         if prob(FUZZ_PROB) {

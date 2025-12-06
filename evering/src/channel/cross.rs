@@ -1,4 +1,5 @@
 use core::cell::UnsafeCell;
+use core::marker::PhantomData;
 use core::mem::MaybeUninit;
 use core::ops::Deref;
 use core::panic::{RefUnwindSafe, UnwindSafe};
@@ -6,10 +7,10 @@ use core::ptr;
 use core::sync::atomic::AtomicUsize;
 
 use crate::boxed::PBox;
-use crate::channel::{Endpoint, Header, Queue, Rx, Slot, Slots, Tx};
+use crate::channel::{Endpoint, Header, Queue, QueueRx, QueueTx, Slot, Slots};
 use crate::mem::{MemAllocator, MetaSpanOf};
 use crate::msg::Envelope;
-use crate::reg::{AsEntry, EntryGuard, Project, Resource};
+use crate::reg::{AsEntry, EntryGuard, Finalize, Project, Resource};
 use crate::token::{PackToken, TokenOf};
 
 type Token<H, M> = PackToken<H, M>;
@@ -35,10 +36,17 @@ unsafe impl<H: Send + Envelope, M> Sync for TokenQueue<H, M> {}
 impl<H: Envelope, M> UnwindSafe for TokenQueue<H, M> {}
 impl<H: Envelope, M> RefUnwindSafe for TokenQueue<H, M> {}
 
+impl<H: Envelope, M> Finalize for TokenQueue<H, M> {
+    fn finalize(&self) {
+        // Recover the disconnection state for next preparation.
+        self.header.open()
+    }
+}
+
 impl<H: Envelope, A: MemAllocator> Resource<A> for TokenQueueOf<H, A> {
     type Config = usize;
-    fn new(cfg: Self::Config, ctx: A) -> (Self, A) {
-        let cap = cfg;
+    fn new(conf: Self::Config, ctx: A) -> (Self, A) {
+        let cap = conf;
         let alloc = ctx;
         let header = Header::new(cap);
         let buffer: PBox<_, A> = PBox::new_slice_in(
@@ -55,26 +63,6 @@ impl<H: Envelope, A: MemAllocator> Resource<A> for TokenQueueOf<H, A> {
 
     fn free(s: Self, ctx: A) -> A {
         let alloc = ctx;
-        // let (view, alloc) = self.project(alloc);
-        // struct DropView<'a, H: Envelope, A: MemAllocator> {
-        //     h: &'a Header,
-        //     view: ptr::NonNull<Tokens<H, A>>,
-        // }
-
-        // impl<H: Envelope, A: MemAllocator> Queue for DropView<'_, H, A> {
-        //     type Item = SpanPackToken<H, A>;
-
-        //     fn header(&self) -> &Header {
-        //         self.h
-        //     }
-
-        //     fn buf(&self) -> &Slots<Self::Item> {
-        //         unsafe { self.view.as_ref() }
-        //     }
-        // }
-
-        // let drop_view = DropView::<'_, _, A> { h: &self.h, view };
-        // unsafe { drop_view.drop_in() };
         let Self { header: _, buf } = s;
         let b = buf.detoken(alloc);
         PBox::drop_in(b)
@@ -112,21 +100,33 @@ pub trait AsTokenDuplex<H: Envelope, M>: AsEntry<TokenDuplex<H, M>> {}
 impl<H: Envelope, M, T: AsEntry<TokenDuplex<H, M>>> AsTokenDuplex<H, M> for T {}
 
 pub type DuplexView<H, M, E> = EntryGuard<E, TokenDuplex<H, M>, ViewOfDuplex<H, M>>;
+pub type LDuplexView<H, M, E> = Split<DuplexView<H, M, E>, Left>;
+pub type RDuplexView<H, M, E> = Split<DuplexView<H, M, E>, Right>;
+pub type Sender<H, M, E, R> = QueueTx<Split<DuplexView<H, M, E>, R>>;
+pub type Receiver<H, M, E, R> = QueueRx<Split<DuplexView<H, M, E>, R>>;
+
 pub type TokenDuplexOf<H, A> = TokenDuplex<H, MetaSpanOf<A>>;
 pub struct TokenDuplex<H: Envelope, M> {
     l: TokenQueue<H, M>,
     r: TokenQueue<H, M>,
 }
 
-#[repr(transparent)]
-#[derive(Clone, PartialEq)]
-pub struct LEndpoint<T>(T);
+pub struct Left;
+pub struct Right;
 
-#[repr(transparent)]
 #[derive(Clone, PartialEq)]
-pub struct REndpoint<T>(T);
+pub struct Split<T, Role> {
+    inner: T,
+    _role: PhantomData<Role>,
+}
 
-impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplexOf<H,A> {
+impl<H: Envelope, M> Finalize for TokenDuplex<H, M> {
+    fn finalize(&self) {
+        self.l.header.close()
+    }
+}
+
+impl<H: Envelope, A: MemAllocator> Resource<A> for TokenDuplexOf<H, A> {
     type Config = usize;
 
     fn new(cfg: Self::Config, ctx: A) -> (Self, A) {
@@ -155,15 +155,15 @@ impl<H: Envelope, A: MemAllocator> Project<A> for TokenDuplexOf<H, A> {
     }
 }
 
-impl<T> const Deref for LEndpoint<T> {
+impl<T, Role> const Deref for Split<T, Role> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
-        &self.0
+        &self.inner
     }
 }
 
-impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for LEndpoint<DuplexView<H, M, E>> {
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for Split<DuplexView<H, M, E>, Left> {
     type Item = Token<H, M>;
 
     #[inline]
@@ -177,17 +177,9 @@ impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for LEndpoint<DuplexView<H, M
     }
 }
 
-impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for LEndpoint<DuplexView<H, M, E>> {}
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for Split<DuplexView<H, M, E>, Left> {}
 
-impl<T> const Deref for REndpoint<T> {
-    type Target = T;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for REndpoint<DuplexView<H, M, E>> {
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for Split<DuplexView<H, M, E>, Right> {
     type Item = Token<H, M>;
 
     #[inline]
@@ -201,18 +193,28 @@ impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Queue for REndpoint<DuplexView<H, M
     }
 }
 
-impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for REndpoint<DuplexView<H, M, E>> {}
+impl<E: AsTokenDuplex<H, M>, H: Envelope, M> Endpoint for Split<DuplexView<H, M, E>, Right> {}
 
 impl<E: AsTokenDuplex<H, M> + Clone, H: Envelope, M> DuplexView<H, M, E> {
-    pub fn sr_duplex(self) -> (Tx<LEndpoint<Self>>, Rx<REndpoint<Self>>) {
-        let lq = LEndpoint(self.clone());
-        let rq = REndpoint(self);
-        (lq.sender(), rq.receiver())
+    fn split(duplex:Self)->(LDuplexView<H, M, E>, RDuplexView<H, M, E>) {
+        (
+            LDuplexView {
+                inner: duplex.clone(),
+                _role: PhantomData,
+            },
+            RDuplexView {
+                inner: duplex,
+                _role: PhantomData,
+            },
+        )
+    }
+    pub fn lsplit(self) -> (Sender<H, M, E, Left>, Receiver<H, M, E, Right>) {
+        let (l,r) = Self::split(self);
+        (l.sender(), r.receiver())
     }
 
-    pub fn rs_duplex(self) -> (Tx<REndpoint<Self>>, Rx<LEndpoint<Self>>) {
-        let lq = LEndpoint(self.clone());
-        let rq = REndpoint(self);
-        (rq.sender(), lq.receiver())
+    pub fn rsplit(self) -> (Sender<H,M,E,Right>,Receiver<H,M,E,Left>) {
+        let (l,r) = Self::split(self);
+        (r.sender(), l.receiver())
     }
 }

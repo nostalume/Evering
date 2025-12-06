@@ -102,12 +102,12 @@ pub mod allocator {
 pub mod channel {
     use super::root::Span;
     use crate::channel::cross;
-    use crate::channel::driver;
-    use crate::channel::{Receiver, Sender};
+    use crate::channel::{QueueReceiver, QueueSender};
     use crate::msg::Envelope;
     use crate::reg::{Entry, MemEntry};
     use crate::token;
 
+    pub use crate::channel::{TryRecvError,TrySendError};
     pub type Token = token::Token<Span>;
     pub type MsgToken<H> = token::PackToken<H, Span>;
 
@@ -116,22 +116,39 @@ pub mod channel {
     pub type MsgDuplexPeek<'a, H> = cross::DuplexView<H, Span, &'a Entry<MsgDuplex<H>>>;
     pub type MsgDuplexView<H, S, M> = cross::DuplexView<H, Span, MemEntry<MsgDuplex<H>, S, M>>;
 
-    pub trait MsgSender<H: Envelope>: Sender<Item = MsgToken<H>> {}
+    pub type SenderPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
+    pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
+    pub type SenderView<'a, H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
+    pub type ReceiverView<'a, H, R, S, M> = cross::Sender<H, Span, MemEntry<MsgDuplex<H>, S, M>, R>;
 
-    impl<H: Envelope, T: Sender<Item = MsgToken<H>>> MsgSender<H> for T {}
-    pub trait MsgReceiver<H: Envelope>: Receiver<Item = MsgToken<H>> {}
+    pub trait MsgSender<H: Envelope>:
+        QueueSender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>>
+    {
+    }
 
-    impl<H: Envelope, T: Receiver<Item = MsgToken<H>>> MsgReceiver<H> for T {}
+    impl<H: Envelope, T: QueueSender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>>>
+        MsgSender<H> for T
+    {
+    }
+    pub trait MsgReceiver<H: Envelope>:
+        QueueReceiver<Item = MsgToken<H>, TryError = TryRecvError>
+    {
+    }
 
-    pub type CachePool<H, const N: usize> = driver::CachePoolHandle<MsgToken<H>, N>;
+    impl<H: Envelope, T: QueueReceiver<Item = MsgToken<H>, TryError = TryRecvError>> MsgReceiver<H>
+        for T
+    {
+    }
 
-    pub trait MsgSubmitter<H: Envelope>: driver::Submitter<H, Span> {}
+    // pub type CachePool<H, const N: usize> = driver::CachePoolHandle<MsgToken<H>, N>;
 
-    impl<H: Envelope, T: driver::Submitter<H, Span>> MsgSubmitter<H> for T {}
+    // pub trait MsgSubmitter<H: Envelope>: driver::Submitter<H, Span> {}
 
-    pub trait MsgCompleter<H: Envelope>: driver::Completer<H, Span> {}
+    // impl<H: Envelope, T: driver::Submitter<H, Span>> MsgSubmitter<H> for T {}
 
-    impl<H: Envelope, T: driver::Completer<H, Span>> MsgCompleter<H> for T {}
+    // pub trait MsgCompleter<H: Envelope>: driver::Completer<H, Span> {}
+
+    // impl<H: Envelope, T: driver::Completer<H, Span>> MsgCompleter<H> for T {}
 }
 
 pub use root::{Session, SessionBy};

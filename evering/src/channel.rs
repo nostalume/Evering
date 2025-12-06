@@ -1,6 +1,6 @@
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
-use core::sync::atomic::{self, AtomicUsize, Ordering};
+use core::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
 
 use crossbeam_utils::{Backoff, CachePadded};
 
@@ -43,10 +43,13 @@ pub struct Header {
 
     /// The queue capacity.
     cap: usize,
+
+    /// The disconnection.
+    close: AtomicBool,
 }
 
 impl Header {
-    fn new(cap: usize) -> Self {
+    const fn new(cap: usize) -> Self {
         assert!(cap > 0, "capacity must not zero");
         // Head is initialized to `{ lap: 0, index: 0 }`.
         // Tail is initialized to `{ lap: 0, index: 0 }`.
@@ -59,7 +62,20 @@ impl Header {
             tail: CachePadded::new(AtomicUsize::new(tail)),
             one_lap,
             cap,
+            close: AtomicBool::new(false),
         }
+    }
+
+    pub fn close(&self) {
+        self.close.store(true, Ordering::Release)
+    }
+
+    pub fn open(&self) {
+        self.close.store(false, Ordering::Release)
+    }
+
+    pub fn is_close(&self) -> bool {
+        self.close.load(Ordering::Relaxed)
     }
 }
 
@@ -356,23 +372,29 @@ trait QueueDrop: Queue {
 
 impl<T: Queue> QueueDrop for T {}
 
-trait Endpoint: Sized {
+trait QueueClose: Queue {
+    #[inline]
+    fn close(&self) {
+        self.header().close()
+    }
+
+    #[inline]
+    fn is_close(&self) -> bool {
+        self.header().is_close()
+    }
+}
+
+impl<T: Queue> QueueClose for T {}
+
+trait Endpoint: Sized + Queue {
     #[inline(always)]
-    fn channel(self) -> (Tx<Self>, Rx<Self>)
-    where
-        Self: Clone,
-    {
-        (Tx(self.clone()), Rx(self))
+    fn sender(self) -> QueueTx<Self> {
+        QueueTx { tx: self }
     }
 
     #[inline(always)]
-    fn sender(self) -> Tx<Self> {
-        Tx(self)
-    }
-
-    #[inline(always)]
-    fn receiver(self) -> Rx<Self> {
-        Rx(self)
+    fn receiver(self) -> QueueRx<Self> {
+        QueueRx { rx: self }
     }
 }
 
@@ -402,18 +424,106 @@ pub trait AsyncReceiver: Receiver {
     fn recv(&self) -> impl Future<Output = Result<Self::Item, Self::Error>>;
 }
 
+pub trait QueueSender: Sender {
+    type Handle: Queue;
+
+    fn handle(&self) -> &Self::Handle;
+
+    #[inline(always)]
+    fn close(&self) {
+        self.handle().close()
+    }
+
+    #[inline(always)]
+    fn is_close(&self) {
+        self.handle().close()
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.handle().capacity()
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.handle().is_empty()
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.handle().is_full()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.handle().len()
+    }
+}
+
+pub trait QueueReceiver: Receiver {
+    type Handle: Queue;
+
+    fn handle(&self) -> &Self::Handle;
+
+    #[inline(always)]
+    fn close(&self) {
+        self.handle().close()
+    }
+
+    #[inline(always)]
+    fn is_close(&self) {
+        self.handle().close()
+    }
+
+    #[inline(always)]
+    fn capacity(&self) -> usize {
+        self.handle().capacity()
+    }
+
+    #[inline(always)]
+    fn is_empty(&self) -> bool {
+        self.handle().is_empty()
+    }
+
+    #[inline(always)]
+    fn is_full(&self) -> bool {
+        self.handle().is_full()
+    }
+
+    #[inline(always)]
+    fn len(&self) -> usize {
+        self.handle().len()
+    }
+}
+
+#[derive(Debug)]
+pub enum TrySendError<T> {
+    Full(T),
+    Disconnected,
+}
+
+#[derive(Debug)]
+pub enum TryRecvError {
+    Empty,
+    Disconnected,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 #[repr(transparent)]
-#[derive(Clone, PartialEq)]
-pub struct Tx<S>(S);
+pub struct QueueTx<T: Queue> {
+    tx: T,
+}
 
+#[derive(Clone, Debug, PartialEq)]
 #[repr(transparent)]
-#[derive(Clone, PartialEq)]
-pub struct Rx<R>(R);
+pub struct QueueRx<T: Queue> {
+    rx: T,
+}
 
-impl<S: Queue> Sender for Tx<S> {
-    type Item = S::Item;
+impl<T: Queue> Sender for QueueTx<T> {
+    type Item = T::Item;
 
-    type TryError = S::Item;
+    type TryError = TrySendError<T::Item>;
 
     #[inline(always)]
     fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError> {
@@ -421,67 +531,91 @@ impl<S: Queue> Sender for Tx<S> {
     }
 }
 
-impl<S: Queue> Tx<S> {
-    #[inline(always)]
-    pub fn try_send(&self, value: S::Item) -> Result<(), S::Item> {
-        self.0.push(value)
-    }
+impl<T: Queue> QueueSender for QueueTx<T> {
+    type Handle = T;
 
     #[inline(always)]
-    pub fn capacity(&self) -> usize {
-        self.0.capacity()
-    }
-
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
-
-    #[inline(always)]
-    pub fn is_full(&self) -> bool {
-        self.0.is_full()
-    }
-
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.0.len()
+    fn handle(&self) -> &Self::Handle {
+        &self.tx
     }
 }
 
-impl<S: Queue> Receiver for Rx<S> {
-    type Item = S::Item;
+impl<T: Queue> QueueTx<T> {
+    #[inline(always)]
+    pub fn try_send(&self, value: T::Item) -> Result<(), TrySendError<T::Item>> {
+        if self.tx.header().is_close() {
+            return Err(TrySendError::Disconnected);
+        }
+        self.tx.push(value).map_err(TrySendError::Full)
+    }
 
-    type TryError = ();
+    //     #[inline(always)]
+    //     pub fn capacity(&self) -> usize {
+    //         self.tx.capacity()
+    //     }
+
+    //     #[inline(always)]
+    //     pub fn is_empty(&self) -> bool {
+    //         self.tx.is_empty()
+    //     }
+
+    //     #[inline(always)]
+    //     pub fn is_full(&self) -> bool {
+    //         self.tx.is_full()
+    //     }
+
+    //     #[inline(always)]
+    //     pub fn len(&self) -> usize {
+    //         self.tx.len()
+    //     }
+}
+
+impl<T: Queue> Receiver for QueueRx<T> {
+    type Item = T::Item;
+
+    type TryError = TryRecvError;
 
     #[inline(always)]
     fn try_recv(&self) -> Result<Self::Item, Self::TryError> {
-        self.try_recv().ok_or(())
+        self.try_recv()
     }
 }
 
-impl<S: Queue> Rx<S> {
-    #[inline(always)]
-    pub fn try_recv(&self) -> Option<S::Item> {
-        self.0.pop()
-    }
+impl<T: Queue> QueueReceiver for QueueRx<T> {
+    type Handle = T;
 
     #[inline(always)]
-    pub fn capacity(&self) -> usize {
-        self.0.capacity()
+    fn handle(&self) -> &Self::Handle {
+        &self.rx
+    }
+}
+
+impl<T: Queue> QueueRx<T> {
+    #[inline(always)]
+    pub fn try_recv(&self) -> Result<T::Item, TryRecvError> {
+        if self.rx.header().is_close() {
+            return Err(TryRecvError::Disconnected);
+        }
+        self.rx.pop().ok_or(TryRecvError::Empty)
     }
 
-    #[inline(always)]
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
-    }
+    // #[inline(always)]
+    // pub fn capacity(&self) -> usize {
+    //     self.rx.capacity()
+    // }
 
-    #[inline(always)]
-    pub fn is_full(&self) -> bool {
-        self.0.is_full()
-    }
+    // #[inline(always)]
+    // pub fn is_empty(&self) -> bool {
+    //     self.rx.is_empty()
+    // }
 
-    #[inline(always)]
-    pub fn len(&self) -> usize {
-        self.0.len()
-    }
+    // #[inline(always)]
+    // pub fn is_full(&self) -> bool {
+    //     self.rx.is_full()
+    // }
+
+    // #[inline(always)]
+    // pub fn len(&self) -> usize {
+    //     self.rx.len()
+    // }
 }

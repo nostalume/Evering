@@ -39,7 +39,7 @@ pub struct Entry<T> {
 
 pub type MemEntry<T, S, M> = MemRef<Entry<T>, S, M>;
 
-pub struct EntryGuard<E: const Deref<Target = Entry<T>>, T, V> {
+pub struct EntryGuard<E: const Deref<Target = Entry<T>>, T: Finalize, V> {
     entry: E,
     id: Id,
     pub view: V,
@@ -227,7 +227,9 @@ impl<T> Entry<T> {
     }
 }
 
-impl<H: const Deref<Target = Entry<T>> + Clone, T, V: Clone> Clone for EntryGuard<H, T, V> {
+impl<H: const Deref<Target = Entry<T>> + Clone, T: Finalize, V: Clone> Clone
+    for EntryGuard<H, T, V>
+{
     fn clone(&self) -> Self {
         self.entry.rc.fetch_add(1, Ordering::Relaxed);
         Self {
@@ -238,17 +240,18 @@ impl<H: const Deref<Target = Entry<T>> + Clone, T, V: Clone> Clone for EntryGuar
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T, V> Drop for EntryGuard<E, T, V> {
+impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> Drop for EntryGuard<E, T, V> {
     fn drop(&mut self) {
         let prev = self.entry.rc.fetch_sub(1, Ordering::AcqRel);
         if prev == 1 {
             // state must be `ACTIVE` -> `INACTIVE`, ensure ordering release.
+            unsafe { self.entry.as_ref().finalize() };
             self.entry.state.store(state::INACTIVE, Ordering::Release);
         }
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T, V> Deref for EntryGuard<E, T, V> {
+impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> Deref for EntryGuard<E, T, V> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -256,18 +259,19 @@ impl<E: const Deref<Target = Entry<T>>, T, V> Deref for EntryGuard<E, T, V> {
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T: core::fmt::Debug, V: core::fmt::Debug> core::fmt::Debug
-    for EntryGuard<E, T, V>
+impl<E: const Deref<Target = Entry<T>>, T: Finalize + core::fmt::Debug, V: core::fmt::Debug>
+    core::fmt::Debug for EntryGuard<E, T, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("EntryGuard")
             .field("entry", &*self.entry)
             .field("value", self.as_ref())
+            .field("view", &self.view)
             .finish()
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T: core::fmt::Debug, V> core::fmt::Display
+impl<E: const Deref<Target = Entry<T>>, T: Finalize + core::fmt::Debug, V> core::fmt::Display
     for EntryGuard<E, T, V>
 {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -275,13 +279,13 @@ impl<E: const Deref<Target = Entry<T>>, T: core::fmt::Debug, V> core::fmt::Displ
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T, V> PartialEq for EntryGuard<E, T, V> {
+impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> PartialEq for EntryGuard<E, T, V> {
     fn eq(&self, other: &Self) -> bool {
         &*self.entry as *const Entry<T> == &*other.entry && self.id == other.id
     }
 }
 
-impl<E: const Deref<Target = Entry<T>>, T, V> EntryGuard<E, T, V> {
+impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> EntryGuard<E, T, V> {
     pub fn rc(e: &Self) -> usize {
         e.entry.rc.load(Ordering::Relaxed)
     }
@@ -292,8 +296,12 @@ impl<E: const Deref<Target = Entry<T>>, T, V> EntryGuard<E, T, V> {
     }
 }
 
-unsafe impl<E: const Deref<Target = Entry<T>>, T, V> Send for EntryGuard<E, T, V> {}
-unsafe impl<E: const Deref<Target = Entry<T>>, T: Sync, V> Sync for EntryGuard<E, T, V> {}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> Send for EntryGuard<E, T, V> {}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize + Sync, V> Sync for EntryGuard<E, T, V> {}
+
+pub trait Finalize {
+    fn finalize(&self);
+}
 
 #[repr(C)]
 pub struct Registry<T, const N: usize> {
@@ -341,7 +349,9 @@ impl<T, const N: usize> Registry<T, N> {
             entries: const { Entry::array() },
         }
     }
+}
 
+impl<T: Finalize, const N: usize> Registry<T, N> {
     #[inline]
     pub const fn capacity(&self) -> usize {
         N
@@ -441,7 +451,7 @@ impl<T, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
+impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
     pub fn from_layout(area: MemBlkLayout<S, M>) -> Result<Self, mem::Error<S, M>> {
         let mut area = area;
         let reg = area.push::<Header<T, N>>(())?;
@@ -464,7 +474,7 @@ impl<T, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
 
 pub trait Resource<Ctx>: Sized {
     type Config;
-    fn new(cfg: Self::Config, ctx: Ctx) -> (Self, Ctx);
+    fn new(conf: Self::Config, ctx: Ctx) -> (Self, Ctx);
     fn free(s: Self, ctx: Ctx) -> Ctx;
 }
 
@@ -473,7 +483,7 @@ pub trait Project<Ctx>: Resource<Ctx> {
     fn project(&self, ctx: Ctx) -> (Self::View, Ctx);
 }
 
-impl<T, const N: usize> Registry<T, N> {
+impl<T: Finalize, const N: usize> Registry<T, N> {
     pub fn prepare<C>(&self, cfg: T::Config, ctx: C) -> Result<(Id, C), C>
     where
         T: Resource<C>,
@@ -498,7 +508,7 @@ impl<T, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T, const N: usize> Registry<T, N> {
+impl<T: Finalize, const N: usize> Registry<T, N> {
     pub fn peek<'a, C>(&'a self, id: Id, ctx: C) -> (Option<PeekEntry<'a, T, T::View>>, C)
     where
         T: Project<C>,
@@ -511,7 +521,7 @@ impl<T, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
+impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
     pub fn view<C>(&self, id: Id, ctx: C) -> (Option<ViewEntry<T, T::View, S, M>>, C)
     where
         T: Project<C>,
@@ -529,9 +539,9 @@ mod tests {
     use alloc::sync::Arc;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
-    use crate::{reg::EntryGuard, tests::tracing_init};
+    use crate::tests::tracing_init;
 
-    use super::{Project, Registry, Resource};
+    use super::{EntryGuard, Finalize, Project, Registry, Resource};
 
     fn mock_reg<T, const N: usize>() -> Arc<Registry<T, N>> {
         Registry::new().into()
@@ -554,6 +564,12 @@ mod tests {
         }
         fn mock_ctx() -> (Arc<AtomicUsize>, Arc<AtomicUsize>) {
             (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)))
+        }
+    }
+
+    impl Finalize for MockResource {
+        fn finalize(&self) {
+            ()
         }
     }
 
