@@ -1,227 +1,221 @@
-use core::marker::PhantomData;
+// use core::marker::PhantomData;
+// use core::time::Duration;
+// use std::os::fd::{AsFd, OwnedFd};
+// use std::sync::Arc;
+// use std::time::Instant;
+
 use core::time::Duration;
-use std::os::fd::{AsFd, OwnedFd};
-use std::sync::Arc;
 use std::time::Instant;
 
-// use evering_ipc::driver::cell::IdCell;
-// use evering_ipc::driver::unlocked::PoolDriver;
-// use evering_ipc::shm::boxed::{ShmBox, ShmSlice, ShmToken};
-// use evering_ipc::shm::os::{
-//     FdBackend,
-//     unix::{MFdFlags, ProtFlags, AddrSpec, UnixFdConf},
-// };
-// use evering_ipc::shm::tlsf::SpinTlsf;
-// use evering_ipc::uring::{IReceiver, ISender, UringSpec};
-// use evering_ipc::{IpcAlloc, IpcHandle, IpcSpec};
-// use tokio::runtime::Builder;
+use bytes::Bytes;
+use evering::{
+    msg::{self, Envelope, Message, Move, MoveMessage, TypeTag, type_id},
+    os::{
+        FdBackend,
+        unix::{AddrSpec, UnixFd},
+    },
+    perlude::{
+        Session,
+        allocator::{Access, MapBuilder, Optimistic, Pessimistic},
+        channel::{
+            CachePool, Completer, MsgCompleter, MsgSubmitter, QueueChannel, ReqId, Submitter,
+            TryRecvError, TrySendError, TrySubmitError,
+        },
+    },
+};
+use tokio::runtime::Builder;
 
-// use super::*;
+use crate::{CONCURRENCY, check_req, check_resp, req, resp, shmid, shmsize};
 
-// use tokio::task::{spawn_local, yield_now};
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct Byte {
+    data: u8,
+}
 
-// type ShmReq<I> = ShmBox<[u8], IpcAlloc<I>>;
-// type ShmResp<I> = ShmBox<[u8], IpcAlloc<I>>;
-// type ShmReqT<I> = ShmToken<u8, IpcAlloc<I>, ShmSlice>;
-// type ShmRespT<I> = ShmToken<u8, IpcAlloc<I>, ShmSlice>;
+impl core::fmt::Debug for Byte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        core::fmt::Debug::fmt(&self.data, f)
+    }
+}
 
-// enum Sqe<I: IpcSpec> {
-//     Exit,
-//     Ping {
-//         ping: i32,
-//         req: ShmReqT<I>,
-//         resp: ShmRespT<I>,
-//     },
-// }
+impl Byte {
+    #[inline]
+    pub fn as_slice(s: &[Byte]) -> &[u8] {
+        unsafe { core::slice::from_raw_parts(s.as_ptr() as *const u8, s.len()) }
+    }
+}
 
-// impl<I: IpcSpec> core::fmt::Debug for Sqe<I> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             Self::Exit => write!(f, "Exit"),
-//             Self::Ping { ping, req, resp } => f.debug_struct("Ping").field("ping", ping).finish(),
-//         }
-//     }
-// }
+#[inline]
+pub fn as_slice(bytes: &Bytes) -> &[Byte] {
+    unsafe { core::slice::from_raw_parts(bytes.as_ptr() as *const Byte, bytes.len()) }
+}
 
-// enum Rqe<I: IpcSpec> {
-//     Exited,
-//     Pong { pong: i32, resp: ShmRespT<I> },
-// }
+impl TypeTag for Byte {
+    const TYPE_ID: msg::TypeId = type_id::type_id("Info");
+}
 
-// impl<I: IpcSpec> core::fmt::Debug for Rqe<I> {
-//     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-//         match self {
-//             Self::Exited => write!(f, "Exit"),
-//             Self::Pong { pong, resp } => f.debug_struct("Pong").field("pong", pong).finish(),
-//         }
-//     }
-// }
+impl Message for Byte {
+    type Semantics = Move;
+}
 
-// struct IpcInfo<I: IpcSpec>(PhantomData<I>);
+const CAP: usize = CONCURRENCY.next_power_of_two();
 
-// impl<I: IpcSpec> UringSpec for IpcInfo<I> {
-//     type SQE = Sqe<I>;
-//     type CQE = Rqe<I>;
-// }
+type UnixSession<H, const N: usize> = Session<Optimistic, H, N, AddrSpec, FdBackend>;
 
-// type MyPoolDriver<I> = PoolDriver<IpcInfo<I>>;
+fn mock_session<H: Envelope, const N: usize>(name: &str, size: usize) -> UnixSession<H, N> {
+    let fd = UnixFd::memfd(name, size, false).expect("should create");
+    let builder = MapBuilder::fd();
+    builder
+        .shared(size, Access::WRITE | Access::READ, fd)
+        .unwrap()
+}
 
-// struct MyIpcSpec<F>(PhantomData<F>);
-// impl<F: AsFd> IpcSpec for MyIpcSpec<F> {
-//     type A = SpinTlsf;
-//     type S = AddrSpec;
-//     type M = FdBackend<F>;
-// }
+pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
+    let shmid = shmid(id);
+    let shmsize = shmsize(bufsize);
+    let handle = mock_session::<ReqId<()>, 1>(&shmid, shmsize);
 
-// const CAP: usize = CONCURRENCY.next_power_of_two();
+    let runtime = Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
 
-// type MyIpc<F> = IpcHandle<MyIpcSpec<F>, MyPoolDriver<MyIpcSpec<F>>, CAP>;
+    #[cfg(feature = "tracing")]
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::DEBUG)
+        .try_init();
 
-// fn default_cfg(id: &str, size: usize) -> UnixFdConf<OwnedFd> {
-//     UnixFdConf::default_mem(id, size, MFdFlags::empty()).unwrap()
-// }
+    let id = handle.prepare(CAP).expect("alloc ok");
+    let view = handle.acquire(id).expect("view ok");
 
-// fn init_or_load<F: AsFd + 'static>(size: usize, cfg: UnixFdConf<F>) -> Arc<MyIpc<F>> {
-//     let h = IpcHandle::init_or_load(
-//         FdBackend::new(),
-//         None,
-//         size,
-//         ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-//         cfg,
-//     )
-//     .unwrap();
-//     Arc::new(h)
-// }
+    let (ls, lr) = view.clone().lsplit();
+    let (rs, rr) = view.clone().rsplit();
 
-// pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
-//     let shmid = shmid(id);
-//     let shmsize = shmsize(bufsize);
-//     let s_cfg = default_cfg(shmid.as_str(), shmsize);
-//     let handle = init_or_load(shmsize, s_cfg);
+    let (ls, lr) = CachePool::<(), CAP>::new().bind(ls, lr);
 
-//     let runtime = Builder::new_multi_thread()
-//         .worker_threads(1)
-//         .enable_all()
-//         .build()
-//         .unwrap();
+    let elapsed = std::thread::scope(|s| {
+        let salloc = handle.alloc.clone();
+        let server = s.spawn(|| {
+            runtime.block_on(async move {
+                // let handle = shandle;
+                // let cq = handle.server();
+                let respdata = resp(bufsize);
+                let alloc = salloc;
+                loop {
+                    let packet = match rr.try_recv() {
+                        Ok(p) => p,
+                        Err(TryRecvError::Empty) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            rs.close();
+                            break;
+                        }
+                    };
 
-//     let elapsed = std::thread::scope(|s| {
-//         let handle_c = handle.clone();
-//         let server_handle = s.spawn(|| {
-//             runtime.block_on(async move {
-//                 let handle = handle_c.clone();
-//                 let cq = handle.server();
-//                 let respdata = resp(bufsize);
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("[Server]: received");
 
-//                 'outer: loop {
-//                     let msg = match cq.recv().await {
-//                         Ok(m) => m,
-//                         Err(_) => {
-//                             break 'outer;
-//                         }
-//                     };
+                    let (req, header) = packet.into_parts();
+                    let req = Byte::slice_detoken(req, &alloc).expect("should detoken");
+                    check_req(bufsize, Byte::as_slice(&req));
+                    drop(req);
 
-//                     let (id, data) = msg.into_inner();
-//                     match data {
-//                         Sqe::Exit => {
-//                             cq.send(IdCell::new(id, Rqe::Exited)).await.unwrap();
-//                             break 'outer;
-//                         }
-//                         Sqe::Ping { ping, req, resp } => {
-//                             assert_eq!(ping, PING);
-//                             let buf = req.into_box();
-//                             check_req(bufsize, buf.as_ref());
+                    let (resp, alloc) = Byte::copied_slice_token(as_slice(&respdata), &alloc);
 
-//                             let mut resp_box = resp.into_box();
-//                             resp_box.as_mut().copy_from_slice(&respdata);
+                    let resp = resp.pack(header);
+                    match rs.try_send(resp) {
+                        Ok(_) => continue,
+                        Err(TrySendError::Full(_)) => {
+                            tokio::task::yield_now().await;
+                            continue;
+                        }
+                        Err(TrySendError::Disconnected) => break,
+                    }
+                }
+            })
+        });
 
-//                             cq.send(IdCell::new(
-//                                 id,
-//                                 Rqe::Pong {
-//                                     pong: PONG,
-//                                     resp: resp_box.into(),
-//                                 },
-//                             ))
-//                             .await
-//                             .unwrap();
-//                         }
-//                     }
-//                 }
-//             })
-//         });
+        let calloc = handle.alloc.clone();
+        let client = s.spawn(|| {
+            let lsfinal = ls.clone();
+            runtime.block_on(async move {
+                tokio::spawn(async move {
+                    loop {
+                        match lr.complete() {
+                            Ok(_) => continue,
+                            Err(TryRecvError::Empty) => {
+                                tokio::task::yield_now().await;
+                                continue;
+                            }
+                            Err(TryRecvError::Disconnected) => break,
+                        }
+                    }
+                });
 
-//         let client_handle = s.spawn(|| {
-//             runtime.block_on(async move {
-//                 let req_data = req(bufsize);
-//                 let handle = handle.clone();
-//                 let (sb, rb) = handle.client();
+                let tasks = (0..CONCURRENCY)
+                    .map(|_| {
+                        let req_data = req(bufsize);
+                        let alloc = calloc.clone();
+                        let ls = ls.clone();
 
-//                 tokio::spawn(async move {
-//                     loop {
-//                         while !rb.try_complete() {
-//                             yield_now().await;
-//                         }
-//                     }
-//                 });
+                        tokio::spawn(async move {
+                            for _ in 0..(iters / CONCURRENCY) {
+                                let (req, alloc) =
+                                    Byte::copied_slice_token(as_slice(&req_data), &alloc);
+                                let req = req.pack_default();
 
-//                 let tasks = (0..CONCURRENCY)
-//                     .map(|_| {
-//                         let req_c = req_data.clone();
-//                         let handle_c = handle.clone();
-//                         let sb_c = sb.clone();
+                                let op = match ls.try_submit(req) {
+                                    Ok(op) => op,
+                                    Err(TrySubmitError::SendError(TrySendError::Full(_))) => {
+                                        tokio::task::yield_now().await;
+                                        continue;
+                                    }
+                                    Err(TrySubmitError::SendError(TrySendError::Disconnected)) => {
+                                        break;
+                                    }
+                                    Err(TrySubmitError::CacheFull) => {
+                                        tokio::task::yield_now().await;
+                                        continue;
+                                    }
+                                };
+                                let (resp, _) = op.await.into_parts();
+                                let resp =
+                                    Byte::slice_detoken(resp, alloc).expect("should detoken");
 
-//                         tokio::spawn(async move {
-//                             for _ in 0..(iters / CONCURRENCY) {
-//                                 let req_box = ShmBox::copy_from_slice(&req_c, handle_c.alloc());
-//                                 let resp_box = unsafe {
-//                                     ShmBox::new_zeroed_slice_in(bufsize, handle_c.alloc())
-//                                         .assume_init()
-//                                 };
+                                check_resp(bufsize, Byte::as_slice(&resp));
+                                drop(resp);
+                            }
+                        })
+                    })
+                    .collect::<Vec<_>>();
 
-//                                 let op = Sqe::Ping {
-//                                     ping: PING,
-//                                     req: req_box.into(),
-//                                     resp: resp_box.into(),
-//                                 };
+                let now = Instant::now();
+                for task in tasks.into_iter() {
+                    task.await.unwrap();
+                }
+                let elapsed = now.elapsed();
+                lsfinal.close();
+                elapsed
+            })
+        });
 
-//                                 match sb_c.try_submit(op) {
-//                                     Ok(op) => match op.await {
-//                                         Rqe::Exited => {}
-//                                         Rqe::Pong {
-//                                             pong,
-//                                             resp: resp_ret_token,
-//                                         } => {
-//                                             let resp_ret = resp_ret_token.into_box();
-//                                             assert_eq!(pong, PONG);
-//                                             check_resp(bufsize, resp_ret.as_ref());
-//                                         }
-//                                     },
-//                                     _ => {}
-//                                 }
-//                             }
-//                         })
-//                     })
-//                     .collect::<Vec<_>>();
+        let elapsed = client.join().unwrap();
+        server.join().unwrap();
+        elapsed
+    });
 
-//                 let now = Instant::now();
-//                 for task in tasks.into_iter() {
-//                     task.await.unwrap();
-//                 }
-//                 let elapsed = now.elapsed();
-//                 sb.try_submit(Sqe::Exit).unwrap();
-//                 elapsed
-//             })
-//         });
+    elapsed
+}
 
-//         let elapsed = client_handle.join().unwrap();
-//         server_handle.join().unwrap();
-//         elapsed
-//     });
-
-//     elapsed
-// }
-// #[test]
-// fn ipc_test() {
-//     let elapsed = bench("test", 1000, 1024);
-//     println!("elapsed: {elapsed:?}");
-// }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn ipc_test() {
+        let elapsed = super::bench("test", 30000, 4096);
+        println!("elapsed: {elapsed:?}");
+    }
+}

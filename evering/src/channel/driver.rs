@@ -480,13 +480,25 @@ pub trait Completer<U> {
     fn complete(&self) -> Result<TryCompState, Self::Error>;
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Sx<S: super::Sender, U, const N: usize>
 where
     S::Item: Identifier<U>,
 {
     sender: S,
     pool: CachePoolHandle<U, N>,
+}
+
+impl<S: super::Sender + Clone, U, const N: usize> Clone for Sx<S, U, N>
+where
+    S::Item: Identifier<U>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            sender: self.sender.clone(),
+            pool: self.pool.clone(),
+        }
+    }
 }
 
 impl<S: super::Sender, U, const N: usize> Sx<S, U, N>
@@ -536,13 +548,25 @@ where
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Cx<R: super::Receiver, U, const N: usize>
 where
     R::Item: Identifier<U>,
 {
     receiver: R,
     pool: CachePoolHandle<U, N>,
+}
+
+impl<R: super::Receiver + QueueChannel + Clone, U, const N: usize> Clone for Cx<R, U, N>
+where
+    R::Item: Identifier<U>,
+{
+    fn clone(&self) -> Self {
+        Self {
+            receiver: self.receiver.clone(),
+            pool: self.pool.clone(),
+        }
+    }
 }
 
 impl<R: super::Receiver + QueueChannel, U, const N: usize> super::QueueChannel for Cx<R, U, N>

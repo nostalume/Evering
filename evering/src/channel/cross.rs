@@ -149,10 +149,19 @@ pub struct TokenDuplex<H: Envelope, M> {
 pub struct Left;
 pub struct Right;
 
-#[derive(Clone, PartialEq)]
+#[derive(PartialEq)]
 pub struct Split<T, Role> {
     inner: T,
     _role: PhantomData<Role>,
+}
+
+impl<T: Clone, Role> Clone for Split<T, Role> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            _role: PhantomData,
+        }
+    }
 }
 
 impl<H: Envelope, M> Finalize for TokenDuplex<H, M> {

@@ -1,10 +1,7 @@
-#[macro_use]
-mod utils;
-
 mod evering;
 mod monoio;
 mod shmipc;
-
+mod utils;
 use std::hint::black_box;
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -14,21 +11,23 @@ use bytesize::ByteSize;
 use criterion::{Criterion, criterion_group, criterion_main};
 
 const BUFSIZES: &[usize] = &[
-    1 << 2,
-    1 << 6,
-    1 << 8,
-    1 << 10,
-    1 << 12,
-    16 << 10,
-    32 << 10,
-    64 << 10,
-    256 << 10,
-    512 << 10,
-    1 << 20,
-    4 << 20,
+    4,
+    64,
+    // 256,
+    // 1024,
+    // 4096,
+    // 16 << 10,
+    // 32 << 10,
+    // 64 << 10,
+    // back pressure failed :(
+    // 256 << 10,
+    // 512 << 10,
+    // 1 << 20,
+    // 4 << 20,
 ];
 
 const CONCURRENCY: usize = 200;
+const METADATA: usize = 4096;
 
 const PING: i32 = 1;
 const PONG: i32 = 2;
@@ -68,23 +67,28 @@ fn check_buf(bufsize: usize, resp: &[u8], expected: u8) {
 }
 
 /// Returns arbitrary response data.
+#[inline]
 fn make_buf(bufsize: usize, expected: u8) -> Bytes {
     // Black boxed to mock runtime values
     black_box(Bytes::from(vec![black_box(expected); bufsize]))
 }
 
+#[inline]
 fn check_req(bufsize: usize, req: &[u8]) {
     check_buf(bufsize, req, REQ);
 }
 
+#[inline]
 fn req(bufsize: usize) -> Bytes {
     make_buf(bufsize, REQ)
 }
 
+#[inline]
 fn resp(bufsize: usize) -> Bytes {
     make_buf(bufsize, RESP)
 }
 
+#[inline]
 fn check_resp(bufsize: usize, resp: &[u8]) {
     check_buf(bufsize, resp, RESP);
 }
@@ -103,8 +107,10 @@ fn groups(c: &mut Criterion) {
     }
 
     let mut g = c.benchmark_group("ipc_benchmark");
+
     for (i, bufsize) in BUFSIZES.iter().copied().enumerate() {
         let bsize = ByteSize::b(bufsize as u64).display().iec_short();
+
         for (name, f) in benches![monoio, shmipc, evering] {
             let id = format!("ipc_benchmark_{i:02}_{bsize:.0}_{name}");
             g.bench_function(&id, |b| {
@@ -116,7 +122,8 @@ fn groups(c: &mut Criterion) {
 
 criterion_group!(
     name = ipc_benchmark;
-    config = Criterion::default().sample_size(100).measurement_time(Duration::from_secs(30));
+    config = Criterion::default().sample_size(50).measurement_time(Duration::from_secs(30));
     targets = groups
 );
+
 criterion_main!(ipc_benchmark);

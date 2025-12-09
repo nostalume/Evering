@@ -5,6 +5,10 @@ authors.workspace = true
 license.workspace = true
 edition.workspace = true
 
+[features]
+default = []
+tracing = ["evering/tracing"]
+
 [dependencies]
 nix.workspace = true
 fastrand.workspace = true
@@ -17,11 +21,14 @@ monoio = { version = "0.2.4", features = ["sync"] }
 
 criterion = { version = "0.7.0", features = ["html_reports"] }
 
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
 [dependencies.shmipc]
 git = "https://github.com/cloudwego/shmipc-rs"
 rev = "de966a6ca2d76d574b943f6fd4d3abfa6ff2df5f"
 
 [[bench]]
 name = "ipc-bench"
-path = "src/bench.rs"
+path = "src/lib.rs"
 harness = false

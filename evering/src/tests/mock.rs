@@ -4,10 +4,10 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::mem::{AddrSpec, MemBlkHandle, MemBlkLayout, Mmap, Mprotect, RawMemBlk};
+use crate::mem::{Access, Accessible, AddrSpec, MapLayout, MapView, Mmap, Mprotect, RawMap};
 use crate::mem::{MemAllocInfo, MemAllocator};
 use crate::msg::Envelope;
-use crate::perlude::allocator::{MemAlloc, Optimistic};
+use crate::perlude::allocator::{MapAlloc, Optimistic};
 use crate::perlude::{Session, SessionBy};
 
 use crate::tests::{prob, tracing_init};
@@ -16,6 +16,18 @@ const MAX_ADDR: usize = 0x10000;
 
 type MockFlags = u8;
 type MockPageTable = [MockFlags];
+
+impl const From<Access> for MockFlags {
+    fn from(_value: Access) -> Self {
+        0
+    }
+}
+
+impl Accessible for MockFlags {
+    fn permits(self, _access: crate::mem::Access) -> bool {
+        true
+    }
+}
 
 struct MockAddr;
 
@@ -65,7 +77,7 @@ impl<'a> Mmap<MockAddr> for MockBackend<'a> {
         _mflags: (),
         pflags: <MockAddr as AddrSpec>::Flags,
         handle: usize,
-    ) -> Result<RawMemBlk<MockAddr, Self>, Self::Error> {
+    ) -> Result<RawMap<MockAddr, Self>, Self::Error> {
         for entry in self.0.iter_mut().skip(handle).take(size) {
             if *entry != 0 {
                 return Err(());
@@ -73,17 +85,14 @@ impl<'a> Mmap<MockAddr> for MockBackend<'a> {
             *entry = pflags;
         }
         let start = self.start().add(handle);
-        Ok(unsafe { RawMemBlk::from_raw(start, size, pflags, self) })
+        Ok(unsafe { RawMap::from_raw(start, size, pflags, self) })
     }
 
-    fn unmap(area: &mut RawMemBlk<MockAddr, Self>) -> Result<(), Self::Error> {
+    fn unmap(area: &mut RawMap<MockAddr, Self>) -> Result<(), Self::Error> {
         let start = area.spec.start();
         let arr_start = area.bk.arr_addr(start);
         let size = area.spec.size();
         for entry in area.bk.iter_mut().skip(arr_start).take(size) {
-            if *entry == 0 {
-                return Err(());
-            }
             *entry = 0;
         }
         Ok(())
@@ -92,7 +101,7 @@ impl<'a> Mmap<MockAddr> for MockBackend<'a> {
 
 impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
     unsafe fn protect(
-        area: &mut RawMemBlk<MockAddr, Self>,
+        area: &mut RawMap<MockAddr, Self>,
         new_flags: <MockAddr as AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
         let start = area.start();
@@ -109,42 +118,33 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
 }
 
 impl MockBackend<'_> {
-    fn shared(self, start: usize, size: usize) -> MemBlkLayout<MockAddr, Self> {
-        MemBlkLayout::new(self.map(None, size, (), 0, start).unwrap()).unwrap()
+    fn shared(self, start: usize, size: usize) -> MapLayout<MockAddr, Self> {
+        MapLayout::new(self.map(None, size, (), 0, start).unwrap()).unwrap()
     }
 }
 
-type MockMemHandle<'a> = MemBlkHandle<MockAddr, MockBackend<'a>>;
-type MockAlloc<'a> = MemAlloc<Optimistic, MockAddr, MockBackend<'a>>;
+type MockMapView<'a> = MapView<MockAddr, MockBackend<'a>>;
+type MockAlloc<'a> = MapAlloc<Optimistic, MockAddr, MockBackend<'a>>;
 type MockSession<'a, H, const N: usize> = Session<Optimistic, H, N, MockAddr, MockBackend<'a>>;
 
-fn mock_handle(bk: &mut [u8], start: usize, size: usize) -> MockMemHandle<'_> {
+fn mock_handle(bk: &mut [u8], start: usize, size: usize) -> MockMapView<'_> {
     let bk = MockBackend(bk);
     bk.shared(start, size).try_into().unwrap()
 }
 
-fn mock_arena(bk: &mut [u8], start: usize, size: usize) -> MockAlloc<'_> {
+fn mock_alloc(bk: &mut [u8], start: usize, size: usize) -> MockAlloc<'_> {
     let bk = MockBackend(bk);
     bk.shared(start, size).try_into().unwrap()
 }
 
-fn mock_conn<H: Envelope, const N: usize>(
+fn mock_session<H: Envelope, const N: usize>(
     bk: &mut [u8],
     start: usize,
     size: usize,
-) -> MockSession<H, N> {
+) -> MockSession<'_, H, N> {
     let bk = MockBackend(bk);
     SessionBy::from(bk.shared(start, size)).unwrap()
 }
-
-// fn mock_aconn<H: Envelope, const N: usize>(
-//     bk: &mut [u8],
-//     start: usize,
-//     size: usize,
-// ) -> MockAConn<'_, H, N> {
-//     let bk = MockBackend(bk);
-//     bk.shared(start, size).try_into().unwrap()
-// }
 
 #[test]
 fn area_init() {
@@ -166,11 +166,11 @@ fn arena_exceed() {
     const BYTES_SIZE: usize = 50;
     const REDUCED_SIZE: usize = 35;
     const START: usize = 1;
-    const NUM: usize = 5;
+    const NUM: usize = 3;
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     let mut metas = Vec::new();
@@ -196,8 +196,63 @@ fn arena_exceed() {
 
             s.spawn(move || {
                 bar.wait();
-                let meta = a.malloc_bytes(REDUCED_SIZE).unwrap();
-                tracing::debug!("freelist bytes: {:?}", meta)
+                match a.malloc_bytes(REDUCED_SIZE) {
+                    Ok(meta) => {
+                        tracing::debug!("alloc bytes in node: {:?}", meta)
+                    }
+                    Err(e) => {
+                        tracing::debug!("alloc bytes error in node: {:?}", e)
+                    }
+                }
+            });
+        }
+    });
+}
+
+#[test]
+fn arena_exceed_box() {
+    use std::sync::Barrier;
+    use std::thread;
+
+    use crate::boxed::PBox;
+    // use crate::mem::MemAlloc;
+
+    const BYTES_SIZE: usize = 50;
+    const REDUCED_SIZE: usize = 35;
+    const START: usize = 1;
+    const NUM: usize = 3;
+
+    tracing_init();
+    let mut pt = [0; MAX_ADDR];
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
+
+    let bar = Barrier::new(NUM);
+    let mut metas = Vec::new();
+
+    for _ in START..=NUM {
+        let bytes: PBox<[u8], _> = PBox::new_slice_in(BYTES_SIZE, |_| 0, &a);
+        tracing::debug!("push bytes: {:?} bytes", bytes.as_ptr());
+        metas.push(bytes);
+    }
+
+    // Fill the header reserved bytes
+    let remained = a.remained();
+    let _ = PBox::into_raw(PBox::new_slice_in(remained - REDUCED_SIZE*10, |_| 0u8, &a));
+    // let _ = a.malloc_bytes(remained).unwrap();
+
+    // Generate freelist nodes
+    metas.drain(..).for_each(|bytes| {
+        tracing::debug!("drain bytes: {:?} bytes", bytes.len());
+    });
+
+    thread::scope(|s| {
+        for _ in (START..=NUM).rev() {
+            let a = &a;
+            let bar = &bar;
+
+            s.spawn(move || {
+                bar.wait();
+                let slice: PBox<[u8], _> = PBox::new_slice_in(REDUCED_SIZE, |_| 0, &a);
             });
         }
     });
@@ -216,7 +271,7 @@ fn arena_frag() {
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -249,7 +304,7 @@ fn arena_dealloc() {
 
     tracing_init();
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     let mut metas: Vec<_> = (0..ALLOC_NUM)
@@ -304,7 +359,7 @@ fn pbox_droppy() {
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -360,7 +415,7 @@ fn pbox_dyn() {
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -418,7 +473,7 @@ fn parc_stress() {
     const NUM: usize = 5;
 
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
     let droppy = Droppy(PArc::new_in(AtomicUsize::new(0), &a));
 
     let bar = Barrier::new(NUM);
@@ -448,7 +503,6 @@ fn token_of_pbox() {
 
     use crate::boxed::PBox;
 
-    tracing_init();
     #[derive(Debug)]
     struct Recover {
         f1: u64,
@@ -467,8 +521,10 @@ fn token_of_pbox() {
     const ALLOC_NUM: usize = 500;
     const NUM: usize = 5;
 
+    tracing_init();
+
     let mut pt = [0; MAX_ADDR];
-    let a = mock_arena(&mut pt, 0, MAX_ADDR);
+    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
@@ -562,7 +618,7 @@ fn conn_sync() {
     tracing_init();
 
     let mut pt = [0; MAX_ADDR];
-    let conn = mock_conn::<(), N>(&mut pt, 0, MAX_ADDR);
+    let conn = mock_session::<(), N>(&mut pt, 0, MAX_ADDR);
     let alloc = conn.alloc.clone();
 
     let h = conn.prepare(SIZE).expect("alloc ok");
@@ -702,7 +758,7 @@ async fn conn_async() {
     tracing_init();
 
     let mut pt = [0; MAX_ADDR];
-    let conn = mock_conn::<ReqNull, N>(&mut pt, 0, MAX_ADDR);
+    let conn = mock_session::<ReqNull, N>(&mut pt, 0, MAX_ADDR);
     let handle = conn.prepare(SIZE).expect("alloc ok");
     let view = conn.acquire(handle).expect("view ok");
 

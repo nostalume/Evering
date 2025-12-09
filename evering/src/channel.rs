@@ -472,16 +472,24 @@ pub enum TryRecvError {
     Disconnected,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 #[repr(transparent)]
 pub struct QueueTx<T: Queue> {
     tx: T,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 #[repr(transparent)]
 pub struct QueueRx<T: Queue> {
     rx: T,
+}
+
+impl<T: Queue + Clone> Clone for QueueTx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            tx: self.tx.clone(),
+        }
+    }
 }
 
 impl<T: Queue> Sender for QueueTx<T> {
@@ -532,6 +540,14 @@ impl<T: Queue> QueueTx<T> {
     //     pub fn len(&self) -> usize {
     //         self.tx.len()
     //     }
+}
+
+impl<T: Queue + Clone> Clone for QueueRx<T> {
+    fn clone(&self) -> Self {
+        Self {
+            rx: self.rx.clone(),
+        }
+    }
 }
 
 impl<T: Queue> Receiver for QueueRx<T> {

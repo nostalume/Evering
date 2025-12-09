@@ -10,14 +10,16 @@ use crossbeam_utils::{Backoff, CachePadded};
 
 use crate::{
     header::{self, Magic},
-    mem::{self, AddrSpec, MemBlkLayout, Mmap},
-    numeric::{Alignable, CastInto, Packable},
+    mem::{self, AddrSpec, MapLayout, Mmap},
+    numeric::{self, Alignable, CastInto, Packable},
 };
 
-pub type UInt = u32;
-type PackedUInt = u64;
-type AtomicUInt = AtomicU32;
-type AtomicPackedUInt = AtomicU64;
+type UInt = u32;
+type AtomicUInt = numeric::Atomic<UInt>;
+
+type PackedUInt = numeric::Pack<UInt>;
+type AtomicPackedUInt = numeric::AtomicPack<UInt>;
+
 type PAtomicUInt = CachePadded<AtomicUInt>;
 type PAtomicPackedUInt = CachePadded<AtomicPackedUInt>;
 
@@ -161,7 +163,7 @@ unsafe impl const mem::Span for SpanMeta {
 
 impl SpanMeta {
     #[inline]
-    const fn raw(raw_offset: Offset, raw_size: Size) -> Self {
+    const fn from_raw(raw_offset: Offset, raw_size: Size) -> Self {
         Self {
             raw: AddrSpan {
                 start_offset: raw_offset,
@@ -177,7 +179,7 @@ impl SpanMeta {
     }
 
     #[inline]
-    pub const unsafe fn resolve(self, base_ptr: *const u8) -> Meta {
+    pub const unsafe fn recall(self, base_ptr: *const u8) -> Meta {
         Meta {
             base_ptr,
             raw: self.raw,
@@ -196,7 +198,7 @@ impl Meta {
     }
 
     #[inline]
-    const fn raw(base_ptr: *const u8, raw_offset: Offset, raw_size: Size) -> Self {
+    const fn from_raw(base_ptr: *const u8, raw_offset: Offset, raw_size: Size) -> Self {
         Self {
             base_ptr,
             raw: AddrSpan {
@@ -263,43 +265,44 @@ impl Meta {
 
 #[derive(Clone, Copy, Debug)]
 pub struct MetaConfig {
-    min_segment_size: Size,
-    allocated: Size,
+    min_data_size: Size,
+    forward: Size,
 }
 
 impl MetaConfig {
     pub const fn default<S: Strategy>() -> Self {
-        use core::mem;
         Self {
-            min_segment_size: ArenaMeta::<S>::MIN_SEGMENT_SIZE,
-            allocated: mem::size_of::<Header<S>>() as Size,
+            min_data_size: ArenaMeta::<S>::MIN_DATA_SIZE,
+            forward: 0,
         }
     }
 
-    pub const fn with_min_segment_size(self, min_segment_size: Size) -> Self {
+    pub const fn with_min_data_size(self, min_data_size: Size) -> Self {
         Self {
-            min_segment_size,
+            min_data_size,
             ..self
         }
     }
 
-    pub const fn with_allocated(self, allocated: Size) -> Self {
-        Self { allocated, ..self }
+    pub const fn with_forward(self, foward: Size) -> Self {
+        Self {
+            forward: foward,
+            ..self
+        }
     }
 }
 
 #[repr(C)]
 pub struct ArenaMeta<S: Strategy> {
     sentinel: SegmentNode,
-    // hot path
     allocated: PAtomicUInt,
     discarded: PAtomicUInt,
-    min_segment_size: AtomicUInt,
+    min_data_size: AtomicUInt,
     strategy: PhantomData<S>,
 }
 
 pub type Header<S> = header::Header<ArenaMeta<S>>;
-pub type MemArenaMeta<S, A, M> = mem::MemRef<Header<S>, A, M>;
+pub type MemArenaMeta<S, A, M> = mem::MapHandle<Header<S>, A, M>;
 
 impl<S: Strategy> core::fmt::Debug for ArenaMeta<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -318,8 +321,8 @@ impl<S: Strategy> header::Layout for ArenaMeta<S> {
 
     #[inline]
     fn init(&mut self, conf: Self::Config) -> header::Status {
-        let data = Self::from_config(conf);
         let ptr = self as *mut Self;
+        let data = Self::from_config(conf);
         unsafe { ptr.write(data) };
         header::Status::Initialized
     }
@@ -331,15 +334,17 @@ impl<S: Strategy> header::Layout for ArenaMeta<S> {
 }
 
 impl<S: Strategy> ArenaMeta<S> {
-    pub const MIN_SEGMENT_SIZE: Size = 20;
+    pub const MIN_DATA_SIZE: Size = 20;
 
     #[inline]
     const fn from_config(conf: MetaConfig) -> Self {
         let MetaConfig {
-            min_segment_size,
-            allocated,
+            min_data_size,
+            forward,
         } = conf;
-        Self::new(min_segment_size, allocated)
+
+        let allocated = UInt::size_of::<Header<S>>() + forward;
+        Self::new(min_data_size, allocated)
     }
 
     #[inline]
@@ -348,7 +353,7 @@ impl<S: Strategy> ArenaMeta<S> {
             sentinel: SegmentNode::sentinel(),
             allocated: CachePadded::new(AtomicUInt::new(allocated)),
             discarded: CachePadded::new(AtomicUInt::new(0)),
-            min_segment_size: AtomicUInt::new(min_segment_size),
+            min_data_size: AtomicUInt::new(min_segment_size),
             strategy: PhantomData,
         }
     }
@@ -356,63 +361,6 @@ impl<S: Strategy> ArenaMeta<S> {
     #[inline]
     fn load(&self) -> SegmentNodeData {
         self.sentinel.load()
-    }
-
-    #[inline]
-    fn alloc_fast<H: const Deref<Target = Header<S>>>(
-        &self,
-        a: &Arena<H, S>,
-        size: UInt,
-        align: UInt,
-    ) -> Option<Meta> {
-        let mut allocated = self.allocated();
-        loop {
-            let want = allocated.align_up(align) + size;
-            if want > a.size {
-                break None;
-            }
-
-            match self.allocated.compare_exchange_weak(
-                allocated,
-                want,
-                Ordering::SeqCst,
-                Ordering::Acquire,
-            ) {
-                Ok(allocated) => {
-                    break {
-                        let raw_size = want - allocated;
-
-                        #[cfg(feature = "tracing")]
-                        tracing::debug!(
-                            "allocate {} bytes at offset {} from arena",
-                            raw_size,
-                            allocated
-                        );
-                        let meta = Meta::raw(a.base_ptr(), allocated, raw_size).align_to(align);
-                        // unsafe { meta.clear(a) }
-                        Some(meta)
-                    };
-                }
-                Err(changed) => {
-                    allocated = changed;
-                    continue;
-                }
-            }
-        }
-    }
-
-    #[inline]
-    // remove the last node: `offset+size` or return false
-    fn dealloc_last(&self, offset: Offset, size: Size) -> bool {
-        if self
-            .allocated
-            .compare_exchange(offset + size, offset, Ordering::SeqCst, Ordering::Relaxed)
-            .is_ok()
-        {
-            return true;
-        }
-
-        false
     }
 
     #[inline]
@@ -428,18 +376,18 @@ impl<S: Strategy> ArenaMeta<S> {
     #[inline]
     fn incre_discarded(&self, size: Size) {
         #[cfg(feature = "tracing")]
-        tracing::debug!("discard {size} bytes");
+        tracing::debug!("[Arena]: discard {size} bytes");
         self.discarded.fetch_add(size, Ordering::Release);
     }
 
     #[inline]
-    pub fn min_segment_size(&self) -> Size {
-        self.min_segment_size.load(Ordering::Acquire)
+    pub fn min_data_size(&self) -> Size {
+        self.min_data_size.load(Ordering::Acquire)
     }
 
     #[inline]
-    fn with_min_segment_size(&self, size: Size) {
-        self.min_segment_size.store(size, Ordering::Release);
+    fn with_min_data_size(&self, size: Size) {
+        self.min_data_size.store(size, Ordering::Release);
     }
 }
 
@@ -463,6 +411,7 @@ impl SegmentNodeData {
     const fn encode(self) -> <UInt as Packable>::Packed {
         UInt::pack(self.size, self.next)
     }
+
     #[inline]
     const fn decode(value: <UInt as Packable>::Packed) -> Self {
         let (size, next) = UInt::unpack(value);
@@ -494,6 +443,7 @@ impl SegmentNodeData {
         self.is_sentinel() && self.next_is_tail()
     }
 
+    /// Mark `self` as `Removed` by notating `size = SEGMENT_NODE_REMOVED`
     #[inline]
     const fn remove(self) -> Self {
         Self {
@@ -502,6 +452,7 @@ impl SegmentNodeData {
         }
     }
 
+    /// Insert a new node next to `self` by notate `self.next = new_segment.node_offset`
     #[inline]
     const fn insert(self, next: Segment) -> Self {
         Self {
@@ -510,14 +461,25 @@ impl SegmentNodeData {
         }
     }
 
+    /// Skip a node to its next node for `self` by notate `self.next = this.next`
     #[inline]
-    const fn advance(self, to: Self) -> Self {
+    const fn advance(self, this: Self) -> Self {
         Self {
             size: self.size,
-            next: to.next,
+            next: this.next,
         }
     }
 
+    /// Merge a continguous node.
+    #[inline]
+    const unsafe fn merge(self, this: Self, size: Offset) -> Self {
+        Self {
+            size,
+            next: this.next,
+        }
+    }
+
+    /// Mark as sentinel node.
     #[inline]
     const fn sentinel() -> Self {
         Self {
@@ -536,12 +498,12 @@ struct SegmentNode {
 
 impl core::fmt::Debug for SegmentNode {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let data = self.load();
+        let data = SegmentNodeData::decode(self.node.load(Ordering::Relaxed));
         core::fmt::Debug::fmt(&data, f)
     }
 }
 
-impl core::ops::Deref for SegmentNode {
+impl const core::ops::Deref for SegmentNode {
     type Target = AtomicU64;
 
     #[inline]
@@ -574,6 +536,11 @@ impl SegmentNode {
     }
 
     #[inline]
+    unsafe fn offset(&self, base_ptr: *const u8) -> Offset {
+        ((self as *const Self).addr() - base_ptr.addr()) as Offset
+    }
+
+    #[inline]
     fn compare_exchange_data(
         &self,
         current: SegmentNodeData,
@@ -581,14 +548,16 @@ impl SegmentNode {
         success: Ordering,
         failure: Ordering,
     ) -> Result<SegmentNodeData, SegmentNodeData> {
-        let current = current.encode();
-        let new = new.encode();
-        match self.node.compare_exchange(current, new, success, failure) {
+        match self
+            .node
+            .compare_exchange(current.encode(), new.encode(), success, failure)
+        {
             Ok(word) => Ok(SegmentNodeData::decode(word)),
             Err(word) => Err(SegmentNodeData::decode(word)),
         }
     }
 
+    /// Remove `self` by notate as `Removed`.
     #[inline]
     fn remove(&self) -> Result<SegmentNodeData, SegmentNodeData> {
         let cur = self.load();
@@ -603,9 +572,10 @@ impl SegmentNode {
         }
     }
 
+    /// Insert a new `SegmentNode` next to `self` by `self.next = next_segment.node_offset`.
     #[inline]
     fn insert(&self, next: Segment) -> Result<(), SegmentNodeData> {
-        // prev(self) -> next(new segment)
+        // [self] -> [next]
         next.init_node(self);
         let cur = self.load();
         if cur.next == next.node_offset {
@@ -614,11 +584,16 @@ impl SegmentNode {
         }
         let inserted = cur.insert(next);
         match self.compare_exchange_data(cur, inserted, Ordering::AcqRel, Ordering::Relaxed) {
-            Ok(_) => Ok(()),
+            Ok(_) => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Arena]: create segment node: {:?}", next);
+                Ok(())
+            }
             Err(word) => Err(word),
         }
     }
 
+    /// Skip a `SegmentNode` related to `self` by `self.next = this.next`.
     #[inline]
     fn advance(&self, next_to: &SegmentNode) -> Result<(), SegmentNodeData> {
         let cur = self.load();
@@ -629,22 +604,52 @@ impl SegmentNode {
             Err(word) => Err(word),
         }
     }
+
+    #[inline]
+    fn merge(&self, next: &SegmentNode, size: Size) -> Result<SegmentNodeData, SegmentNodeData> {
+        let cur = self.load();
+        let next_data = next.load();
+        let merged = unsafe { cur.merge(next_data, size) };
+        // if next.remove().is_err() {
+        //     return Err(cur);
+        // }
+        match self.compare_exchange_data(cur, merged, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => Ok(merged),
+            Err(word) => Err(word),
+        }
+    }
 }
 
 type SegmentView<'a> = (&'a SegmentNode, SegmentNodeData);
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Copy, Clone, PartialEq, Eq)]
 struct Segment {
     base_ptr: *const u8,
     node_offset: Offset,
     data_size: Size,
 }
 
+impl core::fmt::Debug for Segment {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.is_sentinel() {
+            f.debug_struct("Segment Setinel")
+                .field("node_offset", &self.node_offset)
+                .finish()
+        } else {
+            f.debug_struct("Segment")
+                .field("node_offset", &self.node_offset)
+                .field("data_size", &self.data_size)
+                .field("end_offset", &self.end_offset())
+                .finish()
+        }
+    }
+}
+
 impl Segment {
     /// # Safety
     /// - offset must point to a well-aligned and in-bounds SegmentNode
     #[inline]
-    const unsafe fn raw(base_ptr: *const u8, node_offset: Offset, data_size: Size) -> Self {
+    const unsafe fn from_raw(base_ptr: *const u8, node_offset: Offset, data_size: Size) -> Self {
         Self {
             base_ptr,
             node_offset,
@@ -660,7 +665,12 @@ impl Segment {
         min_data_size: Size,
     ) -> Option<Self> {
         let (aligned_offset, _, available) = Self::validate(offset, size, min_data_size)?;
-        unsafe { Some(Self::raw(base_ptr, aligned_offset, available)) }
+        unsafe { Some(Self::from_raw(base_ptr, aligned_offset, available)) }
+    }
+
+    #[inline]
+    const fn is_sentinel(&self) -> bool {
+        self.data_size == SENTINEL_SIZE
     }
 
     #[inline]
@@ -670,7 +680,7 @@ impl Segment {
 
     #[inline]
     const fn end_offset(&self) -> Offset {
-        self.data_offset() + self.data_size
+        self.data_offset().checked_add(self.data_size).unwrap_or(0)
     }
 
     #[inline]
@@ -687,6 +697,17 @@ impl Segment {
     }
 
     #[inline]
+    const fn node(&self) -> &SegmentNode {
+        // Safety: Segment node offset should be valid in its initiation.
+        unsafe {
+            &*self
+                .base_ptr
+                .add(self.node_offset.cast_into())
+                .cast::<SegmentNode>()
+        }
+    }
+
+    #[inline]
     const fn validate(
         offset: Offset,
         size: Size,
@@ -694,12 +715,12 @@ impl Segment {
     ) -> Option<(Offset, Size, Size)> {
         let aligned_offset = offset.align_up_of::<SegmentNode>();
         let overhead = offset.align_offset_of::<SegmentNode>() + SEGMENT_NODE_SIZE;
-        let available = size.checked_sub(overhead)?;
-        if available < min_data_size {
+        let data_size = size.checked_sub(overhead)?;
+        if data_size < min_data_size {
             return None;
         }
 
-        Some((aligned_offset, overhead, available))
+        Some((aligned_offset, overhead, data_size))
     }
 
     #[inline]
@@ -713,20 +734,17 @@ impl Segment {
 
     #[inline]
     fn init_node(&self, prev: &SegmentNode) {
-        // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
-        unsafe {
-            let ptr = self.base_ptr.add(self.node_offset.cast_into());
-            let node = &*ptr.cast::<SegmentNode>();
-            let prev_data = prev.load();
-            let node_data = SegmentNodeData {
-                size: self.data_size,
-                next: prev_data.next,
-            };
-            node.store(node_data);
-        }
+        let node = self.node();
+        let prev_data = prev.load();
+        let node_data = SegmentNodeData {
+            size: self.data_size,
+            next: prev_data.next,
+        };
+        node.store(node_data);
     }
 }
 
+#[derive(Debug, Clone, Copy)]
 struct ReqSegment {
     seg: Segment,
     req_size: Size,
@@ -777,7 +795,7 @@ pub struct Arena<H: const Deref<Target = Header<S>>, S: Strategy> {
 }
 
 pub type RefArena<'a, S> = Arena<&'a Header<S>, S>;
-pub type MemArena<S, A, M> = Arena<MemArenaMeta<S, A, M>, S>;
+pub type MapArena<S, A, M> = Arena<MemArenaMeta<S, A, M>, S>;
 
 pub struct Pessimistic;
 pub struct Optimistic;
@@ -795,7 +813,7 @@ pub trait Strategy: Sized {
 impl Strategy for Optimistic {
     #[inline]
     fn order(val: Size, next_node_size: Size) -> bool {
-        val >= next_node_size
+        val > next_node_size
     }
 
     fn alloc_slow<H: const Deref<Target = Header<Optimistic>>>(
@@ -856,11 +874,8 @@ unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for A
 
     #[inline]
     fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
-        let size = layout.size();
-        let size = cap_bound_ok(size)?;
-        let align = layout.align();
-        let align = cap_bound_ok(align)?;
-
+        let size = cap_bound_ok(layout.size())?;
+        let align = cap_bound_ok(layout.align())?;
         self.alloc(size, align)
     }
 }
@@ -911,15 +926,15 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
     }
 }
 
-impl<S: Strategy, A: AddrSpec, M: Mmap<A>> TryFrom<MemBlkLayout<A, M>> for MemArena<S, A, M> {
+impl<S: Strategy, A: AddrSpec, M: Mmap<A>> TryFrom<MapLayout<A, M>> for MapArena<S, A, M> {
     type Error = mem::Error<A, M>;
 
-    fn try_from(area: MemBlkLayout<A, M>) -> Result<Self, Self::Error> {
+    fn try_from(area: MapLayout<A, M>) -> Result<Self, Self::Error> {
         Self::from_layout(area, Config::default())
     }
 }
 
-impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MemArena<S, A, M> {
+impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MapArena<S, A, M> {
     #[inline]
     pub fn as_ref(&self) -> RefArena<'_, S> {
         RefArena {
@@ -931,18 +946,16 @@ impl<S: Strategy, A: AddrSpec, M: Mmap<A>> MemArena<S, A, M> {
     }
 
     #[inline]
-    pub fn from_layout(area: MemBlkLayout<A, M>, conf: Config) -> Result<Self, mem::Error<A, M>> {
-        use mem::MemBlkOps;
+    pub fn from_layout(area: MapLayout<A, M>, conf: Config) -> Result<Self, mem::Error<A, M>> {
+        use mem::MemOps;
         let mut area = area;
-        let offset = area.offset();
+
         let mconf = MetaConfig::default::<S>();
-        let ptr = area.push::<Header<S>>(mconf)?;
-        let (area, _) = area.finish();
+        let reserve = area.reserve::<Header<S>>()?;
+        let size = cap_bound(area.size() - area.ptr_offset(&reserve));
+        let handle = area.commit(reserve, mconf)?;
 
-        let size = cap_bound(area.size() - offset);
-
-        let header = unsafe { MemArenaMeta::from_raw(area.into(), ptr) };
-        Ok(Self::from_conf(header, size, conf))
+        Ok(Self::from_conf(handle, size, conf))
     }
 }
 
@@ -953,81 +966,62 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
     }
 
     #[inline]
-    fn meta(&self, seg: ReqSegment) -> Meta {
-        Meta::from_req_seg(self.base_ptr(), seg)
+    fn meta(&self, seg: ReqSegment, align: Offset) -> Meta {
+        Meta::from_req_seg(self.base_ptr(), seg).align_to(align)
         // unsafe { meta.clear(self) }
     }
 
+    /// Initiate a new `segment` by normalized `offset` and `size`.
     #[inline]
     fn new_segment(&self, offset: Offset, size: Size) -> Option<Segment> {
         if offset == 0 || size == 0 {
             return None;
         }
-        Segment::new(
-            self.base_ptr(),
-            offset,
-            size,
-            self.header().min_segment_size(),
-        )
+        Segment::new(self.base_ptr(), offset, size, self.header().min_data_size())
     }
 
+    /// Initiate a raw new `segment` by given `offset` and `size`.
     #[inline]
     unsafe fn raw_segment(&self, offset: Offset, data_size: Size) -> Segment {
         // Safety: when constructing the Segment, we have checked the ptr_offset is in bounds and well-aligned.
-        unsafe { Segment::raw(self.base_ptr(), offset, data_size) }
+        unsafe { Segment::from_raw(self.base_ptr(), offset, data_size) }
     }
 
+    /// Resolve a segment of a node by its previous `node.next` and its `node.size`.
     #[inline]
     unsafe fn segment_from_pair(&self, prev: SegmentNodeData, cur: SegmentNodeData) -> Segment {
         unsafe { self.raw_segment(prev.next, cur.size) }
     }
 
     #[inline]
-    fn split_segment(&self, segment: &ReqSegment) -> Option<(ReqSegment, Segment)> {
-        let req_size = segment.req_size;
-        let rem_size = segment.data_size - req_size;
-        let rem_offset = segment.data_offset() + req_size;
-        let rem_segment = self.new_segment(rem_offset, rem_size)?;
-        let alloc_segment = unsafe { self.raw_segment(segment.node_offset, req_size) };
-        Some((
-            ReqSegment {
-                seg: alloc_segment,
-                req_size,
-            },
-            rem_segment,
-        ))
+    fn segment_of(&self, node: &SegmentNode) -> Segment {
+        unsafe { self.raw_segment(node.offset(self.base_ptr()), node.load().size) }
     }
 
+    /// # Safety: the offset is in bounds and well aligned.
+    ///
+    /// Resolve a segment node by the given offset.
     #[inline]
-    fn merge_segment(&self, prev: &Segment, next: &Segment) -> Option<Segment> {
-        if prev.end_offset() != next.node_offset {
-            return None;
-        }
-        let merged_data_size = prev.data_size + next.size();
-        unsafe { Some(self.raw_segment(prev.node_offset, merged_data_size)) }
-    }
-
-    #[inline]
-    fn recycle_segment(&self, segment: Segment) {
-        unsafe { self.dealloc_by(segment.data_offset(), segment.data_size) };
-    }
-
-    #[inline]
-    fn next_segment_node(&self, data: SegmentNodeData) -> &SegmentNode {
-        self.segment_node(data.next)
-    }
-
-    #[inline]
-    fn segment_node(&self, offset: Offset) -> &SegmentNode {
-        // Safety: the offset is in bounds and well aligned.
+    unsafe fn raw_segment_node(&self, offset: Offset) -> &SegmentNode {
         unsafe {
             let ptr = self.base_ptr().add(offset.cast_into());
             &*ptr.cast()
         }
     }
 
+    /// Resolve a segment node by its previous `SegmentNodeData`
     #[inline]
-    fn segment_req(
+    fn next_segment_node(&self, data: SegmentNodeData) -> &SegmentNode {
+        unsafe { self.raw_segment_node(data.next) }
+    }
+
+    /// Require a segment and resolve its next node by its previous node and size.
+    ///
+    /// If previous node or its next node is removed, mark as `Ok(None)` for retrying.
+    ///
+    /// Else return `Err(())`
+    #[inline]
+    fn req_segment(
         &self,
         prev: &SegmentNode,
         size: Size,
@@ -1037,6 +1031,7 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
             return Err(());
         }
 
+        // Removed state indicates retry
         if prev_data.next_is_removed() {
             return Ok(None);
         }
@@ -1057,6 +1052,74 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         };
 
         Ok(Some((seg, cur)))
+    }
+
+    #[inline]
+    fn split_segment(&self, segment: ReqSegment) -> Option<(ReqSegment, Segment)> {
+        let req_size = segment.req_size;
+        let rem_size = segment.data_size - req_size;
+        let rem_offset = (segment.data_offset() + req_size).align_up_of::<SegmentNode>();
+        let alloc_segment = unsafe { self.raw_segment(segment.node_offset, req_size) };
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Arena]: split: offset {}, size {}", rem_offset, rem_size);
+        // unsafe {
+        //     let _ = self.dealloc_by(rem_offset, rem_size);
+        // };
+        let rem_segment = self.new_segment(rem_offset, rem_size)?;
+
+        Some((
+            ReqSegment {
+                seg: alloc_segment,
+                req_size: req_size,
+            },
+            rem_segment,
+        ))
+    }
+
+    #[inline]
+    fn merge_segment(&self, prev: &SegmentNode, cur: &SegmentNode) {
+        let prev_seg = self.segment_of(prev);
+        let cur_seg = self.segment_of(cur);
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            "[Arena]: merge: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}",
+            prev_seg,
+            prev_seg.end_offset().align_up_of::<SegmentNode>(),
+            cur_seg,
+            cur_seg.node_offset,
+        );
+
+        let prev_data = prev.load();
+        if prev_data.is_removed() || prev_data.next_is_removed() {
+            return;
+        }
+
+        if prev_seg.is_sentinel() {
+            return;
+        }
+
+        let prev_end = prev_seg.end_offset().align_up_of::<SegmentNode>();
+        let cur_end = cur_seg.end_offset();
+        if prev_end != cur_seg.node_offset || prev_end >= self.size {
+            return;
+        }
+
+        let size = cur_end - prev_seg.data_offset();
+        match prev.merge(cur, size) {
+            Ok(merge) => {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    "[Arena]: merge checked: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}, new {:?}",
+                    prev_seg,
+                    prev_end,
+                    cur_seg,
+                    cur_seg.node_offset,
+                    merge
+                );
+            }
+            Err(_) => {}
+        }
     }
 
     // find prev and next node that satisfies the given size check.
@@ -1110,6 +1173,60 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         }
     }
 
+    // #[inline]
+    // fn find_by_offset(&self, seg: Segment) -> Result<SegmentView<'_>, SegmentView<'_>> {
+    //     let backoff = Backoff::new();
+
+    //     let header = self.header();
+    //     let mut cur = &header.sentinel;
+    //     let mut cur_data = cur.load();
+
+    //     loop {
+    //         // the list is empty
+    //         if cur_data.is_empty() {
+    //             return Err((cur, cur_data));
+    //         }
+
+    //         if cur_data.is_removed() {
+    //             if cur_data.next_is_tail() {
+    //                 return Err((cur, cur_data));
+    //             }
+    //             cur = self.next_segment_node(cur_data);
+    //             cur_data = cur.load();
+    //             continue;
+    //         }
+
+    //         // the next is the tail, then we should insert the value after the current node.
+    //         if cur_data.next_is_tail() {
+    //             return Err((cur, cur_data));
+    //         }
+
+    //         let next = self.next_segment_node(cur_data);
+    //         let next_data = next.load();
+    //         if next_data.is_removed() {
+    //             backoff.snooze();
+    //             continue;
+    //         }
+
+    //         let cur_seg = self.segment_of(cur);
+    //         let next_seg = self.segment_of(next);
+    //         let end = cur_seg.end_offset();
+    //         if seg.node_offset > end && seg.node_offset < next_seg.node_offset {
+    //             let re_cur = cur.load();
+    //             if re_cur.is_removed() {
+    //                 backoff.snooze();
+    //                 cur = &header.sentinel;
+    //                 cur_data = cur.load();
+    //                 continue;
+    //             }
+    //             return Ok((cur, cur_data));
+    //         }
+
+    //         cur = next;
+    //         cur_data = next_data;
+    //     }
+    // }
+
     fn discard(&self) -> Result<Size, Error> {
         if self.read_only {
             return Err(Error::ReadOnly);
@@ -1162,52 +1279,85 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         }
     }
 
+    /// Deallocate a `meta`
     pub fn dealloc(&self, meta: Meta) -> bool {
-        unsafe { self.dealloc_by(meta.raw.start_offset, meta.raw.size) }
+        unsafe {
+            match self.dealloc_by(meta.raw.start_offset, meta.raw.size) {
+                Ok(_) => true,
+                Err(Some(_)) => true,
+                Err(None) => false,
+            }
+        }
     }
 
-    unsafe fn dealloc_by(&self, offset: UInt, size: UInt) -> bool {
-        let header = self.header();
-        if header.dealloc_last(offset, size) {
+    #[inline]
+    // remove the last node: `offset+size` or return false
+    fn dealloc_last(&self, offset: Offset, size: Size) -> bool {
+        let Some(new_offset) = offset.checked_add(size) else {
+            return false;
+        };
+        if self
+            .header()
+            .allocated
+            .compare_exchange(new_offset, offset, Ordering::SeqCst, Ordering::Relaxed)
+            .is_ok()
+        {
             return true;
         }
 
-        // enough space to initiate segment?
+        false
+    }
+
+    /// Deallocate by given `offset` and `size`.
+    ///
+    /// If deallocate fastly, return `Ok(())`,
+    ///
+    /// Else if deallocate by creating node, return `Option<Segment>`.
+    unsafe fn dealloc_by(&self, offset: UInt, size: UInt) -> Result<(), Option<Segment>> {
+        if self.dealloc_last(offset, size) {
+            return Ok(());
+        }
+
+        // initiate a new segment
         let Some(segment) = self.new_segment(offset, size) else {
-            return false;
+            return Err(None);
         };
 
         let backoff = Backoff::new();
 
         loop {
-            let (cur, cur_data) = match self.find_by(segment.data_size) {
+            // find the previous node for current segment
+            let (prev, prev_data) = match self.find_by(size) {
                 Ok(res) => res,
                 Err(res) => res,
             };
 
-            if cur_data.is_removed() {
+            if prev_data.is_removed() {
                 backoff.snooze();
                 continue;
             }
 
-            // found original node, then we need to refind the position.
-            if segment.node_offset == cur_data.next {
+            // found original node, refind again
+            if segment.node_offset == prev_data.next {
                 backoff.snooze();
                 continue;
             }
 
-            match cur.insert(segment) {
+            match prev.insert(segment) {
                 Ok(_) => {
+                    let prev_data = prev.load();
                     #[cfg(feature = "tracing")]
                     tracing::debug!(
-                        "create segment node ({} bytes) at {}, next segment {}",
-                        cur_data.size,
-                        segment.node_offset,
-                        cur_data.next,
+                        "[Arena]: new prev: {:?}, with next segment {:?}",
+                        prev_data,
+                        segment,
                     );
+                    //
+                    // let _ = self.merge_segment(prev, self.next_segment_node(prev.load()));
 
-                    header.incre_discarded(SEGMENT_NODE_SIZE);
-                    return true;
+                    // TODO: improve this.
+                    self.header().incre_discarded(SEGMENT_NODE_SIZE);
+                    return Err(Some(segment));
                 }
                 Err(cur) => {
                     if cur.is_removed() {
@@ -1220,14 +1370,40 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
             }
         }
     }
-    fn alloc_slow_by(&self, cur: &SegmentNode, size: Size, align: Offset) -> Result<Meta, Error> {
+
+    /// Allocate by given `size` and `align`.
+    pub fn alloc(&self, size: UInt, align: UInt) -> Result<Meta, Error> {
+        if self.read_only {
+            return Err(Error::ReadOnly);
+        }
+        if size == 0 {
+            use mem::Meta;
+            return Ok(Meta::null());
+        }
+
+        if let Some(meta) = self.alloc_fast(size, align) {
+            Ok(meta)
+        } else {
+            for i in 0..self.max_retries {
+                match S::alloc_slow(self, size, align) {
+                    Ok(m) => return Ok(m),
+                    Err(e) if i + 1 == self.max_retries => return Err(e),
+                    Err(_) => { /* retry */ }
+                }
+            }
+            unreachable!()
+        }
+    }
+
+    fn alloc_slow_by(&self, prev: &SegmentNode, size: Size, align: Offset) -> Result<Meta, Error> {
         use mem::MemAllocInfo;
 
         let backoff = Backoff::new();
 
         let want = size + align - 1;
         loop {
-            let (cur_seg, next) = match self.segment_req(cur, want) {
+            // require this segment and resolve next node with given constrain.
+            let (cur_seg, cur) = match self.req_segment(prev, want) {
                 Err(_) => {
                     return Err(Error::UnenoughSpace {
                         requested: size,
@@ -1242,25 +1418,26 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
                 Ok(Some(res)) => res,
             };
 
-            if next.remove().is_err() {
+            if cur.remove().is_err() {
                 backoff.snooze();
                 continue;
             };
 
-            match cur.advance(next) {
+            match prev.advance(cur) {
                 Ok(_) => {
-                    #[cfg(feature = "tracing")]
-                    tracing::debug!(
-                        "allocate {} bytes at offset {} from segment",
-                        size,
-                        cur_seg.node_offset
-                    );
-                    // `want = size + align - 1 -> offset.align_up(align)`
-                    if let Some((alloc_seg, rem_seg)) = self.split_segment(&cur_seg) {
-                        self.recycle_segment(rem_seg);
-                        return Ok(self.meta(alloc_seg).align_to(align));
+                    if let Some((alloc_seg, rem_seg)) = self.split_segment(cur_seg) {
+                        rem_seg.init_node(prev);
+                        // let next = self.next_segment_node(prev.load());
+                        // let _ = self.merge_segment(next, self.next_segment_node(next.load()));
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!("[Arena]: allocate as segment with split: {:?}", alloc_seg);
+                        return Ok(self.meta(alloc_seg, align));
                     }
-                    return Ok(self.meta(cur_seg).align_to(align));
+                    // let next = self.next_segment_node(prev.load());
+                    // let _ = self.merge_segment(next, self.next_segment_node(next.load()));
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!("[Arena]: allocate as segment: {:?}", cur_seg);
+                    return Ok(self.meta(cur_seg, align));
                 }
                 Err(cur) => {
                     if cur.is_removed() {
@@ -1275,27 +1452,44 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         }
     }
 
-    pub fn alloc(&self, size: UInt, align: UInt) -> Result<Meta, Error> {
-        if self.read_only {
-            return Err(Error::ReadOnly);
-        }
-        if size == 0 {
-            use mem::Meta;
-            return Ok(Meta::null());
-        }
-
+    #[inline]
+    fn alloc_fast(&self, size: UInt, align: UInt) -> Option<Meta> {
         let header = self.header();
-        if let Some(meta) = header.alloc_fast(self, size, align) {
-            Ok(meta)
-        } else {
-            for i in 0..self.max_retries {
-                match S::alloc_slow(self, size, align) {
-                    Ok(m) => return Ok(m),
-                    Err(e) if i + 1 == self.max_retries => return Err(e),
-                    Err(_) => { /* retry */ }
+        let mut allocated = header.allocated();
+
+        loop {
+            let want = allocated.align_up(align).checked_add(size)?;
+            if want > self.size {
+                break None;
+            }
+
+            match header.allocated.compare_exchange_weak(
+                allocated,
+                want,
+                Ordering::SeqCst,
+                Ordering::Acquire,
+            ) {
+                Ok(allocated) => {
+                    break {
+                        let raw_size = want - allocated;
+
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            "[Arena]: fast allocate with offset {}, size {}",
+                            allocated,
+                            raw_size,
+                        );
+                        let meta =
+                            Meta::from_raw(self.base_ptr(), allocated, raw_size).align_to(align);
+                        // unsafe { meta.clear(a) }
+                        Some(meta)
+                    };
+                }
+                Err(changed) => {
+                    allocated = changed;
+                    continue;
                 }
             }
-            unreachable!()
         }
     }
 }

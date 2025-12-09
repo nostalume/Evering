@@ -12,7 +12,7 @@ use std::{
 };
 
 use crate::{
-    mem::{self, Access, RawMemBlk},
+    mem::{self, Access, RawMap},
     os::FdBackend,
 };
 
@@ -154,21 +154,34 @@ impl<F: AsFd> UnixFd<F> {
     }
 }
 
+impl const From<Access> for ProtFlags {
+    fn from(value: Access) -> Self {
+        let mut prot = ProtFlags::empty();
+        if value.contains(Access::READ) {
+            prot = prot.union(ProtFlags::PROT_READ);
+        }
+        if value.contains(Access::WRITE) {
+            prot = prot.union(ProtFlags::PROT_WRITE);
+        }
+        if value.contains(Access::EXEC) {
+            prot = prot.union(ProtFlags::PROT_EXEC);
+        }
+        prot
+    }
+}
+
+impl mem::Accessible for ProtFlags {
+    fn permits(self, access: Access) -> bool {
+        let access = Self::from(access);
+        self.contains(access)
+    }
+}
+
 pub struct AddrSpec;
 
 impl mem::AddrSpec for AddrSpec {
     type Addr = Addr;
     type Flags = ProtFlags;
-}
-
-impl const From<Access> for ProtFlags {
-    fn from(value: Access) -> Self {
-        match value {
-            Access::Write => ProtFlags::PROT_WRITE,
-            Access::Read => ProtFlags::PROT_READ,
-            Access::ReadWrite => ProtFlags::PROT_WRITE.union(ProtFlags::PROT_READ),
-        }
-    }
 }
 
 impl mem::Mmap<AddrSpec> for FdBackend {
@@ -185,7 +198,7 @@ impl mem::Mmap<AddrSpec> for FdBackend {
         mflags: Self::MapFlags,
         pflags: <AddrSpec as mem::AddrSpec>::Flags,
         conf: Self::Handle,
-    ) -> Result<RawMemBlk<AddrSpec, Self>, Self::Error> {
+    ) -> Result<RawMap<AddrSpec, Self>, Self::Error> {
         use core::num::NonZeroUsize;
         use nix::sys::mman;
 
@@ -201,11 +214,11 @@ impl mem::Mmap<AddrSpec> for FdBackend {
 
         unsafe {
             let ptr = mman::mmap(start, size, pflags, mflags, fd, 0)?;
-            Ok(RawMemBlk::from_ptr(ptr, size.get(), pflags, self))
+            Ok(RawMap::from_ptr(ptr, size.get(), pflags, self))
         }
     }
 
-    fn unmap(area: &mut RawMemBlk<AddrSpec, Self>) -> Result<(), Self::Error> {
+    fn unmap(area: &mut RawMap<AddrSpec, Self>) -> Result<(), Self::Error> {
         let start = unsafe { as_c_void(area.spec.start()) };
         let size = area.spec.size();
         unsafe { nix::sys::mman::munmap(start, size) }
@@ -214,7 +227,7 @@ impl mem::Mmap<AddrSpec> for FdBackend {
 
 impl mem::Mprotect<AddrSpec> for FdBackend {
     unsafe fn protect(
-        area: &mut RawMemBlk<AddrSpec, Self>,
+        area: &mut RawMap<AddrSpec, Self>,
         pflags: <AddrSpec as mem::AddrSpec>::Flags,
     ) -> Result<(), Self::Error> {
         let start = unsafe { as_c_void(area.spec.start()) };
@@ -229,7 +242,7 @@ impl mem::SharedMmap<AddrSpec> for FdBackend {
         size: usize,
         access: Access,
         handle: Self::Handle,
-    ) -> Result<RawMemBlk<AddrSpec, Self>, Self::Error> {
+    ) -> Result<RawMap<AddrSpec, Self>, Self::Error> {
         use mem::Mmap;
         let pflags = access.into();
         let mflags = MapFlags::MAP_SHARED;
@@ -258,7 +271,7 @@ mod tests {
 
         let fd = UnixFd::memfd(NAME, SIZE, false).expect("should create");
         let mut blk = FdBackend
-            .shared(SIZE, Access::ReadWrite, fd)
+            .shared(SIZE, Access::READ | Access::WRITE, fd)
             .expect("should create");
 
         unsafe {
@@ -283,7 +296,7 @@ mod tests {
         unistd::ftruncate(fd.as_fd(), GROW_SIZE as off_t).unwrap();
 
         let mut blk = bk
-            .shared(GROW_SIZE, Access::ReadWrite, fd)
+            .shared(GROW_SIZE, Access::READ | Access::WRITE, fd)
             .expect("should create");
 
         unsafe {
@@ -306,7 +319,7 @@ mod tests {
 
         let bk = FdBackend;
         let mut blk1 = bk
-            .shared(SIZE, Access::ReadWrite, fd1)
+            .shared(SIZE, Access::READ | Access::WRITE, fd1)
             .expect("should create");
 
         unsafe {
@@ -317,7 +330,7 @@ mod tests {
 
         let bk2 = FdBackend;
         let mut blk2 = bk2
-            .shared(SIZE, Access::ReadWrite, fd2)
+            .shared(SIZE, Access::READ | Access::WRITE, fd2)
             .expect("should create");
 
         unsafe {
@@ -337,7 +350,7 @@ mod tests {
         let fd1 = UnixFd::shm_create(NAME, SIZE).expect("should create");
         let bk = FdBackend;
         let mut blk1 = bk
-            .shared(SIZE, Access::ReadWrite, fd1)
+            .shared(SIZE, Access::READ | Access::WRITE, fd1)
             .expect("should create");
         unsafe {
             blk1.write(VALUE);
@@ -347,7 +360,7 @@ mod tests {
         let fd2 = UnixFd::shm_open(NAME).expect("should open");
         let bk2 = FdBackend;
         let mut blk2 = bk2
-            .shared(SIZE, Access::ReadWrite, fd2)
+            .shared(SIZE, Access::READ | Access::WRITE, fd2)
             .expect("should create");
         unsafe {
             let buf = blk2.read(VALUE.len());
@@ -367,7 +380,7 @@ mod tests {
         let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
         let bk = FdBackend;
         let mut blk = bk
-            .shared(SIZE, Access::ReadWrite, fd)
+            .shared(SIZE, Access::READ | Access::WRITE, fd)
             .expect("should create");
         unsafe {
             blk.write(VALUE);
@@ -385,7 +398,7 @@ mod tests {
 
         let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
         let bk = FdBackend;
-        let res = bk.shared(0, Access::ReadWrite, fd);
+        let res = bk.shared(0, Access::READ | Access::WRITE, fd);
         assert!(res.is_err());
 
         UnixFd::shm_unlink(NAME).expect("should unlink");
@@ -400,8 +413,12 @@ mod tests {
 
         let fd1 = UnixFd::shm_create(NAME, SIZE).expect("should create");
         let fd2 = fd1.dup().expect("should dup");
-        let mut blk1 = FdBackend.shared(SIZE, Access::ReadWrite, fd1).unwrap();
-        let mut blk2 = FdBackend.shared(SIZE, Access::ReadWrite, fd2).unwrap();
+        let mut blk1 = FdBackend
+            .shared(SIZE, Access::READ | Access::WRITE, fd1)
+            .unwrap();
+        let mut blk2 = FdBackend
+            .shared(SIZE, Access::READ | Access::WRITE, fd2)
+            .unwrap();
 
         unsafe {
             blk1.write_in(VALUE, 0);
@@ -419,15 +436,22 @@ mod tests {
     }
 
     #[test]
+    #[should_panic]
     fn perm_change() {
         use nix::sys::mman::ProtFlags;
         const NAME: &str = "perm";
         const SIZE: usize = 1024;
+        const VALUE: &[u8] = b"hello";
 
         let fd = UnixFd::shm_create(NAME, SIZE).expect("should create");
-        let mut blk = FdBackend.shared(SIZE, Access::ReadWrite, fd).unwrap();
+        let mut blk = FdBackend
+            .shared(SIZE, Access::READ | Access::WRITE, fd)
+            .unwrap();
 
         unsafe { blk.protect(ProtFlags::PROT_READ).unwrap() };
+
+        // should panic:
+        unsafe { blk.write_in(VALUE, 0) };
 
         let _ = Mmap::unmap(&mut blk);
         let _ = UnixFd::shm_unlink(NAME);

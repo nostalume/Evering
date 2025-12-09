@@ -101,6 +101,7 @@ mod numeric {
         cast!(from:u32, to:usize);
         cast!(from:u32, to:u64);
     }
+
     #[cfg(target_pointer_width = "32")]
     pub use target32::*;
 
@@ -198,9 +199,18 @@ mod numeric {
         fn unpack(packed: Self::Packed) -> (Self, Self);
     }
 
+    pub const trait AtomicPackable: Sized + Packable {
+        type AtomicSelf;
+        type AtomicPacked;
+    }
+
+    pub type Pack<T> = <T as Packable>::Packed;
+    pub type Atomic<T> = <T as AtomicPackable>::AtomicSelf;
+    pub type AtomicPack<T> = <T as AtomicPackable>::AtomicPacked;
+
     macro_rules! pack_bits {
         (unpack:$unpack:ty, pack:$pack:ty) => {
-            impl const crate::numeric::Packable for $unpack {
+            impl const Packable for $unpack {
                 type Packed = $pack;
 
                 fn pack(first: Self, second: Self) -> Self::Packed {
@@ -218,9 +228,25 @@ mod numeric {
         };
     }
 
+    macro_rules! atomic_pack_bits {
+        (unpack:$unpack:ty, atomic:$atomic:ty, atomic_pack:$atomic_pack:ty) => {
+            impl const AtomicPackable for $unpack {
+                type AtomicSelf = $atomic;
+                type AtomicPacked = $atomic_pack;
+            }
+        };
+    }
+
+    use core::sync::atomic;
+
     pack_bits!(unpack:u16, pack:u32);
+    atomic_pack_bits!(unpack:u16, atomic: atomic::AtomicU16, atomic_pack: atomic::AtomicU32);
     pack_bits!(unpack:u32, pack:u64);
+    #[cfg(all(target_has_atomic = "32", target_has_atomic = "64"))]
+    atomic_pack_bits!(unpack:u32, atomic: atomic::AtomicU32, atomic_pack: atomic::AtomicU64);
     pack_bits!(unpack:u64, pack:u128);
+    #[cfg(all(target_has_atomic = "64", target_has_atomic = "128"))]
+    atomic_pack_bits!(unpack:u64, atomic: atomic::AtomicU64, atomic_pack: atomic::AtomicU128);
 }
 
 mod counter {
@@ -254,9 +280,9 @@ mod counter {
             unsafe { &*self.counter }
         }
 
-        const fn as_raw(&self) -> *mut T {
+        const fn data(&self) -> &mut T {
             let counter = unsafe { &mut *self.counter };
-            &mut counter.data as *mut T
+            &mut counter.data
         }
 
         pub fn acquire(&self) -> Self {
@@ -274,16 +300,15 @@ mod counter {
             }
         }
 
-        pub unsafe fn release_in<F: FnOnce(*mut T)>(&self, dispose: F) {
+        pub unsafe fn release_by<F: FnOnce(*mut T)>(&self, dispose: F) {
             if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
-                dispose(self.as_raw());
+                dispose(self.data());
                 drop(unsafe { Box::from_raw(self.counter) });
             }
         }
 
         pub unsafe fn release(&self) {
             if self.counter().counts.fetch_sub(1, Ordering::AcqRel) == 1 {
-                unsafe { core::ptr::drop_in_place(self.as_raw()) };
                 drop(unsafe { Box::from_raw(self.counter) });
             }
         }

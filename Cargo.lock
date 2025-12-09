@@ -327,6 +327,7 @@ dependencies = [
 name = "evering"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.10.0",
  "crossbeam-queue",
  "crossbeam-utils",
  "fastrand",
@@ -570,6 +571,8 @@ dependencies = [
  "nix 0.30.1",
  "shmipc",
  "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

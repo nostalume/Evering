@@ -1,7 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    mem::{AddrSpec, Mmap, RawMemBlk},
+    boxed::PBox,
+    mem::{Access, AddrSpec, MemAllocator, Mmap, RawMap},
     msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
 };
 
@@ -45,23 +46,35 @@ pub(crate) trait MemBlkTestIO {
     }
 }
 
-impl<S: AddrSpec, M: Mmap<S>> MemBlkTestIO for RawMemBlk<S, M> {
+impl<S: AddrSpec, M: Mmap<S>> MemBlkTestIO for RawMap<S, M> {
     #[inline]
     unsafe fn write_bytes(&self, data: &[u8], len: usize, offset: usize) {
+        use crate::mem::{Access, Accessible};
+
         debug_assert!(self.size() >= data.len() + offset);
         debug_assert!(data.len() >= len);
+
+        if !self.spec.flags().permits(Access::WRITE) {
+            panic!("[write]: permission denied")
+        }
         unsafe {
-            use crate::mem::MemBlkOps;
+            use crate::mem::MemOps;
             core::ptr::copy_nonoverlapping(data.as_ptr(), self.start_mut_ptr().add(offset), len)
         };
     }
 
     #[inline]
     unsafe fn read_bytes(&self, buf: &mut [u8], len: usize, offset: usize) {
+        use crate::mem::{Access, Accessible};
+
         debug_assert!(self.size() >= buf.len() + offset);
         debug_assert!(buf.len() >= len);
+
+        if !self.spec.flags().permits(Access::READ) {
+            panic!("[read]: permission denied")
+        }
         unsafe {
-            use crate::mem::MemBlkOps;
+            use crate::mem::MemOps;
             core::ptr::copy_nonoverlapping(self.start_ptr().add(offset), buf.as_mut_ptr(), len)
         };
     }
@@ -91,23 +104,47 @@ impl Message for Info {
     type Semantics = Move;
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub(crate) enum Exit {
-    Exit,
-    None,
+#[repr(transparent)]
+#[derive(Clone, Copy)]
+pub(crate) struct Byte {
+    data: u8,
 }
 
-impl Envelope for Exit {}
-
-impl Tag<Exit> for Exit {
-    fn with_tag(self, value: Exit) -> Self
-    where
-        Self: Sized,
-    {
-        value
+impl core::fmt::Debug for Byte {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        core::fmt::Debug::fmt(&self.data, f)
     }
+}
 
-    fn tag(&self) -> Exit {
-        self.clone()
+impl Byte {
+    #[inline]
+    pub fn mock() -> Self {
+        Self {
+            data: fastrand::u8(0..128),
+        }
+    }
+}
+
+impl TypeTag for Byte {
+    const TYPE_ID: crate::msg::TypeId = type_id::type_id("Info");
+}
+
+impl Message for Byte {
+    type Semantics = Move;
+}
+
+#[derive(Debug)]
+pub(crate) struct Infos<A: MemAllocator> {
+    version: u32,
+    data: PBox<[u8], A>,
+}
+
+impl<A: MemAllocator> Infos<A> {
+    #[inline]
+    pub fn mock(a: A) -> Self {
+        Self {
+            version: fastrand::u32(0..100),
+            data: PBox::new_slice_in(fastrand::usize(0..128), |_| fastrand::u8(0..128), a),
+        }
     }
 }

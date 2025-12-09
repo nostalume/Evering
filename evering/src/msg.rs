@@ -221,10 +221,11 @@ impl<T: Message<Semantics = Move>> MoveMessage for T {}
 
 impl<T: MoveMessage> MoveMessage for [T] {}
 
-pub trait TransitMove: MoveMessage {
+pub struct CoMove;
+pub trait CoMoveMessage {
     type Portable<A: MemAllocator>;
-    fn tokens<A: MemAllocator>(self, alloc: A) -> (Self::Portable<A>, A);
-    fn detokens<A: MemAllocator>(repr: Self::Portable<A>, alloc: A) -> Option<(Self, A)>
+    fn token<A: MemAllocator>(self, alloc: A) -> (Self::Portable<A>, A);
+    fn detoken<A: MemAllocator>(repr: Self::Portable<A>, alloc: A) -> Option<(Self, A)>
     where
         Self: Sized;
 }

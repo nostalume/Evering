@@ -9,7 +9,7 @@ use crossbeam_utils::Backoff;
 
 use crate::{
     header,
-    mem::{self, AddrSpec, MemBlkLayout, MemRef, Mmap},
+    mem::{self, AddrSpec, Mmap},
     numeric::Id,
     reg::state::{ACTIVE, INACTIVE},
 };
@@ -37,7 +37,7 @@ pub struct Entry<T> {
     state: AtomicU8,
 }
 
-pub type MemEntry<T, S, M> = MemRef<Entry<T>, S, M>;
+pub type MapEntry<T, S, M> = mem::MapHandle<Entry<T>, S, M>;
 
 pub struct EntryGuard<E: const Deref<Target = Entry<T>>, T: Finalize, V> {
     entry: E,
@@ -46,9 +46,9 @@ pub struct EntryGuard<E: const Deref<Target = Entry<T>>, T: Finalize, V> {
 }
 
 pub type RefEntry<'a, T> = EntryGuard<&'a Entry<T>, T, ()>;
-pub type HoldEntry<T, S, M> = EntryGuard<MemEntry<T, S, M>, T, ()>;
+pub type HoldEntry<T, S, M> = EntryGuard<MapEntry<T, S, M>, T, ()>;
 pub type PeekEntry<'a, T, V> = EntryGuard<&'a Entry<T>, T, V>;
-pub type ViewEntry<T, V, S, M> = EntryGuard<MemEntry<T, S, M>, T, V>;
+pub type ViewEntry<T, V, S, M> = EntryGuard<MapEntry<T, S, M>, T, V>;
 
 unsafe impl<T: Send> Send for Entry<T> {}
 unsafe impl<T: Sync> Sync for Entry<T> {}
@@ -297,10 +297,7 @@ impl<E: const Deref<Target = Entry<T>>, T: Finalize, V> EntryGuard<E, T, V> {
 }
 
 unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V: Send> Send for EntryGuard<E, T, V> {}
-unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V: Send> Sync
-    for EntryGuard<E, T, V>
-{
-}
+unsafe impl<E: const Deref<Target = Entry<T>>, T: Finalize, V: Send> Sync for EntryGuard<E, T, V> {}
 
 pub trait Finalize {
     fn finalize(&self);
@@ -314,7 +311,7 @@ pub struct Registry<T, const N: usize> {
 }
 
 pub type Header<T, const N: usize> = header::Header<Registry<T, N>>;
-pub type MemRegistry<T, const N: usize, S, M> = mem::MemRef<Header<T, N>, S, M>;
+pub type MapRegistry<T, const N: usize, S, M> = mem::MapHandle<Header<T, N>, S, M>;
 
 impl<T, const N: usize> core::fmt::Debug for Registry<T, N> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -454,14 +451,13 @@ impl<T: Finalize, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
-    pub fn from_layout(area: MemBlkLayout<S, M>) -> Result<Self, mem::Error<S, M>> {
+impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MapRegistry<T, N, S, M> {
+    pub fn from_layout(area: mem::MapLayout<S, M>) -> Result<Self, mem::Error<S, M>> {
         let mut area = area;
         let reg = area.push::<Header<T, N>>(())?;
-        let (area, _) = area.finish();
+        let _ = area.finish();
 
-        let header = unsafe { Self::from_raw(area.into(), reg) };
-        Ok(header)
+        Ok(reg)
     }
 
     pub fn acquire(r: &Self, id: Id) -> Option<HoldEntry<T, S, M>> {
@@ -524,7 +520,7 @@ impl<T: Finalize, const N: usize> Registry<T, N> {
     }
 }
 
-impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MemRegistry<T, N, S, M> {
+impl<T: Finalize, const N: usize, S: AddrSpec, M: Mmap<S>> MapRegistry<T, N, S, M> {
     pub fn view<C>(&self, id: Id, ctx: C) -> (Option<ViewEntry<T, T::View, S, M>>, C)
     where
         T: Project<C>,

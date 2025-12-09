@@ -17,6 +17,7 @@ windows = ["std"]
 spin.workspace = true
 crossbeam-utils.workspace = true
 memory_addr = "0.4.0"
+bitflags = "2.10.0"
 
 # helper
 tracing = { version = "0.1", optional = true }

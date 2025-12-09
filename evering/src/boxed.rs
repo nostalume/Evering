@@ -27,6 +27,9 @@ impl<T: ?Sized, A: MemAllocator> Drop for PBox<T, A> {
             core::ptr::drop_in_place(self.ptr.as_ptr());
         }
         let meta = mem::replace(&mut self.meta, Meta::null());
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("PBox meta: {:?}", meta);
         self.alloc.demalloc(meta);
     }
 }
@@ -180,7 +183,7 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
     }
 
     #[inline]
-    const fn into_raw(b: Self) -> (A::Meta, A) {
+    pub const fn into_raw(b: Self) -> (A::Meta, A) {
         let b = mem::ManuallyDrop::new(b);
         let m = unsafe { ptr::read(&b.meta) };
         let alloc = unsafe { ptr::read(&b.alloc) };
@@ -188,7 +191,7 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
     }
 
     #[inline]
-    fn into_raw_ptr(b: Self) -> (*mut T, A::Meta, A) {
+    pub fn into_raw_ptr(b: Self) -> (*mut T, A::Meta, A) {
         let mut b = mem::ManuallyDrop::new(b);
         let ptr = &raw mut **b;
         let m = unsafe { ptr::read(&b.meta) };
@@ -197,7 +200,7 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
     }
 
     #[inline]
-    const unsafe fn from_raw_ptr(ptr: *mut T, meta: A::Meta, alloc: A) -> Self {
+    pub const unsafe fn from_raw_ptr(ptr: *mut T, meta: A::Meta, alloc: A) -> Self {
         unsafe {
             let ptr = NonNull::new_unchecked(ptr);
             Self { ptr, meta, alloc }

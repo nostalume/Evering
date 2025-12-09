@@ -181,6 +181,8 @@ pub struct RcMeta {
     rc: AtomicUsize,
 }
 
+pub type RcHeader = Header<RcMeta>;
+
 impl Layout for RcMeta {
     type Config = ();
 

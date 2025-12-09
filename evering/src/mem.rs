@@ -5,12 +5,32 @@ use core::ptr::{self, NonNull};
 
 mod area;
 
-pub use self::area::{MemBlkHandle, MemBlkLayout, MemRef, RawMemBlk};
+pub use self::area::{MapHandle, MapLayout, MapView, RawMap};
 pub use alloc::alloc::{AllocError, handle_alloc_error};
+
+bitflags::bitflags! {
+    #[repr(transparent)]
+    #[derive(Debug,Clone,Copy,PartialEq,Eq)]
+    pub struct Access: u8 {
+        const READ  = 0x1;
+        const WRITE = 0x1 << 1;
+        const EXEC  = 0x1 << 2;
+    }
+}
+
+impl core::fmt::Display for Access {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        core::fmt::Debug::fmt(&self, f)
+    }
+}
+
+pub const trait Accessible: Copy + From<Access> {
+    fn permits(self, access: Access) -> bool;
+}
 
 pub trait AddrSpec {
     type Addr: memory_addr::MemoryAddr;
-    type Flags: Copy;
+    type Flags: Accessible;
 }
 
 pub trait Mmap<S: AddrSpec>: Sized {
@@ -25,18 +45,25 @@ pub trait Mmap<S: AddrSpec>: Sized {
         mflags: Self::MapFlags,
         pflags: S::Flags,
         handle: Self::Handle,
-    ) -> Result<RawMemBlk<S, Self>, Self::Error>;
-    fn unmap(area: &mut RawMemBlk<S, Self>) -> Result<(), Self::Error>;
+    ) -> Result<RawMap<S, Self>, Self::Error>;
+    fn unmap(area: &mut RawMap<S, Self>) -> Result<(), Self::Error>;
 }
 
 pub trait Mprotect<S: AddrSpec>: Mmap<S> {
-    unsafe fn protect(
-        area: &mut RawMemBlk<S, Self>,
-        new_flags: S::Flags,
-    ) -> Result<(), Self::Error>;
+    unsafe fn protect(area: &mut RawMap<S, Self>, new_flags: S::Flags) -> Result<(), Self::Error>;
+}
+
+pub trait SharedMmap<S: AddrSpec>: Mmap<S> {
+    fn shared(
+        self,
+        size: usize,
+        access: Access,
+        handle: Self::Handle,
+    ) -> Result<RawMap<S, Self>, Self::Error>;
 }
 
 pub enum Error<S: AddrSpec, M: Mmap<S>> {
+    PermissionDenied { requested: Access },
     OutofSize { requested: usize, bound: usize },
     UnenoughSpace { requested: usize, allocated: usize },
     Contention,
@@ -49,6 +76,9 @@ impl<S: AddrSpec, M: Mmap<S>> core::error::Error for Error<S, M> {}
 impl<S: AddrSpec, M: Mmap<S>> core::fmt::Debug for Error<S, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
+            Self::PermissionDenied { requested } => {
+                write!(f, "Permission denied, requested {:?}", requested)
+            }
             Self::UnenoughSpace {
                 requested,
                 allocated,
@@ -75,31 +105,15 @@ impl<S: AddrSpec, M: Mmap<S>> core::fmt::Display for Error<S, M> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum Access {
-    Write,
-    Read,
-    ReadWrite,
-}
-
-pub trait SharedMmap<S: AddrSpec>: Mmap<S> {
-    fn shared(
-        self,
-        size: usize,
-        access: Access,
-        handle: Self::Handle,
-    ) -> Result<RawMemBlk<S, Self>, Self::Error>;
-}
-
-pub struct MemBlkBuilder<S: AddrSpec, M: Mmap<S>> {
+pub struct MapBuilder<S: AddrSpec, M: Mmap<S>> {
     bk: M,
     _marker: PhantomData<S>,
 }
 
-impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
+impl<S: AddrSpec, M: Mmap<S>> MapBuilder<S, M> {
     #[inline]
     pub const fn from_backend(bk: M) -> Self {
-        MemBlkBuilder {
+        MapBuilder {
             bk,
             _marker: PhantomData,
         }
@@ -113,16 +127,16 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
         mflags: M::MapFlags,
         pflags: S::Flags,
         handle: M::Handle,
-    ) -> Result<MemBlkLayout<S, M>, Error<S, M>> {
+    ) -> Result<MapLayout<S, M>, Error<S, M>> {
         let Self { bk, _marker } = self;
         let raw = bk
             .map(start, size, mflags, pflags, handle)
             .map_err(|e| Error::MapError(e))?;
-        MemBlkLayout::new(raw)
+        MapLayout::new(raw)
     }
 
     #[inline]
-    pub fn map<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
+    pub fn map<T: TryFrom<MapLayout<S, M>, Error = Error<S, M>>>(
         self,
         start: Option<S::Addr>,
         size: usize,
@@ -134,23 +148,23 @@ impl<S: AddrSpec, M: Mmap<S>> MemBlkBuilder<S, M> {
     }
 }
 
-impl<S: AddrSpec, M: SharedMmap<S>> MemBlkBuilder<S, M> {
+impl<S: AddrSpec, M: SharedMmap<S>> MapBuilder<S, M> {
     #[inline]
     pub fn shared_layout(
         self,
         size: usize,
         access: Access,
         handle: M::Handle,
-    ) -> Result<MemBlkLayout<S, M>, Error<S, M>> {
+    ) -> Result<MapLayout<S, M>, Error<S, M>> {
         let Self { bk, _marker } = self;
         let raw = bk
             .shared(size, access, handle)
             .map_err(|e| Error::MapError(e))?;
-        MemBlkLayout::new(raw)
+        MapLayout::new(raw)
     }
 
     #[inline]
-    pub fn shared<T: TryFrom<MemBlkLayout<S, M>, Error = Error<S, M>>>(
+    pub fn shared<T: TryFrom<MapLayout<S, M>, Error = Error<S, M>>>(
         self,
         size: usize,
         access: Access,
@@ -187,7 +201,7 @@ pub const unsafe trait Span: Clone {
     fn is_null(&self) -> bool;
 }
 
-pub const unsafe trait Meta: Clone {
+pub const unsafe trait Meta: Clone + core::fmt::Debug {
     type SpanMeta: Span;
     fn null() -> Self;
     fn is_null(&self) -> bool;
@@ -272,7 +286,7 @@ unsafe impl<A: MemDeallocBy> MemDeallocBy for &A {
     }
 }
 
-pub unsafe trait MemBlkOps {
+pub unsafe trait MemOps {
     #[inline]
     fn start<Addr: memory_addr::MemoryAddr>(&self) -> Addr {
         self.start_ptr().addr().into()
@@ -442,7 +456,7 @@ pub unsafe trait MemBlkOps {
     }
 }
 
-unsafe impl<M: MemBlkOps> MemBlkOps for &M {
+unsafe impl<M: MemOps> MemOps for &M {
     fn start_ptr(&self) -> *const u8 {
         (*self).start_ptr()
     }
