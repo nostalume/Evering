@@ -3,7 +3,7 @@ use core::{
     mem::MaybeUninit,
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicU32, AtomicU64, Ordering},
+    sync::atomic::{AtomicU64, Ordering},
 };
 
 use crossbeam_utils::{Backoff, CachePadded};
@@ -11,7 +11,7 @@ use crossbeam_utils::{Backoff, CachePadded};
 use crate::{
     header::{self, Magic},
     mem::{self, AddrSpec, MapLayout, Mmap},
-    numeric::{self, Alignable, CastInto, Packable},
+    numeric::{self, Alignable, CastInto, Measurable, Packable},
 };
 
 type UInt = u32;

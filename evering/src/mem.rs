@@ -493,7 +493,7 @@ macro_rules! addr_span {
 
             #[inline]
             pub const fn align_of<T>(&self) -> Self {
-                use crate::numeric::Alignable;
+                use crate::numeric::{Alignable, Measurable};
                 Self {
                     start_offset: self.start_offset.align_up_of::<T>(),
                     size: <$ty>::size_of::<T>(),

@@ -13,17 +13,16 @@ use criterion::{Criterion, criterion_group, criterion_main};
 const BUFSIZES: &[usize] = &[
     4,
     64,
-    // 256,
-    // 1024,
-    // 4096,
-    // 16 << 10,
-    // 32 << 10,
-    // 64 << 10,
-    // back pressure failed :(
-    // 256 << 10,
-    // 512 << 10,
-    // 1 << 20,
-    // 4 << 20,
+    256,
+    1024,
+    4096,
+    16 << 10,
+    32 << 10,
+    64 << 10,
+    256 << 10,
+    512 << 10,
+    1 << 20,
+    4 << 20,
 ];
 
 const CONCURRENCY: usize = 200;

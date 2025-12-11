@@ -32,6 +32,7 @@ pub mod msg;
 pub mod os;
 pub mod perlude;
 mod reg;
+mod talc;
 mod tests;
 mod token;
 
@@ -115,22 +116,14 @@ mod numeric {
         cast!(from:u32, to:u64);
     }
 
-    pub const trait Alignable {
+    pub const trait Measurable {
         fn size_of<T>() -> Self;
         fn align_of<T>() -> Self;
-        fn align_down(self, other: Self) -> Self;
-        fn align_down_of<T>(self) -> Self;
-        fn align_up(self, other: Self) -> Self;
-        fn align_up_of<T>(self) -> Self;
-        fn align_offset(&self, other: &Self) -> Self;
-        fn align_offset_of<T>(&self) -> Self;
-        fn is_aligned(&self, other: &Self) -> bool;
-        fn is_aligned_of<T>(&self) -> bool;
     }
 
-    macro_rules! align {
+    macro_rules! measure {
         ($ty:ty) => {
-            impl const crate::numeric::Alignable for $ty {
+            impl const Measurable for $ty {
                 #[inline(always)]
                 fn size_of<T>() -> Self {
                     let size = core::mem::size_of::<T>();
@@ -143,6 +136,24 @@ mod numeric {
                     assert!(size <= Self::MAX as usize, "size_of::<T>() is too large");
                     size as Self
                 }
+            }
+        };
+    }
+
+    pub const trait Alignable {
+        fn align_down(self, other: Self) -> Self;
+        fn align_down_of<T>(self) -> Self;
+        fn align_up(self, other: Self) -> Self;
+        fn align_up_of<T>(self) -> Self;
+        fn align_offset(&self, other: &Self) -> Self;
+        fn align_offset_of<T>(&self) -> Self;
+        fn is_aligned(&self, other: &Self) -> bool;
+        fn is_aligned_of<T>(&self) -> bool;
+    }
+
+    macro_rules! align {
+        ($ty:ty) => {
+            impl const Alignable for $ty {
                 #[inline(always)]
                 fn align_down(self, other: Self) -> Self {
                     self & !(other - 1)
@@ -186,11 +197,67 @@ mod numeric {
         };
     }
 
+    measure!(usize);
+    measure!(u64);
+    measure!(u32);
+    measure!(u16);
+    measure!(u8);
     align!(usize);
     align!(u64);
     align!(u32);
     align!(u16);
     align!(u8);
+
+    pub trait AlignPtr: Sized {
+        fn align_up(self, align: usize) -> Self;
+        #[inline]
+        fn align_up_of<T>(self) -> Self {
+            self.align_up(core::mem::align_of::<T>())
+        }
+        fn align_down(self, align: usize) -> Self;
+        #[inline]
+        fn align_down_of<T>(self) -> Self {
+            self.align_down(core::mem::align_of::<T>())
+        }
+    }
+
+    impl AlignPtr for *const u8 {
+        fn align_up(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_down ptr must not underflow.
+            debug_assert!(self.addr() > align - 1);
+
+            self.wrapping_sub(self.addr() % align)
+        }
+
+        fn align_down(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_up ptr must not overflow.
+            debug_assert!(usize::MAX - self.addr() > align - 1);
+
+            let up = self.wrapping_add(align - 1);
+            up.wrapping_sub(up.addr() % align)
+        }
+    }
+
+    impl AlignPtr for *mut u8 {
+        fn align_up(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_down ptr must not underflow.
+            debug_assert!(self.addr() > align - 1);
+
+            self.wrapping_sub(self.addr() % align)
+        }
+
+        fn align_down(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_up ptr must not overflow.
+            debug_assert!(usize::MAX - self.addr() > align - 1);
+
+            let up = self.wrapping_add(align - 1);
+            up.wrapping_sub(up.addr() % align)
+        }
+    }
 
     pub const trait Packable: Sized {
         type Packed;
