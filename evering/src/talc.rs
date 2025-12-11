@@ -260,6 +260,151 @@ impl FreeTail {
     }
 }
 
+/// The static configuration for the allocator binning strategy.
+///
+/// # Parameters
+/// * `LINEAR_STAGES`: How many linear stages to use before switching to exponential.
+///    - e.g., `2` means (Word Stride) -> (Double Word Stride) -> Exponential.
+/// * `SLOTS_PER_LINEAR`: The number of bins ("slots") enforced per linear stage.
+///    - This acts as the "restrictive gap value". If set to 16, each linear stage covers
+///      16 * Stride bytes.
+/// * `LOG_DIVS`: The log2 of the number of divisions per power-of-two(`2^n`) in the exponential range.
+///    - e.g., `2` means 4 divisions. `3` means 8 divisions.
+pub struct BinConfig<const LINEAR_STAGES: usize, const SLOTS_PER_LINEAR: usize, const LOG_DIVS: u32>;
+
+/// A simplified struct to hold pre-calculated stage data.
+#[derive(Copy, Clone, Debug)]
+pub struct LinearStage {
+    pub limit: usize,       // The size limit (exclusive) for this stage
+    pub stride: usize,      // The step size (gap) for this stage
+    pub base_bucket: usize, // The bucket index offset where this stage starts
+}
+
+impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const SLOTS_PER_LINEAR: usize>
+    BinConfig<LINEAR_STAGES, SLOTS_PER_LINEAR, LOG_DIVS>
+{
+    // 1. Derived Exponential Constants
+    //
+    pub const DIVS_PER_POW2: usize = 1 << LOG_DIVS;
+    // The bitshift required to isolate the division bits.
+    // We rely on LOG_DIVS directly, saving the .ilog2() calculation.
+    pub const DIV_BITS: usize = LOG_DIVS as usize;
+
+    // 2. Derived Linear Stage Logic
+    //
+    // We pre-calculate the "End Limit" and "Base Bucket Index" for every linear stage.
+    // This creates a compile-time lookup table.
+    pub const STAGE_DATA: [LinearStage; LINEAR_STAGES] = Self::calculate_stages();
+
+    /// The upper bound size where linear binning ends and exponential logic begins.
+    /// Any size >= this value uses the exponential logic.
+    pub const EXPONENTIAL_START_SIZE: usize = Self::STAGE_DATA[LINEAR_STAGES - 1].limit;
+
+    /// The bucket index where the exponential section begins.
+    pub const EXPONENTIAL_START_BUCKET: usize =
+        Self::STAGE_DATA[LINEAR_STAGES - 1].base_bucket + SLOTS_PER_LINEAR;
+
+    /// The 'Magnitude' offset for the exponential logic.
+    /// This effectively aligns the log2 calculation so that the first exponential
+    /// bin starts seamlessly after the last linear bin.
+    pub const MIN_EXP_BITS_LESS_ONE: usize = Self::EXPONENTIAL_START_SIZE.ilog2() as usize;
+
+    /// Const function to generate the lookup table for linear stages.
+    const fn calculate_stages() -> [LinearStage; LINEAR_STAGES] {
+        let mut stages = [LinearStage {
+            limit: 0,
+            stride: 0,
+            base_bucket: 0,
+        }; LINEAR_STAGES];
+
+        let mut i = 0;
+        let mut current_stride = WORD_SIZE;
+        let mut current_limit = MIN_CHUNK_SIZE;
+        let mut current_bucket = 0;
+
+        while i < LINEAR_STAGES {
+            // The limit for this stage is the previous limit + (Slots * Stride)
+            let next_limit = current_limit + (SLOTS_PER_LINEAR * current_stride);
+
+            stages[i] = LinearStage {
+                limit: next_limit,
+                stride: current_stride,
+                base_bucket: current_bucket,
+            };
+
+            // Prepare for next iteration
+            current_limit = next_limit;
+            current_bucket += SLOTS_PER_LINEAR;
+            current_stride *= 2; // Stride doubles: 8 -> 16 -> 32 ...
+            i += 1;
+        }
+        stages
+    }
+
+    /// Maps a size to a bin index using the provided compile-time configuration.
+    #[inline]
+    const unsafe fn which_bin(size: usize) -> usize {
+        // 0. Safety Check
+        // In a real allocator, you might prefer returning a Result or clamping.
+        if size < MIN_CHUNK_SIZE {
+            return 0; // or panic in debug
+        }
+
+        // 1. Linear Stage Check
+        // Loop unrolling is likely to happen here by the compiler because
+        // LINEAR_STAGES is a small constant (e.g., 2 or 3).
+        let mut i = 0;
+        while i < LINEAR_STAGES {
+            let stage = &Self::STAGE_DATA[i];
+
+            // If size fits in this linear stage
+            if size < stage.limit {
+                // Logic:
+                // We need to find how far `size` is from the START of this stage.
+                // Start of stage 0 = MIN_CHUNK_SIZE
+                // Start of stage N = Limit of stage N-1
+
+                let stage_start = if i == 0 {
+                    MIN_CHUNK_SIZE
+                } else {
+                    Self::STAGE_DATA[i - 1].limit
+                };
+
+                // Formula: Offset / Stride + Base_Bucket_Index
+                return (size - stage_start) / stage.stride + stage.base_bucket;
+            }
+            i += 1;
+        }
+
+        // 2. Exponential Stage (Pseudo-Logarithmic)
+        // If we reach here, size >= Conf::EXPONENTIAL_START_SIZE
+
+        // A. Find the coarse magnitude (Power of 2 range)
+        // ilog2 returns floor(log2(size)).
+        let bits_less_one = size.ilog2() as usize;
+
+        // Normalizing the magnitude relative to where exponential bins start.
+        let magnitude = bits_less_one - Self::MIN_EXP_BITS_LESS_ONE;
+
+        // B. Find the fine division (Fractional part)
+        // We want the 'LOG_DIVS' bits immediately following the MSB.
+        // Shift right to bring those bits to the bottom.
+        // Example: 1_XX_00... >> shift becomes 1XX
+        let shift_amount = bits_less_one - Self::DIV_BITS;
+        let shifted = size >> shift_amount;
+
+        // Mask out the leading '1' to get just the index (0..DIVS-1).
+        // effectively: shifted - (1 << LOG_DIVS)
+        let division = shifted - Self::DIVS_PER_POW2;
+
+        // C. Calculate Final Index
+        // Index = (Magnitude * Divs_Per_Mag) + Division_Index + Start_Bucket
+        let bucket_offset = (magnitude * Self::DIVS_PER_POW2) + division;
+
+        bucket_offset + Self::EXPONENTIAL_START_BUCKET
+    }
+}
+
 const MIN_CHUNK_SIZE: usize = Tag::MIN_TAG_OFFSET + Tag::SIZE;
 /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
 fn is_chunk_size(base: *mut u8, acme: *mut u8) -> bool {
