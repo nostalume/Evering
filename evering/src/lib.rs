@@ -41,6 +41,34 @@ mod seal {
 }
 
 mod numeric {
+    pub mod bit {
+        pub type Word = usize;
+        pub type Bit = usize;
+        pub const WORD_SIZE: usize = core::mem::size_of::<Word>();
+        pub const WORD_ALIGN: usize = core::mem::align_of::<Word>();
+        pub const WORD_BITS: usize = Word::BITS as usize;
+
+        #[inline]
+        pub const fn bit_check(word: Word, bit: Bit) -> bool {
+            ((word >> bit) & 1) != 0
+        }
+
+        #[inline]
+        pub const fn bit_set(word: &mut Word, bit: Bit) {
+            *word |= 1usize << bit;
+        }
+
+        #[inline]
+        pub const fn bit_clear(word: &mut Word, bit: Bit) {
+            *word &= !(1usize << bit);
+        }
+
+        #[inline]
+        pub const fn bit_flip(word: &mut Word, bit: Bit) {
+            *word ^= 1usize << bit;
+        }
+    }
+
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     #[repr(C)]
     pub struct Id {
@@ -259,6 +287,27 @@ mod numeric {
         }
     }
 
+    impl AlignPtr for NonNull<u8> {
+        fn align_up(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_down ptr must not underflow.
+            debug_assert!(self.addr().get() > align - 1);
+
+            unsafe { self.sub(self.addr().get() % align) }
+        }
+
+        fn align_down(self, align: usize) -> Self {
+            debug_assert!(align.is_power_of_two());
+            // the align_up ptr must not overflow.
+            debug_assert!(usize::MAX - self.addr().get() > align - 1);
+
+            unsafe {
+                let up = self.add(align - 1);
+                up.sub(up.addr().get() % align)
+            }
+        }
+    }
+
     pub const trait Packable: Sized {
         type Packed;
 
@@ -304,7 +353,7 @@ mod numeric {
         };
     }
 
-    use core::sync::atomic;
+    use core::{ptr::NonNull, sync::atomic};
 
     pack_bits!(unpack:u16, pack:u32);
     atomic_pack_bits!(unpack:u16, atomic: atomic::AtomicU16, atomic_pack: atomic::AtomicU32);
