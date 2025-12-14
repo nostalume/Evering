@@ -1070,7 +1070,7 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         Some((
             ReqSegment {
                 seg: alloc_segment,
-                req_size: req_size,
+                req_size,
             },
             rem_segment,
         ))
@@ -1106,19 +1106,16 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         }
 
         let size = cur_end - prev_seg.data_offset();
-        match prev.merge(cur, size) {
-            Ok(merge) => {
-                #[cfg(feature = "tracing")]
-                tracing::debug!(
-                    "[Arena]: merge checked: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}, new {:?}",
-                    prev_seg,
-                    prev_end,
-                    cur_seg,
-                    cur_seg.node_offset,
-                    merge
-                );
-            }
-            Err(_) => {}
+        if let Ok(_merge) = prev.merge(cur, size) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Arena]: merge checked: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}, new {:?}",
+                prev_seg,
+                prev_end,
+                cur_seg,
+                cur_seg.node_offset,
+                merge
+            );
         }
     }
 
@@ -1345,7 +1342,7 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
 
             match prev.insert(segment) {
                 Ok(_) => {
-                    let prev_data = prev.load();
+                    let _prev_data = prev.load();
                     #[cfg(feature = "tracing")]
                     tracing::debug!(
                         "[Arena]: new prev: {:?}, with next segment {:?}",

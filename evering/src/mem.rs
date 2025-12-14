@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 mod area;
 
-pub use self::area::{MapHandle, MapLayout, MapView, RawMap};
+pub use self::area::{MapHandle, MapLayout, RawMap};
 pub use alloc::alloc::{AllocError, handle_alloc_error};
 
 bitflags::bitflags! {

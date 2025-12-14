@@ -16,9 +16,9 @@ use evering::{
     },
     perlude::{
         Session,
-        allocator::{Access, MapBuilder, Optimistic, Pessimistic},
+        allocator::{Access, MapBuilder, Optimistic},
         channel::{
-            CachePool, Completer, MsgCompleter, MsgSubmitter, QueueChannel, ReqId, Submitter,
+            CachePool, Completer, QueueChannel, ReqId, Submitter,
             TryRecvError, TrySendError, TrySubmitError,
         },
     },
@@ -95,7 +95,9 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
 
     let (ls, lr) = CachePool::<(), CAP>::new().bind(ls, lr);
 
-    let elapsed = std::thread::scope(|s| {
+    
+
+    std::thread::scope(|s| {
         let salloc = handle.alloc.clone();
         let server = s.spawn(|| {
             runtime.block_on(async move {
@@ -124,7 +126,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                     check_req(bufsize, Byte::as_slice(&req));
                     drop(req);
 
-                    let (resp, alloc) = Byte::copied_slice_token(as_slice(&respdata), &alloc);
+                    let (resp, _alloc) = Byte::copied_slice_token(as_slice(&respdata), &alloc);
 
                     let resp = resp.pack(header);
                     match rs.try_send(resp) {
@@ -206,9 +208,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
         let elapsed = client.join().unwrap();
         server.join().unwrap();
         elapsed
-    });
-
-    elapsed
+    })
 }
 
 #[cfg(test)]
