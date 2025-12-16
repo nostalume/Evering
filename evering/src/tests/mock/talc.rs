@@ -102,8 +102,9 @@ fn parc_stress() {
     let mut pt = [0; MAX_ADDR];
     let a = mock_alloc(&mut pt, 0, MAX_ADDR);
     let droppy = Droppy(PArc::new_in(AtomicUsize::new(0), &a));
-
+    
     let bar = Barrier::new(NUM);
+    tracing::debug!("bar addr: {:?}",&raw const bar);
     thread::scope(|s| {
         for _ in 0..NUM {
             let b_ref = &bar;

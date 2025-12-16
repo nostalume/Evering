@@ -1,7 +1,6 @@
 use core::alloc;
 use core::cell::UnsafeCell;
 use core::ops::Deref;
-use core::ptr::null_mut;
 use core::{marker::PhantomData, ptr::NonNull};
 
 use spin::Mutex;
@@ -953,8 +952,13 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         size: Size,
     ) -> Result<NonNull<[FreeNodeLink]>, ()> {
         let base = base.align_up_of::<Word>();
+        let size = unsafe {
+            (base.add(size))
+                .align_down_of::<Word>()
+                .byte_offset_from_unsigned(base)
+        };
         #[cfg(feature = "tracing")]
-        tracing::debug!("[Talc]: claim base: {:?}", base);
+        tracing::debug!("[Talc]: claim base: {:?}, size: {:?}", base, size);
         // if !self.bins.is_null() {
         //     if size <= Self::MIN_HEAP_SIZE {
         //         return Err(());
@@ -973,7 +977,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
             if size < Tag::SIZE + Self::BIN_ARRAY_SIZE + Tag::SIZE {
                 return Err(());
             }
-            Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
+            Tag::init(base.cast(), base.cast(), true, self.base_ptr());
             #[cfg(feature = "tracing")]
             tracing::debug!("[Talc]: claim mock tag: {:?}", base);
             let metadata_base = base.byte_add(Tag::SIZE);
@@ -1378,6 +1382,9 @@ impl<
 
     pub fn deallocate(&self, meta: Meta) {
         let _lock = self.header.lock.lock();
+        if meta.is_null() {
+            return;
+        }
         unsafe {
             self.header.talc.as_mut_unchecked().deallocate(
                 self.bins,
@@ -1508,6 +1515,10 @@ impl Meta {
         }
     }
     #[inline]
+    const fn is_null(&self) -> bool {
+        self.view.is_null()
+    }
+    #[inline]
     fn from_raw(base_ptr: *const u8, offset: Offset, size: Size) -> Self {
         Self {
             base_ptr,
@@ -1524,6 +1535,9 @@ impl Meta {
     }
     #[inline]
     const unsafe fn as_nonnull(&self) -> NonNull<u8> {
+        if self.is_null() {
+            return NonNull::dangling();
+        }
         unsafe { self.view.as_nonnull(self.base_ptr) }
     }
 }
@@ -1582,7 +1596,7 @@ impl<S: AddrSpec, M: Mmap<S>, const LS: usize, const BPL: usize, const LD: usize
         let mut area = area;
 
         let reserve = area.reserve::<Header<LS, BPL, LD>>()?;
-        let size = area.size() - area.cur_offset();
+        let size = area.size() - reserve.next();
         conf.1 = size;
         #[cfg(feature = "tracing")]
         tracing::debug!("[Talc]: with conf: {:?}", conf);

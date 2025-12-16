@@ -568,6 +568,11 @@ impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
     unsafe fn drop_in(&mut self) {
         unsafe {
             ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data);
+
+            let meta = mem::replace(&mut self.meta, Meta::null());
+            #[cfg(feature = "tracing")]
+            tracing::debug!("PArc meta: {:?}", meta);
+            self.alloc.demalloc(meta);
         }
     }
 

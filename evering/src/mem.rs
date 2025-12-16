@@ -546,9 +546,6 @@ macro_rules! addr_span {
 
             #[inline]
             pub const unsafe fn as_nonnull(&self, base_ptr: *const u8) -> NonNull<u8> {
-                if self.size == 0 {
-                    return NonNull::dangling();
-                }
                 unsafe { NonNull::new_unchecked(self.as_mut_ptr(base_ptr)) }
             }
         }
