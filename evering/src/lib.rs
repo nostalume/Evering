@@ -238,7 +238,6 @@ mod numeric {
     align!(u8);
 
     pub trait AlignPtr: Sized {
-        fn align_offset(self, align: usize) -> usize;
         fn align_up(self, align: usize) -> Self;
         #[inline]
         fn align_up_of<T>(self) -> Self {
@@ -253,41 +252,33 @@ mod numeric {
 
     impl AlignPtr for *const u8 {
         #[inline]
-        fn align_offset(self, align: usize) -> usize {
-            debug_assert!(align.is_power_of_two());
-            self.addr() & (align - 1)
-        }
-        #[inline]
         fn align_up(self, align: usize) -> Self {
-            self.wrapping_sub(self.align_offset(align))
+            debug_assert!(align.is_power_of_two());
+            let addr = self.addr();
+            debug_assert!(addr <= usize::MAX - (align - 1));
+            ((addr + align - 1) & !(align - 1)) as *const u8
         }
+
         #[inline]
         fn align_down(self, align: usize) -> Self {
-            // the align_up ptr must not overflow.
-            debug_assert!(usize::MAX - self.addr() > align - 1);
-
-            let up = self.wrapping_add(align - 1);
-            up.wrapping_sub(up.align_offset(align))
+            debug_assert!(align.is_power_of_two());
+            (self.addr() & !(align - 1)) as *const u8
         }
     }
 
     impl AlignPtr for *mut u8 {
         #[inline]
-        fn align_offset(self, align: usize) -> usize {
-            debug_assert!(align.is_power_of_two());
-            self.addr() & (align - 1)
-        }
-        #[inline]
         fn align_up(self, align: usize) -> Self {
-            self.wrapping_sub(self.align_offset(align))
+            debug_assert!(align.is_power_of_two());
+            let addr = self.addr();
+            debug_assert!(addr <= usize::MAX - (align - 1));
+            ((addr + align - 1) & !(align - 1)) as *mut u8
         }
+
         #[inline]
         fn align_down(self, align: usize) -> Self {
-            // the align_up ptr must not overflow.
-            debug_assert!(usize::MAX - self.addr() > align - 1);
-
-            let up = self.wrapping_add(align - 1);
-            up.wrapping_sub(up.align_offset(align))
+            debug_assert!(align.is_power_of_two());
+            (self.addr() & !(align - 1)) as *mut u8
         }
     }
 

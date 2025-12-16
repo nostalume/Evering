@@ -196,12 +196,7 @@ impl Tag {
     }
 
     /// Encode and write a Tag value to `tag_ptr`.
-    const unsafe fn init(
-        tag: *mut Self,
-        chunk_base: *mut u8,
-        is_above_free: bool,
-        heap_base: *mut u8,
-    ) {
+    unsafe fn init(tag: *mut Self, chunk_base: *mut u8, is_above_free: bool, heap_base: *mut u8) {
         // let base_value = chunk_base.addr();
         let rel_base = unsafe { Rel::from_raw(chunk_base, heap_base) };
         debug_assert!(
@@ -214,6 +209,9 @@ impl Tag {
         } else {
             Self::ALLOCATED_FLAG
         };
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: tag init offset: {:#x}", rel_base.offset);
 
         unsafe { *tag = Self(rel_base.offset | flags) };
     }
@@ -312,7 +310,7 @@ impl FreeNode {
     }
 
     #[inline]
-    const unsafe fn insert(
+    unsafe fn insert(
         node: *mut Self,
         next: FreeNodeLink,
         prev_next: *mut FreeNodeLink,
@@ -338,7 +336,13 @@ impl FreeNode {
 
     /// Assume `prev_next` point to `next`, resolve the `next` node and insert `this node`.
     #[inline]
-    const unsafe fn insert_by(node: *mut Self, prev_next: *mut FreeNodeLink, heap_base: *mut u8) {
+    unsafe fn insert_by(node: *mut Self, prev_next: *mut FreeNodeLink, heap_base: *mut u8) {
+        #[cfg(feature = "tracing")]
+        tracing::debug!(
+            "[Talc]: insert_by: prev_next: {:?}, node: {:?}",
+            prev_next,
+            node
+        );
         unsafe {
             Self::insert(node, *prev_next, prev_next, heap_base);
         }
@@ -419,7 +423,7 @@ impl FreeHead {
     }
 
     #[inline]
-    const unsafe fn init(
+    unsafe fn init(
         head: *mut Self,
         prev_next: *mut FreeNodeLink,
         size_low: Size,
@@ -520,9 +524,11 @@ impl FreeTail {
     /// Calculates the chunk base pointer from the chunk acme pointer
     /// by reading the `size_high` field.
     #[inline]
-    const unsafe fn to_head(tail: *mut Self) -> *mut FreeHead {
+    unsafe fn to_head(tail: *mut Self) -> *mut FreeHead {
         unsafe {
             let size = (*tail).size_high;
+            #[cfg(feature = "tracing")]
+            tracing::debug!("[Talc]: to head, size: {}", size);
             tail.byte_sub(size - FreeTail::SIZE).cast()
         }
     }
@@ -655,16 +661,17 @@ impl Chunk {
                 base: suffix_base,
                 acme: self.acme,
             };
+            tracing::debug!("[Talc]: split suffix {:?}", suffix);
             if suffix.is_valid() {
                 self.acme = suffix_base;
                 #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: split_suffix success, tag_ptr {:?}", tag_ptr);
+                tracing::debug!("[Talc]: split suffix success, tag_ptr {:?}", tag_ptr);
                 (Some(suffix), tag_ptr.cast())
             } else {
                 // Tag pointer doesn't change, resolve to original acme.
                 tag_ptr = self.acme.sub(Tag::SIZE);
                 #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: split_suffix failed, tag_ptr {:?}", tag_ptr);
+                tracing::debug!("[Talc]: split suffix failed, tag_ptr {:?}", tag_ptr);
                 (None, tag_ptr.cast())
             }
         }
@@ -701,9 +708,9 @@ pub struct BinConfig<
 /// A simplified struct to hold pre-calculated stage data.
 #[derive(Copy, Clone, Debug)]
 pub struct LinearStage {
-    pub limit: usize,       // The size limit (exclusive) for this stage
-    pub stride: usize,      // The step size (gap) for this stage
-    pub base_bucket: usize, // The bucket index offset where this stage starts
+    pub size_limit: usize,       // The size limit (exclusive) for this stage
+    pub start_bucket_idx: usize, // The bucket index offset where this stage starts
+    pub stride: usize,           // The step size (gap) for this stage
 }
 
 impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
@@ -714,6 +721,9 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
 
     pub const MIN_CHUNK_SIZE: usize = Chunk::MIN_CHUNK_SIZE;
 
+    pub const UNIT_GAP: Size = WORD_SIZE;
+    // (BYTES_PER_LINEAR * stride)/(UNIT_GAP * stride)
+    pub const BUCKET_IDX_PER_STAGES: usize = BYTES_PER_LINEAR / Self::UNIT_GAP;
     // 1. Derived Exponential Constants
     //
     pub const DIVS_PER_POW2: usize = 1 << LOG_DIVS;
@@ -729,11 +739,11 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
 
     /// The upper bound size where linear binning ends and exponential logic begins.
     /// Any size >= this value uses the exponential logic.
-    pub const EXPONENTIAL_START_SIZE: usize = Self::STAGE_DATA[LINEAR_STAGES - 1].limit;
+    pub const EXPONENTIAL_START_SIZE: Size = Self::STAGE_DATA[LINEAR_STAGES - 1].size_limit;
 
     /// The bucket index where the exponential section begins.
     pub const EXPONENTIAL_START_BUCKET: usize =
-        Self::STAGE_DATA[LINEAR_STAGES - 1].base_bucket + BYTES_PER_LINEAR;
+        Self::STAGE_DATA[LINEAR_STAGES - 1].start_bucket_idx + Self::BUCKET_IDX_PER_STAGES;
 
     /// The 'Magnitude' offset for the exponential logic.
     /// This effectively aligns the log2 calculation so that the first exponential
@@ -743,9 +753,9 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
     /// Const function to generate the lookup table for linear stages.
     const fn init_stages() -> [LinearStage; LINEAR_STAGES] {
         let mut stages = [LinearStage {
-            limit: 0,
+            size_limit: 0,
             stride: 0,
-            base_bucket: 0,
+            start_bucket_idx: 0,
         }; LINEAR_STAGES];
 
         let mut i = 0;
@@ -758,14 +768,14 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
             let next_limit = current_limit + (BYTES_PER_LINEAR * current_stride);
 
             stages[i] = LinearStage {
-                limit: next_limit,
+                size_limit: next_limit,
+                start_bucket_idx: current_bucket,
                 stride: current_stride,
-                base_bucket: current_bucket,
             };
 
             // Prepare for next iteration
             current_limit = next_limit;
-            current_bucket += BYTES_PER_LINEAR;
+            current_bucket += Self::BUCKET_IDX_PER_STAGES;
             current_stride *= 2; // Stride doubles: 1 -> 2 -> 4 ...
             i += 1;
         }
@@ -785,7 +795,7 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
             let stage = &Self::STAGE_DATA[i];
 
             // If size fits in this linear stage
-            if size < stage.limit {
+            if size < stage.size_limit {
                 // Logic:
                 // We need to find how far `size` is from the START of this stage.
                 // Start of stage 0 = MIN_CHUNK_SIZE
@@ -794,11 +804,12 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
                 let stage_start = if i == 0 {
                     Self::MIN_CHUNK_SIZE
                 } else {
-                    Self::STAGE_DATA[i - 1].limit
+                    Self::STAGE_DATA[i - 1].size_limit
                 };
 
                 // Formula: Offset / Stride + Base_Bucket_Index
-                return (size - stage_start) / (stage.stride * WORD_SIZE) + stage.base_bucket;
+                return (size - stage_start) / (stage.stride * Self::UNIT_GAP)
+                    + stage.start_bucket_idx;
             }
             i += 1;
         }
@@ -942,6 +953,8 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         size: Size,
     ) -> Result<NonNull<[FreeNodeLink]>, ()> {
         let base = base.align_up_of::<Word>();
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: claim base: {:?}", base);
         // if !self.bins.is_null() {
         //     if size <= Self::MIN_HEAP_SIZE {
         //         return Err(());
@@ -961,6 +974,8 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                 return Err(());
             }
             Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
+            #[cfg(feature = "tracing")]
+            tracing::debug!("[Talc]: claim mock tag: {:?}", base);
             let metadata_base = base.byte_add(Tag::SIZE);
             let (bins, metadata_acme) = self.metadata(metadata_base.cast());
             let metadata_chunk_acme = metadata_acme.byte_add(Tag::SIZE);
@@ -968,8 +983,12 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
             let free_size = size - (metadata_chunk_acme.offset_from_unsigned(base));
             if Chunk::is_chunk_size(free_size) {
                 self.insert_free(bins, FreeHead::from_base(metadata_chunk_acme), free_size);
-
                 Tag::init(metadata_acme.cast(), base, true, self.base_ptr());
+                tracing::debug!(
+                    "[Talc]: claim metadata end tag: {:?}, {:#b}",
+                    metadata_acme,
+                    metadata_acme.read()
+                );
             } else {
                 // the whole memory only hold a single chunk.
                 let acme = base.byte_add(size);
@@ -979,6 +998,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                     metadata_acme.cast::<Rel<Tag>>().write(tag_rel);
                 }
                 Tag::init(tag_ptr, base, false, self.base_ptr());
+                tracing::debug!("[Talc]: claim metadata end tag in chunk: {:?}", base);
             }
             Ok(bins)
             // }
@@ -1062,8 +1082,6 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     #[inline]
     fn bin_by_size(size: usize, bins: NonNull<[FreeNodeLink]>) -> (*mut FreeNodeLink, usize) {
         let idx = Self::bin_idx(size);
-        #[cfg(feature = "tracing")]
-        tracing::debug!("[Talc]: idx: {}", idx);
         (Self::bin_by_idx(idx, bins), idx)
     }
 
@@ -1080,6 +1098,12 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                 let iter = FreeNodeIter::new(*Self::bin_by_idx(idx, bins), self.base_ptr());
                 for head in iter {
                     let (word_idx, bit_idx) = Self::word_bit_idx(idx);
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        "[Talc]: scan errors, word_idx {}, bit_idx {}",
+                        word_idx,
+                        bit_idx
+                    );
                     assert!(bit_check(self.avails[word_idx], bit_idx));
 
                     let acme = FreeHead::to_acme(head.as_ptr());
@@ -1106,6 +1130,8 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         debug_assert!(Chunk::is_chunk_size(size));
 
         let (bin_ptr, bin_idx) = Self::bin_by_size(size, bins);
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: insert, head: {:?}", head);
 
         unsafe {
             if (*bin_ptr).is_none() {
@@ -1114,35 +1140,33 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                 self.set_avail(bin_idx);
             }
             FreeHead::init(head, bin_ptr, size, self.base_ptr());
-            let tail = FreeTail::from_acme(head.byte_add(size).cast());
+            let tail = FreeHead::to_tail(head);
             FreeTail::init(tail, size);
         }
     }
 
     #[inline]
-    const unsafe fn remove_free(
+    unsafe fn remove_free(
         &mut self,
         bins: NonNull<[FreeNodeLink]>,
         head: *mut FreeHead,
         bin_idx: usize,
     ) {
         unsafe {
-            let bin = *Self::bin_by_idx(bin_idx, bins);
-            debug_assert!(bin.is_some());
+            let bin = Self::bin_by_idx(bin_idx, bins);
+            debug_assert!((*bin).is_some());
             FreeHead::deinit(head, self.base_ptr());
 
-            if bin.is_none() {
+            if (*bin).is_none() {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: remove free clear avail idx: {}", bin_idx);
                 self.clear_avail(bin_idx);
             }
         }
     }
 
     #[inline]
-    const unsafe fn remove_free_by_head(
-        &mut self,
-        bins: NonNull<[FreeNodeLink]>,
-        head: *mut FreeHead,
-    ) {
+    unsafe fn remove_free_by_head(&mut self, bins: NonNull<[FreeNodeLink]>, head: *mut FreeHead) {
         unsafe {
             let bin_idx = Self::bin_idx((*head).size_low);
             self.remove_free(bins, head, bin_idx);
@@ -1150,7 +1174,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 
     #[inline]
-    const unsafe fn remove_free_by_tail(
+    unsafe fn remove_free_by_tail(
         &mut self,
         bins: NonNull<[FreeNodeLink]>,
         tail: *mut FreeTail,
@@ -1176,16 +1200,18 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         let need_align = align > WORD_ALIGN;
 
         let mut bin_idx = self.next_avail_bin_idx(Self::bin_idx(req_size))?;
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: acquire chunk next avail idx: {}", bin_idx);
         loop {
             unsafe {
                 let cur_rel = *Self::bin_by_idx(bin_idx, bins);
                 let iter = FreeNodeIter::new(cur_rel, self.base_ptr());
                 for head in iter {
-                    let size = head.as_ref().size_low;
+                    let chunk_size = head.as_ref().size_low;
                     let base = FreeHead::to_base(head.as_ptr());
                     let acme = FreeHead::to_acme(head.as_ptr());
                     // no need align
-                    if size >= req_size && !need_align {
+                    if chunk_size >= req_size && !need_align {
                         let alloc_acme = base.add(size).align_up_of::<Word>();
                         self.remove_free(bins, head.as_ptr(), bin_idx);
                         return Some((Chunk::from_endpoint(base, acme), base, alloc_acme));
@@ -1196,9 +1222,12 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                         let alloc_acme = alloc_base.add(size).align_up_of::<Word>();
                         #[cfg(feature = "tracing")]
                         tracing::debug!(
-                            "[Talc]: acquire chunk, alloc_base: {:?}, alloc_acme: {:?}",
+                            "[Talc]: acquire chunk, alloc_base: {:?}, alloc_acme: {:?}, chunk_size: {:?}, size: {:?}, head: {:?}",
                             alloc_base,
-                            alloc_acme
+                            alloc_acme,
+                            chunk_size,
+                            size,
+                            head
                         );
                         self.remove_free(bins, head.as_ptr(), bin_idx);
                         return Some((Chunk::from_endpoint(base, acme), alloc_base, alloc_acme));
@@ -1225,6 +1254,8 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
                 .ok_or(())?;
 
             if let Some(prefix) = free.split_prefix(alloc_base) {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: insert prefix: {:?}", prefix);
                 self.insert_free(bins, prefix.head(), prefix.size_by_range());
             } else {
                 Tag::clear_above_free(free.prev_tag());
@@ -1232,6 +1263,8 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
 
             let (suffix, tag_ptr) = free.split_suffix(alloc_acme);
             if let Some(suffix) = suffix {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: insert suffix: {:?}", suffix);
                 self.insert_free(bins, suffix.head(), suffix.size_by_range());
                 Tag::init(tag_ptr, free.base, true, self.base_ptr());
             } else {
@@ -1268,11 +1301,19 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         unsafe {
             let tag = Tag::from_alloc_base(ptr.as_ptr(), size, self.base_ptr());
             let mut chunk = Tag::chunk(tag, self.base_ptr());
+            #[cfg(feature = "tracing")]
+            tracing::debug!("[Talc]: deallocate tag: {:?}, chunk: {:?}", tag, chunk);
 
             debug_assert!((*tag).is_allocated());
             debug_assert!(Chunk::is_valid(chunk));
 
             let prev_tag = chunk.prev_tag();
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Talc]: deallocate prev tag: {:?}, read: {:#b}",
+                prev_tag,
+                prev_tag.cast::<usize>().read()
+            );
             // try recombine below if below is free.
             if !(*prev_tag).is_allocated() {
                 let prev_tail = chunk.prev_tail();
@@ -1286,9 +1327,10 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
             // try recombine above.
             if (*tag).is_above_free() {
                 let next_head = chunk.next_head();
+                let next_size = (*next_head).size_low;
                 self.remove_free_by_head(bins, next_head);
 
-                chunk.acme = chunk.acme.byte_add((*next_head).size_low);
+                chunk.acme = chunk.acme.byte_add(next_size);
             }
 
             // free the recombined chunk back.
