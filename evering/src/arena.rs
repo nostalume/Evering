@@ -127,7 +127,7 @@ unsafe impl const mem::Meta for Meta {
         }
         let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
         // memory allocated while it may be uninitiated.
-        unsafe { NonNull::new_unchecked(ptr as *mut _) }
+        unsafe { NonNull::new_unchecked(ptr.cast_mut().cast()) }
     }
 
     #[inline]
@@ -239,25 +239,9 @@ impl Meta {
     }
 
     #[inline]
-    fn align_of<T>(self) -> Self {
-        let mut meta = self;
-        let aligned = self.raw.align_of::<T>();
-        meta.view = aligned;
-        meta
-    }
-
-    #[inline]
     fn align_to(self, align: UInt) -> Self {
         let mut meta = self;
         let aligned = self.raw.align_to(align);
-        meta.view = aligned;
-        meta
-    }
-
-    #[inline]
-    fn align_to_of<T>(self) -> Self {
-        let mut meta = self;
-        let aligned = self.raw.align_to_of::<T>();
         meta.view = aligned;
         meta
     }
@@ -993,10 +977,10 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         unsafe { self.raw_segment(prev.next, cur.size) }
     }
 
-    #[inline]
-    fn segment_of(&self, node: &SegmentNode) -> Segment {
-        unsafe { self.raw_segment(node.offset(self.base_ptr()), node.load().size) }
-    }
+    // #[inline]
+    // fn segment_of(&self, node: &SegmentNode) -> Segment {
+    //     unsafe { self.raw_segment(node.offset(self.base_ptr()), node.load().size) }
+    // }
 
     /// # Safety: the offset is in bounds and well aligned.
     ///
@@ -1076,48 +1060,48 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
         ))
     }
 
-    #[inline]
-    fn merge_segment(&self, prev: &SegmentNode, cur: &SegmentNode) {
-        let prev_seg = self.segment_of(prev);
-        let cur_seg = self.segment_of(cur);
+    // #[inline]
+    // fn merge_segment(&self, prev: &SegmentNode, cur: &SegmentNode) {
+    //     let prev_seg = self.segment_of(prev);
+    //     let cur_seg = self.segment_of(cur);
 
-        #[cfg(feature = "tracing")]
-        tracing::debug!(
-            "[Arena]: merge: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}",
-            prev_seg,
-            prev_seg.end_offset().align_up_of::<SegmentNode>(),
-            cur_seg,
-            cur_seg.node_offset,
-        );
+    //     #[cfg(feature = "tracing")]
+    //     tracing::debug!(
+    //         "[Arena]: merge: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}",
+    //         prev_seg,
+    //         prev_seg.end_offset().align_up_of::<SegmentNode>(),
+    //         cur_seg,
+    //         cur_seg.node_offset,
+    //     );
 
-        let prev_data = prev.load();
-        if prev_data.is_removed() || prev_data.next_is_removed() {
-            return;
-        }
+    //     let prev_data = prev.load();
+    //     if prev_data.is_removed() || prev_data.next_is_removed() {
+    //         return;
+    //     }
 
-        if prev_seg.is_sentinel() {
-            return;
-        }
+    //     if prev_seg.is_sentinel() {
+    //         return;
+    //     }
 
-        let prev_end = prev_seg.end_offset().align_up_of::<SegmentNode>();
-        let cur_end = cur_seg.end_offset();
-        if prev_end != cur_seg.node_offset || prev_end >= self.size {
-            return;
-        }
+    //     let prev_end = prev_seg.end_offset().align_up_of::<SegmentNode>();
+    //     let cur_end = cur_seg.end_offset();
+    //     if prev_end != cur_seg.node_offset || prev_end >= self.size {
+    //         return;
+    //     }
 
-        let size = cur_end - prev_seg.data_offset();
-        if let Ok(_merge) = prev.merge(cur, size) {
-            #[cfg(feature = "tracing")]
-            tracing::debug!(
-                "[Arena]: merge checked: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}, new {:?}",
-                prev_seg,
-                prev_end,
-                cur_seg,
-                cur_seg.node_offset,
-                merge
-            );
-        }
-    }
+    //     let size = cur_end - prev_seg.data_offset();
+    //     if let Ok(merge) = prev.merge(cur, size) {
+    //         #[cfg(feature = "tracing")]
+    //         tracing::debug!(
+    //             "[Arena]: merge checked: prev_seg: {:?} [end]: {}, cur_seg: {:?} [node]: {}, new {:?}",
+    //             prev_seg,
+    //             prev_end,
+    //             cur_seg,
+    //             cur_seg.node_offset,
+    //             merge
+    //         );
+    //     }
+    // }
 
     // find prev and next node that satisfies the given size check.
     fn find_by(&self, size: Size) -> Result<SegmentView<'_>, SegmentView<'_>> {

@@ -1,4 +1,15 @@
-mod root {
+pub mod talc {
+    use crate::talc;
+
+    pub type Meta = talc::Meta;
+    pub type Span = talc::SpanMeta;
+
+    pub type AllocHeader<const LS: usize, const BPL: usize, const LD: usize> = talc::Header<LS,BPL,LD>;
+    pub type RefAlloc<'a,const LS: usize, const BPL: usize, const LD: usize> = talc::RefTalc<'a,LS,BPL,LD>;
+    pub type MapAlloc<const LS: usize, const BPL: usize, const LD: usize,S,M> = talc::MapTalc<LS,BPL,LD,S,M>;
+}
+
+mod arena {
     use core::marker::PhantomData;
 
     use super::channel::MsgDuplex;
@@ -103,10 +114,10 @@ mod root {
 }
 
 pub mod allocator {
-    use super::root::Meta;
+    use super::arena::Meta;
     use crate::mem;
 
-    pub use super::root::{Config, MapAlloc, Optimistic, Pessimistic, RefAlloc};
+    pub use super::arena::{Config, MapAlloc, Optimistic, Pessimistic, RefAlloc};
     pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
 
     pub trait MemAllocator: mem::MemAllocator<Meta = Meta> {}
@@ -114,7 +125,7 @@ pub mod allocator {
 }
 
 pub mod channel {
-    use super::root::Span;
+    use super::arena::Span;
     use crate::channel::driver::CachePoolHandle;
     use crate::channel::{Receiver, Sender};
     use crate::channel::{cross, driver};
@@ -202,4 +213,4 @@ pub mod channel {
     }
 }
 
-pub use root::{Session, SessionBy};
+pub use arena::{Session, SessionBy};

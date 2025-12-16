@@ -169,57 +169,58 @@ mod numeric {
     }
 
     pub const trait Alignable {
-        fn align_down(self, other: Self) -> Self;
+        fn align_down(self, align: Self) -> Self;
         fn align_down_of<T>(self) -> Self;
-        fn align_up(self, other: Self) -> Self;
+        fn align_up(self, align: Self) -> Self;
         fn align_up_of<T>(self) -> Self;
-        fn align_offset(&self, other: &Self) -> Self;
-        fn align_offset_of<T>(&self) -> Self;
-        fn is_aligned(&self, other: &Self) -> bool;
-        fn is_aligned_of<T>(&self) -> bool;
+        fn align_offset(self, align: Self) -> Self;
+        fn align_offset_of<T>(self) -> Self;
+        fn is_aligned(self, align: Self) -> bool;
+        fn is_aligned_of<T>(self) -> bool;
     }
 
     macro_rules! align {
         ($ty:ty) => {
             impl const Alignable for $ty {
                 #[inline(always)]
-                fn align_down(self, other: Self) -> Self {
-                    self & !(other - 1)
+                fn align_down(self, align: Self) -> Self {
+                    debug_assert!(align.is_power_of_two());
+                    self & !(align - 1)
                 }
                 #[inline(always)]
                 fn align_down_of<T>(self) -> Self {
                     let align = core::mem::align_of::<T>();
-                    assert!(align <= Self::MAX as usize, "align_of::<T>() is too large");
                     self.align_down(align as Self)
                 }
                 #[inline(always)]
-                fn align_up(self, other: Self) -> Self {
-                    (self + other - 1) & !(other - 1)
+                fn align_up(self, align: Self) -> Self {
+                    debug_assert!(align.is_power_of_two());
+                    debug_assert!(Self::MAX - self > align - 1, "align up overflow");
+                    (self + align - 1) & !(align - 1)
                 }
                 #[inline(always)]
                 fn align_up_of<T>(self) -> Self {
                     let align = core::mem::align_of::<T>();
-                    assert!(align <= Self::MAX as usize, "align_of::<T>() is too large");
                     self.align_up(align as Self)
                 }
                 #[inline(always)]
-                fn align_offset(&self, other: &Self) -> Self {
-                    *self & (*other - 1)
+                fn align_offset(self, align: Self) -> Self {
+                    debug_assert!(align.is_power_of_two());
+                    self & (align - 1)
                 }
-                fn align_offset_of<T>(&self) -> Self {
+                fn align_offset_of<T>(self) -> Self {
                     let align = core::mem::align_of::<T>();
-                    assert!(align <= Self::MAX as usize, "align_of::<T>() is too large");
-                    self.align_offset(&(align as Self))
+                    self.align_offset(align as Self)
                 }
                 #[inline(always)]
-                fn is_aligned(&self, other: &Self) -> bool {
-                    self.align_offset(other) == 0
+                fn is_aligned(self, align: Self) -> bool {
+                    self.align_offset(align) == 0
                 }
                 #[inline(always)]
-                fn is_aligned_of<T>(&self) -> bool {
+                fn is_aligned_of<T>(self) -> bool {
                     let align = core::mem::align_of::<T>();
                     assert!(align <= Self::MAX as usize, "align_of::<T>() is too large");
-                    self.is_aligned(&(align as Self))
+                    self.is_aligned(align as Self)
                 }
             }
         };
@@ -237,6 +238,7 @@ mod numeric {
     align!(u8);
 
     pub trait AlignPtr: Sized {
+        fn align_offset(self, align: usize) -> usize;
         fn align_up(self, align: usize) -> Self;
         #[inline]
         fn align_up_of<T>(self) -> Self {
@@ -250,61 +252,42 @@ mod numeric {
     }
 
     impl AlignPtr for *const u8 {
-        fn align_up(self, align: usize) -> Self {
+        #[inline]
+        fn align_offset(self, align: usize) -> usize {
             debug_assert!(align.is_power_of_two());
-            // the align_down ptr must not underflow.
-            debug_assert!(self.addr() > align - 1);
-
-            self.wrapping_sub(self.addr() % align)
+            self.addr() & (align - 1)
         }
-
+        #[inline]
+        fn align_up(self, align: usize) -> Self {
+            self.wrapping_sub(self.align_offset(align))
+        }
+        #[inline]
         fn align_down(self, align: usize) -> Self {
-            debug_assert!(align.is_power_of_two());
             // the align_up ptr must not overflow.
             debug_assert!(usize::MAX - self.addr() > align - 1);
 
             let up = self.wrapping_add(align - 1);
-            up.wrapping_sub(up.addr() % align)
+            up.wrapping_sub(up.align_offset(align))
         }
     }
 
     impl AlignPtr for *mut u8 {
-        fn align_up(self, align: usize) -> Self {
+        #[inline]
+        fn align_offset(self, align: usize) -> usize {
             debug_assert!(align.is_power_of_two());
-            // the align_down ptr must not underflow.
-            debug_assert!(self.addr() > align - 1);
-
-            self.wrapping_sub(self.addr() % align)
+            self.addr() & (align - 1)
         }
-
+        #[inline]
+        fn align_up(self, align: usize) -> Self {
+            self.wrapping_sub(self.align_offset(align))
+        }
+        #[inline]
         fn align_down(self, align: usize) -> Self {
-            debug_assert!(align.is_power_of_two());
             // the align_up ptr must not overflow.
             debug_assert!(usize::MAX - self.addr() > align - 1);
 
             let up = self.wrapping_add(align - 1);
-            up.wrapping_sub(up.addr() % align)
-        }
-    }
-
-    impl AlignPtr for NonNull<u8> {
-        fn align_up(self, align: usize) -> Self {
-            debug_assert!(align.is_power_of_two());
-            // the align_down ptr must not underflow.
-            debug_assert!(self.addr().get() > align - 1);
-
-            unsafe { self.sub(self.addr().get() % align) }
-        }
-
-        fn align_down(self, align: usize) -> Self {
-            debug_assert!(align.is_power_of_two());
-            // the align_up ptr must not overflow.
-            debug_assert!(usize::MAX - self.addr().get() > align - 1);
-
-            unsafe {
-                let up = self.add(align - 1);
-                up.sub(up.addr().get() % align)
-            }
+            up.wrapping_sub(up.align_offset(align))
         }
     }
 
@@ -353,7 +336,7 @@ mod numeric {
         };
     }
 
-    use core::{ptr::NonNull, sync::atomic};
+    use core::sync::atomic;
 
     pack_bits!(unpack:u16, pack:u32);
     atomic_pack_bits!(unpack:u16, atomic: atomic::AtomicU16, atomic_pack: atomic::AtomicU32);

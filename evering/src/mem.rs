@@ -5,7 +5,7 @@ use core::ptr::{self, NonNull};
 
 mod area;
 
-pub use self::area::{MapHandle, MapLayout, RawMap};
+pub use self::area::{MapHandle, MapLayout, MapView, RawMap};
 pub use alloc::alloc::{AllocError, handle_alloc_error};
 
 bitflags::bitflags! {
@@ -539,9 +539,14 @@ macro_rules! addr_span {
             }
 
             #[inline]
-            pub const unsafe fn as_mut_ptr(&self, base_ptr: *mut u8) -> *mut u8 {
+            pub const unsafe fn as_mut_ptr(&self, base_ptr: *const u8) -> *mut u8 {
                 use crate::numeric::CastInto;
-                unsafe { base_ptr.add(self.start_offset.cast_into()) }
+                unsafe { base_ptr.add(self.start_offset.cast_into()).cast_mut() }
+            }
+
+            #[inline]
+            pub const unsafe fn as_nonnull(&self, base_ptr: *const u8) -> NonNull<u8> {
+                unsafe { NonNull::new_unchecked(self.as_mut_ptr(base_ptr)) }
             }
         }
     };

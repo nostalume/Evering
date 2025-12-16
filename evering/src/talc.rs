@@ -1,30 +1,62 @@
 use core::alloc;
+use core::cell::UnsafeCell;
+use core::ops::Deref;
 use core::ptr::null_mut;
 use core::{marker::PhantomData, ptr::NonNull};
 
+use spin::Mutex;
+
+use crate::mem::{AddrSpec, MapLayout, Mmap};
 use crate::numeric::bit::{bit_check, bit_flip};
 use crate::numeric::{
     AlignPtr, Alignable,
     bit::{WORD_ALIGN, WORD_BITS, WORD_SIZE, Word},
 };
+use crate::{header, mem};
 
-type Size = usize;
-type Offset = usize;
+type UInt = usize;
+type Size = UInt;
+type Offset = UInt;
+type AddrSpan = crate::mem::AddrSpan<Offset>;
 
 /// A relocatable pointer represented as an offset from a base pointer.
 ///
 /// # Safety
 ///
 /// - callers must ensure `base_ptr` is the same base used for creation.
-#[derive(Debug, PartialEq, Eq, PartialOrd)]
+#[derive(PartialEq, Eq, PartialOrd)]
 #[repr(transparent)]
-struct Rel<T> {
+pub struct Rel<T: ?Sized> {
     pub offset: Offset,
     _marker: PhantomData<T>,
 }
 type RelPtr = Rel<u8>;
 
-impl<T> Rel<T> {
+impl<T: ?Sized> core::fmt::Debug for Rel<T> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "Rel<{}> {{ offset: {:?} }}",
+            core::any::type_name::<T>(),
+            self.offset
+        )
+    }
+}
+
+impl<T: ?Sized> Rel<T> {
+    #[inline]
+    const fn null() -> Self {
+        Self {
+            offset: Offset::MAX,
+            _marker: PhantomData,
+        }
+    }
+
+    #[inline]
+    const fn is_null(&self) -> bool {
+        self.offset == Offset::MAX
+    }
+
     #[inline]
     const fn new(offset: Offset) -> Self {
         Self {
@@ -40,13 +72,33 @@ impl<T> Rel<T> {
     /// - `ptr` must be within the same allocation as `base_ptr`.
     /// - `ptr >= base_ptr`.
     #[inline]
-    const unsafe fn from_raw(ptr: *mut T, base_ptr: *const u8) -> Rel<T> {
-        Rel {
+    const unsafe fn from_raw(ptr: *mut T, base_ptr: *const u8) -> Self {
+        Self {
             offset: unsafe { ptr.byte_offset_from_unsigned(base_ptr.cast_mut()) },
             _marker: PhantomData,
         }
     }
+}
 
+impl<T> Rel<[T]> {
+    #[inline]
+    const unsafe fn as_raw(self, len: usize, base_ptr: *const u8) -> *mut [T] {
+        core::ptr::slice_from_raw_parts_mut(
+            base_ptr.wrapping_add(self.offset).cast::<T>().cast_mut(),
+            len,
+        )
+    }
+
+    #[inline]
+    const unsafe fn as_ptr(self, len: usize, base_ptr: *const u8) -> NonNull<[T]> {
+        unsafe {
+            let ptr = self.as_raw(len, base_ptr);
+            NonNull::new_unchecked(ptr)
+        }
+    }
+}
+
+impl<T> Rel<T> {
     /// Return a raw pointer using `base_ptr` by wrapping arithmetic.
     /// # Safety
     ///
@@ -65,7 +117,7 @@ impl<T> Rel<T> {
     }
 }
 
-impl<T> Clone for Rel<T> {
+impl<T: ?Sized> Clone for Rel<T> {
     fn clone(&self) -> Self {
         Self {
             offset: self.offset,
@@ -74,7 +126,7 @@ impl<T> Clone for Rel<T> {
     }
 }
 
-impl<T> Copy for Rel<T> {}
+impl<T: ?Sized> Copy for Rel<T> {}
 
 const _: () = {
     assert!(
@@ -89,9 +141,19 @@ const _: () = {
     )
 };
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 #[repr(transparent)]
 struct Tag(Word);
+
+impl core::fmt::Debug for Tag {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Tag")
+            .field("is_allocated", &self.is_allocated())
+            .field("is_above_free", &self.is_above_free())
+            .field("relative base:", &self.to_base_rel())
+            .finish()
+    }
+}
 
 impl Tag {
     const SIZE: Size = core::mem::size_of::<Self>();
@@ -126,6 +188,13 @@ impl Tag {
         }
     }
 
+    #[inline]
+    fn chunk(tag: *mut Self, heap_base: *mut u8) -> Chunk {
+        let base = Tag::to_base(tag, heap_base);
+        let acme = Tag::to_acme(tag);
+        unsafe { Chunk::from_endpoint(base, acme) }
+    }
+
     /// Encode and write a Tag value to `tag_ptr`.
     const unsafe fn init(
         tag: *mut Self,
@@ -150,8 +219,18 @@ impl Tag {
     }
 
     #[inline]
-    const fn chunk_base(self, heap_base: *mut u8) -> *mut u8 {
-        unsafe { RelPtr::new(self.0 & Self::BASE_MASK).as_raw(heap_base) }
+    const fn to_base_rel(self) -> RelPtr {
+        RelPtr::new(self.0 & Self::BASE_MASK)
+    }
+
+    #[inline]
+    const fn to_base(tag: *mut Self, heap_base: *mut u8) -> *mut u8 {
+        unsafe { (*tag).to_base_rel().as_raw(heap_base) }
+    }
+
+    #[inline]
+    const fn to_acme(tag: *mut Self) -> *mut u8 {
+        unsafe { tag.byte_add(Self::SIZE).cast() }
     }
 
     #[inline]
@@ -193,14 +272,14 @@ impl Tag {
 ///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
 #[derive(Debug)]
 #[repr(C)]
-struct FreeNode {
+pub struct FreeNode {
     /// The ptr to the next free node.
     pub next: Option<Rel<FreeNode>>,
     /// The ptr to the prev free node's `next` field.
     pub prev_next: Rel<Option<Rel<FreeNode>>>,
 }
 
-type FreeNodeLink = Option<Rel<FreeNode>>;
+pub type FreeNodeLink = Option<Rel<FreeNode>>;
 
 impl FreeNode {
     const LINK_SIZE: Size = core::mem::size_of::<FreeNodeLink>();
@@ -294,12 +373,12 @@ impl FreeNodeIter {
 }
 
 impl Iterator for FreeNodeIter {
-    type Item = NonNull<FreeNode>;
+    type Item = NonNull<FreeHead>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let cur = unsafe { Rel::as_ptr(self.cur?, self.heap_base) };
+        let cur = unsafe { Rel::<FreeNode>::as_ptr(self.cur?, self.heap_base) };
         self.cur = unsafe { (*cur.as_ptr()).next };
-        Some(cur)
+        Some(cur.cast())
     }
 }
 
@@ -309,6 +388,7 @@ impl Iterator for FreeNodeIter {
 ///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
 ///
 ///  Where `[FreeListNode] [size: usize] = [FreeHead]`
+#[derive(Debug)]
 #[repr(C)]
 struct FreeHead {
     node: FreeNode,
@@ -360,11 +440,6 @@ impl FreeHead {
         }
     }
 
-    // #[inline]
-    // unsafe fn init(head: *mut Self, size: usize) {
-    //     unsafe { (*head).size_low = size }
-    // }
-
     /// Gets the raw base pointer of the chunk from a pointer to the FreeHead.
     #[inline]
     const fn to_base(head: *mut Self) -> *mut u8 {
@@ -406,6 +481,7 @@ impl FreeHead {
 ///
 /// # Layout:
 ///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
+#[derive(Debug)]
 #[repr(transparent)]
 struct FreeTail {
     // Stores the size of the entire chunk
@@ -452,15 +528,11 @@ impl FreeTail {
     }
 }
 
+/// `Chunk` is a memory range satisfy the chunk restriction of Talc.
 #[derive(Debug, Clone, Copy)]
 struct Chunk {
-    base: *mut u8,
-    acme: *mut u8,
-}
-
-struct AllocChunk {
-    chunk: Chunk,
-    alloc_base: *mut u8,
+    pub base: *mut u8,
+    pub acme: *mut u8,
 }
 
 impl Chunk {
@@ -477,19 +549,76 @@ impl Chunk {
         }
     }
 
-    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
-    fn is_valid(self) -> bool {
-        Self::is_chunk_size(self.base, self.acme)
-    }
-
-    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
-    fn is_chunk_size<T, U>(base: *mut T, acme: *mut U) -> bool {
-        debug_assert!(acme >= base.cast(), "!(acme {:p} >= base {:p})", acme, base);
-        unsafe { acme.byte_offset_from_unsigned(base) >= Chunk::MIN_CHUNK_SIZE }
+    #[inline]
+    const fn from_head(base: NonNull<FreeHead>) -> Self {
+        let acme = unsafe { FreeHead::to_acme(base.as_ptr()) };
+        unsafe { Self::from_endpoint(base.as_ptr(), acme) }
     }
 
     #[inline]
-    const fn to_chunk_size(size: usize) -> usize {
+    const unsafe fn head(&self) -> *mut FreeHead {
+        unsafe { FreeHead::from_base(self.base) }
+    }
+
+    #[inline]
+    const unsafe fn tail(&self) -> *mut FreeTail {
+        unsafe { FreeTail::from_acme(self.acme) }
+    }
+
+    #[inline]
+    const unsafe fn next_head(&self) -> *mut FreeHead {
+        unsafe { FreeHead::from_base(self.acme) }
+    }
+
+    #[inline]
+    const unsafe fn prev_tail(&self) -> *mut FreeTail {
+        unsafe { FreeTail::from_acme(self.base) }
+    }
+
+    #[inline]
+    const unsafe fn tag(&self) -> *mut Tag {
+        Tag::from_acme(self.acme)
+    }
+
+    #[inline]
+    const unsafe fn prev_tag(&self) -> *mut Tag {
+        Tag::from_acme(self.base)
+    }
+
+    #[inline]
+    fn size_by_range(&self) -> Size {
+        self.acme.addr() - self.base.addr()
+    }
+
+    #[inline]
+    unsafe fn size_by_head(&self) -> Size {
+        let head = unsafe { self.head() };
+        unsafe { (*head).size_low }
+    }
+
+    #[inline]
+    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
+    fn is_valid(self) -> bool {
+        Self::is_chunk(self.base, self.acme)
+    }
+
+    #[inline]
+    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
+    fn is_chunk<T, U>(base: *mut T, acme: *mut U) -> bool {
+        if !(acme >= base.cast()) {
+            return false;
+        }
+        debug_assert!(acme >= base.cast(), "!(acme {:p} >= base {:p})", acme, base);
+        Self::is_chunk_size(unsafe { acme.byte_offset_from_unsigned(base) })
+    }
+
+    #[inline]
+    const fn is_chunk_size(size: usize) -> bool {
+        size >= Chunk::MIN_CHUNK_SIZE
+    }
+
+    #[inline]
+    const fn chunk_size(size: usize) -> usize {
         if size <= FreeNode::SIZE {
             Chunk::MIN_CHUNK_SIZE
         } else {
@@ -517,8 +646,8 @@ impl Chunk {
     /// Split to a prefix chunk if possible and modify the acme to the new suffix base.
     #[inline]
     fn split_suffix(&mut self, alloc_acme: *mut u8) -> (Option<Self>, *mut Tag) {
+        // Suffix Chunk should be suffix_base >= alloc_acme && [suffix_base(new_acme), acme] >= MIN_CHUNK_SIZE && [free_base, suffix_base(new_acme)] >= MIN_CHUNK_SIZE
         unsafe {
-            // Suffix Chunk should be suffix_base >= alloc_acme && [suffix_base(new_acme), acme] >= MIN_CHUNK_SIZE && [free_base, suffix_base(new_acme)] >= MIN_CHUNK_SIZE
             // While we extract the new/old Tag pointer.
             let mut tag_ptr = self.base.add(Self::MIN_TAG_OFFSET).max(alloc_acme);
             let suffix_base = tag_ptr.add(Tag::SIZE);
@@ -527,11 +656,15 @@ impl Chunk {
                 acme: self.acme,
             };
             if suffix.is_valid() {
-                self.base = suffix_base;
+                self.acme = suffix_base;
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: split_suffix success, tag_ptr {:?}", tag_ptr);
                 (Some(suffix), tag_ptr.cast())
             } else {
                 // Tag pointer doesn't change, resolve to original acme.
                 tag_ptr = self.acme.sub(Tag::SIZE);
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: split_suffix failed, tag_ptr {:?}", tag_ptr);
                 (None, tag_ptr.cast())
             }
         }
@@ -540,11 +673,11 @@ impl Chunk {
 
 pub trait BinMarker: crate::seal::Sealed {}
 
-impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
+impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
     crate::seal::Sealed for BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
 {
 }
-impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize> BinMarker
+impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize> BinMarker
     for BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
 {
 }
@@ -559,8 +692,11 @@ impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: us
 ///      `16 * Stride` bytes where `Stride = 2^(LINEAR_STAGES)`.
 /// * `LOG_DIVS`: The log2 of the number of divisions per power-of-two(`2^n`) in the exponential range.
 ///    - e.g., `2` means 4 divisions. `3` means 8 divisions.
-pub struct BinConfig<const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize, const LOG_DIVS: u32>;
-pub type Normal = BinConfig<2, 256, 2>;
+pub struct BinConfig<
+    const LINEAR_STAGES: usize,
+    const BYTES_PER_LINEAR: usize,
+    const LOG_DIVS: usize,
+>;
 
 /// A simplified struct to hold pre-calculated stage data.
 #[derive(Copy, Clone, Debug)]
@@ -570,22 +706,26 @@ pub struct LinearStage {
     pub base_bucket: usize, // The bucket index offset where this stage starts
 }
 
-impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
+impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
     BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
 {
+    pub const BIN_COUNTS: Size = LINEAR_STAGES * WORD_BITS;
+    pub const BIN_ARRAY_SIZE: Size = Self::BIN_COUNTS * FreeNode::LINK_SIZE;
+
     pub const MIN_CHUNK_SIZE: usize = Chunk::MIN_CHUNK_SIZE;
+
     // 1. Derived Exponential Constants
     //
     pub const DIVS_PER_POW2: usize = 1 << LOG_DIVS;
     // The bitshift required to isolate the division bits.
     // We rely on LOG_DIVS directly, saving the .ilog2() calculation.
-    pub const DIV_BITS: usize = LOG_DIVS as usize;
+    pub const DIV_BITS: usize = LOG_DIVS;
 
     // 2. Derived Linear Stage Logic
     //
     // We pre-calculate the "End Limit" and "Base Bucket Index" for every linear stage.
     // This creates a compile-time lookup table.
-    pub const STAGE_DATA: [LinearStage; LINEAR_STAGES] = Self::calculate_stages();
+    pub const STAGE_DATA: [LinearStage; LINEAR_STAGES] = Self::init_stages();
 
     /// The upper bound size where linear binning ends and exponential logic begins.
     /// Any size >= this value uses the exponential logic.
@@ -601,7 +741,7 @@ impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: us
     pub const MIN_EXP_BITS_LESS_ONE: usize = Self::EXPONENTIAL_START_SIZE.ilog2() as usize;
 
     /// Const function to generate the lookup table for linear stages.
-    const fn calculate_stages() -> [LinearStage; LINEAR_STAGES] {
+    const fn init_stages() -> [LinearStage; LINEAR_STAGES] {
         let mut stages = [LinearStage {
             limit: 0,
             stride: 0,
@@ -688,26 +828,160 @@ impl<const LOG_DIVS: u32, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: us
         // Index = (Magnitude * Divs_Per_Mag) + Division_Index + Start_Bucket
         let bucket_offset = (magnitude * Self::DIVS_PER_POW2) + division;
 
-        bucket_offset + Self::EXPONENTIAL_START_BUCKET
+        (bucket_offset + Self::EXPONENTIAL_START_BUCKET).min(Self::BIN_COUNTS - 1)
     }
 }
 
-pub struct Talc<C: BinMarker, const N: usize> {
-    avails: [usize; N],
-    bins: NonNull<[FreeNodeLink]>,
-    _config: PhantomData<C>,
+/// # Talc Allocator
+#[repr(C)]
+pub struct TalcMeta<const LS: usize, const BPL: usize, const LD: usize> {
+    /// The bits array of available node.
+    ///
+    /// Each bits of a word suggests existence or not.
+    avails: [Word; LS],
+    /// The pointer to the array of nodes in bits array.
+    bins: Rel<[FreeNodeLink]>,
+    _config: PhantomData<BinConfig<LS, BPL, LD>>,
 }
 
-impl<C: BinMarker, const N: usize> Talc<C, N> {
-    pub const MIN_HEAP_SIZE: Size = Chunk::MIN_CHUNK_SIZE + Tag::SIZE;
-    pub const BIN_COUNTS: Size = N * WORD_BITS;
-    pub const BIN_ARRAY_SIZE: Size = Self::BIN_COUNTS * FreeNode::LINK_SIZE;
+unsafe impl<const LS: usize, const BPL: usize, const LD: usize> Send for TalcMeta<LS, BPL, LD> {}
 
-    const fn new(bins: NonNull<[FreeNodeLink]>) -> Self {
-        Talc {
-            avails: [0usize; N],
-            bins,
+#[repr(C)]
+pub struct TalckMeta<const LS: usize, const BPL: usize, const LD: usize> {
+    lock: Mutex<()>,
+    talc: UnsafeCell<TalcMeta<LS, BPL, LD>>,
+}
+
+unsafe impl<const LS: usize, const BPL: usize, const LD: usize> Sync for TalckMeta<LS, BPL, LD> {}
+
+pub type Header<const LS: usize, const BPL: usize, const LD: usize> =
+    header::Header<TalckMeta<LS, BPL, LD>>;
+pub type MemTalck<const LS: usize, const BPL: usize, const LD: usize, S, M> =
+    mem::MapHandle<Header<LS, BPL, LD>, S, M>;
+
+/// For backpressure of range `[4b,...,4mb]`, suggesting a covering for `<= 14kb` fine granularity
+///
+/// - `4 B → 16 KiB`  ← very hot
+/// - `32–64 KiB`    ← hot
+/// - `256 KiB+`     ← cold but expensive.
+// pub type Normal = BinConfig<3, 256, 2>;
+pub type NHeader = Header<3, 256, 2>;
+pub type NMemTalck<S, M> = mem::MapHandle<NHeader, S, M>;
+
+pub struct Talc<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> {
+    header: H,
+    bins: NonNull<[FreeNodeLink]>,
+}
+unsafe impl<
+    H: const Deref<Target = Header<LS, BPL, LD>> + Send,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> Send for Talc<H, LS, BPL, LD>
+{
+}
+unsafe impl<
+    H: const Deref<Target = Header<LS, BPL, LD>> + Send,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> Sync for Talc<H, LS, BPL, LD>
+{
+}
+
+pub type RefTalc<'a, const LS: usize, const BPL: usize, const LD: usize> =
+    Talc<&'a Header<LS, BPL, LD>, LS, BPL, LD>;
+pub type MapTalc<const LS: usize, const BPL: usize, const LD: usize, S, M> =
+    Talc<MemTalck<LS, BPL, LD, S, M>, LS, BPL, LD>;
+
+impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
+    const BIN_COUNTS: usize = BinConfig::<LS, BPL, LD>::BIN_COUNTS;
+    const BIN_ARRAY_SIZE: Size = BinConfig::<LS, BPL, LD>::BIN_ARRAY_SIZE;
+    const MIN_HEAP_SIZE: Size = Chunk::MIN_CHUNK_SIZE + Tag::SIZE;
+
+    #[inline]
+    const fn null() -> Self {
+        TalcMeta {
+            avails: [0usize; LS],
+            bins: Rel::null(),
             _config: PhantomData,
+        }
+    }
+
+    #[inline]
+    const fn bins(&self) -> NonNull<[FreeNodeLink]> {
+        unsafe { self.bins.as_ptr(Self::BIN_COUNTS, self.base_ptr()) }
+    }
+
+    #[inline]
+    unsafe fn metadata(&mut self, ptr: *mut FreeNodeLink) -> (NonNull<[FreeNodeLink]>, *mut u8) {
+        // let metadata_base = base.add(Tag::SIZE).cast::<FreeNodeLink>();
+        unsafe {
+            let mut i = 0;
+            while i < Self::BIN_COUNTS {
+                let bin = ptr.add(i);
+                bin.write(None);
+                i += 1;
+            }
+            let slice = core::ptr::slice_from_raw_parts_mut(ptr, Self::BIN_COUNTS);
+            let metadata = Rel::<[FreeNodeLink]>::from_raw(slice, self.base_ptr());
+            let acme = ptr.add(Self::BIN_COUNTS);
+            self.bins = metadata;
+            (NonNull::new_unchecked(slice), acme.cast())
+        }
+    }
+
+    pub unsafe fn claim(
+        &mut self,
+        base: *mut u8,
+        size: Size,
+    ) -> Result<NonNull<[FreeNodeLink]>, ()> {
+        let base = base.align_up_of::<Word>();
+        // if !self.bins.is_null() {
+        //     if size <= Self::MIN_HEAP_SIZE {
+        //         return Err(());
+        //     }
+        //     unsafe {
+        //         // init anchor tag.
+        //         let bins = self.bins.as_ptr(Self::BIN_COUNTS, self.base_ptr());
+        //         Tag::init(base.cast(), base_ptr(), true, self.base_ptr());
+        //         let chunk_base = base.wrapping_add(Tag::SIZE);
+        //         self.insert_free(bins, FreeHead::from_base(chunk_base), size);
+        //         self.scan_errors(bins);
+        //         return Ok(bins);
+        //     };
+        // } else {
+        unsafe {
+            if size < Tag::SIZE + Self::BIN_ARRAY_SIZE + Tag::SIZE {
+                return Err(());
+            }
+            Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
+            let metadata_base = base.byte_add(Tag::SIZE);
+            let (bins, metadata_acme) = self.metadata(metadata_base.cast());
+            let metadata_chunk_acme = metadata_acme.byte_add(Tag::SIZE);
+
+            let free_size = size - (metadata_chunk_acme.offset_from_unsigned(base));
+            if Chunk::is_chunk_size(free_size) {
+                self.insert_free(bins, FreeHead::from_base(metadata_chunk_acme), free_size);
+
+                Tag::init(metadata_acme.cast(), base, true, self.base_ptr());
+            } else {
+                // the whole memory only hold a single chunk.
+                let acme = base.byte_add(size);
+                let tag_ptr = Tag::from_acme(acme);
+                if tag_ptr != metadata_acme.cast() {
+                    let tag_rel = Rel::<Tag>::from_raw(tag_ptr, self.base_ptr());
+                    metadata_acme.cast::<Rel<Tag>>().write(tag_rel);
+                }
+                Tag::init(tag_ptr, base, false, self.base_ptr());
+            }
+            Ok(bins)
+            // }
         }
     }
 
@@ -717,15 +991,18 @@ impl<C: BinMarker, const N: usize> Talc<C, N> {
     }
 
     #[inline]
+    const fn word_bit_idx(idx: usize) -> (usize, usize) {
+        (idx / WORD_BITS, idx % WORD_BITS)
+    }
+
+    #[inline]
     const unsafe fn toggle_avail(&mut self, idx: usize, should_be: bool) {
         debug_assert!(idx < Self::BIN_COUNTS);
 
-        let word_idx = idx / WORD_BITS;
-        let bit_idx = idx % WORD_BITS;
-        debug_assert!(word_idx < N);
+        let (word_idx, bit_idx) = Self::word_bit_idx(idx);
+        debug_assert!(word_idx < LS);
 
-        let ptr = self.avails.as_mut_slice();
-        let word = &mut ptr[word_idx];
+        let word = &mut self.avails[word_idx];
         debug_assert!(bit_check(*word, bit_idx) != should_be);
         bit_flip(word, bit_idx);
         debug_assert!(bit_check(*word, bit_idx) == should_be);
@@ -742,21 +1019,24 @@ impl<C: BinMarker, const N: usize> Talc<C, N> {
     }
 
     #[inline(always)]
-    const fn next_avail_bin(&self, bin_idx: usize) -> Option<usize> {
-        let word_idx = bin_idx / WORD_BITS;
-        if word_idx >= N {
+    const fn next_avail_bin_idx(&self, idx: usize) -> Option<usize> {
+        let word_idx = idx / WORD_BITS;
+        if word_idx >= LS {
             return None;
         }
 
-        let bit_idx = bin_idx % WORD_BITS;
-        // shift to get the bits of the bin.
+        let bit_idx = idx % WORD_BITS;
+        // shift to get the bits array of the given idx.
         let shift_avails = self.avails[word_idx] >> bit_idx;
         if shift_avails != 0 {
-            return Some(bin_idx + shift_avails.trailing_zeros() as usize);
+            // `trailing_zeros` gets the zero counts from the first non-zero bit 1.
+            // thus we calculate the distance from the original idx to the first non-zero bit.
+            return Some(idx + shift_avails.trailing_zeros() as usize);
         }
 
+        // if the word of given idx is empty, found the next repeatly.
         let mut i = word_idx + 1;
-        while i < N {
+        while i < LS {
             let word = self.avails[i];
             if word != 0 {
                 return Some(i * WORD_BITS + word.trailing_zeros() as usize);
@@ -766,46 +1046,88 @@ impl<C: BinMarker, const N: usize> Talc<C, N> {
 
         None
     }
-}
 
-impl<const LS: usize, const SPL: usize, const LD: u32> Talc<BinConfig<LS, SPL, LD>, LS> {
     #[inline(always)]
     const fn bin_idx(size: usize) -> usize {
-        BinConfig::<LS, SPL, LD>::bin_idx(size)
+        BinConfig::<LS, BPL, LD>::bin_idx(size)
+    }
+
+    // Context resolution
+    #[inline]
+    const fn bin_by_idx(idx: usize, bins: NonNull<[FreeNodeLink]>) -> *mut FreeNodeLink {
+        debug_assert!(idx < Self::BIN_COUNTS);
+        unsafe { bins.as_mut_ptr().add(idx) }
     }
 
     #[inline]
-    const fn bin_by_idx(&self, idx: usize) -> *mut FreeNodeLink {
-        unsafe { self.bins.as_mut_ptr().add(idx) }
+    fn bin_by_size(size: usize, bins: NonNull<[FreeNodeLink]>) -> (*mut FreeNodeLink, usize) {
+        let idx = Self::bin_idx(size);
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: idx: {}", idx);
+        (Self::bin_by_idx(idx, bins), idx)
     }
 
-    #[inline]
-    const fn bin_by_size(&self, size: usize) -> *mut FreeNodeLink {
-        self.bin_by_idx(Self::bin_idx(size))
+    #[cfg(not(debug_assertions))]
+    fn scan_errors(&self) {}
+
+    #[cfg(debug_assertions)]
+    fn scan_errors(&self, bins: NonNull<[FreeNodeLink]>) {
+        // #[cfg(any(test, feature = "tracing"))]
+        // let mut vec = std::vec::Vec::new();
+
+        for idx in 0..Self::BIN_COUNTS {
+            unsafe {
+                let iter = FreeNodeIter::new(*Self::bin_by_idx(idx, bins), self.base_ptr());
+                for head in iter {
+                    let (word_idx, bit_idx) = Self::word_bit_idx(idx);
+                    assert!(bit_check(self.avails[word_idx], bit_idx));
+
+                    let acme = FreeHead::to_acme(head.as_ptr());
+                    let tail = FreeHead::to_tail(head.as_ptr());
+                    let size_low = head.as_ref().size_low;
+                    let size_high = (*tail).size_high;
+                    let size_real = acme.byte_offset_from_unsigned(head.as_ptr());
+                    assert!(size_low == size_high && size_high == size_real);
+
+                    let prev_tag = Tag::from_acme(head.as_ptr().cast());
+                    assert!((*prev_tag).is_above_free());
+                    // a free chunk should already merged below free chunk.
+                    // so any below chunk should be allocated.
+                    assert!((*prev_tag).is_allocated());
+                }
+            }
+        }
     }
+}
 
+impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     #[inline]
-    fn insert_free(&mut self, head: *mut FreeHead, acme: *mut u8) {
-        debug_assert!(Chunk::is_chunk_size(head, acme));
+    fn insert_free(&mut self, bins: NonNull<[FreeNodeLink]>, head: *mut FreeHead, size: Size) {
+        debug_assert!(Chunk::is_chunk_size(size));
 
-        let size = acme.addr() - head.addr();
-        let bin_idx = BinConfig::<LS, SPL, LD>::bin_idx(size);
-        let bin_ptr = self.bin_by_idx(bin_idx);
+        let (bin_ptr, bin_idx) = Self::bin_by_size(size, bins);
 
         unsafe {
             if (*bin_ptr).is_none() {
+                #[cfg(feature = "tracing")]
+                tracing::debug!("[Talc]: insert, set avail: {}", bin_idx);
                 self.set_avail(bin_idx);
             }
             FreeHead::init(head, bin_ptr, size, self.base_ptr());
-            let tail = FreeTail::from_acme(acme);
+            let tail = FreeTail::from_acme(head.byte_add(size).cast());
             FreeTail::init(tail, size);
         }
     }
 
     #[inline]
-    const unsafe fn remove_free_by(&mut self, head: *mut FreeHead, bin_idx: usize) {
+    const unsafe fn remove_free(
+        &mut self,
+        bins: NonNull<[FreeNodeLink]>,
+        head: *mut FreeHead,
+        bin_idx: usize,
+    ) {
         unsafe {
-            let bin = *self.bin_by_idx(bin_idx);
+            let bin = *Self::bin_by_idx(bin_idx, bins);
             debug_assert!(bin.is_some());
             FreeHead::deinit(head, self.base_ptr());
 
@@ -816,66 +1138,101 @@ impl<const LS: usize, const SPL: usize, const LD: u32> Talc<BinConfig<LS, SPL, L
     }
 
     #[inline]
-    const unsafe fn remove_free(&mut self, head: *mut FreeHead) {
+    const unsafe fn remove_free_by_head(
+        &mut self,
+        bins: NonNull<[FreeNodeLink]>,
+        head: *mut FreeHead,
+    ) {
         unsafe {
             let bin_idx = Self::bin_idx((*head).size_low);
-            self.remove_free_by(head, bin_idx);
+            self.remove_free(bins, head, bin_idx);
         }
     }
 
     #[inline]
+    const unsafe fn remove_free_by_tail(
+        &mut self,
+        bins: NonNull<[FreeNodeLink]>,
+        tail: *mut FreeTail,
+    ) -> *mut FreeHead {
+        unsafe {
+            let head = FreeTail::to_head(tail);
+            self.remove_free_by_head(bins, head);
+            head
+        }
+    }
+    /// Acquire a free chunk by given `size` and `align`.
+    ///
+    /// - `chunk_size >= req_size = size + Tag::SIZE`
+    /// - `chunk_base <= alloc_base <= alloc_base + req_size <= chunk_acme`
+    #[inline]
     unsafe fn acquire_chunk(
         &mut self,
-        layout: alloc::Layout,
-    ) -> Option<(*mut FreeHead, *mut u8, *mut u8)> {
-        let req_size = Chunk::to_chunk_size(layout.size());
-        let need_align = layout.align() > WORD_ALIGN;
+        bins: NonNull<[FreeNodeLink]>,
+        size: Size,
+        align: Offset,
+    ) -> Option<(Chunk, *mut u8, *mut u8)> {
+        let req_size = Chunk::chunk_size(size);
+        let need_align = align > WORD_ALIGN;
 
-        let mut bin = self.next_avail_bin(Self::bin_idx(req_size))?;
+        let mut bin_idx = self.next_avail_bin_idx(Self::bin_idx(req_size))?;
         loop {
             unsafe {
-                let cur_rel = *self.bin_by_idx(bin);
+                let cur_rel = *Self::bin_by_idx(bin_idx, bins);
                 let iter = FreeNodeIter::new(cur_rel, self.base_ptr());
-                for node in iter {
-                    let head = FreeHead::from_node(node);
-                    let size = (*head).size_low;
-                    if size >= req_size {
-                        if !need_align {
-                            self.remove_free_by(head, bin);
-                            return Some((head, FreeHead::to_acme(head), FreeHead::to_base(head)));
-                        }
-                    } else {
-                        let base = FreeHead::to_base(head);
-                        let acme = FreeHead::to_acme(head);
-                        let align_base = base.align_up(layout.align());
-                        if align_base.add(req_size) <= acme {
-                            self.remove_free_by(head, bin);
-                            return Some((head, acme, align_base));
-                        }
+                for head in iter {
+                    let size = head.as_ref().size_low;
+                    let base = FreeHead::to_base(head.as_ptr());
+                    let acme = FreeHead::to_acme(head.as_ptr());
+                    // no need align
+                    if size >= req_size && !need_align {
+                        let alloc_acme = base.add(size).align_up_of::<Word>();
+                        self.remove_free(bins, head.as_ptr(), bin_idx);
+                        return Some((Chunk::from_endpoint(base, acme), base, alloc_acme));
+                    }
+                    // need align
+                    let alloc_base = base.align_up(align);
+                    if alloc_base.add(req_size) <= acme {
+                        let alloc_acme = alloc_base.add(size).align_up_of::<Word>();
+                        #[cfg(feature = "tracing")]
+                        tracing::debug!(
+                            "[Talc]: acquire chunk, alloc_base: {:?}, alloc_acme: {:?}",
+                            alloc_base,
+                            alloc_acme
+                        );
+                        self.remove_free(bins, head.as_ptr(), bin_idx);
+                        return Some((Chunk::from_endpoint(base, acme), alloc_base, alloc_acme));
                     }
                 }
             }
-            bin = self.next_avail_bin(bin + 1)?;
+            bin_idx = self.next_avail_bin_idx(bin_idx + 1)?;
         }
     }
 
-    pub unsafe fn alloc(&mut self, layout: alloc::Layout) -> Result<NonNull<u8>, ()> {
-        debug_assert!(layout.size() != 0);
+    pub unsafe fn allocate(
+        &mut self,
+        bins: NonNull<[FreeNodeLink]>,
+        layout: alloc::Layout,
+    ) -> Result<NonNull<u8>, ()> {
+        if layout.size() == 0 {
+            return Ok(NonNull::dangling());
+        }
 
+        self.scan_errors(bins);
         unsafe {
-            let (free_base, free_acme, alloc_base) = self.acquire_chunk(layout).ok_or(())?;
+            let (mut free, alloc_base, alloc_acme) = self
+                .acquire_chunk(bins, layout.size(), layout.align())
+                .ok_or(())?;
 
-            let mut free = Chunk::from_endpoint(free_base, free_acme);
             if let Some(prefix) = free.split_prefix(alloc_base) {
-                self.insert_free(prefix.base.cast(), prefix.acme);
+                self.insert_free(bins, prefix.head(), prefix.size_by_range());
             } else {
-                Tag::clear_above_free(Tag::from_acme(free.base));
+                Tag::clear_above_free(free.prev_tag());
             }
 
-            let alloc_acme = alloc_base.add(layout.size()).align_up_of::<Word>();
-            let (prefix, tag_ptr) = free.split_suffix(alloc_acme);
-            if let Some(prefix) = prefix {
-                self.insert_free(prefix.base.cast(), prefix.acme);
+            let (suffix, tag_ptr) = free.split_suffix(alloc_acme);
+            if let Some(suffix) = suffix {
+                self.insert_free(bins, suffix.head(), suffix.size_by_range());
                 Tag::init(tag_ptr, free.base, true, self.base_ptr());
             } else {
                 Tag::init(tag_ptr, free.base, false, self.base_ptr());
@@ -891,95 +1248,315 @@ impl<const LS: usize, const SPL: usize, const LD: u32> Talc<BinConfig<LS, SPL, L
     }
 
     /// Free previously allocated/reallocated memory.
+    ///
     /// # Safety
     /// `ptr` must have been previously allocated given `layout`.
-    pub unsafe fn free(&mut self, ptr: NonNull<u8>, layout: alloc::Layout) {
-        // self.scan_for_errors();
+    pub unsafe fn deallocate(
+        &mut self,
+        bins: NonNull<[FreeNodeLink]>,
+        ptr: NonNull<u8>,
+        size: Size,
+    ) {
+        if size == 0 {
+            return;
+        }
+
         // #[cfg(feature = "counters")]
         // self.counters.account_dealloc(layout.size());
 
+        self.scan_errors(bins);
         unsafe {
-            let tag = Tag::from_alloc_base(ptr.as_ptr(), layout.size(), self.base_ptr());
-            let mut chunk_base = (*tag).chunk_base(self.base_ptr());
-            let mut chunk_acme = tag.add(Tag::SIZE);
+            let tag = Tag::from_alloc_base(ptr.as_ptr(), size, self.base_ptr());
+            let mut chunk = Tag::chunk(tag, self.base_ptr());
 
             debug_assert!((*tag).is_allocated());
-            debug_assert!(Chunk::is_chunk_size(chunk_base, chunk_acme));
+            debug_assert!(Chunk::is_valid(chunk));
 
-            // let tail = Tag::from_acme(chunk_base);
-            // if Tag::is_allocated(self)
-            let prev_tag = Tag::from_acme(chunk_base);
-            // try recombine below
+            let prev_tag = chunk.prev_tag();
+            // try recombine below if below is free.
             if !(*prev_tag).is_allocated() {
-                let prev_tail = FreeTail::from_acme(chunk_base);
-                let prev_head = FreeTail::to_head(prev_tail);
-                self.remove_free(prev_head);
+                let prev_tail = chunk.prev_tail();
+                let prev_head = self.remove_free_by_tail(bins, prev_tail);
 
-                chunk_base = prev_head.cast();
+                chunk.base = prev_head.cast();
             } else {
                 Tag::set_above_free(prev_tag);
             }
 
-            // try recombine above
+            // try recombine above.
             if (*tag).is_above_free() {
-                let next_head = FreeHead::from_base(chunk_acme.cast());
-                let next_size = (*next_head).size_low;
-                self.remove_free_by(next_head, Self::bin_idx(next_size));
+                let next_head = chunk.next_head();
+                self.remove_free_by_head(bins, next_head);
 
-                chunk_acme = chunk_acme.add(next_size);
+                chunk.acme = chunk.acme.byte_add((*next_head).size_low);
             }
 
-            // add the full recombined free chunk back into the books
-            self.insert_free(chunk_base.cast(), chunk_acme.cast());
+            // free the recombined chunk back.
+            self.insert_free(bins, chunk.head(), chunk.size_by_range());
+        }
+    }
+}
+
+impl<const LS: usize, const BPL: usize, const LD: usize> TalckMeta<LS, BPL, LD> {
+    const SIZE: Size = core::mem::size_of::<Self>();
+    const ALIGN: Offset = core::mem::align_of::<Self>();
+    const fn null() -> Self {
+        Self {
+            lock: spin::Mutex::new(()),
+            talc: UnsafeCell::new(TalcMeta::<LS, BPL, LD>::null()),
+        }
+    }
+}
+
+impl<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> Talc<H, LS, BPL, LD>
+{
+    const BIN_COUNTS: usize = BinConfig::<LS, BPL, LD>::BIN_COUNTS;
+    const BIN_ARRAY_SIZE: Size = BinConfig::<LS, BPL, LD>::BIN_ARRAY_SIZE;
+    const MIN_HEAP_SIZE: Size = Chunk::MIN_CHUNK_SIZE + Tag::SIZE;
+
+    pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, ()> {
+        let _lock = self.header.lock.lock();
+        unsafe {
+            let base_ptr = self.header.talc.as_ref_unchecked().base_ptr();
+            self.header
+                .talc
+                .as_mut_unchecked()
+                .allocate(self.bins, layout)
+                .map(|ptr| {
+                    let size = layout.size();
+                    Meta::from_ptr(base_ptr, ptr.as_ptr(), size)
+                })
         }
     }
 
-    pub unsafe fn claim(&mut self, base: *mut u8, acme: *mut u8) -> Result<(), ()> {
-        let (base, acme) = (base.align_up_of::<Word>(), acme.align_down_of::<Word>());
-
-        if !self.bins.is_empty() {
-            if acme.addr() - base.addr() <= Self::MIN_HEAP_SIZE {
-                return Err(());
-            }
-            unsafe {
-                Tag::init(base.cast(), null_mut(), true, self.base_ptr());
-                let chunk_base = base.wrapping_add(Tag::SIZE);
-                self.insert_free(chunk_base.cast(), acme);
-                // self.scan_errors();
-                return Ok(());
-            };
-        } else {
-            unsafe {
-                if !acme.addr() - base.addr() >= Tag::SIZE + Self::BIN_ARRAY_SIZE + Tag::SIZE {
-                    return Err(());
-                }
-                Tag::init(base.cast(), null_mut(), true, base.cast());
-                let metadata_base = base.add(Tag::SIZE).cast::<FreeNodeLink>();
-                for i in 0..Self::BIN_COUNTS {
-                    let bin = metadata_base.add(i);
-                    bin.write(None);
-                }
-                let metadata = NonNull::slice_from_raw_parts(
-                    NonNull::new_unchecked(metadata_base),
-                    Self::BIN_COUNTS,
-                );
-                self.bins = metadata;
-                let metadata_acme = metadata_base.add(Self::BIN_COUNTS);
-                let metadata_chunk_acme = metadata_acme.byte_add(Tag::SIZE);
-                if Chunk::is_chunk_size(metadata_chunk_acme, acme) {
-                    self.insert_free(metadata_chunk_acme.cast(), acme);
-                    Tag::init(metadata_acme.cast(), base, true, self.base_ptr());
-                } else {
-                    let tag_ptr = acme.sub(Tag::SIZE).cast();
-                    if tag_ptr != metadata_acme.cast() {
-                        let tag_rel = Rel::<Tag>::from_raw(tag_ptr, self.base_ptr());
-                        metadata_acme.cast::<Rel<Tag>>().write(tag_rel);
-                    }
-                    Tag::init(tag_ptr, base, false, self.base_ptr());
-                }
-            }
+    pub fn deallocate(&self, meta: Meta) {
+        let _lock = self.header.lock.lock();
+        unsafe {
+            self.header.talc.as_mut_unchecked().deallocate(
+                self.bins,
+                meta.as_nonnull(),
+                meta.view.size,
+            );
         }
+    }
+}
 
-        Ok(())
+unsafe impl<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> mem::MemAlloc for Talc<H, LS, BPL, LD>
+{
+    type Meta = Meta;
+
+    type Error = ();
+
+    #[inline]
+    fn base_ptr(&self) -> *const u8 {
+        unsafe { self.header.talc.as_ref_unchecked().base_ptr() }
+    }
+
+    #[inline]
+    fn malloc_by(&self, layout: std::alloc::Layout) -> Result<Self::Meta, Self::Error> {
+        self.allocate(layout)
+    }
+}
+
+unsafe impl<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> mem::MemDealloc for Talc<H, LS, BPL, LD>
+{
+    fn demalloc(&self, meta: Self::Meta) -> bool {
+        self.deallocate(meta);
+        true
+    }
+}
+
+impl<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> mem::MemAllocator for Talc<H, LS, BPL, LD>
+{
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct Meta {
+    base_ptr: *const u8,
+    view: AddrSpan,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+pub struct SpanMeta {
+    view: AddrSpan,
+}
+
+unsafe impl Send for Meta {}
+
+unsafe impl const mem::Meta for Meta {
+    type SpanMeta = SpanMeta;
+
+    #[inline]
+    fn null() -> Self {
+        Self {
+            base_ptr: core::ptr::null(),
+            view: AddrSpan::null(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self) -> bool {
+        self.view.is_null()
+    }
+
+    #[inline]
+    fn as_uninit<T>(&self) -> NonNull<std::mem::MaybeUninit<T>> {
+        if self.is_null() {
+            return NonNull::dangling();
+        }
+        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
+        // memory allocated while it may be uninitiated.
+        unsafe { NonNull::new_unchecked(ptr.cast_mut().cast()) }
+    }
+
+    #[inline]
+    fn erase(self) -> Self::SpanMeta {
+        SpanMeta { view: self.view }
+    }
+
+    #[inline]
+    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
+        Meta {
+            base_ptr,
+            view: span.view,
+        }
+    }
+}
+
+unsafe impl const mem::Span for SpanMeta {
+    #[inline]
+    fn null() -> Self {
+        Self {
+            view: AddrSpan::null(),
+        }
+    }
+
+    #[inline]
+    fn is_null(&self) -> bool {
+        self.view.is_null()
+    }
+}
+
+impl Meta {
+    #[inline]
+    const fn null() -> Self {
+        Self {
+            base_ptr: core::ptr::null(),
+            view: AddrSpan::null(),
+        }
+    }
+    #[inline]
+    fn from_raw(base_ptr: *const u8, offset: Offset, size: Size) -> Self {
+        Self {
+            base_ptr,
+            view: AddrSpan::new(offset, size),
+        }
+    }
+    #[inline]
+    unsafe fn from_ptr(base_ptr: *const u8, ptr: *const u8, size: Size) -> Self {
+        let offset = unsafe { ptr.byte_offset_from_unsigned(base_ptr) };
+        Self {
+            base_ptr,
+            view: AddrSpan::new(offset, size),
+        }
+    }
+    #[inline]
+    const unsafe fn as_nonnull(&self) -> NonNull<u8> {
+        unsafe { self.view.as_nonnull(self.base_ptr) }
+    }
+}
+
+impl<const LS: usize, const BPL: usize, const LD: usize> header::Layout for TalckMeta<LS, BPL, LD> {
+    type Config = (Offset, Size);
+
+    const MAGIC: header::Magic = 0x1234;
+
+    fn init(&mut self, conf: Self::Config) -> header::Status {
+        let ptr = &raw mut *self;
+        unsafe { ptr.write(Self::null()) };
+        let inits_ptr = unsafe {
+            ptr.add(Self::SIZE + conf.0)
+                .cast::<u8>()
+                .align_up_of::<Self>()
+        };
+        unsafe {
+            let _ = self.talc.as_mut_unchecked().claim(inits_ptr.cast(), conf.1);
+        }
+        header::Status::Initialized
+    }
+
+    fn attach(&self) -> header::Status {
+        header::Status::Initialized
+    }
+}
+
+impl<
+    H: const Deref<Target = Header<LS, BPL, LD>>,
+    const LS: usize,
+    const BPL: usize,
+    const LD: usize,
+> Talc<H, LS, BPL, LD>
+{
+    #[inline]
+    pub const fn header(&self) -> &Header<LS, BPL, LD> {
+        &self.header
+    }
+
+    #[inline]
+    pub const fn new(header: H, bins: NonNull<[FreeNodeLink]>) -> Self {
+        Self { header, bins }
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>, const LS: usize, const BPL: usize, const LD: usize>
+    MapTalc<LS, BPL, LD, S, M>
+{
+    #[inline]
+    pub fn from_layout(
+        area: MapLayout<S, M>,
+        mut conf: (Offset, Size),
+    ) -> Result<Self, mem::Error<S, M>> {
+        use mem::MemOps;
+        let mut area = area;
+
+        let reserve = area.reserve::<Header<LS, BPL, LD>>()?;
+        let size = area.size() - area.cur_offset();
+        conf.1 = size;
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: with conf: {:?}", conf);
+        let handle = area.commit(reserve, conf)?;
+        let bins = unsafe { handle.talc.as_ref_unchecked().bins() };
+
+        Ok(Self::new(handle, bins))
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>, const LS: usize, const BPL: usize, const LD: usize>
+    TryFrom<MapLayout<S, M>> for MapTalc<LS, BPL, LD, S, M>
+{
+    type Error = mem::Error<S, M>;
+
+    fn try_from(value: MapLayout<S, M>) -> Result<Self, Self::Error> {
+        Self::from_layout(value, (0, 0))
     }
 }
