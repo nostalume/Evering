@@ -866,7 +866,7 @@ unsafe impl<const LS: usize, const BPL: usize, const LD: usize> Sync for TalckMe
 
 pub type Header<const LS: usize, const BPL: usize, const LD: usize> =
     header::Header<TalckMeta<LS, BPL, LD>>;
-pub type MemTalck<const LS: usize, const BPL: usize, const LD: usize, S, M> =
+pub type MapHeader<const LS: usize, const BPL: usize, const LD: usize, S, M> =
     mem::MapHandle<Header<LS, BPL, LD>, S, M>;
 
 /// For backpressure of range `[4b,...,4mb]`, suggesting a covering for `<= 14kb` fine granularity
@@ -907,7 +907,7 @@ unsafe impl<
 pub type RefTalc<'a, const LS: usize, const BPL: usize, const LD: usize> =
     Talc<&'a Header<LS, BPL, LD>, LS, BPL, LD>;
 pub type MapTalc<const LS: usize, const BPL: usize, const LD: usize, S, M> =
-    Talc<MemTalck<LS, BPL, LD, S, M>, LS, BPL, LD>;
+    Talc<MapHeader<LS, BPL, LD, S, M>, LS, BPL, LD>;
 
 impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     const BIN_COUNTS: usize = BinConfig::<LS, BPL, LD>::BIN_COUNTS;

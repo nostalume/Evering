@@ -21,9 +21,15 @@ pub mod type_id {
 
     type_tag! {
         u8,
+        u16,
         u32,
+        u64,
+        f32,
         f64,
+        i8,
+        i16,
         i32,
+        i64,
         bool,
         ()
     }
@@ -168,6 +174,32 @@ pub trait Message: TypeTag {
 
 impl<T: Message> Message for [T] {
     type Semantics = T::Semantics;
+}
+
+macro_rules! move_msg {
+    ($($ty:ty),*) => {
+        $(
+            impl Message for $ty {
+                type Semantics = Move;
+            }
+        )*
+    };
+}
+
+// define move message for primitive type.
+move_msg! {
+    u8,
+    u16,
+    u32,
+    u64,
+    f32,
+    f64,
+    i8,
+    i16,
+    i32,
+    i64,
+    bool,
+    ()
 }
 
 pub struct Move;

@@ -7,7 +7,7 @@ use core::ops::{Deref, DerefMut};
 
 use memory_addr::{MemoryAddr, VirtAddr};
 
-use crate::mem::{Access, Accessible, AddrSpec, MapLayout, Mmap, Mprotect, RawMap};
+use crate::mem::{Access, Accessible, AddrSpec, MapLayout, MapView, Mmap, Mprotect, RawMap};
 
 const MAX_ADDR: usize = 0x20000;
 
@@ -117,5 +117,21 @@ impl<'a> Mprotect<MockAddr> for MockBackend<'a> {
 impl MockBackend<'_> {
     fn shared(self, start: usize, size: usize) -> MapLayout<MockAddr, Self> {
         MapLayout::new(self.map(None, size, (), 0, start).unwrap()).unwrap()
+    }
+}
+
+type MockMapView<'a> = MapView<MockAddr, MockBackend<'a>>;
+fn mock_view(bk: &mut [u8], start: usize, size: usize) -> MockMapView<'_> {
+    let bk = MockBackend(bk);
+    bk.shared(start, size).try_into().unwrap()
+}
+
+#[test]
+fn area_init() {
+    const STEP: usize = 0x2000;
+    let mut pt = [0; MAX_ADDR];
+    for start in (0..MAX_ADDR).step_by(STEP) {
+        let a = mock_view(&mut pt, start, STEP);
+        tracing::debug!("{:?}", a.header());
     }
 }

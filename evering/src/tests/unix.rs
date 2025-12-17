@@ -66,9 +66,7 @@ fn arena_alloc() {
     const ALLOC_NUM: usize = 200;
     const NUM: usize = 5;
     const NAME: &str = "alloc";
-    const SIZE: usize = {
-        (BYTES_SIZE * ALLOC_NUM).next_power_of_two()
-    };
+    const SIZE: usize = { (BYTES_SIZE * ALLOC_NUM).next_power_of_two() };
 
     tracing_init();
     let a = mock_alloc(NAME, SIZE);
@@ -238,7 +236,6 @@ fn token_slice() {
     use std::sync::Barrier;
     use std::thread;
 
-    use super::Byte;
     use crate::mem::MemAllocator;
     use crate::msg::MoveMessage;
     use crate::token::AllocToken;
@@ -252,7 +249,7 @@ fn token_slice() {
     tracing_init();
 
     fn rand_slice_token<A: MemAllocator>(a: A) -> (AllocToken<A>, A) {
-        Byte::slice_token(fastrand::usize(1..128), |_| Byte::mock(), a)
+        u8::slice_token(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
     }
 
     let a = mock_alloc(NAME, SIZE);
@@ -287,7 +284,7 @@ fn token_slice() {
                 s.spawn(move || {
                     b_ref.wait();
                     chunk.into_iter().for_each(|token| {
-                        let slice = Byte::slice_detoken(token, &a_ref).expect("should detoken");
+                        let slice = u8::slice_detoken(token, &a_ref).expect("should detoken");
                         tracing::debug!("{:?}", slice)
                     })
                 })
@@ -298,7 +295,6 @@ fn token_slice() {
 
 #[tokio::test]
 async fn conn_async() {
-    use super::Byte;
     use crate::msg::MoveMessage;
     use crate::perlude::allocator::MemAllocator;
     use crate::perlude::channel::{
@@ -314,7 +310,7 @@ async fn conn_async() {
     const SIZE: usize = 60000;
 
     fn rand_slice_token<A: MemAllocator>(a: A) -> (Token, A) {
-        Byte::slice_token(fastrand::usize(1..128), |_| Byte::mock(), a)
+        u8::slice_token(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
     }
 
     async fn client_task<const N: usize, S: MsgSubmitter<(), N>, A: MemAllocator>(
@@ -344,7 +340,7 @@ async fn conn_async() {
             };
 
             let (res, _) = op.await.into_parts();
-            let info = Byte::slice_detoken(res, &alloc).unwrap();
+            let info = u8::slice_detoken(res, &alloc).unwrap();
             tracing::debug!("[Client] receive: {:?}", info);
         }
     }
@@ -422,7 +418,7 @@ async fn conn_async() {
 
     let alloc = conn.alloc.clone();
     let handler = move |token: Token| {
-        let info = Byte::slice_detoken(token, &alloc).expect("should work");
+        let info = u8::slice_detoken(token, &alloc).expect("should work");
         tracing::debug!("[Server] receive: {:?}", info);
         let (new, _) = rand_slice_token(&alloc);
         Some(new)

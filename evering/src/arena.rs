@@ -286,7 +286,7 @@ pub struct ArenaMeta<S: Strategy> {
 }
 
 pub type Header<S> = header::Header<ArenaMeta<S>>;
-pub type MemArenaMeta<S, A, M> = mem::MapHandle<Header<S>, A, M>;
+pub type MapHeader<S, A, M> = mem::MapHandle<Header<S>, A, M>;
 
 impl<S: Strategy> core::fmt::Debug for ArenaMeta<S> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -779,7 +779,7 @@ pub struct Arena<H: const Deref<Target = Header<S>>, S: Strategy> {
 }
 
 pub type RefArena<'a, S> = Arena<&'a Header<S>, S>;
-pub type MapArena<S, A, M> = Arena<MemArenaMeta<S, A, M>, S>;
+pub type MapArena<S, A, M> = Arena<MapHeader<S, A, M>, S>;
 
 pub struct Pessimistic;
 pub struct Optimistic;
