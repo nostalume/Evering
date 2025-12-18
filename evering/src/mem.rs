@@ -175,61 +175,65 @@ impl<S: AddrSpec, M: SharedMmap<S>> MapBuilder<S, M> {
 }
 
 pub type MetaOf<A> = <A as MemAlloc>::Meta;
-pub type SpanOf<M> = <M as Meta>::SpanMeta;
-pub type MetaSpanOf<A> = SpanOf<MetaOf<A>>;
+// pub type SpanOf<M> = <M as Meta>::SpanMeta;
+// pub type MetaSpanOf<A> = SpanOf<MetaOf<A>>;
 
 /// Marker trait for constraint of `MetaSpanOf<A>` for `A: MemAllocator`
-pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
-    fn erase(meta: MetaOf<A>) -> Self;
-    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A>;
-}
+// pub trait IsMetaSpanOf<A: MemAllocator>: Sized {
+//     fn erase(meta: MetaOf<A>) -> Self;
+//     unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A>;
+// }
 
-impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
-    #[inline(always)]
-    fn erase(meta: MetaOf<A>) -> Self {
-        meta.erase()
-    }
+// impl<A: MemAllocator> IsMetaSpanOf<A> for MetaSpanOf<A> {
+//     #[inline(always)]
+//     fn erase(meta: MetaOf<A>) -> Self {
+//         meta.erase()
+//     }
 
-    #[inline(always)]
-    unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A> {
-        unsafe { Meta::recall(self, base_ptr) }
-    }
-}
+//     #[inline(always)]
+//     unsafe fn recall(self, base_ptr: *const u8) -> MetaOf<A> {
+//         unsafe { Meta::recall(self, base_ptr) }
+//     }
+// }
 
-pub const unsafe trait Span: Clone {
+// pub const unsafe trait Span: Clone {
+//     fn null() -> Self;
+//     fn is_null(&self) -> bool;
+// }
+
+pub trait Meta: Clone {
+    // type SpanMeta: Span;
     fn null() -> Self;
     fn is_null(&self) -> bool;
-}
-
-pub const unsafe trait Meta: Clone + core::fmt::Debug {
-    type SpanMeta: Span;
-    fn null() -> Self;
-    fn is_null(&self) -> bool;
-
-    fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>>;
-    unsafe fn as_ptr<T>(&self) -> *mut T {
-        self.as_uninit::<T>().as_ptr().cast()
+    unsafe fn recall(&self, base_ptr: *const u8) -> NonNull<u8>;
+    fn recall_by<A: MemAlloc>(&self, alloc: &A) -> NonNull<u8> {
+        unsafe { self.recall(alloc.base_ptr()) }
     }
+    unsafe fn layout(&self) -> Layout;
 
-    fn as_uninit_slice<T>(&self, len: usize) -> NonNull<[MaybeUninit<T>]> {
-        let ptr = self.as_uninit::<T>();
-        NonNull::slice_from_raw_parts(ptr, len)
-    }
-    unsafe fn as_slice<T>(&self, len: usize) -> *mut [T] {
-        let ptr = unsafe { self.as_ptr::<T>() };
-        ptr::slice_from_raw_parts_mut(ptr, len)
-    }
+    // fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>>;
+    // unsafe fn as_ptr<T>(&self) -> *mut T {
+    //     self.as_uninit::<T>().as_ptr().cast()
+    // }
 
-    fn erase(self) -> Self::SpanMeta;
-    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
+    // fn as_uninit_slice<T>(&self, len: usize) -> NonNull<[MaybeUninit<T>]> {
+    //     let ptr = self.as_uninit::<T>();
+    //     NonNull::slice_from_raw_parts(ptr, len)
+    // }
+    // unsafe fn as_slice<T>(&self, len: usize) -> *mut [T] {
+    //     let ptr = unsafe { self.as_ptr::<T>() };
+    //     ptr::slice_from_raw_parts_mut(ptr, len)
+    // }
+
+    // fn erase(self) -> Self::SpanMeta;
+    // unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self;
 }
 
 pub trait MemAllocator: MemAlloc + MemDealloc {}
 impl<A: MemAllocator> MemAllocator for &A {}
-pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
-impl<A: MemAllocator2> MemAllocator2 for &A {}
+// pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
+// impl<A: MemAllocator2> MemAllocator2 for &A {}
 
-/// Allocate or deallocate raw type `T` in persistence.
 pub unsafe trait MemAlloc {
     type Meta: Meta;
     type Error;
@@ -245,13 +249,18 @@ pub unsafe trait MemAlloc {
     }
 }
 
-pub unsafe trait MemDealloc: MemAlloc {
-    // deallocate meta `T` in persistence.
-    fn demalloc(&self, meta: Self::Meta) -> bool;
-}
+// pub unsafe trait MemDealloc: MemAlloc {
+//     // deallocate meta `T` in persistence.
+//     fn demalloc(&self, meta: Self::Meta) -> bool;
+// }
 
-pub unsafe trait MemDeallocBy: MemAlloc {
-    fn demalloc_by(&self, meta: Self::Meta, layout: Layout) -> bool;
+pub unsafe trait MemDealloc: MemAlloc {
+    fn demalloc(&self, meta: Self::Meta, layout: Layout) -> bool;
+    #[inline]
+    fn demalloc_bytes(&self, meta: Self::Meta) -> bool {
+        let layout = meta.layout();
+        self.demalloc(meta, layout)
+    }
 }
 
 pub trait MemAllocInfo: MemAlloc {
@@ -275,16 +284,16 @@ unsafe impl<A: MemAlloc> MemAlloc for &A {
 }
 
 unsafe impl<A: MemDealloc> MemDealloc for &A {
-    fn demalloc(&self, meta: Self::Meta) -> bool {
-        (*self).demalloc(meta)
+    fn demalloc(&self, meta: Self::Meta, layout: Layout) -> bool {
+        (*self).demalloc(meta, layout)
     }
 }
 
-unsafe impl<A: MemDeallocBy> MemDeallocBy for &A {
-    fn demalloc_by(&self, meta: Self::Meta, layout: Layout) -> bool {
-        (*self).demalloc_by(meta, layout)
-    }
-}
+// unsafe impl<A: MemDeallocBy> MemDeallocBy for &A {
+//     fn demalloc_by(&self, meta: Self::Meta, layout: Layout) -> bool {
+//         (*self).demalloc_by(meta, layout)
+//     }
+// }
 
 pub unsafe trait MemOps {
     #[inline]

@@ -87,7 +87,7 @@ fn conn_sync() {
                 },
             };
 
-            let (t, _) = p.into_parts();
+            let (t, _) = p.unpack();
             // assert!(h == Exit::None, "header corrupted");
 
             match handler(t) {
@@ -98,7 +98,7 @@ fn conn_sync() {
                     alive = false;
                 }
                 Some(reply) => {
-                    let pack = reply.pack_default();
+                    let pack = reply.with_default();
                     let _ = s.try_send(pack);
                 }
             }
@@ -118,7 +118,7 @@ fn conn_sync() {
     let (rs, rr) = q.clone().rsplit();
 
     let (msg, alloc) = Info::mock().token(alloc);
-    let _ = ls.try_send(msg.pack_default());
+    let _ = ls.try_send(msg.with_default());
 
     let handler = |token: Token, label: &'static str| {
         if prob(FUZZ_PROB) {
@@ -164,7 +164,7 @@ async fn conn_async() {
             }
 
             let (msg, _) = Info::mock().token(&alloc);
-            let token = msg.pack_default();
+            let token = msg.with_default();
 
             let op = match submitter.try_submit(token) {
                 Ok(op) => op,
@@ -179,7 +179,7 @@ async fn conn_async() {
                 }
             };
 
-            let (res, _) = op.await.into_parts();
+            let (res, _) = op.await.unpack();
             let info = Info::detoken(res, &alloc).unwrap();
             tracing::debug!("[Client] receive: {:?}", info);
         }
@@ -224,14 +224,14 @@ async fn conn_async() {
                 }
             };
 
-            let (token, header) = packet.into_parts();
+            let (token, header) = packet.unpack();
             match handler(token) {
                 None => {
                     sender.close();
                     break;
                 }
                 Some(reply) => {
-                    let packed = reply.pack(header);
+                    let packed = reply.with(header);
                     match sender.try_send(packed) {
                         Ok(_) => continue,
                         Err(TrySendError::Full(_)) => {

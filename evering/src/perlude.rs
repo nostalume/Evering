@@ -2,7 +2,7 @@ pub mod talc {
     use crate::talc;
 
     pub type Meta = talc::Meta;
-    pub type Span = talc::SpanMeta;
+    // pub type Span = talc::SpanMeta;
 
     pub type AllocHeader<const LS: usize, const BPL: usize, const LD: usize> =
         talc::Header<LS, BPL, LD>;
@@ -28,7 +28,7 @@ mod arena {
     pub use crate::arena::{Config, Optimistic, Pessimistic};
 
     pub type Meta = arena::Meta;
-    pub type Span = arena::SpanMeta;
+    // pub type Span = arena::SpanMeta;
 
     pub type AllocMetaConfig = arena::MetaConfig;
     pub type AllocHeader<G> = arena::Header<G>;
@@ -128,7 +128,7 @@ pub mod allocator {
 }
 
 pub mod channel {
-    use super::arena::Span;
+    use super::arena::Meta;
     use crate::channel::driver::CachePoolHandle;
     use crate::channel::{Receiver, Sender};
     use crate::channel::{cross, driver};
@@ -139,19 +139,19 @@ pub mod channel {
     pub use crate::channel::driver::{Completer, Submitter, TryCompState};
     pub use crate::channel::{QueueChannel, TryRecvError, TrySendError};
     pub use crate::token::{ReqId, ReqNull};
-    pub type Token = token::Token<Span>;
-    pub type MsgToken<H> = token::PackToken<H, Span>;
-    pub type OpMsgToken<H> = token::ReqToken<H, Span>;
+    pub type Token = token::Token<Meta>;
+    pub type MsgToken<H> = token::PackToken<H, Meta>;
+    pub type OpMsgToken<H> = token::ReqToken<H, Meta>;
 
-    pub type MsgQueue<H> = cross::TokenQueue<H, Span>;
-    pub type MsgDuplex<H> = cross::TokenDuplex<H, Span>;
-    pub type MsgDuplexPeek<'a, H> = cross::DuplexView<H, Span, &'a Entry<MsgDuplex<H>>>;
-    pub type MsgDuplexView<H, S, M> = cross::DuplexView<H, Span, MapEntry<MsgDuplex<H>, S, M>>;
+    pub type MsgQueue<H> = cross::TokenQueue<H, Meta>;
+    pub type MsgDuplex<H> = cross::TokenDuplex<H, Meta>;
+    pub type MsgDuplexPeek<'a, H> = cross::DuplexView<H, Meta, &'a Entry<MsgDuplex<H>>>;
+    pub type MsgDuplexView<H, S, M> = cross::DuplexView<H, Meta, MapEntry<MsgDuplex<H>, S, M>>;
 
-    pub type SenderPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
-    pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
-    pub type SenderView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
-    pub type ReceiverView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
+    pub type SenderPeek<'a, H, R> = cross::Sender<H, Meta, &'a Entry<MsgDuplex<H>>, R>;
+    pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Meta, &'a Entry<MsgDuplex<H>>, R>;
+    pub type SenderView<H, R, S, M> = cross::Sender<H, Meta, MapEntry<MsgDuplex<H>, S, M>, R>;
+    pub type ReceiverView<H, R, S, M> = cross::Sender<H, Meta, MapEntry<MsgDuplex<H>, S, M>, R>;
 
     pub type SubmitterPeek<'a, H, const N: usize, R> =
         driver::Sx<SenderPeek<'a, H, R>, MsgToken<H>, N>;
@@ -226,111 +226,111 @@ macro_rules! root {
         })?
     ) => {
         mod $modname {
-            use crate::mem::{self, SpanOf};
+            // use crate::mem::{self};
 
-            pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
+            // pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
 
-            pub type Meta = $meta;
-            pub type Span = SpanOf<Meta>;
+            // pub type Meta = $meta;
+            // pub type Span = SpanOf<Meta>;
 
             $(
                 $( pub type $name = $ty; )*
             )?
 
-            pub trait MemAllocator: mem::MemAllocator<Meta = Meta> {}
-            impl<T: mem::MemAllocator<Meta = Meta>> MemAllocator for T {}
+            // pub trait MemAllocator: mem::MemAllocator<Meta = Meta> {}
+            // impl<T: mem::MemAllocator<Meta = Meta>> MemAllocator for T {}
 
-            pub mod channel {
-                use super::Span;
-                use crate::channel::driver::CachePoolHandle;
-                use crate::channel::{Receiver, Sender};
-                use crate::channel::{cross, driver};
-                use crate::msg::Envelope;
-                use crate::reg::{Entry, MapEntry};
-                use crate::token;
+            // pub mod channel {
+            //     use super::Span;
+            //     use crate::channel::driver::CachePoolHandle;
+            //     use crate::channel::{Receiver, Sender};
+            //     use crate::channel::{cross, driver};
+            //     use crate::msg::Envelope;
+            //     use crate::reg::{Entry, MapEntry};
+            //     use crate::token;
 
-                pub use crate::channel::driver::{Completer, Submitter, TryCompState};
-                pub use crate::channel::{QueueChannel, TryRecvError, TrySendError};
-                pub use crate::token::{ReqId, ReqNull};
+            //     pub use crate::channel::driver::{Completer, Submitter, TryCompState};
+            //     pub use crate::channel::{QueueChannel, TryRecvError, TrySendError};
+            //     pub use crate::token::{ReqId, ReqNull};
 
-                pub type Token = token::Token<Span>;
-                pub type MsgToken<H> = token::PackToken<H, Span>;
-                pub type OpMsgToken<H> = token::ReqToken<H, Span>;
+            //     pub type Token = token::Token<Span>;
+            //     pub type MsgToken<H> = token::PackToken<H, Span>;
+            //     pub type OpMsgToken<H> = token::ReqToken<H, Span>;
 
-                pub type MsgQueue<H> = cross::TokenQueue<H, Span>;
-                pub type MsgDuplex<H> = cross::TokenDuplex<H, Span>;
-                pub type MsgDuplexPeek<'a, H> = cross::DuplexView<H, Span, &'a Entry<MsgDuplex<H>>>;
-                pub type MsgDuplexView<H, S, M> = cross::DuplexView<H, Span, MapEntry<MsgDuplex<H>, S, M>>;
+            //     pub type MsgQueue<H> = cross::TokenQueue<H, Span>;
+            //     pub type MsgDuplex<H> = cross::TokenDuplex<H, Span>;
+            //     pub type MsgDuplexPeek<'a, H> = cross::DuplexView<H, Span, &'a Entry<MsgDuplex<H>>>;
+            //     pub type MsgDuplexView<H, S, M> = cross::DuplexView<H, Span, MapEntry<MsgDuplex<H>, S, M>>;
 
-                pub type SenderPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
-                pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
-                pub type SenderView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
-                pub type ReceiverView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
+            //     pub type SenderPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
+            //     pub type ReceiverPeek<'a, H, R> = cross::Sender<H, Span, &'a Entry<MsgDuplex<H>>, R>;
+            //     pub type SenderView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
+            //     pub type ReceiverView<H, R, S, M> = cross::Sender<H, Span, MapEntry<MsgDuplex<H>, S, M>, R>;
 
-                pub type SubmitterPeek<'a, H, const N: usize, R> =
-                    driver::Sx<SenderPeek<'a, H, R>, MsgToken<H>, N>;
-                pub type CompleterPeek<'a, H, const N: usize, R> =
-                    driver::Cx<ReceiverPeek<'a, H, R>, MsgToken<H>, N>;
-                pub type SubmitterView<H, const N: usize, R, S, M> =
-                    driver::Sx<SenderView<H, R, S, M>, MsgToken<H>, N>;
-                pub type CompleterView<H, const N: usize, R, S, M> =
-                    driver::Cx<ReceiverView<H, R, S, M>, MsgToken<H>, N>;
-                pub type TrySubmitError<H> = driver::TrySubmitError<TrySendError<OpMsgToken<H>>>;
-                pub type RefOp<'a, H, const N: usize> = driver::RefOp<'a, MsgToken<H>, N>;
-                pub type OwnOp<H, const N: usize> = driver::OwnOp<MsgToken<H>, N>;
+            //     pub type SubmitterPeek<'a, H, const N: usize, R> =
+            //         driver::Sx<SenderPeek<'a, H, R>, MsgToken<H>, N>;
+            //     pub type CompleterPeek<'a, H, const N: usize, R> =
+            //         driver::Cx<ReceiverPeek<'a, H, R>, MsgToken<H>, N>;
+            //     pub type SubmitterView<H, const N: usize, R, S, M> =
+            //         driver::Sx<SenderView<H, R, S, M>, MsgToken<H>, N>;
+            //     pub type CompleterView<H, const N: usize, R, S, M> =
+            //         driver::Cx<ReceiverView<H, R, S, M>, MsgToken<H>, N>;
+            //     pub type TrySubmitError<H> = driver::TrySubmitError<TrySendError<OpMsgToken<H>>>;
+            //     pub type RefOp<'a, H, const N: usize> = driver::RefOp<'a, MsgToken<H>, N>;
+            //     pub type OwnOp<H, const N: usize> = driver::OwnOp<MsgToken<H>, N>;
 
-                pub trait MsgSender<H: Envelope>:
-                    Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel
-                {
-                }
+            //     pub trait MsgSender<H: Envelope>:
+            //         Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel
+            //     {
+            //     }
 
-                impl<
-                    H: Envelope,
-                    T: Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel,
-                > MsgSender<H> for T
-                {
-                }
+            //     impl<
+            //         H: Envelope,
+            //         T: Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel,
+            //     > MsgSender<H> for T
+            //     {
+            //     }
 
-                pub trait MsgReceiver<H: Envelope>:
-                    Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel
-                {
-                }
+            //     pub trait MsgReceiver<H: Envelope>:
+            //         Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel
+            //     {
+            //     }
 
-                impl<H: Envelope, T: Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel>
-                    MsgReceiver<H> for T
-                {
-                }
+            //     impl<H: Envelope, T: Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel>
+            //         MsgReceiver<H> for T
+            //     {
+            //     }
 
-                pub type CachePool<H, const N: usize> = CachePoolHandle<MsgToken<H>, N>;
+            //     pub type CachePool<H, const N: usize> = CachePoolHandle<MsgToken<H>, N>;
 
-                pub trait MsgSubmitter<H: Envelope, const N: usize>:
-                    Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel
-                {
-                }
+            //     pub trait MsgSubmitter<H: Envelope, const N: usize>:
+            //         Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel
+            //     {
+            //     }
 
-                impl<
-                    H: Envelope,
-                    const N: usize,
-                    T: Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel,
-                > MsgSubmitter<H, N> for T
-                {
-                }
+            //     impl<
+            //         H: Envelope,
+            //         const N: usize,
+            //         T: Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel,
+            //     > MsgSubmitter<H, N> for T
+            //     {
+            //     }
 
-                pub trait MsgCompleter<H: Envelope, const N: usize>:
-                    Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel
-                {
-                }
+            //     pub trait MsgCompleter<H: Envelope, const N: usize>:
+            //         Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel
+            //     {
+            //     }
 
-                impl<
-                    H: Envelope,
-                    const N: usize,
-                    T: Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel,
-                > MsgCompleter<H, N> for T
-                {
-                }
-            }
+            //     impl<
+            //         H: Envelope,
+            //         const N: usize,
+            //         T: Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel,
+            //     > MsgCompleter<H, N> for T
+            //     {
+            //     }
+            // }
         }
-    };
+    }
 }
 
 root!(

@@ -4,14 +4,14 @@ use core::ops::{Deref, DerefMut};
 use core::ptr::{self, NonNull};
 use core::sync::atomic::AtomicUsize;
 
-use crate::mem::{AllocError, IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf, handle_alloc_error};
+use crate::mem::{AllocError, MemAllocator, Meta, handle_alloc_error};
 use crate::token::{Token, TokenOf};
+use crate::{msg, token};
 
 const fn is_zst<T>() -> bool {
     size_of::<T>() == 0
 }
 
-#[repr(C)]
 pub struct PBox<T: ?Sized, A: MemAllocator> {
     ptr: NonNull<T>,
     meta: A::Meta,
@@ -21,16 +21,22 @@ pub struct PBox<T: ?Sized, A: MemAllocator> {
 unsafe impl<T: ?Sized + Send, A: MemAllocator + Send> Send for PBox<T, A> {}
 unsafe impl<T: ?Sized + Sync, A: MemAllocator + Sync> Sync for PBox<T, A> {}
 
+impl<T: core::fmt::Debug + ?Sized, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        core::fmt::Debug::fmt(&**self, f)
+    }
+}
+
 impl<T: ?Sized, A: MemAllocator> Drop for PBox<T, A> {
     fn drop(&mut self) {
         unsafe {
             core::ptr::drop_in_place(self.ptr.as_ptr());
+            let layout = Layout::for_value_raw(self.ptr.as_ptr());
+            if layout.size() != 0 {
+                let meta = mem::replace(&mut self.meta, Meta::null());
+                self.alloc.demalloc(meta, layout);
+            }
         }
-        let meta = mem::replace(&mut self.meta, Meta::null());
-
-        #[cfg(feature = "tracing")]
-        tracing::debug!("PBox meta: {:?}", meta);
-        self.alloc.demalloc(meta);
     }
 }
 
@@ -50,91 +56,52 @@ impl<T: ?Sized, A: MemAllocator> DerefMut for PBox<T, A> {
     }
 }
 
-impl<T: crate::msg::Message, A: MemAllocator> PBox<T, A> {
+impl<T: ?Sized + token::PointeeIn + msg::Message, A: MemAllocator> PBox<T, A> {
     #[inline]
-    pub fn token(self) -> Token<MetaSpanOf<A>> {
+    pub fn token(self) -> Token<A::Meta> {
         let (token, alloc) = self.token_with();
         mem::forget(alloc);
         token
     }
 
     #[inline]
-    pub fn token_with(self) -> (Token<MetaSpanOf<A>>, A) {
+    pub fn token_with(self) -> (Token<A::Meta>, A) {
         let (token_of, alloc) = self.token_of_with();
-        let token = Token::forget(token_of);
-        (token, alloc)
-    }
-
-    #[inline]
-    pub fn detoken(token: Token<MetaSpanOf<A>>, alloc: A) -> Option<Self> {
-        let token_of = Token::recall::<T>(token)?;
-        let b = PBox::<T, A>::detoken_of(token_of, alloc);
-        Some(b)
+        (token_of.into(), alloc)
     }
 }
 
-impl<T, A: MemAllocator> PBox<T, A> {
+impl<T: ?Sized + token::PointeeIn, A: MemAllocator> PBox<T, A> {
     #[inline]
-    pub fn token_of(self) -> TokenOf<T, MetaSpanOf<A>> {
+    pub fn token_of(self) -> TokenOf<T, A::Meta> {
         let (token, alloc) = self.token_of_with();
         mem::forget(alloc);
         token
     }
 
     #[inline]
-    pub fn token_of_with(self) -> (TokenOf<T, MetaSpanOf<A>>, A) {
+    pub fn token_of_with(self) -> (TokenOf<T, A::Meta>, A) {
         let (ptr, meta, alloc) = Self::into_raw_ptr(self);
-        let token = unsafe { TokenOf::from_raw(meta.erase(), ptr) };
+        let token = unsafe { TokenOf::from_raw(meta, ptr) };
         (token, alloc)
     }
+}
 
-    #[inline]
-    pub fn detoken_of<M: IsMetaSpanOf<A>>(token: TokenOf<T, M>, alloc: A) -> Self {
-        unsafe {
-            token.detokenize(alloc, |meta, ptr, alloc| {
-                Self::from_raw_ptr(ptr, meta, alloc)
-            })
-        }
-    }
-
+impl<T, A: MemAllocator> PBox<T, A> {
     pub fn new_in(x: T, alloc: A) -> PBox<T, A> {
-        let boxed = Self::new_uninit_in(alloc);
+        let boxed = PBox::new_uninit_in(alloc);
         boxed.write(x)
     }
 
     pub fn try_new_in(x: T, alloc: A) -> Result<PBox<T, A>, AllocError> {
-        let boxed = Self::try_new_uninit_in(alloc)?;
+        let boxed = PBox::try_new_uninit_in(alloc)?;
         Ok(boxed.write(x))
-    }
-    pub fn new_uninit_in(alloc: A) -> PBox<mem::MaybeUninit<T>, A> {
-        let layout = Layout::new::<mem::MaybeUninit<T>>();
-        // NOTE: Prefer match over unwrap_or_else since closure sometimes not inlineable.
-        // That would make code size bigger.
-        match PBox::try_new_uninit_in(alloc) {
-            Ok(m) => m,
-            Err(_) => alloc::alloc::handle_alloc_error(layout),
-        }
-    }
-
-    pub fn try_new_uninit_in(alloc: A) -> Result<PBox<mem::MaybeUninit<T>, A>, AllocError> {
-        if is_zst::<T>() {
-            return Ok(PBox::null(alloc));
-        }
-
-        let layout = Layout::new::<mem::MaybeUninit<T>>();
-        let meta = alloc.malloc_by(layout).map_err(|_| AllocError)?;
-        Ok(PBox::from_meta(meta, alloc))
-    }
-
-    pub fn from_meta(meta: A::Meta, alloc: A) -> PBox<mem::MaybeUninit<T>, A> {
-        let ptr = meta.as_uninit();
-        PBox { ptr, meta, alloc }
     }
 
     #[inline]
-    pub const fn null(alloc: A) -> Self
+    pub fn null(alloc: A) -> Self
     where
-        A::Meta: [const] Meta,
+        A::Meta: Meta,
     {
         let ptr = NonNull::dangling();
         let meta = A::Meta::null();
@@ -143,15 +110,6 @@ impl<T, A: MemAllocator> PBox<T, A> {
 }
 
 impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
-    pub fn drop_in(b: Self) -> A {
-        let (ptr, meta, alloc) = Self::into_raw_ptr(b);
-        unsafe {
-            core::ptr::drop_in_place(ptr);
-        }
-        alloc.demalloc(meta);
-        alloc
-    }
-
     #[inline]
     pub fn as_ref(&self) -> &T {
         self
@@ -206,55 +164,20 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
             Self { ptr, meta, alloc }
         }
     }
-}
 
-impl<T: crate::msg::Message, A: MemAllocator> PBox<[T], A> {
-    #[inline]
-    pub fn token(self) -> Token<MetaSpanOf<A>> {
-        let (token, alloc) = self.token_with();
-        mem::forget(alloc);
-        token
-    }
-
-    #[inline]
-    pub fn token_with(self) -> (Token<MetaSpanOf<A>>, A) {
-        let (token_of, alloc) = self.token_of_with();
-        let token = Token::forget(token_of);
-        (token, alloc)
-    }
-
-    #[inline]
-    pub fn detoken<M: IsMetaSpanOf<A>>(token: Token<M>, alloc: A) -> Option<Self> {
-        let token_of = Token::recall::<[T]>(token)?;
-        let b = PBox::<[T], A>::detoken_of(token_of, alloc);
-        Some(b)
-    }
-}
-
-impl<T, A: MemAllocator> PBox<[T], A> {
-    #[inline]
-    pub fn token_of(self) -> TokenOf<[T], MetaSpanOf<A>> {
-        let (token, alloc) = self.token_of_with();
-        mem::forget(alloc);
-        token
-    }
-
-    #[inline]
-    pub fn token_of_with(self) -> (TokenOf<[T], MetaSpanOf<A>>, A) {
-        let (ptr, meta, alloc) = Self::into_raw_ptr(self);
-        let token = unsafe { TokenOf::from_slice(meta.erase(), ptr) };
-        (token, alloc)
-    }
-
-    #[inline]
-    pub fn detoken_of<M: IsMetaSpanOf<A>>(token: TokenOf<[T], M>, alloc: A) -> Self {
+    pub fn drop_in(b: Self) -> A {
+        let (ptr, meta, alloc) = Self::into_raw_ptr(b);
         unsafe {
-            token.detokenize(alloc, |meta, ptr, alloc| {
-                Self::from_raw_ptr(ptr, meta, alloc)
-            })
+            core::ptr::drop_in_place(ptr);
+            let layout = Layout::for_value_raw(ptr);
+            if layout.size() != 0 {
+                alloc.demalloc(meta, layout);
+            }
         }
+        alloc
     }
-
+}
+impl<T, A: MemAllocator> PBox<[T], A> {
     #[inline]
     pub fn copy_elem(elem: T, len: usize, alloc: A) -> PBox<[T], A>
     where
@@ -279,7 +202,7 @@ impl<T, A: MemAllocator> PBox<[T], A> {
         mut f: F,
         alloc: A,
     ) -> Result<PBox<[T], A>, AllocError> {
-        let mut uninit = Self::try_new_uninit_slice_in(len, alloc)?;
+        let mut uninit = PBox::try_new_uninit_slice_in(len, alloc)?;
         for (i, elm) in uninit.iter_mut().enumerate() {
             elm.write(f(i));
         }
@@ -296,7 +219,51 @@ impl<T, A: MemAllocator> PBox<[T], A> {
             m.assume_init()
         }
     }
+}
 
+impl<T, A: MemAllocator> PBox<mem::MaybeUninit<T>, A> {
+    pub fn new_uninit_in(alloc: A) -> Self {
+        let layout = Layout::new::<mem::MaybeUninit<T>>();
+        // NOTE: Prefer match over unwrap_or_else since closure sometimes not inlineable.
+        // That would make code size bigger.
+        match PBox::try_new_uninit_in(alloc) {
+            Ok(m) => m,
+            Err(_) => alloc::alloc::handle_alloc_error(layout),
+        }
+    }
+
+    pub fn try_new_uninit_in(alloc: A) -> Result<Self, AllocError> {
+        if is_zst::<T>() {
+            return Ok(PBox::null(alloc));
+        }
+
+        let layout = Layout::new::<mem::MaybeUninit<T>>();
+        let meta = alloc.malloc_by(layout).map_err(|_| AllocError)?;
+        Ok(PBox::from_meta(meta, alloc))
+    }
+
+    pub fn from_meta(meta: A::Meta, alloc: A) -> Self {
+        let ptr = meta.recall_by(&alloc).cast();
+        PBox { ptr, meta, alloc }
+    }
+
+    #[inline]
+    pub unsafe fn assume_init(self) -> PBox<T, A> {
+        let (ptr, meta, alloc) = PBox::into_raw_ptr(self);
+        unsafe { PBox::from_raw_ptr(ptr as *mut T, meta, alloc) }
+    }
+
+    #[inline]
+    pub fn write(self, value: T) -> PBox<T, A> {
+        let mut this = self;
+        unsafe {
+            (*this).write(value);
+            this.assume_init()
+        }
+    }
+}
+
+impl<T, A: MemAllocator> PBox<[mem::MaybeUninit<T>], A> {
     #[inline]
     pub fn new_uninit_slice_in(len: usize, alloc: A) -> PBox<[mem::MaybeUninit<T>], A> {
         match PBox::try_new_uninit_slice_in(len, alloc) {
@@ -321,40 +288,15 @@ impl<T, A: MemAllocator> PBox<[T], A> {
             alloc.malloc_by(layout).map_err(|_| AllocError)?
         };
 
-        let ptr = meta.as_uninit();
+        let ptr = meta.recall_by(&alloc).cast();
         let slice = ptr::slice_from_raw_parts_mut(ptr.as_ptr(), len);
         unsafe { Ok(PBox::from_raw_ptr(slice, meta, alloc)) }
     }
-}
 
-impl<T, A: MemAllocator> PBox<mem::MaybeUninit<T>, A> {
-    #[inline]
-    pub unsafe fn assume_init(self) -> PBox<T, A> {
-        let (ptr, meta, alloc) = PBox::into_raw_ptr(self);
-        unsafe { PBox::from_raw_ptr(ptr as *mut T, meta, alloc) }
-    }
-
-    #[inline]
-    pub fn write(self, value: T) -> PBox<T, A> {
-        let mut this = self;
-        unsafe {
-            (*this).write(value);
-            this.assume_init()
-        }
-    }
-}
-
-impl<T, A: MemAllocator> PBox<[mem::MaybeUninit<T>], A> {
     #[inline]
     pub unsafe fn assume_init(self) -> PBox<[T], A> {
         let (ptr, meta, alloc) = PBox::into_raw_ptr(self);
         unsafe { PBox::from_raw_ptr(ptr as *mut [T], meta, alloc) }
-    }
-}
-
-impl<T: core::fmt::Debug + ?Sized, A: MemAllocator> core::fmt::Debug for PBox<T, A> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&**self, f)
     }
 }
 
@@ -434,7 +376,7 @@ impl<T: ?Sized, A: MemAllocator> Drop for PArc<T, A> {
         }
 
         core::sync::atomic::fence(core::sync::atomic::Ordering::Acquire);
-        unsafe { self.drop_in() }
+        // unsafe { self.drop_in() }
     }
 }
 
@@ -510,7 +452,7 @@ impl<T, A: MemAllocator> PArc<T, A> {
                 Layout::new::<T>(),
                 |layout| alloc.malloc_by(layout),
                 |meta| {
-                    meta.as_uninit::<PArcIn<T>>()
+                    meta.recall_by(&alloc)
                         .cast::<PArcIn<mem::MaybeUninit<T>>>()
                         .as_ptr()
                 },
@@ -540,7 +482,7 @@ impl<T, A: MemAllocator> PArc<T, A> {
                 Layout::new::<T>(),
                 |layout| alloc.malloc_by(layout),
                 |meta| {
-                    meta.as_uninit::<PArcIn<T>>()
+                    meta.recall_by(&alloc)
                         .cast::<PArcIn<mem::MaybeUninit<T>>>()
                         .as_ptr()
                 },
@@ -564,17 +506,16 @@ impl<T: ?Sized, A: MemAllocator> PArc<T, A> {
         unsafe { &raw mut (*ptr).data }
     }
 
-    #[inline(never)]
-    unsafe fn drop_in(&mut self) {
-        unsafe {
-            ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data);
+    // #[inline(never)]
+    // unsafe fn drop_in(&mut self) {
+    //     unsafe {
+    //         ptr::drop_in_place(&mut (*self.ptr.as_ptr()).data);
 
-            let meta = mem::replace(&mut self.meta, Meta::null());
-            #[cfg(feature = "tracing")]
-            tracing::debug!("PArc meta: {:?}", meta);
-            self.alloc.demalloc(meta);
-        }
-    }
+    //         let layout = self.ptr.
+    //         let meta = mem::replace(&mut self.meta, Meta::null());
+    //         self.alloc.demalloc(meta);
+    //     }
+    // }
 
     #[inline]
     unsafe fn allocate_by<E>(

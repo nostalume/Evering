@@ -1,14 +1,33 @@
 use core::marker::PhantomData;
+use core::mem;
 use core::ops::Deref;
 use core::ptr::{self, NonNull};
 
 use crate::boxed::PBox;
 use crate::channel::driver::Identified;
-use crate::mem::{IsMetaSpanOf, MemAllocator, Meta, MetaSpanOf};
+use crate::mem::{MemAlloc, MemAllocator, Meta};
 use crate::msg::{Envelope, Message, Tag, TagId, TagRef, TypeId, TypeTag};
 use crate::numeric::Id;
 
-#[derive(Clone, Copy, Debug)]
+pub const trait PointeeIn {
+    fn metadata(ptr: *const Self) -> Metadata;
+}
+
+impl<T> PointeeIn for T {
+    #[inline(always)]
+    fn metadata(_ptr: *const Self) -> Metadata {
+        Metadata::Sized
+    }
+}
+
+impl<T> PointeeIn for [T] {
+    #[inline(always)]
+    fn metadata(ptr: *const Self) -> Metadata {
+        Metadata::Slice(ptr.len())
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Metadata {
     Sized,
     Slice(usize),
@@ -16,136 +35,80 @@ enum Metadata {
 
 impl Metadata {
     #[inline(always)]
-    const fn from_ptr<T>(_ptr: *const T) -> Self {
-        Metadata::Sized
+    const fn from_ptr<T: [const] PointeeIn + ?Sized>(ptr: *const T) -> Self {
+        T::metadata(ptr)
     }
 
-    #[inline(always)]
-    const fn from_slice<T>(ptr: *const [T]) -> Self {
-        Metadata::Slice(ptr.len())
+    #[inline]
+    pub unsafe fn as_ptr<T: ?Sized>(self, raw: *mut u8) -> *mut T {
+        // Safety: interprets the ptr by `transmute_copy`.
+        // thin ptr or slice ptr will match the size by Metadata context.
+        //
+        // Don't use `transmute` due to size check hack.
+        match self {
+            Metadata::Sized => unsafe { mem::transmute_copy(&raw) },
+            Metadata::Slice(len) => {
+                let slice = ptr::slice_from_raw_parts_mut(raw as *mut (), len);
+                unsafe { mem::transmute_copy(&slice) }
+            }
+        }
     }
 }
 
-pub struct TokenOf<T: ?Sized + ptr::Pointee, M> {
-    span: M,
+pub struct TokenOf<T: ?Sized, M: Meta> {
+    meta: M,
     metadata: Metadata,
     _marker: PhantomData<T>,
 }
 
-impl<T, M> TokenOf<T, M> {
+impl<T: ?Sized, M: Meta> TokenOf<T, M> {
     #[inline]
-    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> (NonNull<T>, A)
-    where
-        M: IsMetaSpanOf<A> + Clone,
-    {
-        let meta = unsafe { IsMetaSpanOf::recall(self.span.clone(), alloc.base_ptr()) };
-        match self.metadata {
-            Metadata::Sized => {
-                let ptr = unsafe { meta.as_ptr::<T>() };
-                unsafe { (NonNull::new_unchecked(ptr), alloc) }
-            }
-            _ => unreachable!(),
-        }
+    pub unsafe fn boxed<A: MemAllocator<Meta = M>>(self, alloc: A) -> PBox<T, A> {
+        let ptr = unsafe { self.metadata.as_ptr(self.meta.recall_by(&alloc).as_ptr()) };
+
+        unsafe { PBox::from_raw_ptr(ptr, self.meta, alloc) }
     }
 
+    #[inline]
+    pub fn as_ptr<A: MemAlloc>(&self, alloc: &A) -> NonNull<T> {
+        let ptr = unsafe { self.metadata.as_ptr(self.meta.recall_by(&alloc).as_ptr()) };
+        unsafe { NonNull::new_unchecked(ptr) }
+    }
+
+    #[inline]
+    pub unsafe fn detokenize<A: MemAlloc, H>(
+        self,
+        alloc: A,
+        f: impl FnOnce(M, *mut T, A) -> H,
+    ) -> H {
+        let ptr = self.as_ptr(&alloc);
+        let Self {
+            meta, metadata: _, ..
+        } = self;
+        f(meta, ptr.as_ptr(), alloc)
+    }
+}
+
+impl<T: ?Sized + PointeeIn, M: Meta> TokenOf<T, M> {
     #[inline(always)]
-    pub const unsafe fn from_raw(span: M, ptr: *const T) -> Self {
+    pub unsafe fn from_raw(meta: M, ptr: *const T) -> Self
+    {
         let metadata = Metadata::from_ptr(ptr);
         TokenOf {
-            span,
+            meta,
             metadata,
             _marker: PhantomData,
         }
     }
-
-    pub unsafe fn detokenize<A: MemAllocator, Out>(
-        self,
-        alloc: A,
-        f: impl FnOnce(A::Meta, *mut T, A) -> Out,
-    ) -> Out
-    where
-        M: IsMetaSpanOf<A>,
-    {
-        let TokenOf { span, metadata, .. } = self;
-        let meta = unsafe { IsMetaSpanOf::recall(span, alloc.base_ptr()) };
-        match metadata {
-            Metadata::Sized => {
-                let ptr = unsafe { meta.as_ptr::<T>() };
-                f(meta, ptr, alloc)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn detoken<A: MemAllocator>(self, alloc: A) -> PBox<T, A>
-    where
-        M: IsMetaSpanOf<A>,
-    {
-        PBox::<T, A>::detoken_of(self, alloc)
-    }
 }
 
-impl<T, M> TokenOf<[T], M> {
-    #[inline]
-    pub fn as_ptr<A: MemAllocator>(&self, alloc: A) -> (NonNull<[T]>, A)
-    where
-        M: IsMetaSpanOf<A> + Clone,
-    {
-        let meta = unsafe { IsMetaSpanOf::recall(self.span.clone(), alloc.base_ptr()) };
-        match self.metadata {
-            Metadata::Slice(len) => {
-                let ptr = unsafe { meta.as_slice::<T>(len) };
-                unsafe { (NonNull::new_unchecked(ptr), alloc) }
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    #[inline(always)]
-    pub const unsafe fn from_slice(span: M, ptr: *const [T]) -> Self {
-        let metadata = Metadata::from_slice(ptr);
-        TokenOf {
-            span,
-            metadata,
-            _marker: PhantomData,
-        }
-    }
-
-    pub unsafe fn detokenize<A: MemAllocator, Out>(
-        self,
-        alloc: A,
-        f: impl FnOnce(A::Meta, *mut [T], A) -> Out,
-    ) -> Out
-    where
-        M: IsMetaSpanOf<A>,
-    {
-        let TokenOf { span, metadata, .. } = self;
-        let meta = unsafe { IsMetaSpanOf::recall(span, alloc.base_ptr()) };
-        match metadata {
-            Metadata::Slice(len) => {
-                let ptr = unsafe { meta.as_slice::<T>(len) };
-                f(meta, ptr, alloc)
-            }
-            _ => unreachable!(),
-        }
-    }
-
-    pub fn detoken<A: MemAllocator>(self, alloc: A) -> PBox<[T], A>
-    where
-        M: IsMetaSpanOf<A>,
-    {
-        PBox::<[T], A>::detoken_of(self, alloc)
-    }
-}
-
-pub type AllocToken<A> = Token<MetaSpanOf<A>>;
-pub struct Token<M> {
-    span: M,
+pub struct Token<M: Meta> {
+    meta: M,
     metadata: Metadata,
     id: TypeId,
 }
 
-impl<M> core::fmt::Debug for Token<M> {
+impl<M: Meta> core::fmt::Debug for Token<M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("Token")
             .field("metadata", &self.metadata)
@@ -154,21 +117,31 @@ impl<M> core::fmt::Debug for Token<M> {
     }
 }
 
-impl<M> Token<M> {
+impl<M: Meta, T: ?Sized + Message> From<TokenOf<T, M>> for Token<M> {
+    fn from(value: TokenOf<T, M>) -> Self {
+        Self {
+            meta: value.meta,
+            metadata: value.metadata,
+            id: T::TYPE_ID,
+        }
+    }
+}
+
+impl<M: Meta> Token<M> {
     #[inline]
-    pub const fn empty() -> Self
+    pub fn null() -> Self
     where
-        M: [const] crate::mem::Span,
+        M: Meta,
     {
         Self {
-            span: M::null(),
+            meta: M::null(),
             metadata: Metadata::Sized,
             id: <() as TypeTag>::TYPE_ID,
         }
     }
 
     #[inline(always)]
-    pub fn pack_default<H: Envelope + Default>(self) -> PackToken<H, M> {
+    pub fn with_default<H: Envelope + Default>(self) -> PackToken<H, M> {
         PackToken {
             header: H::default(),
             token: self,
@@ -176,7 +149,7 @@ impl<M> Token<M> {
     }
 
     #[inline(always)]
-    pub const fn pack<H: Envelope>(self, header: H) -> PackToken<H, M> {
+    pub const fn with<H: Envelope>(self, header: H) -> PackToken<H, M> {
         PackToken {
             header,
             token: self,
@@ -184,36 +157,22 @@ impl<M> Token<M> {
     }
 
     #[inline]
-    pub fn recall<T: Message + ?Sized>(token: Self) -> Option<TokenOf<T, M>> {
-        let Self { span, metadata, id } = token;
-        if id == T::TYPE_ID {
-            let token_of = TokenOf {
-                span,
-                metadata,
-                _marker: PhantomData,
-            };
-            Some(token_of)
-        } else {
-            None
-        }
-    }
-
-    #[inline]
-    pub fn forget<T: Message + ?Sized>(token_of: TokenOf<T, M>) -> Self {
-        let TokenOf { span, metadata, .. } = token_of;
-        let id = T::TYPE_ID;
-
-        Self { span, metadata, id }
+    pub fn identify<T: Message + ?Sized>(self) -> Option<TokenOf<T, M>> {
+        (self.id == T::TYPE_ID).then_some(TokenOf {
+            meta: self.meta,
+            metadata: self.metadata,
+            _marker: PhantomData,
+        })
     }
 }
 
 pub type ReqToken<T, M> = PackToken<ReqId<T>, M>;
-pub struct PackToken<H: Envelope, M> {
+pub struct PackToken<H: Envelope, M: Meta> {
     header: H,
     token: Token<M>,
 }
 
-impl<H: Envelope + core::fmt::Debug, M> core::fmt::Debug for PackToken<H, M> {
+impl<H: Envelope + core::fmt::Debug, M: Meta> core::fmt::Debug for PackToken<H, M> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.debug_struct("PackToken")
             .field("header", &self.header)
@@ -222,21 +181,20 @@ impl<H: Envelope + core::fmt::Debug, M> core::fmt::Debug for PackToken<H, M> {
     }
 }
 
-impl<H: Envelope, M> PackToken<H, M> {
+impl<H: Envelope, M: Meta> PackToken<H, M> {
     #[inline]
-    pub fn into_parts(self) -> (Token<M>, H) {
-        let Self { header, token } = self;
-        (token, header)
+    pub fn unpack(self) -> (Token<M>, H) {
+        (self.token, self.header)
     }
 
     #[inline]
-    pub fn map_header_in<F: FnOnce(&mut H, &Token<M>)>(&mut self, f: F) {
+    pub fn update<F: FnOnce(&mut H, &Token<M>)>(&mut self, f: F) {
         f(&mut self.header, &self.token)
     }
 
     #[inline]
-    pub fn map_header<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M> {
-        let (token, header) = self.into_parts();
+    pub fn map<T: Envelope, F: FnOnce(H, &Token<M>) -> T>(self, f: F) -> PackToken<T, M> {
+        let (token, header) = self.unpack();
         PackToken {
             header: f(header, &token),
             token,
@@ -256,11 +214,11 @@ impl<H: Envelope, M> PackToken<H, M> {
     }
 
     #[inline]
-    pub fn with_tag_in<T>(&mut self, value: T)
+    pub fn set_tag<T>(&mut self, value: T)
     where
         H: TagRef<T>,
     {
-        self.header.with_tag_in(value);
+        self.header.set_tag(value);
     }
 
     #[inline]
@@ -297,19 +255,22 @@ impl<T: Envelope> const Deref for ReqId<T> {
 impl<T: Envelope> Envelope for ReqId<T> {}
 
 impl<T: Envelope> TagId for ReqId<T> {
+    #[inline]
     fn with_id(self, value: Id) -> Self
     where
         Self: Sized,
     {
         Self { id: value, ..self }
     }
+    #[inline]
     fn id(&self) -> Id {
         self.id
     }
 }
 
-impl<T: Tag<H>, H> Tag<H> for ReqId<T> {
-    fn with_tag(self, value: H) -> Self
+impl<H: Tag<T>, T> Tag<T> for ReqId<H> {
+    #[inline]
+    fn with_tag(self, value: T) -> Self
     where
         Self: Sized,
     {
@@ -319,7 +280,8 @@ impl<T: Tag<H>, H> Tag<H> for ReqId<T> {
         }
     }
 
-    fn tag(&self) -> H {
+    #[inline]
+    fn tag(&self) -> T {
         self.header.tag()
     }
 }
@@ -330,16 +292,16 @@ impl<T: Envelope> ReqId<T> {
     }
 }
 
-impl<T: Envelope, M> Identified<ReqToken<T, M>> for PackToken<T, M> {
+impl<T: Envelope, M: Meta> Identified<ReqToken<T, M>> for PackToken<T, M> {
     fn compose(self, id: Id) -> ReqToken<T, M> {
-        let (token, header) = self.into_parts();
+        let (token, header) = self.unpack();
         let header = ReqId { header, id };
-        token.pack(header)
+        token.with(header)
     }
 
     fn decompose(token: ReqToken<T, M>) -> (Self, Id) {
-        let (token, header) = token.into_parts();
+        let (token, header) = token.unpack();
         let ReqId { id, header } = header;
-        (token.pack(header), id)
+        (token.with(header), id)
     }
 }

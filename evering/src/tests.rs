@@ -2,8 +2,10 @@
 
 use crate::{
     boxed::PBox,
+    channel,
     mem::{self, Access, AddrSpec, MapView, MemAllocInfo, MemAllocator, MetaSpanOf, Mmap, RawMap},
     msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
+    token,
 };
 
 mod mock;
@@ -130,7 +132,7 @@ fn area_init<S: AddrSpec, M: Mmap<S>>(v: MapView<S, M>) {
 }
 
 fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug> + MemAllocInfo + Clone + Sync,
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + MemAllocInfo + Clone + Sync,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -391,10 +393,8 @@ fn parc_stress<const CLONE_NUM: usize, const NUM: usize>(
 }
 
 fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<
-        Error = impl core::fmt::Debug,
-        Meta = impl mem::Meta<SpanMeta = impl Send>,
-    > + Sync,
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl Send + mem::Meta>
+    + Sync,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -455,4 +455,44 @@ fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
             })
             .collect();
     });
+}
+
+fn sync_stress<H: Envelope, M:mem::Meta, F: FnMut(token::Token<M>) -> Option<token::Token<M>>>(
+    s: impl channel::Sender<
+        Item = token::PackToken<H, M>,
+        TryError = channel::TrySendError<token::PackToken<H, M>>,
+    > + channel::QueueChannel,
+    r: impl channel::Receiver<Item = token::PackToken<H, M>, TryError = channel::TryRecvError>
+    + channel::QueueChannel,
+    fuzz_prob: f32,
+    mut handler: F,
+) {
+    use std::thread;
+
+    loop {
+        if !prob(fuzz_prob) {
+            thread::yield_now();
+        }
+
+        let p = match r.try_recv() {
+            Ok(p) => p,
+            Err(e) => match e {
+                channel::TryRecvError::Empty => continue,
+                channel::TryRecvError::Disconnected => break,
+            },
+        };
+
+        let (t, header) = p.unpack();
+
+        match handler(t) {
+            None => {
+                s.close();
+                break;
+            }
+            Some(reply) => {
+                let pack = reply.with(header);
+                let _ = s.try_send(pack);
+            }
+        }
+    }
 }

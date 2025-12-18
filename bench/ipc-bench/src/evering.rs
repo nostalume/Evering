@@ -121,14 +121,14 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                     #[cfg(feature = "tracing")]
                     tracing::debug!("[Server]: received");
 
-                    let (req, header) = packet.into_parts();
+                    let (req, header) = packet.unpack();
                     let req = Byte::slice_detoken(req, &alloc).expect("should detoken");
                     check_req(bufsize, Byte::as_slice(&req));
                     drop(req);
 
                     let (resp, _alloc) = Byte::copied_slice_token(as_slice(&respdata), &alloc);
 
-                    let resp = resp.pack(header);
+                    let resp = resp.with(header);
                     match rs.try_send(resp) {
                         Ok(_) => continue,
                         Err(TrySendError::Full(_)) => {
@@ -168,7 +168,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                             for _ in 0..(iters / CONCURRENCY) {
                                 let (req, alloc) =
                                     Byte::copied_slice_token(as_slice(&req_data), &alloc);
-                                let req = req.pack_default();
+                                let req = req.with_default();
 
                                 let op = match ls.try_submit(req) {
                                     Ok(op) => op,
@@ -184,7 +184,7 @@ pub fn bench(id: &str, iters: usize, bufsize: usize) -> Duration {
                                         continue;
                                     }
                                 };
-                                let (resp, _) = op.await.into_parts();
+                                let (resp, _) = op.await.unpack();
                                 let resp =
                                     Byte::slice_detoken(resp, alloc).expect("should detoken");
 

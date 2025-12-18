@@ -8,6 +8,7 @@ use crate::os::unix::{AddrSpec, UnixFd};
 use crate::perlude::Session;
 use crate::perlude::allocator::{MapAlloc, Optimistic};
 use crate::tests::{prob, tracing_init};
+use crate::token::Token;
 
 type UnixMemHandle = MapView<AddrSpec, FdBackend>;
 type UnixAlloc = MapAlloc<Optimistic, AddrSpec, FdBackend>;
@@ -66,7 +67,7 @@ fn arena_alloc() {
     const ALLOC_NUM: usize = 200;
     const NUM: usize = 5;
     const NAME: &str = "alloc";
-    const SIZE: usize = { (BYTES_SIZE * ALLOC_NUM).next_power_of_two() };
+    const SIZE: usize = (BYTES_SIZE * ALLOC_NUM).next_power_of_two();
 
     tracing_init();
     let a = mock_alloc(NAME, SIZE);
@@ -238,7 +239,6 @@ fn token_slice() {
 
     use crate::mem::MemAllocator;
     use crate::msg::MoveMessage;
-    use crate::token::AllocToken;
 
     const ALLOC_NUM: usize = 100;
     const NUM: usize = 5;
@@ -248,7 +248,7 @@ fn token_slice() {
 
     tracing_init();
 
-    fn rand_slice_token<A: MemAllocator>(a: A) -> (AllocToken<A>, A) {
+    fn rand_slice_token<A: MemAllocator>(a: A) -> (Token<A::Meta>, A) {
         u8::slice_token(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
     }
 
@@ -324,7 +324,7 @@ async fn conn_async() {
             }
 
             let (msg, _) = rand_slice_token(&alloc);
-            let token = msg.pack_default();
+            let token = msg.with_default();
 
             let op = match submitter.try_submit(token) {
                 Ok(op) => op,
@@ -339,7 +339,7 @@ async fn conn_async() {
                 }
             };
 
-            let (res, _) = op.await.into_parts();
+            let (res, _) = op.await.unpack();
             let info = u8::slice_detoken(res, &alloc).unwrap();
             tracing::debug!("[Client] receive: {:?}", info);
         }
@@ -384,14 +384,14 @@ async fn conn_async() {
                 }
             };
 
-            let (token, header) = packet.into_parts();
+            let (token, header) = packet.unpack();
             match handler(token) {
                 None => {
                     sender.close();
                     break;
                 }
                 Some(reply) => {
-                    let packed = reply.pack(header);
+                    let packed = reply.with(header);
                     match sender.try_send(packed) {
                         Ok(_) => continue,
                         Err(TrySendError::Full(_)) => {

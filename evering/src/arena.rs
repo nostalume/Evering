@@ -1,4 +1,5 @@
 use core::{
+    alloc,
     marker::PhantomData,
     mem::MaybeUninit,
     ops::Deref,
@@ -91,25 +92,16 @@ impl core::fmt::Display for Error {
 /// The metadata of the structs allocated from ARENA.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Meta {
-    base_ptr: *const u8,
-    raw: AddrSpan,
-    view: AddrSpan,
-}
-
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SpanMeta {
     raw: AddrSpan,
     view: AddrSpan,
 }
 
 unsafe impl Send for Meta {}
 
-unsafe impl const mem::Meta for Meta {
-    type SpanMeta = SpanMeta;
+impl mem::Meta for Meta {
     #[inline]
     fn null() -> Self {
         Self {
-            base_ptr: core::ptr::null(),
             raw: AddrSpan::null(),
             view: AddrSpan::null(),
         }
@@ -120,48 +112,74 @@ unsafe impl const mem::Meta for Meta {
         self.raw.is_null() || self.view.is_null()
     }
 
-    #[inline]
-    fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>> {
-        if self.is_null() {
-            return NonNull::dangling();
-        }
-        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
-        // memory allocated while it may be uninitiated.
-        unsafe { NonNull::new_unchecked(ptr.cast_mut().cast()) }
+    unsafe fn recall(&self, base_ptr: *const u8) -> NonNull<u8> {
+        unsafe { self.view.as_nonnull(base_ptr) }
     }
 
-    #[inline]
-    fn erase(self) -> Self::SpanMeta {
-        SpanMeta {
-            raw: self.raw,
-            view: self.view,
-        }
-    }
+    // #[inline]
+    // fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>> {
+    //     if self.is_null() {
+    //         return NonNull::dangling();
+    //     }
+    //     let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
+    //     // memory allocated while it may be uninitiated.
+    //     unsafe { NonNull::new_unchecked(ptr.cast_mut().cast()) }
+    // }
 
-    #[inline]
-    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
-        Meta {
-            base_ptr,
-            raw: span.raw,
-            view: span.view,
-        }
-    }
+    // #[inline]
+    // fn erase(self) -> Self::SpanMeta {
+    //     SpanMeta {
+    //         raw: self.raw,
+    //         view: self.view,
+    //     }
+    // }
+
+    // #[inline]
+    // unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
+    //     Meta {
+    //         base_ptr,
+    //         raw: span.raw,
+    //         view: span.view,
+    //     }
+    // }
 }
 
-unsafe impl const mem::Span for SpanMeta {
-    fn null() -> Self {
-        Self {
-            raw: AddrSpan::null(),
-            view: AddrSpan::null(),
-        }
-    }
+// impl SpanMeta {
+//     #[inline]
+//     const fn from_raw(raw_offset: Offset, raw_size: Size) -> Self {
+//         Self {
+//             raw: AddrSpan {
+//                 start_offset: raw_offset,
+//                 size: raw_size,
+//             },
+//             // just set the ptr_offset to the memory_offset, and ptr_size to the memory_size.
+//             // we will align the ptr_offset and ptr_size when it should be aligned.
+//             view: AddrSpan {
+//                 start_offset: raw_offset,
+//                 size: raw_size,
+//             },
+//         }
+//     }
 
-    fn is_null(&self) -> bool {
-        self.raw.is_null() || self.view.is_null()
-    }
-}
+//     #[inline]
+//     pub const unsafe fn recall(self, base_ptr: *const u8) -> Meta {
+//         Meta {
+//             base_ptr,
+//             raw: self.raw,
+//             view: self.view,
+//         }
+//     }
+// }
 
-impl SpanMeta {
+impl Meta {
+    // #[inline]
+    // pub const fn forget(self) -> SpanMeta {
+    //     SpanMeta {
+    //         raw: self.raw,
+    //         view: self.view,
+    //     }
+    // }
+
     #[inline]
     const fn from_raw(raw_offset: Offset, raw_size: Size) -> Self {
         Self {
@@ -179,45 +197,8 @@ impl SpanMeta {
     }
 
     #[inline]
-    pub const unsafe fn recall(self, base_ptr: *const u8) -> Meta {
-        Meta {
-            base_ptr,
-            raw: self.raw,
-            view: self.view,
-        }
-    }
-}
-
-impl Meta {
-    #[inline]
-    pub const fn forget(self) -> SpanMeta {
-        SpanMeta {
-            raw: self.raw,
-            view: self.view,
-        }
-    }
-
-    #[inline]
-    const fn from_raw(base_ptr: *const u8, raw_offset: Offset, raw_size: Size) -> Self {
+    const fn from_req_seg(req_seg: ReqSegment) -> Self {
         Self {
-            base_ptr,
-            raw: AddrSpan {
-                start_offset: raw_offset,
-                size: raw_size,
-            },
-            // just set the ptr_offset to the memory_offset, and ptr_size to the memory_size.
-            // we will align the ptr_offset and ptr_size when it should be aligned.
-            view: AddrSpan {
-                start_offset: raw_offset,
-                size: raw_size,
-            },
-        }
-    }
-
-    #[inline]
-    const fn from_req_seg(base_ptr: *const u8, req_seg: ReqSegment) -> Self {
-        Self {
-            base_ptr,
             raw: AddrSpan {
                 start_offset: req_seg.seg.node_offset,
                 size: req_seg.seg.data_size,
@@ -229,14 +210,14 @@ impl Meta {
         }
     }
 
-    #[inline]
-    unsafe fn clear(&self) {
-        const NULL: u8 = 0;
-        unsafe {
-            let ptr = self.view.as_ptr(self.base_ptr).cast_mut();
-            core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
-        }
-    }
+    // #[inline]
+    // unsafe fn clear(&self) {
+    //     const NULL: u8 = 0;
+    //     unsafe {
+    //         let ptr = self.view.as_ptr(self.base_ptr).cast_mut();
+    //         core::ptr::write_bytes(ptr, NULL, self.view.size.cast_into());
+    //     }
+    // }
 
     #[inline]
     fn align_to(self, align: UInt) -> Self {
@@ -865,7 +846,7 @@ unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for A
 }
 
 unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemDealloc for Arena<H, S> {
-    fn demalloc(&self, meta: Meta) -> bool {
+    fn demalloc(&self, _ptr: NonNull<u8>, meta: Meta, _layout: alloc::Layout) -> bool {
         self.dealloc(meta)
     }
 }
@@ -951,7 +932,7 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
 
     #[inline]
     fn meta(&self, seg: ReqSegment, align: Offset) -> Meta {
-        Meta::from_req_seg(self.base_ptr(), seg).align_to(align)
+        Meta::from_req_seg(seg).align_to(align)
         // unsafe { meta.clear(self) }
     }
 
@@ -1460,8 +1441,7 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
                             allocated,
                             raw_size,
                         );
-                        let meta =
-                            Meta::from_raw(self.base_ptr(), allocated, raw_size).align_to(align);
+                        let meta = Meta::from_raw(allocated, raw_size).align_to(align);
                         // unsafe { meta.clear(a) }
                         Some(meta)
                     };

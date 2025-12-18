@@ -1,4 +1,4 @@
-use crate::{boxed::PBox, mem::MemAllocator, numeric::Id, token::AllocToken};
+use crate::{boxed::PBox, mem::MemAllocator, numeric::Id, token::Token};
 
 pub mod type_id {
     pub type TypeId = u64;
@@ -205,7 +205,7 @@ move_msg! {
 pub struct Move;
 pub trait MoveMessage: Message<Semantics = Move> {
     #[inline]
-    fn token<A: MemAllocator>(self, alloc: A) -> (AllocToken<A>, A)
+    fn token<A: MemAllocator>(self, alloc: A) -> (Token<A::Meta>, A)
     where
         Self: Sized,
     {
@@ -213,7 +213,7 @@ pub trait MoveMessage: Message<Semantics = Move> {
     }
 
     #[inline]
-    fn copied_slice_token<A: MemAllocator>(t: &[Self], alloc: A) -> (AllocToken<A>, A)
+    fn copied_slice_token<A: MemAllocator>(t: &[Self], alloc: A) -> (Token<A::Meta>, A)
     where
         Self: Sized,
     {
@@ -225,7 +225,7 @@ pub trait MoveMessage: Message<Semantics = Move> {
         len: usize,
         f: F,
         alloc: A,
-    ) -> (AllocToken<A>, A)
+    ) -> (Token<A::Meta>, A)
     where
         Self: Sized,
     {
@@ -233,7 +233,7 @@ pub trait MoveMessage: Message<Semantics = Move> {
     }
 
     #[inline]
-    fn detoken<A: MemAllocator>(t: AllocToken<A>, alloc: A) -> Option<PBox<Self, A>>
+    fn detoken<A: MemAllocator>(t: Token<A::Meta>, alloc: A) -> Option<PBox<Self, A>>
     where
         Self: Sized,
     {
@@ -241,7 +241,7 @@ pub trait MoveMessage: Message<Semantics = Move> {
     }
 
     #[inline]
-    fn slice_detoken<A: MemAllocator>(t: AllocToken<A>, alloc: A) -> Option<PBox<[Self], A>>
+    fn slice_detoken<A: MemAllocator>(t: Token<A::Meta>, alloc: A) -> Option<PBox<[Self], A>>
     where
         Self: Sized,
     {
@@ -273,14 +273,14 @@ pub trait Tag<T>: Envelope {
     fn tag(&self) -> T;
 }
 
+pub trait TagRef<T>: Envelope {
+    fn set_tag(&mut self, value: T);
+    fn tag_ref(&self) -> &T;
+}
+
 pub trait TagId: Envelope {
     fn with_id(self, value: Id) -> Self
     where
         Self: Sized;
     fn id(&self) -> Id;
-}
-
-pub trait TagRef<T>: Envelope {
-    fn with_tag_in(&mut self, value: T);
-    fn tag_ref(&self) -> &T;
 }

@@ -1380,17 +1380,13 @@ impl<
         }
     }
 
-    pub fn deallocate(&self, meta: Meta) {
+    pub fn deallocate(&self, ptr: NonNull<u8>, layout: alloc::Layout) {
         let _lock = self.header.lock.lock();
-        if meta.is_null() {
-            return;
-        }
         unsafe {
-            self.header.talc.as_mut_unchecked().deallocate(
-                self.bins,
-                meta.as_nonnull(),
-                meta.view.size,
-            );
+            self.header
+                .talc
+                .as_mut_unchecked()
+                .deallocate(self.bins, ptr, layout.size());
         }
     }
 }
@@ -1424,8 +1420,8 @@ unsafe impl<
     const LD: usize,
 > mem::MemDealloc for Talc<H, LS, BPL, LD>
 {
-    fn demalloc(&self, meta: Self::Meta) -> bool {
-        self.deallocate(meta);
+    fn demalloc(&self, ptr: NonNull<u8>, _meta: Self::Meta, layout: alloc::Layout) -> bool {
+        self.deallocate(ptr, layout);
         true
     }
 }
@@ -1441,58 +1437,17 @@ impl<
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Meta {
-    base_ptr: *const u8,
     view: AddrSpan,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct SpanMeta {
-    view: AddrSpan,
-}
+// #[derive(Debug, Copy, Clone, PartialEq, Eq)]
+// pub struct SpanMeta {
+//     view: AddrSpan,
+// }
 
 unsafe impl Send for Meta {}
 
-unsafe impl const mem::Meta for Meta {
-    type SpanMeta = SpanMeta;
-
-    #[inline]
-    fn null() -> Self {
-        Self {
-            base_ptr: core::ptr::null(),
-            view: AddrSpan::null(),
-        }
-    }
-
-    #[inline]
-    fn is_null(&self) -> bool {
-        self.view.is_null()
-    }
-
-    #[inline]
-    fn as_uninit<T>(&self) -> NonNull<std::mem::MaybeUninit<T>> {
-        if self.is_null() {
-            return NonNull::dangling();
-        }
-        let ptr = unsafe { self.view.as_ptr(self.base_ptr) };
-        // memory allocated while it may be uninitiated.
-        unsafe { NonNull::new_unchecked(ptr.cast_mut().cast()) }
-    }
-
-    #[inline]
-    fn erase(self) -> Self::SpanMeta {
-        SpanMeta { view: self.view }
-    }
-
-    #[inline]
-    unsafe fn recall(span: Self::SpanMeta, base_ptr: *const u8) -> Self {
-        Meta {
-            base_ptr,
-            view: span.view,
-        }
-    }
-}
-
-unsafe impl const mem::Span for SpanMeta {
+impl mem::Meta for Meta {
     #[inline]
     fn null() -> Self {
         Self {
@@ -1504,13 +1459,30 @@ unsafe impl const mem::Span for SpanMeta {
     fn is_null(&self) -> bool {
         self.view.is_null()
     }
+
+    unsafe fn recall(&self, base_ptr: *const u8) -> NonNull<u8> {
+        unsafe { self.as_nonnull(base_ptr) }
+    }
 }
+
+// unsafe impl const mem::Span for SpanMeta {
+//     #[inline]
+//     fn null() -> Self {
+//         Self {
+//             view: AddrSpan::null(),
+//         }
+//     }
+
+//     #[inline]
+//     fn is_null(&self) -> bool {
+//         self.view.is_null()
+//     }
+// }
 
 impl Meta {
     #[inline]
     const fn null() -> Self {
         Self {
-            base_ptr: core::ptr::null(),
             view: AddrSpan::null(),
         }
     }
@@ -1519,9 +1491,8 @@ impl Meta {
         self.view.is_null()
     }
     #[inline]
-    fn from_raw(base_ptr: *const u8, offset: Offset, size: Size) -> Self {
+    fn from_raw(offset: Offset, size: Size) -> Self {
         Self {
-            base_ptr,
             view: AddrSpan::new(offset, size),
         }
     }
@@ -1529,16 +1500,15 @@ impl Meta {
     unsafe fn from_ptr(base_ptr: *const u8, ptr: *const u8, size: Size) -> Self {
         let offset = unsafe { ptr.byte_offset_from_unsigned(base_ptr) };
         Self {
-            base_ptr,
             view: AddrSpan::new(offset, size),
         }
     }
     #[inline]
-    const unsafe fn as_nonnull(&self) -> NonNull<u8> {
+    const unsafe fn as_nonnull(&self, base_ptr: *const u8) -> NonNull<u8> {
         if self.is_null() {
             return NonNull::dangling();
         }
-        unsafe { self.view.as_nonnull(self.base_ptr) }
+        unsafe { self.view.as_nonnull(base_ptr) }
     }
 }
 
