@@ -8,7 +8,7 @@ pub mod cross;
 pub mod driver;
 mod local;
 
-type Slots<T> = [Slot<T>];
+// type Slots<T> = [Slot<T>];
 /// A slot in a queue.
 pub struct Slot<T> {
     /// The current stamp.
@@ -83,7 +83,7 @@ pub trait Queue {
     type Item;
 
     fn header(&self) -> &Header;
-    fn buf(&self) -> &Slots<Self::Item>;
+    fn buf(&self) -> &[Slot<Self::Item>];
 }
 
 pub trait QueueOps: Queue {

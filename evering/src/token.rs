@@ -63,7 +63,7 @@ pub struct TokenOf<T: ?Sized, M: Meta> {
 
 impl<T: ?Sized, M: Meta> TokenOf<T, M> {
     #[inline]
-    pub unsafe fn boxed<A: MemAllocator<Meta = M>>(self, alloc: A) -> PBox<T, A> {
+    pub fn boxed<A: MemAllocator<Meta = M>>(self, alloc: A) -> PBox<T, A> {
         let ptr = unsafe { self.metadata.as_ptr(self.meta.recall_by(&alloc).as_ptr()) };
 
         unsafe { PBox::from_raw_ptr(ptr, self.meta, alloc) }
@@ -91,8 +91,7 @@ impl<T: ?Sized, M: Meta> TokenOf<T, M> {
 
 impl<T: ?Sized + PointeeIn, M: Meta> TokenOf<T, M> {
     #[inline(always)]
-    pub unsafe fn from_raw(meta: M, ptr: *const T) -> Self
-    {
+    pub unsafe fn from_raw(meta: M, ptr: *const T) -> Self {
         let metadata = Metadata::from_ptr(ptr);
         TokenOf {
             meta,

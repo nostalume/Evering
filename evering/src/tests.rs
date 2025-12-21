@@ -3,8 +3,8 @@
 use crate::{
     boxed::PBox,
     channel,
-    mem::{self, Access, AddrSpec, MapView, MemAllocInfo, MemAllocator, MetaSpanOf, Mmap, RawMap},
-    msg::{Envelope, Message, Move, Tag, TypeTag, type_id},
+    mem::{self, AddrSpec, MapView, MemAllocInfo, MemAllocator, Mmap, RawMap},
+    msg::{Envelope, Message, Move, TypeTag, type_id},
     token,
 };
 
@@ -106,10 +106,9 @@ impl Message for Info {
     type Semantics = Move;
 }
 
-#[derive(Debug)]
 pub(crate) struct Infos<A: MemAllocator> {
     version: u32,
-    data: PBox<[u8], A>,
+    data: token::TokenOf<[u8], A::Meta>,
 }
 
 impl<A: MemAllocator> Infos<A> {
@@ -117,9 +116,23 @@ impl<A: MemAllocator> Infos<A> {
     pub fn mock(a: A) -> Self {
         Self {
             version: fastrand::u32(0..100),
-            data: PBox::new_slice_in(fastrand::usize(0..128), |_| fastrand::u8(0..128), a),
+            data: PBox::new_slice_in(fastrand::usize(0..128), |_| fastrand::u8(0..128), a)
+                .token_of(),
         }
     }
+
+    #[inline]
+    pub fn data(&self, alloc: &A) -> &[u8] {
+        unsafe { self.data.as_ptr(alloc).as_ref() }
+    }
+}
+
+impl<A: MemAllocator> TypeTag for Infos<A> {
+    const TYPE_ID: crate::msg::TypeId = type_id::type_id("Info");
+}
+
+impl<A: MemAllocator> Message for Infos<A> {
+    type Semantics = Move;
 }
 
 fn area_init<S: AddrSpec, M: Mmap<S>>(v: MapView<S, M>) {
@@ -132,7 +145,10 @@ fn area_init<S: AddrSpec, M: Mmap<S>>(v: MapView<S, M>) {
 }
 
 fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + MemAllocInfo + Clone + Sync,
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug>
+    + MemAllocInfo
+    + Clone
+    + Sync,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -155,7 +171,7 @@ fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
     // Now it generate freelist nodes
     metas.drain(..).for_each(|meta| {
         tracing::debug!("drain bytes: {:?}", meta);
-        a.demalloc(meta);
+        a.demalloc_bytes(meta);
     });
 
     thread::scope(|s| {
@@ -179,7 +195,7 @@ fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
 }
 
 fn alloc_frag<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug> + Sync,
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + Sync,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -232,7 +248,7 @@ fn alloc_dealloc<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usi
                 b_ref.wait();
                 for meta in chunk {
                     tracing::debug!("{:?}", meta);
-                    a_ref.demalloc(meta);
+                    a_ref.demalloc_bytes(meta);
                 }
             });
         }
@@ -393,8 +409,7 @@ fn parc_stress<const CLONE_NUM: usize, const NUM: usize>(
 }
 
 fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl Send + mem::Meta>
-    + Sync,
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl Send + mem::Meta> + Sync,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -448,7 +463,7 @@ fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
                 s.spawn(move || {
                     b_ref.wait();
                     chunk.into_iter().for_each(|token| {
-                        let recover = token.detoken(&a_ref);
+                        let recover = token.boxed(&a_ref);
                         tracing::debug!("{:?}", recover)
                     })
                 })
@@ -457,7 +472,7 @@ fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
     });
 }
 
-fn sync_stress<H: Envelope, M:mem::Meta, F: FnMut(token::Token<M>) -> Option<token::Token<M>>>(
+fn sync_stress<H: Envelope, M: mem::Meta, F: FnMut(token::Token<M>) -> Option<token::Token<M>>>(
     s: impl channel::Sender<
         Item = token::PackToken<H, M>,
         TryError = channel::TrySendError<token::PackToken<H, M>>,

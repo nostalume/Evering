@@ -1,7 +1,6 @@
 use core::alloc::Layout;
 use core::marker::PhantomData;
-use core::mem::MaybeUninit;
-use core::ptr::{self, NonNull};
+use core::ptr::NonNull;
 
 mod area;
 
@@ -209,7 +208,7 @@ pub trait Meta: Clone {
     fn recall_by<A: MemAlloc>(&self, alloc: &A) -> NonNull<u8> {
         unsafe { self.recall(alloc.base_ptr()) }
     }
-    unsafe fn layout(&self) -> Layout;
+    fn layout_bytes(&self) -> Layout;
 
     // fn as_uninit<T>(&self) -> NonNull<MaybeUninit<T>>;
     // unsafe fn as_ptr<T>(&self) -> *mut T {
@@ -258,7 +257,7 @@ pub unsafe trait MemDealloc: MemAlloc {
     fn demalloc(&self, meta: Self::Meta, layout: Layout) -> bool;
     #[inline]
     fn demalloc_bytes(&self, meta: Self::Meta) -> bool {
-        let layout = meta.layout();
+        let layout = meta.layout_bytes();
         self.demalloc(meta, layout)
     }
 }

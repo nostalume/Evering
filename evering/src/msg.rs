@@ -1,3 +1,5 @@
+use core::marker::PhantomData;
+
 use crate::{boxed::PBox, mem::MemAllocator, numeric::Id, token::Token};
 
 pub mod type_id {
@@ -203,63 +205,36 @@ move_msg! {
 }
 
 pub struct Move;
-pub trait MoveMessage: Message<Semantics = Move> {
-    #[inline]
-    fn token<A: MemAllocator>(self, alloc: A) -> (Token<A::Meta>, A)
-    where
-        Self: Sized,
-    {
-        PBox::new_in(self, alloc).token_with()
-    }
+pub struct MoveMsg<T: ?Sized + Message<Semantics = Move>>(PhantomData<T>);
 
+impl<T: ?Sized + Message<Semantics = Move>> MoveMsg<T> {
     #[inline]
-    fn copied_slice_token<A: MemAllocator>(t: &[Self], alloc: A) -> (Token<A::Meta>, A)
-    where
-        Self: Sized,
-    {
-        PBox::copy_from_slice(t, alloc).token_with()
+    pub fn detoken<A: MemAllocator>(token: Token<A::Meta>, alloc: A) -> Option<PBox<T, A>> {
+        token.identify().map(|of| of.boxed(alloc))
     }
+}
 
+impl<T: Message<Semantics = Move>> MoveMsg<T> {
     #[inline]
-    fn slice_token<A: MemAllocator, F: FnMut(usize) -> Self>(
+    pub fn new<A: MemAllocator>(value: T, alloc: A) -> (Token<A::Meta>, A) {
+        PBox::new_in(value, alloc).token_with()
+    }
+}
+
+impl<T: Message<Semantics = Move>> MoveMsg<[T]> {
+    #[inline]
+    pub fn new_slice<A: MemAllocator>(
         len: usize,
-        f: F,
+        f: impl FnMut(usize) -> T,
         alloc: A,
-    ) -> (Token<A::Meta>, A)
-    where
-        Self: Sized,
-    {
+    ) -> (Token<A::Meta>, A) {
         PBox::new_slice_in(len, f, alloc).token_with()
     }
 
     #[inline]
-    fn detoken<A: MemAllocator>(t: Token<A::Meta>, alloc: A) -> Option<PBox<Self, A>>
-    where
-        Self: Sized,
-    {
-        PBox::<Self, A>::detoken(t, alloc)
+    pub fn copy_from_slice<A: MemAllocator>(src: &[T], alloc: A) -> (Token<A::Meta>, A) {
+        PBox::copy_from_slice(src, alloc).token_with()
     }
-
-    #[inline]
-    fn slice_detoken<A: MemAllocator>(t: Token<A::Meta>, alloc: A) -> Option<PBox<[Self], A>>
-    where
-        Self: Sized,
-    {
-        PBox::<[Self], A>::detoken(t, alloc)
-    }
-}
-
-impl<T: Message<Semantics = Move>> MoveMessage for T {}
-
-impl<T: MoveMessage> MoveMessage for [T] {}
-
-pub struct CoMove;
-pub trait CoMoveMessage {
-    type Portable<A: MemAllocator>;
-    fn token<A: MemAllocator>(self, alloc: A) -> (Self::Portable<A>, A);
-    fn detoken<A: MemAllocator>(repr: Self::Portable<A>, alloc: A) -> Option<(Self, A)>
-    where
-        Self: Sized;
 }
 
 pub trait Envelope {}

@@ -1,5 +1,5 @@
-use crate::msg::Envelope;
-use crate::perlude::allocator::{MapAlloc, Optimistic};
+use crate::msg::{Envelope, MoveMsg};
+use crate::perlude::arena::{MapAlloc, Optimistic};
 use crate::perlude::{Session, SessionBy};
 
 use crate::tests::mock::{MAX_ADDR, MockAddr, MockBackend};
@@ -59,8 +59,7 @@ fn alloc_tests() {
 fn conn_sync() {
     use std::thread;
 
-    use crate::msg::MoveMessage;
-    use crate::perlude::channel::{MsgReceiver, MsgSender, Token, TryRecvError};
+    use crate::perlude::arena::channel::{MsgReceiver, MsgSender, Token, TryRecvError};
     use crate::tests::Info;
 
     const N: usize = 1;
@@ -117,16 +116,16 @@ fn conn_sync() {
     let (ls, lr) = q.clone().lsplit();
     let (rs, rr) = q.clone().rsplit();
 
-    let (msg, alloc) = Info::mock().token(alloc);
+    let (msg, alloc) = MoveMsg::new(Info::mock(), alloc);
     let _ = ls.try_send(msg.with_default());
 
     let handler = |token: Token, label: &'static str| {
         if prob(FUZZ_PROB) {
             None
         } else {
-            let info = Info::detoken(token, &alloc).expect("should work");
+            let info = MoveMsg::<Info>::detoken(token, &alloc).expect("should work");
             tracing::debug!("[{}] receive: {:?}", label, info);
-            let (new, _) = Info::mock().token(&alloc);
+            let (new, _) = MoveMsg::new(Info::mock(), &alloc);
             Some(new)
         }
     };
@@ -141,9 +140,8 @@ fn conn_sync() {
 
 #[tokio::test]
 async fn conn_async() {
-    use crate::msg::MoveMessage;
-    use crate::perlude::allocator::MemAllocator;
-    use crate::perlude::channel::{
+    use crate::perlude::arena::MemAllocator;
+    use crate::perlude::arena::channel::{
         CachePool, MsgCompleter, MsgReceiver, MsgSender, MsgSubmitter, ReqNull, Token,
         TryRecvError, TrySendError, TrySubmitError,
     };
@@ -163,7 +161,7 @@ async fn conn_async() {
                 break;
             }
 
-            let (msg, _) = Info::mock().token(&alloc);
+            let (msg, _) = MoveMsg::new(Info::mock(), &alloc);
             let token = msg.with_default();
 
             let op = match submitter.try_submit(token) {
@@ -180,7 +178,7 @@ async fn conn_async() {
             };
 
             let (res, _) = op.await.unpack();
-            let info = Info::detoken(res, &alloc).unwrap();
+            let info = MoveMsg::<Info>::detoken(res, &alloc).unwrap();
             tracing::debug!("[Client] receive: {:?}", info);
         }
     }
@@ -259,9 +257,9 @@ async fn conn_async() {
 
     let alloc = conn.alloc.clone();
     let handler = move |token: Token| {
-        let info = Info::detoken(token, &alloc).expect("should work");
+        let info = MoveMsg::<Info>::detoken(token, &alloc).expect("should work");
         tracing::debug!("[Server] receive: {:?}", info);
-        let (new, _) = Info::mock().token(&alloc);
+        let (new, _) = MoveMsg::new(Info::mock(), &alloc);
         Some(new)
     };
 

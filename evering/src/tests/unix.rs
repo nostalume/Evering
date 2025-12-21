@@ -2,7 +2,7 @@
 #![cfg(test)]
 
 use crate::mem::{Access, MapBuilder, MapView};
-use crate::msg::Envelope;
+use crate::msg::{Envelope, MoveMsg};
 use crate::os::FdBackend;
 use crate::os::unix::{AddrSpec, UnixFd};
 use crate::perlude::Session;
@@ -161,7 +161,7 @@ fn token_of_pbox() {
                 s.spawn(move || {
                     b_ref.wait();
                     chunk.into_iter().for_each(|token| {
-                        let recover = token.detoken(&a_ref);
+                        let recover = token.boxed(&a_ref);
                         tracing::debug!("{:?}", recover)
                     })
                 })
@@ -223,7 +223,7 @@ fn token_of_slice() {
                 s.spawn(move || {
                     b_ref.wait();
                     chunk.into_iter().for_each(|token| {
-                        let slice = token.detoken(&a_ref);
+                        let slice = token.boxed(&a_ref);
                         tracing::debug!("{:?}", slice)
                     })
                 })
@@ -238,7 +238,6 @@ fn token_slice() {
     use std::thread;
 
     use crate::mem::MemAllocator;
-    use crate::msg::MoveMessage;
 
     const ALLOC_NUM: usize = 100;
     const NUM: usize = 5;
@@ -249,7 +248,7 @@ fn token_slice() {
     tracing_init();
 
     fn rand_slice_token<A: MemAllocator>(a: A) -> (Token<A::Meta>, A) {
-        u8::slice_token(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
+        MoveMsg::new_slice(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
     }
 
     let a = mock_alloc(NAME, SIZE);
@@ -284,7 +283,8 @@ fn token_slice() {
                 s.spawn(move || {
                     b_ref.wait();
                     chunk.into_iter().for_each(|token| {
-                        let slice = u8::slice_detoken(token, &a_ref).expect("should detoken");
+                        let slice =
+                            MoveMsg::<[u8]>::detoken(token, &a_ref).expect("should detoken");
                         tracing::debug!("{:?}", slice)
                     })
                 })
@@ -295,7 +295,6 @@ fn token_slice() {
 
 #[tokio::test]
 async fn conn_async() {
-    use crate::msg::MoveMessage;
     use crate::perlude::allocator::MemAllocator;
     use crate::perlude::channel::{
         CachePool, MsgCompleter, MsgReceiver, MsgSender, MsgSubmitter, MsgToken, ReqNull, Token,
@@ -310,7 +309,7 @@ async fn conn_async() {
     const SIZE: usize = 60000;
 
     fn rand_slice_token<A: MemAllocator>(a: A) -> (Token, A) {
-        u8::slice_token(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
+        MoveMsg::new_slice(fastrand::usize(1..128), |_| fastrand::u8(0..128), a)
     }
 
     async fn client_task<const N: usize, S: MsgSubmitter<(), N>, A: MemAllocator>(
@@ -340,7 +339,7 @@ async fn conn_async() {
             };
 
             let (res, _) = op.await.unpack();
-            let info = u8::slice_detoken(res, &alloc).unwrap();
+            let info = MoveMsg::<[u8]>::detoken(res, &alloc).unwrap();
             tracing::debug!("[Client] receive: {:?}", info);
         }
     }
@@ -418,7 +417,7 @@ async fn conn_async() {
 
     let alloc = conn.alloc.clone();
     let handler = move |token: Token| {
-        let info = u8::slice_detoken(token, &alloc).expect("should work");
+        let info = MoveMsg::<[u8]>::detoken(token, &alloc).expect("should work");
         tracing::debug!("[Server] receive: {:?}", info);
         let (new, _) = rand_slice_token(&alloc);
         Some(new)

@@ -9,10 +9,7 @@ use core::{
     task::{Context, Poll, Waker},
 };
 
-use crate::{
-    channel::{QueueChannel, Sender},
-    numeric::Id,
-};
+use crate::{channel::QueueChannel, numeric::Id};
 
 use crossbeam_utils::Backoff;
 

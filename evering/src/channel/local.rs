@@ -5,11 +5,11 @@ use core::{
     sync::atomic::AtomicUsize,
 };
 
-use crate::channel::{Header, Slot, Slots};
+use crate::channel::{Header, Slot};
 
 struct Queue<T> {
     h: Header,
-    buf: Box<Slots<T>>,
+    buf: Box<[Slot<T>]>,
 }
 
 unsafe impl<T: Send> Send for Queue<T> {}
@@ -19,7 +19,7 @@ impl<T> RefUnwindSafe for Queue<T> {}
 
 struct QueueHandle<'a, T> {
     h: &'a Header,
-    buf: &'a Slots<T>,
+    buf: &'a [Slot<T>],
 }
 
 impl<T> core::fmt::Debug for QueueHandle<'_, T> {
@@ -46,7 +46,7 @@ impl<T> Queue<T> {
         let h = Header::new(cap);
         // Allocate a buffer of `cap` slots initialized
         // with stamps.
-        let buf: Box<Slots<T>> = (0..cap)
+        let buf: Box<[Slot<T>]> = (0..cap)
             .map(|i| {
                 // Set the stamp to `{ lap: 0, index: i }`.
                 Slot {
@@ -75,7 +75,7 @@ impl<T> super::Queue for QueueHandle<'_, T> {
     }
 
     #[inline]
-    fn buf(&self) -> &Slots<Self::Item> {
+    fn buf(&self) -> &[Slot<Self::Item>] {
         self.buf
     }
 }
