@@ -201,17 +201,17 @@ fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
     let mut metas = Vec::new();
 
     for _ in 0..NUM {
-        let bytes = a.malloc_bytes(BYTES_SIZE).unwrap();
+        let bytes = a.alloc_bytes(BYTES_SIZE).unwrap();
         metas.push(bytes);
     }
 
     // Fill the header reserved bytes
     let remained = a.remained();
-    let _ = a.malloc_bytes(remained).unwrap();
+    let _ = a.alloc_bytes(remained).unwrap();
     // Now it generate freelist nodes
     metas.drain(..).for_each(|meta| {
         tracing::debug!("drain bytes: {:?}", meta);
-        a.demalloc_bytes(meta);
+        a.dealloc_bytes(meta);
     });
 
     thread::scope(|s| {
@@ -221,7 +221,7 @@ fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
 
             s.spawn(move || {
                 bar.wait();
-                match a.malloc_bytes(reduced_size) {
+                match a.alloc_bytes(reduced_size) {
                     Ok(meta) => {
                         tracing::debug!("alloc bytes in node: {:?}", meta)
                     }
@@ -244,7 +244,7 @@ fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize
 
     let bar = Barrier::new(NUM);
     let mut metas: Vec<_> = (0..ALLOC_NUM)
-        .map(|_| a.malloc_bytes(BYTES_SIZE).unwrap())
+        .map(|_| a.alloc_bytes(BYTES_SIZE).unwrap())
         .collect();
     thread::scope(|s| {
         for i in 0..NUM {
@@ -262,7 +262,7 @@ fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize
                 b_ref.wait();
                 for meta in chunk {
                     tracing::debug!("{:?}", meta);
-                    a_ref.demalloc_bytes(meta);
+                    a_ref.dealloc_bytes(meta);
                 }
             });
         }
@@ -276,7 +276,7 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
     use std::sync::Barrier;
     use std::thread;
     use std::time::Instant;
-
+    
     const BOUND: usize = 10;
 
     let a = Arc::new(a);
@@ -299,7 +299,7 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
                     let op_start = Instant::now();
 
                     // 1. Stress the allocator: Mix Malloc and Free
-                    if let Ok(meta) = a_ref.malloc_bytes(BYTES_SIZE) {
+                    if let Ok(meta) = a_ref.alloc_bytes(BYTES_SIZE) {
                         active_allocs.push_back(meta);
                     }
 
@@ -308,7 +308,7 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
                     if active_allocs.len() > BOUND {
                         if let Some(old_meta) = active_allocs.pop_front() {
                             // Explicitly drop/deallocate here
-                            a_ref.demalloc_bytes(old_meta);
+                            a_ref.dealloc_bytes(old_meta);
                         }
                     }
 

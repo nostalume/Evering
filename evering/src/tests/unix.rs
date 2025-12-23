@@ -7,6 +7,7 @@ use crate::os::unix::{AddrSpec, UnixFd};
 use crate::tests;
 
 mod arena;
+mod talc;
 
 type UnixMapView = MapView<AddrSpec, FdBackend>;
 

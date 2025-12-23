@@ -34,7 +34,7 @@ impl<T: ?Sized, A: MemAllocator> Drop for PBox<T, A> {
             let layout = Layout::for_value_raw(self.ptr.as_ptr());
             if layout.size() != 0 {
                 let meta = mem::replace(&mut self.meta, Meta::null());
-                self.alloc.demalloc(meta, layout);
+                self.alloc.dealloc(meta, layout);
             }
         }
     }
@@ -171,7 +171,7 @@ impl<T: ?Sized, A: MemAllocator> PBox<T, A> {
             core::ptr::drop_in_place(ptr);
             let layout = Layout::for_value_raw(ptr);
             if layout.size() != 0 {
-                alloc.demalloc(meta, layout);
+                alloc.dealloc(meta, layout);
             }
         }
         alloc
@@ -238,7 +238,7 @@ impl<T, A: MemAllocator> PBox<mem::MaybeUninit<T>, A> {
         }
 
         let layout = Layout::new::<mem::MaybeUninit<T>>();
-        let meta = alloc.malloc_by(layout).map_err(|_| AllocError)?;
+        let meta = alloc.alloc(layout).map_err(|_| AllocError)?;
         Ok(PBox::from_meta(meta, alloc))
     }
 
@@ -285,7 +285,7 @@ impl<T, A: MemAllocator> PBox<[mem::MaybeUninit<T>], A> {
                 Ok(l) => l,
                 Err(_) => return Err(AllocError),
             };
-            alloc.malloc_by(layout).map_err(|_| AllocError)?
+            alloc.alloc(layout).map_err(|_| AllocError)?
         };
 
         let ptr = meta.recall_by(&alloc).cast();
@@ -450,7 +450,7 @@ impl<T, A: MemAllocator> PArc<T, A> {
         let (ptr, meta) = unsafe {
             PArc::<_, A>::allocate_by(
                 Layout::new::<T>(),
-                |layout| alloc.malloc_by(layout),
+                |layout| alloc.alloc(layout),
                 |meta| {
                     meta.recall_by(&alloc)
                         .cast::<PArcIn<mem::MaybeUninit<T>>>()
@@ -480,7 +480,7 @@ impl<T, A: MemAllocator> PArc<T, A> {
         let (ptr, meta) = unsafe {
             PArc::<_, A>::try_allocate_by(
                 Layout::new::<T>(),
-                |layout| alloc.malloc_by(layout),
+                |layout| alloc.alloc(layout),
                 |meta| {
                     meta.recall_by(&alloc)
                         .cast::<PArcIn<mem::MaybeUninit<T>>>()

@@ -10,6 +10,7 @@
     const_cmp
 )]
 #![feature(
+    trait_alias,
     sized_type_properties,
     layout_for_ptr,
     ptr_metadata,

@@ -316,6 +316,8 @@ impl<S: AddrSpec, M: Mmap<S>> SuspendMap<S, M> {
     }
 }
 
+/// Manages the incremental layout and allocation of objects within a memory-mapped area,
+/// allowing reservation of space and commitment with configuration.
 pub struct MapLayout<S: AddrSpec, M: Mmap<S>> {
     area: SuspendMap<S, M>,
     offset: usize,
@@ -339,11 +341,13 @@ unsafe impl<S: AddrSpec, M: Mmap<S>> MemOps for MapLayout<S, M> {
 }
 
 impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
+    /// Returns a reference to the underlying raw map.
     #[inline]
     fn as_raw(&self) -> &RawMap<S, M> {
         &self.area.raw
     }
 
+    /// Creates a new layout manager from a raw map, initializing the header and offset.
     #[inline]
     pub fn new(raw: RawMap<S, M>) -> Result<Self, Error<S, M>> {
         let (area, offset) = Map::new(raw)?;
@@ -351,6 +355,7 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
         Ok(Self { area, offset })
     }
 
+    /// Advances the current offset by the specified amount, returning a new layout.
     #[inline]
     pub fn forward(self, forward: usize) -> Self {
         Self {
@@ -359,21 +364,25 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
         }
     }
 
+    /// Returns the current offset within the memory area.
     #[inline]
     pub const fn cur_offset(&self) -> usize {
         self.offset
     }
 
+    /// Calculates the offset of the given reserve's pointer relative to the layout's start.
     #[inline]
     pub fn ptr_offset<T>(&self, reserve: &Reserve<T>) -> usize {
         unsafe { self.offset(reserve.ptr) }
     }
 
+    /// Returns the remaining size available for allocation.
     #[inline]
     pub fn rest_size(&self) -> usize {
         self.area.size() - self.offset
     }
 
+    /// Reserves space for a type `T` at the current offset, advancing the offset.
     #[inline]
     pub fn reserve<T: Layout>(&mut self) -> Result<Reserve<T>, Error<S, M>> {
         let (ptr, next) = unsafe { self.as_raw().reserve::<T>(self.offset) }?;
@@ -382,6 +391,7 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
         Ok(reserve)
     }
 
+    /// Commits a reserved space with the given configuration, returning a handle to the object.
     #[inline]
     pub fn commit<T: Layout>(
         &mut self,
@@ -393,6 +403,7 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
         Ok(handle)
     }
 
+    /// Reserves and commits space for a type `T` in one step, advancing the offset.
     #[inline]
     pub fn push<T: Layout>(&mut self, conf: T::Config) -> Result<MapHandle<T, S, M>, Error<S, M>> {
         let (ptr, next) = unsafe { self.as_raw().push::<T>(self.offset, conf) }?;
@@ -401,6 +412,7 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
         Ok(handle)
     }
 
+    /// Finalizes the layout and returns the total offset used.
     pub fn finish(self) -> usize {
         self.offset
     }

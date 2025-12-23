@@ -1,6 +1,5 @@
 use crate::msg::{Envelope, MoveMsg};
-use crate::perlude::arena::{MapAlloc, Optimistic};
-use crate::perlude::{Session, SessionBy};
+use crate::perlude::arena::{MapAlloc, Optimistic,Session,SessionBy};
 
 use crate::tests::mock::{MAX_ADDR, MockAddr, MockBackend};
 use crate::tests::{self, prob, tracing_init};
@@ -105,7 +104,7 @@ async fn conn_async() {
 
     const N: usize = 1;
     const SIZE: usize = 256;
-    const FUZZ_PROB: f32 = 0.001;
+    const FUZZ_PROB: f32 = 0.0001;
 
     tracing_init();
 

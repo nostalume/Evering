@@ -1,5 +1,3 @@
-#![cfg(feature = "unix")]
-
 use core::{ffi::c_void, ptr::NonNull};
 pub use nix::{
     libc::off_t,
@@ -17,7 +15,6 @@ use crate::{
 };
 
 type Addr = usize;
-type Size = usize;
 
 unsafe fn as_c_void(ptr: Addr) -> NonNull<c_void> {
     let ptr = ptr as *mut c_void;

@@ -9,7 +9,7 @@ use crate::mem::{AddrSpec, MapLayout, MemAlloc, Mmap};
 use crate::numeric::bit::{bit_check, bit_flip};
 use crate::numeric::{
     AlignPtr, Alignable,
-    bit::{WORD_ALIGN, WORD_BITS, WORD_SIZE, Word},
+    bit::{WORD_ALIGN, WORD_BITS, Word},
 };
 use crate::{header, mem};
 
@@ -162,6 +162,12 @@ impl Tag {
     pub const IS_ABOVE_FREE_FLAG: usize = 1 << 1;
     pub const ALL_FLAG: usize = Self::IS_ABOVE_FREE_FLAG | Self::ALLOCATED_FLAG;
     pub const BASE_MASK: usize = !(Self::IS_ABOVE_FREE_FLAG | Self::ALLOCATED_FLAG);
+
+    #[cfg(feature = "tracing")]
+    #[inline]
+    fn debug(tag: *mut Self, note: &'static str) {
+        tracing::debug!("[Talc]: {} tag: {:?}, {:?}", note, tag, unsafe { *tag })
+    }
 
     #[inline]
     const fn from_acme(acme: *mut u8) -> *mut Self {
@@ -520,11 +526,9 @@ impl FreeTail {
     /// Calculates the chunk base pointer from the chunk acme pointer
     /// by reading the `size_high` field.
     #[inline]
-    unsafe fn to_head(tail: *mut Self) -> *mut FreeHead {
+    const unsafe fn to_head(tail: *mut Self) -> *mut FreeHead {
         unsafe {
             let size = (*tail).size_high;
-            #[cfg(feature = "tracing")]
-            tracing::debug!("[Talc]: to head, size: {}", size);
             tail.byte_sub(size - FreeTail::SIZE).cast()
         }
     }
@@ -607,7 +611,7 @@ impl Chunk {
     #[inline]
     /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
     fn is_chunk<T, U>(base: *mut T, acme: *mut U) -> bool {
-        if !(acme >= base.cast()) {
+        if (acme < base.cast()) {
             return false;
         }
         debug_assert!(acme >= base.cast(), "!(acme {:p} >= base {:p})", acme, base);
@@ -657,78 +661,75 @@ impl Chunk {
                 base: suffix_base,
                 acme: self.acme,
             };
+            #[cfg(feature = "tracing")]
             tracing::debug!("[Talc]: split suffix {:?}", suffix);
             if suffix.is_valid() {
                 self.acme = suffix_base;
-                #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: split suffix success, tag_ptr {:?}", tag_ptr);
                 (Some(suffix), tag_ptr.cast())
             } else {
                 // Tag pointer doesn't change, resolve to original acme.
                 tag_ptr = self.acme.sub(Tag::SIZE);
-                #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: split suffix failed, tag_ptr {:?}", tag_ptr);
                 (None, tag_ptr.cast())
             }
         }
     }
 }
 
-pub trait BinMarker: crate::seal::Sealed {}
-
-impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
-    crate::seal::Sealed for BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
-{
-}
-impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize> BinMarker
-    for BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
-{
-}
-
 /// The static configuration for the allocator binning strategy.
 ///
 /// # Parameters
+/// * `LOG_UNIT`: The log of units of each bins.
+///     - e.g. `3` for 8-byte UNIT_GAP, and increase in `8 * stride` for each stages.
+/// * `LOG_SLOTS`: The log of slots of each stages.
+///     - e.g. `5` for 32 bins per stage, and increase in `32 * stride` for each stages.
 /// * `LINEAR_STAGES`: How many linear stages to use before switching to exponential.
 ///    - e.g., `2` means (Word Stride) -> (Double Word Stride) -> Exponential.
-/// * `BYTES_PER_LINEAR`: The number of bytes enforced per linear stage.
-///    - This acts as the "restrictive gap value". If set to 16, each linear stage covers
-///      `16 * Stride` bytes where `Stride = 2^(LINEAR_STAGES)`.
 /// * `LOG_DIVS`: The log2 of the number of divisions per power-of-two(`2^n`) in the exponential range.
 ///    - e.g., `2` means 4 divisions. `3` means 8 divisions.
 pub struct BinConfig<
-    const LINEAR_STAGES: usize,
-    const BYTES_PER_LINEAR: usize,
-    const LOG_DIVS: usize,
->;
+    const LOG_UNIT: usize,      // e.g., 3 for 8-byte UNIT_GAP
+    const LOG_SLOTS: usize,     // e.g., 5 for 32 bins per stage
+    const LINEAR_STAGES: usize, // e.g., 3 stages
+    const LOG_DIVS: usize,      // e.g., 2 for 4 divisions per pow2
+> {
+    _marker: PhantomData<()>,
+}
+/// For backpressure of range `[4b,...,4mb]`, suggesting a covering for `<= 14kb` fine granularity
+///
+/// - `4 B → 16 KiB`  ← very hot
+/// - `32–64 KiB`    ← hot
+/// - `256 KiB+`     ← cold but expensive.
+pub type Normal = BinConfig<3, 5, 2, 2>;
 
 /// A simplified struct to hold pre-calculated stage data.
 #[derive(Copy, Clone, Debug)]
 pub struct LinearStage {
-    pub size_limit: usize,       // The size limit (exclusive) for this stage
-    pub start_bucket_idx: usize, // The bucket index offset where this stage starts
-    pub stride: usize,           // The step size (gap) for this stage
+    pub size_limit: usize,  // The size limit (exclusive) for this stage
+    pub start_slots: usize, // The bucket index offset where this stage starts
+    pub stride_log2: usize, // The step size (gap) for this stage
 }
 
-impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: usize>
-    BinConfig<LINEAR_STAGES, BYTES_PER_LINEAR, LOG_DIVS>
+// LU/LS/LinS/LD
+impl<
+    const LOG_UNIT: usize,
+    const LOG_SLOTS: usize,
+    const LINEAR_STAGES: usize,
+    const LOG_DIVS: usize,
+> BinConfig<LOG_UNIT, LOG_SLOTS, LINEAR_STAGES, LOG_DIVS>
 {
-    pub const BIN_COUNTS: Size = LINEAR_STAGES * WORD_BITS;
-    pub const BIN_ARRAY_SIZE: Size = Self::BIN_COUNTS * FreeNode::LINK_SIZE;
+    pub const UNIT_GAP: Size = 1 << LOG_UNIT;
+    pub const SLOTS_PER_STAGES: usize = 1 << LOG_SLOTS;
 
-    pub const MIN_CHUNK_SIZE: usize = Chunk::MIN_CHUNK_SIZE;
+    const _CHECK: () = {
+        assert!(
+            Self::SLOTS_PER_STAGES < WORD_BITS,
+            "buckets of each stages must smaller than the maximal bits each word contains. Try decrease BYTES_PER_LINEAR",
+        )
+    };
 
-    pub const UNIT_GAP: Size = WORD_SIZE;
-    // (BYTES_PER_LINEAR * stride)/(UNIT_GAP * stride)
-    pub const BUCKET_IDX_PER_STAGES: usize = BYTES_PER_LINEAR / Self::UNIT_GAP;
-    // 1. Derived Exponential Constants
-    //
-    pub const DIVS_PER_POW2: usize = 1 << LOG_DIVS;
-    // The bitshift required to isolate the division bits.
-    // We rely on LOG_DIVS directly, saving the .ilog2() calculation.
-    pub const DIV_BITS: usize = LOG_DIVS;
+    pub const BIN_COUNTS: usize = LINEAR_STAGES * Self::SLOTS_PER_STAGES;
+    pub const ARRAY_COUNTS: usize = Self::BIN_COUNTS.div_ceil(WORD_BITS);
 
-    // 2. Derived Linear Stage Logic
-    //
     // We pre-calculate the "End Limit" and "Base Bucket Index" for every linear stage.
     // This creates a compile-time lookup table.
     pub const STAGE_DATA: [LinearStage; LINEAR_STAGES] = Self::init_stages();
@@ -739,40 +740,35 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
 
     /// The bucket index where the exponential section begins.
     pub const EXPONENTIAL_START_BUCKET: usize =
-        Self::STAGE_DATA[LINEAR_STAGES - 1].start_bucket_idx + Self::BUCKET_IDX_PER_STAGES;
-
-    /// The 'Magnitude' offset for the exponential logic.
-    /// This effectively aligns the log2 calculation so that the first exponential
-    /// bin starts seamlessly after the last linear bin.
-    pub const MIN_EXP_BITS_LESS_ONE: usize = Self::EXPONENTIAL_START_SIZE.ilog2() as usize;
+        Self::STAGE_DATA[LINEAR_STAGES - 1].start_slots + Self::SLOTS_PER_STAGES;
 
     /// Const function to generate the lookup table for linear stages.
     const fn init_stages() -> [LinearStage; LINEAR_STAGES] {
         let mut stages = [LinearStage {
             size_limit: 0,
-            stride: 0,
-            start_bucket_idx: 0,
+            stride_log2: 0,
+            start_slots: 0,
         }; LINEAR_STAGES];
 
         let mut i = 0;
-        let mut current_stride = 1;
-        let mut current_limit = Self::MIN_CHUNK_SIZE;
-        let mut current_bucket = 0;
+        let mut cur_limit = Chunk::MIN_CHUNK_SIZE;
+        let mut cur_slots = 0;
 
         while i < LINEAR_STAGES {
             // The limit for this stage is the previous limit + (Slots * Stride)
-            let next_limit = current_limit + (BYTES_PER_LINEAR * current_stride);
+            let cur_stride = 1 << i;
+            let cur_size_range = 1 << (LOG_SLOTS + LOG_UNIT + cur_stride);
+            let next_limit = cur_limit + cur_size_range;
 
             stages[i] = LinearStage {
                 size_limit: next_limit,
-                start_bucket_idx: current_bucket,
-                stride: current_stride,
+                start_slots: cur_slots,
+                stride_log2: cur_stride,
             };
 
             // Prepare for next iteration
-            current_limit = next_limit;
-            current_bucket += Self::BUCKET_IDX_PER_STAGES;
-            current_stride *= 2; // Stride doubles: 1 -> 2 -> 4 ...
+            cur_limit = next_limit;
+            cur_slots += Self::SLOTS_PER_STAGES;
             i += 1;
         }
         stages
@@ -781,7 +777,7 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
     /// Maps a size to a bin index using the provided compile-time configuration.
     #[inline]
     const fn bin_idx(size: usize) -> usize {
-        debug_assert!(size >= Self::MIN_CHUNK_SIZE);
+        debug_assert!(size >= Chunk::MIN_CHUNK_SIZE);
 
         // 1. Linear Stage Check
         // Loop unrolling is likely to happen here by the compiler because
@@ -798,102 +794,190 @@ impl<const LOG_DIVS: usize, const LINEAR_STAGES: usize, const BYTES_PER_LINEAR: 
                 // Start of stage N = Limit of stage N-1
 
                 let stage_start = if i == 0 {
-                    Self::MIN_CHUNK_SIZE
+                    Chunk::MIN_CHUNK_SIZE
                 } else {
                     Self::STAGE_DATA[i - 1].size_limit
                 };
 
-                // Formula: Offset / Stride + Base_Bucket_Index
-                return (size - stage_start) / (stage.stride * Self::UNIT_GAP)
-                    + stage.start_bucket_idx;
+                // Formula: Offset / (Stride * LOG_UNIT) + Base_Bucket_Index
+                return ((size - stage_start) >> (stage.stride_log2 + LOG_UNIT))
+                    + stage.start_slots;
             }
             i += 1;
         }
 
         // 2. Exponential Stage (Pseudo-Logarithmic)
-        // If we reach here, size >= Conf::EXPONENTIAL_START_SIZE
+        // If we reach here, size >= EXPONENTIAL_START_SIZE
 
-        // A. Find the coarse magnitude (Power of 2 range)
-        // ilog2 returns floor(log2(size)).
+        // S = size
+        // `bits_less_one = log(S)` in range `[2^(log(S)), 2^(log(S) + 1)]`.
+        // The base size is `base = 2^(log(S))`.
+        //
+        // divide the range into `D = 2^(LOG_DIVS)` segment and compute which one it falls into.
+        // each segment has size `2^(log(S))/2^(LOG_DIVS) = 2^(log(S) - LOG_DIVS)`.
+        // `division = (S - 2^(log(S))/(2^(log(S) - LOG_DIVS)`
+        // `= S/(2^(log(S) - LOG_DIVS) - 2^(LOG_DIVS)`
+        //
+        // As for `[2^(log(S))]` part, `counts = (log(S) - MIN_EXP_BITS) * DIVS`
         let bits_less_one = size.ilog2() as usize;
-
         // Normalizing the magnitude relative to where exponential bins start.
-        let magnitude = bits_less_one - Self::MIN_EXP_BITS_LESS_ONE;
+        let mag_start_bits = Self::EXPONENTIAL_START_SIZE.ilog2() as usize;
+        let magnitude = bits_less_one - mag_start_bits;
 
-        // B. Find the fine division (Fractional part)
-        // We want the 'LOG_DIVS' bits immediately following the MSB.
-        // Shift right to bring those bits to the bottom.
-        // Example: 1_XX_00... >> shift becomes 1XX
-        let shift_amount = bits_less_one - Self::DIV_BITS;
-        let shifted = size >> shift_amount;
+        let shift_amount = bits_less_one - LOG_DIVS;
+        let division = (size >> shift_amount) - (1 << LOG_DIVS);
 
-        // Mask out the leading '1' to get just the index (0..DIVS-1).
-        // effectively: shifted - (1 << LOG_DIVS)
-        let division = shifted - Self::DIVS_PER_POW2;
-
-        // C. Calculate Final Index
-        // Index = (Magnitude * Divs_Per_Mag) + Division_Index + Start_Bucket
-        let bucket_offset = (magnitude * Self::DIVS_PER_POW2) + division;
+        let bucket_offset = (magnitude << LOG_DIVS) + division;
 
         (bucket_offset + Self::EXPONENTIAL_START_BUCKET).min(Self::BIN_COUNTS - 1)
     }
 }
 
-/// # Talc Allocator
-#[repr(C)]
-pub struct TalcMeta<const LS: usize, const BPL: usize, const LD: usize> {
-    /// The bits array of available node.
-    ///
-    /// Each bits of a word suggests existence or not.
-    avails: [Word; LS],
-    /// The pointer to the array of nodes in bits array.
-    bins: Rel<[FreeNodeLink]>,
-    _config: PhantomData<BinConfig<LS, BPL, LD>>,
+pub const trait AsBinConfig {
+    const BIN_COUNTS: usize;
+    const ARRAY_COUNTS: usize;
+
+    fn bin_idx(size: Size) -> usize;
 }
 
-unsafe impl<const LS: usize, const BPL: usize, const LD: usize> Send for TalcMeta<LS, BPL, LD> {}
+impl<
+    const LOG_UNIT: usize,
+    const LOG_SLOTS: usize,
+    const LINEAR_STAGES: usize,
+    const LOG_DIVS: usize,
+> const AsBinConfig for BinConfig<LOG_UNIT, LOG_SLOTS, LINEAR_STAGES, LOG_DIVS>
+{
+    const BIN_COUNTS: usize = Self::BIN_COUNTS;
+    const ARRAY_COUNTS: usize = Self::ARRAY_COUNTS;
+    // type AvailsArray = [Word; 2];
 
-#[repr(C)]
-pub struct TalckMeta<const LS: usize, const BPL: usize, const LD: usize> {
-    lock: Mutex<()>,
-    talc: UnsafeCell<TalcMeta<LS, BPL, LD>>,
-}
-
-unsafe impl<const LS: usize, const BPL: usize, const LD: usize> Sync for TalckMeta<LS, BPL, LD> {}
-
-impl<const LS: usize, const BPL: usize, const LD: usize> const Deref for TalckMeta<LS, BPL, LD> {
-    type Target = TalcMeta<LS, BPL, LD>;
-
-    fn deref(&self) -> &Self::Target {
-        unsafe { self.talc.as_ref_unchecked() }
+    #[inline(always)]
+    fn bin_idx(size: Size) -> usize {
+        Self::bin_idx(size)
     }
 }
 
-pub type Header<const LS: usize, const BPL: usize, const LD: usize> =
-    header::Header<TalckMeta<LS, BPL, LD>>;
-pub type MapHeader<const LS: usize, const BPL: usize, const LD: usize, S, M> =
-    mem::MapHandle<Header<LS, BPL, LD>, S, M>;
+// abbr: LU/LS/LinS/LD
+/// # Talc Allocator
+#[repr(C)]
+pub struct TalcMeta<C: AsBinConfig> {
+    /// The bits array of available node.
+    ///
+    /// Each bits of a word suggests existence or not.
+    ///
+    /// **Currently due to incomplete of generic const expr, we fix it**.
+    avails: [Word; 2],
+    /// The pointer to the array of nodes in bits array.
+    bins: Rel<[FreeNodeLink]>,
+    _marker: PhantomData<C>,
+}
 
-/// For backpressure of range `[4b,...,4mb]`, suggesting a covering for `<= 14kb` fine granularity
-///
-/// - `4 B → 16 KiB`  ← very hot
-/// - `32–64 KiB`    ← hot
-/// - `256 KiB+`     ← cold but expensive.
-// pub type Normal = BinConfig<3, 256, 2>;
-pub type NHeader = Header<3, 256, 2>;
-pub type NMemTalck<S, M> = mem::MapHandle<NHeader, S, M>;
+pub type NTalcMeta = TalcMeta<Normal>;
 
-impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
-    const BIN_COUNTS: usize = BinConfig::<LS, BPL, LD>::BIN_COUNTS;
-    const BIN_ARRAY_SIZE: Size = BinConfig::<LS, BPL, LD>::BIN_ARRAY_SIZE;
+unsafe impl<C: AsBinConfig> Send for TalcMeta<C> {}
+
+impl<C: const AsBinConfig> TalcMeta<C> {
+    const SIZE: usize = core::mem::size_of::<Self>();
+
+    const BIN_COUNTS: usize = C::BIN_COUNTS;
+    const BIN_ARRAY_SIZE: Size = C::ARRAY_COUNTS;
+
+    const FIX_LEN: usize = 2;
+    const _CHECK: () = {
+        assert!(
+            Self::FIX_LEN * WORD_BITS > Self::BIN_COUNTS,
+            "[Talc]: due to incompleteness of generic const expr, the bin_counts must not exceed 2 * word_bits"
+        )
+    };
+
     const MIN_HEAP_SIZE: Size = Chunk::MIN_CHUNK_SIZE + Tag::SIZE;
+    const METADATA_CHUNK_SIZE: Size = Self::BIN_ARRAY_SIZE + 2 * Tag::SIZE;
 
+    #[inline]
+    const unsafe fn claim_metadata(&mut self, ptr: *mut FreeNodeLink) -> *mut u8 {
+        // let metadata_base = base.add(Tag::SIZE).cast::<FreeNodeLink>();
+        unsafe {
+            let mut i = 0;
+            while i < Self::BIN_COUNTS {
+                let bin = ptr.add(i);
+                bin.write(None);
+                i += 1;
+            }
+            let slice = core::ptr::slice_from_raw_parts_mut(ptr, Self::BIN_COUNTS);
+            let metadata = Rel::<[FreeNodeLink]>::from_raw(slice, self.base_ptr());
+            self.bins = metadata;
+
+            let acme = ptr.add(Self::BIN_COUNTS);
+            acme.cast()
+        }
+    }
+
+    pub unsafe fn claim(&mut self, conf: Config) -> Result<(), ()> {
+        let Config { forward, size } = conf;
+        let base = unsafe {
+            self.base_ptr()
+                .byte_add(Self::SIZE + forward)
+                .align_up_of::<Word>()
+        };
+        let size = size.align_down_of::<Word>();
+
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: claim base: {:?}, size: {:?}", base, size);
+        if !self.bins.is_null() {
+            if size <= Self::MIN_HEAP_SIZE {
+                return Err(());
+            }
+            unsafe {
+                Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
+                #[cfg(feature = "tracing")]
+                Tag::debug(base.cast(), "claim: head");
+
+                self.insert_free(FreeHead::from_base(base.byte_add(Tag::SIZE)), size);
+                self.scan_errors();
+                Ok(())
+            }
+        } else {
+            unsafe {
+                if size < Self::METADATA_CHUNK_SIZE {
+                    return Err(());
+                }
+                Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
+                #[cfg(feature = "tracing")]
+                Tag::debug(base.cast(), "claim: head");
+
+                let metadata_base = base.byte_add(Tag::SIZE);
+                let metadata_acme = self.claim_metadata(metadata_base.cast());
+                let metadata_tag_acme = metadata_acme.byte_add(Tag::SIZE);
+
+                // [(base_ptr)header][(base)tag][metadata(metadata_acme)][tag(metadata_tag_acme)][free]
+                let free_size = size - (metadata_tag_acme.offset_from_unsigned(base));
+                if Chunk::is_chunk_size(free_size) {
+                    self.insert_free(FreeHead::from_base(metadata_tag_acme), free_size);
+                    Tag::init(metadata_acme.cast(), base, true, self.base_ptr());
+                    #[cfg(feature = "tracing")]
+                    Tag::debug(base.cast(), "claim: metadata end");
+                } else {
+                    // the whole memory only hold a single chunk.
+                    let acme = base.byte_add(size);
+                    let tag_ptr = Tag::from_acme(acme);
+                    Tag::init(tag_ptr, base, false, self.base_ptr());
+                    Tag::acme_tag(tag_ptr, acme, self.base_ptr());
+                    #[cfg(feature = "tracing")]
+                    Tag::debug(base.cast(), "claim: single chunk end");
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl<C: const AsBinConfig> TalcMeta<C> {
     #[inline]
     const fn null() -> Self {
         TalcMeta {
-            avails: [0usize; LS],
+            avails: [0usize; 2],
             bins: Rel::null(),
-            _config: PhantomData,
+            _marker: PhantomData,
         }
     }
 
@@ -908,78 +992,6 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 
     #[inline]
-    unsafe fn metadata(&mut self, ptr: *mut FreeNodeLink) -> *mut u8 {
-        // let metadata_base = base.add(Tag::SIZE).cast::<FreeNodeLink>();
-        unsafe {
-            let mut i = 0;
-            while i < Self::BIN_COUNTS {
-                let bin = ptr.add(i);
-                bin.write(None);
-                i += 1;
-            }
-            let slice = core::ptr::slice_from_raw_parts_mut(ptr, Self::BIN_COUNTS);
-            let metadata = Rel::<[FreeNodeLink]>::from_raw(slice, self.base_ptr());
-            let acme = ptr.add(Self::BIN_COUNTS);
-            self.bins = metadata;
-            acme.cast()
-        }
-    }
-
-    pub unsafe fn claim(&mut self, base: *mut u8, size: Size) -> Result<(), ()> {
-        let base = base.align_up_of::<Word>();
-        let size = unsafe {
-            (base.add(size))
-                .align_down_of::<Word>()
-                .byte_offset_from_unsigned(base)
-        };
-        #[cfg(feature = "tracing")]
-        tracing::debug!("[Talc]: claim base: {:?}, size: {:?}", base, size);
-        if !self.bins.is_null() {
-            if size <= Self::MIN_HEAP_SIZE {
-                return Err(());
-            }
-            unsafe {
-                Tag::init(base.cast(), self.base_ptr(), true, self.base_ptr());
-                let chunk_base = base.wrapping_add(Tag::SIZE);
-                self.insert_free(FreeHead::from_base(chunk_base), size);
-                self.scan_errors();
-                return Ok(());
-            };
-        } else {
-            unsafe {
-                if size < Tag::SIZE + Self::BIN_ARRAY_SIZE + Tag::SIZE {
-                    return Err(());
-                }
-                Tag::init(base.cast(), base.cast(), true, self.base_ptr());
-                #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: claim mock tag: {:?}", base);
-                let metadata_base = base.byte_add(Tag::SIZE);
-                let metadata_acme = self.metadata(metadata_base.cast());
-                let metadata_chunk_acme = metadata_acme.byte_add(Tag::SIZE);
-
-                let free_size = size - (metadata_chunk_acme.offset_from_unsigned(base));
-                if Chunk::is_chunk_size(free_size) {
-                    self.insert_free(FreeHead::from_base(metadata_chunk_acme), free_size);
-                    Tag::init(metadata_acme.cast(), base, true, self.base_ptr());
-                    tracing::debug!(
-                        "[Talc]: claim metadata end tag: {:?}, {:#b}",
-                        metadata_acme,
-                        metadata_acme.read()
-                    );
-                } else {
-                    // the whole memory only hold a single chunk.
-                    let acme = base.byte_add(size);
-                    let tag_ptr = Tag::from_acme(acme);
-                    Tag::init(tag_ptr, base, false, self.base_ptr());
-                    Tag::acme_tag(tag_ptr, acme, self.base_ptr());
-                    tracing::debug!("[Talc]: claim metadata end tag in chunk: {:?}", base);
-                }
-                Ok(())
-            }
-        }
-    }
-
-    #[inline]
     const fn word_bit_idx(idx: usize) -> (usize, usize) {
         (idx / WORD_BITS, idx % WORD_BITS)
     }
@@ -989,7 +1001,6 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
         debug_assert!(idx < Self::BIN_COUNTS);
 
         let (word_idx, bit_idx) = Self::word_bit_idx(idx);
-        debug_assert!(word_idx < LS);
 
         let word = &mut self.avails[word_idx];
         debug_assert!(bit_check(*word, bit_idx) != should_be);
@@ -1005,6 +1016,53 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     #[inline]
     const fn clear_avail(&mut self, idx: usize) {
         unsafe { self.toggle_avail(idx, false) };
+    }
+
+    #[inline(always)]
+    const fn bin_idx(size: usize) -> usize {
+        C::bin_idx(size)
+    }
+
+    // Context resolution
+    #[inline]
+    const fn bin_by_idx(&self, idx: usize) -> *mut FreeNodeLink {
+        debug_assert!(idx < Self::BIN_COUNTS);
+        unsafe { self.bins().as_mut_ptr().add(idx) }
+    }
+
+    #[inline]
+    const fn bin_by_size(&self, size: usize) -> (*mut FreeNodeLink, usize) {
+        let idx = Self::bin_idx(size);
+        (self.bin_by_idx(idx), idx)
+    }
+
+    #[inline(always)]
+    const fn next_avail_bin_idx(&self, idx: usize) -> Option<usize> {
+        let word_idx = idx / WORD_BITS;
+        if word_idx >= Self::FIX_LEN {
+            return None;
+        }
+
+        let bit_idx = idx % WORD_BITS;
+        // shift to get the bits array of the given idx.
+        let shift_avails = self.avails[word_idx] >> bit_idx;
+        if shift_avails != 0 {
+            // `trailing_zeros` gets the zero counts from the first non-zero bit 1.
+            // thus we calculate the distance from the original idx to the first non-zero bit.
+            return Some(idx + shift_avails.trailing_zeros() as usize);
+        }
+
+        // if the word of given idx is empty, found the next repeatly.
+        let mut i = word_idx + 1;
+        while i < Self::FIX_LEN {
+            let word = self.avails[i];
+            if word != 0 {
+                return Some(i * WORD_BITS + word.trailing_zeros() as usize);
+            }
+            i += 1;
+        }
+
+        None
     }
 
     #[cfg(not(debug_assertions))]
@@ -1045,54 +1103,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 }
 
-impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
-    #[inline(always)]
-    const fn next_avail_bin_idx(&self, idx: usize) -> Option<usize> {
-        let word_idx = idx / WORD_BITS;
-        if word_idx >= LS {
-            return None;
-        }
-
-        let bit_idx = idx % WORD_BITS;
-        // shift to get the bits array of the given idx.
-        let shift_avails = self.avails[word_idx] >> bit_idx;
-        if shift_avails != 0 {
-            // `trailing_zeros` gets the zero counts from the first non-zero bit 1.
-            // thus we calculate the distance from the original idx to the first non-zero bit.
-            return Some(idx + shift_avails.trailing_zeros() as usize);
-        }
-
-        // if the word of given idx is empty, found the next repeatly.
-        let mut i = word_idx + 1;
-        while i < LS {
-            let word = self.avails[i];
-            if word != 0 {
-                return Some(i * WORD_BITS + word.trailing_zeros() as usize);
-            }
-            i += 1;
-        }
-
-        None
-    }
-
-    #[inline(always)]
-    const fn bin_idx(size: usize) -> usize {
-        BinConfig::<LS, BPL, LD>::bin_idx(size)
-    }
-
-    // Context resolution
-    #[inline]
-    const fn bin_by_idx(&self, idx: usize) -> *mut FreeNodeLink {
-        debug_assert!(idx < Self::BIN_COUNTS);
-        unsafe { self.bins().as_mut_ptr().add(idx) }
-    }
-
-    #[inline]
-    const fn bin_by_size(&self, size: usize) -> (*mut FreeNodeLink, usize) {
-        let idx = Self::bin_idx(size);
-        (self.bin_by_idx(idx), idx)
-    }
-
+impl<C: const AsBinConfig> TalcMeta<C> {
     #[inline]
     const fn insert_free(&mut self, head: *mut FreeHead, size: Size) {
         debug_assert!(Chunk::is_chunk_size(size));
@@ -1109,22 +1120,20 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 
     #[inline]
-    unsafe fn remove_free(&mut self, head: *mut FreeHead, bin_idx: usize) {
+    const unsafe fn remove_free(&mut self, head: *mut FreeHead, bin_idx: usize) {
         unsafe {
             let bin = self.bin_by_idx(bin_idx);
             debug_assert!((*bin).is_some());
             FreeHead::deinit(head, self.base_ptr());
 
             if (*bin).is_none() {
-                #[cfg(feature = "tracing")]
-                tracing::debug!("[Talc]: remove free clear avail idx: {}", bin_idx);
                 self.clear_avail(bin_idx);
             }
         }
     }
 
     #[inline]
-    unsafe fn remove_free_by_head(&mut self, head: *mut FreeHead) {
+    const unsafe fn remove_free_by_head(&mut self, head: *mut FreeHead) {
         unsafe {
             let bin_idx = Self::bin_idx((*head).size_low);
             self.remove_free(head, bin_idx);
@@ -1132,7 +1141,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 
     #[inline]
-    unsafe fn remove_free_by_tail(&mut self, tail: *mut FreeTail) -> *mut FreeHead {
+    const unsafe fn remove_free_by_tail(&mut self, tail: *mut FreeTail) -> *mut FreeHead {
         unsafe {
             let head = FreeTail::to_head(tail);
             self.remove_free_by_head(head);
@@ -1155,7 +1164,7 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
 
         let mut bin_idx = self.next_avail_bin_idx(Self::bin_idx(req_size))?;
         #[cfg(feature = "tracing")]
-        tracing::debug!("[Talc]: acquire chunk next avail idx: {}", bin_idx);
+        tracing::debug!("[Talc]: acquire chunk: next avail idx: {}", bin_idx);
         loop {
             unsafe {
                 let cur_rel = *self.bin_by_idx(bin_idx);
@@ -1275,155 +1284,221 @@ impl<const LS: usize, const BPL: usize, const LD: usize> TalcMeta<LS, BPL, LD> {
     }
 }
 
-impl<const LS: usize, const BPL: usize, const LD: usize> TalckMeta<LS, BPL, LD> {
-    const SIZE: Size = core::mem::size_of::<Self>();
-    const ALIGN: Offset = core::mem::align_of::<Self>();
+#[repr(C)]
+pub struct TalckMeta<C: AsBinConfig> {
+    lock: Mutex<()>,
+    talc: UnsafeCell<TalcMeta<C>>,
+}
+
+pub type NTalckMeta = TalckMeta<Normal>;
+
+unsafe impl<C: AsBinConfig> Sync for TalckMeta<C> {}
+
+impl<C: const AsBinConfig> TalckMeta<C> {
+    #[inline]
     const fn null() -> Self {
         Self {
             lock: spin::Mutex::new(()),
-            talc: UnsafeCell::new(TalcMeta::<LS, BPL, LD>::null()),
+            talc: UnsafeCell::new(TalcMeta::null()),
         }
     }
-}
-
-pub struct Talc<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> {
-    header: H,
-    bins: NonNull<[FreeNodeLink]>,
-}
-
-unsafe impl<
-    H: const Deref<Target = Header<LS, BPL, LD>> + Send,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> Send for Talc<H, LS, BPL, LD>
-{
-}
-unsafe impl<
-    H: const Deref<Target = Header<LS, BPL, LD>> + Send,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> Sync for Talc<H, LS, BPL, LD>
-{
-}
-
-pub type RefTalc<'a, const LS: usize, const BPL: usize, const LD: usize> =
-    Talc<&'a Header<LS, BPL, LD>, LS, BPL, LD>;
-pub type MapTalc<const LS: usize, const BPL: usize, const LD: usize, S, M> =
-    Talc<MapHeader<LS, BPL, LD, S, M>, LS, BPL, LD>;
-
-impl<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> Talc<H, LS, BPL, LD>
-{
-    const BIN_COUNTS: usize = BinConfig::<LS, BPL, LD>::BIN_COUNTS;
-    const BIN_ARRAY_SIZE: Size = BinConfig::<LS, BPL, LD>::BIN_ARRAY_SIZE;
-    const MIN_HEAP_SIZE: Size = Chunk::MIN_CHUNK_SIZE + Tag::SIZE;
-    //
 
     #[inline]
-    const fn talc_ref(&self) -> &TalcMeta<LS, BPL, LD> {
-        unsafe { self.header.talc.as_ref_unchecked() }
+    unsafe fn claim(&mut self, conf: Config) -> Result<(), ()> {
+        unsafe { self.talc_mut().claim(conf) }
+    }
+}
+
+impl<C: AsBinConfig> TalckMeta<C> {
+    #[inline]
+    const fn talc_ref(&self) -> &TalcMeta<C> {
+        unsafe { self.talc.as_ref_unchecked() }
     }
 
     #[inline]
-    const unsafe fn talc_mut(&self) -> &mut TalcMeta<LS, BPL, LD> {
-        unsafe { self.header.talc.as_mut_unchecked() }
+    const unsafe fn talc_mut(&self) -> &mut TalcMeta<C> {
+        unsafe { self.talc.as_mut_unchecked() }
     }
+}
 
-    #[inline]
-    const fn base_ptr(&self) -> *const u8 {
-        self.talc_ref().base_ptr()
-    }
+pub type Header<C> = header::Header<TalckMeta<C>>;
+pub type MapHeader<C, S, M> = mem::MapHandle<Header<C>, S, M>;
 
+pub struct Talc<H: const Deref<Target = Header<C>>, C: const AsBinConfig> {
+    pub header: H,
+}
+
+unsafe impl<H: const Deref<Target = Header<C>> + Send, C: const AsBinConfig> Send for Talc<H, C> {}
+unsafe impl<H: const Deref<Target = Header<C>> + Send, C: const AsBinConfig> Sync for Talc<H, C> {}
+
+pub type RefTalc<'a, C> = Talc<&'a Header<C>, C>;
+pub type MapTalc<C, S, M> = Talc<MapHeader<C, S, M>, C>;
+
+impl<H: const Deref<Target = Header<C>>, C: const AsBinConfig> Talc<H, C> {
     pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, ()> {
         let _lock = self.header.lock.lock();
         unsafe {
-            let base_ptr = self.header.talc.as_ref_unchecked().base_ptr();
-            self.header
-                .talc
-                .as_mut_unchecked()
-                .allocate(layout)
-                .map(|ptr| {
-                    let size = layout.size();
-                    Meta::from_ptr(base_ptr, ptr.as_ptr(), size)
-                })
+            self.header.talc_mut().allocate(layout).map(|ptr| {
+                let size = layout.size();
+                Meta::from_ptr(ptr.as_ptr(), self.base_ptr(), size)
+            })
         }
     }
 
     pub fn deallocate(&self, ptr: NonNull<u8>, layout: alloc::Layout) {
         let _lock = self.header.lock.lock();
         unsafe {
-            self.header
-                .talc
-                .as_mut_unchecked()
-                .deallocate(ptr, layout.size());
+            self.header.talc_mut().deallocate(ptr, layout.size());
         }
     }
 }
 
-unsafe impl<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> mem::MemAlloc for Talc<H, LS, BPL, LD>
-{
+unsafe impl<H: const Deref<Target = Header<C>>, C: const AsBinConfig> mem::MemAlloc for Talc<H, C> {
     type Meta = Meta;
 
     type Error = ();
 
     #[inline]
     fn base_ptr(&self) -> *const u8 {
-        self.base_ptr()
+        self.header.talc_ref().base_ptr()
     }
 
     #[inline]
-    fn malloc_by(&self, layout: std::alloc::Layout) -> Result<Self::Meta, Self::Error> {
+    fn alloc(&self, layout: alloc::Layout) -> Result<Self::Meta, Self::Error> {
         self.allocate(layout)
     }
 }
 
-unsafe impl<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> mem::MemDealloc for Talc<H, LS, BPL, LD>
+unsafe impl<H: const Deref<Target = Header<C>>, C: const AsBinConfig> mem::MemDealloc
+    for Talc<H, C>
 {
-    fn demalloc(&self, meta: Self::Meta, layout: alloc::Layout) -> bool {
+    #[inline]
+    fn dealloc(&self, meta: Self::Meta, layout: alloc::Layout) -> bool {
         self.deallocate(unsafe { meta.as_nonnull(self.base_ptr()) }, layout);
         true
     }
 }
 
-impl<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> mem::MemAllocator for Talc<H, LS, BPL, LD>
-{
+impl<H: const Deref<Target = Header<C>>, C: const AsBinConfig> mem::MemAllocator for Talc<H, C> {}
+
+#[derive(Debug, Clone, Copy)]
+pub struct Config {
+    forward: Offset,
+    size: Size,
+}
+
+impl Config {
+    #[inline]
+    pub const fn new(size: Size) -> Self {
+        Self { forward: 0, size }
+    }
+
+    /// Constrains `[forward][size]` to not exceed the given `[bound]`, adjusting for the forward offset.
+    ///
+    /// Example: If `self.size = 100`, `self.forward = 10`, and `bound = 50`,
+    /// the new `size` is `min(100, 50) - 10 = 40`.
+    #[inline]
+    pub const fn with_bound(self, bound: Size) -> Self {
+        assert!(
+            bound > self.forward,
+            "[Talc]: [forward][size] where must [forward] < [bound]"
+        );
+        Self {
+            size: self.size.min(bound) - self.forward,
+            ..self
+        }
+    }
+
+    #[inline]
+    pub const fn with_offset(self, forward: Offset) -> Self {
+        Self { forward, ..self }
+    }
+}
+
+impl<C: const AsBinConfig> header::Layout for TalckMeta<C> {
+    type Config = Config;
+
+    const MAGIC: header::Magic = 0x1234;
+
+    fn init(&mut self, conf: Self::Config) -> header::Status {
+        let ptr = &raw mut *self;
+        unsafe {
+            ptr.write(Self::null());
+            match self.claim(conf) {
+                Ok(_) => header::Status::Initialized,
+                Err(_) => header::Status::Corrupted,
+            }
+        }
+    }
+
+    fn attach(&self) -> header::Status {
+        header::Status::Initialized
+    }
+}
+
+impl<H: const Deref<Target = Header<C>>, C: const AsBinConfig> Talc<H, C> {
+    #[inline]
+    pub const fn header(&self) -> &Header<C> {
+        &self.header
+    }
+}
+
+impl<'a, C: const AsBinConfig> Clone for RefTalc<'a, C> {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header,
+        }
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>, C: const AsBinConfig> Clone for MapTalc<C, S, M> {
+    fn clone(&self) -> Self {
+        Self {
+            header: self.header.clone(),
+        }
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>, C: const AsBinConfig> MapTalc<C, S, M> {
+    #[inline]
+    pub const fn from_handle(handle: MapHeader<C, S, M>) -> Self {
+        Self { header: handle }
+    }
+
+    #[inline]
+    pub fn from_layout(area: MapLayout<S, M>, conf: Config) -> Result<Self, mem::Error<S, M>> {
+        let mut area = area;
+        let reserve = area.reserve::<Header<C>>()?;
+        let conf = conf.with_bound(area.rest_size());
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Talc]: with conf: {:?}", conf);
+
+        let handle = area.commit(reserve, conf)?;
+        Ok(Self::from_handle(handle))
+    }
+
+    #[inline]
+    pub fn as_ref(&self) -> RefTalc<'_, C> {
+        RefTalc {
+            header: &self.header,
+        }
+    }
+}
+
+impl<S: AddrSpec, M: Mmap<S>, C: const AsBinConfig> TryFrom<MapLayout<S, M>> for MapTalc<C, S, M> {
+    type Error = mem::Error<S, M>;
+
+    fn try_from(area: MapLayout<S, M>) -> Result<Self, Self::Error> {
+        use crate::mem::MemOps;
+        let size = area.size();
+        Self::from_layout(area, Config::new(size))
+    }
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Meta {
     view: AddrSpan,
 }
-
-// #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-// pub struct SpanMeta {
-//     view: AddrSpan,
-// }
 
 unsafe impl Send for Meta {}
 
@@ -1458,131 +1533,25 @@ impl Meta {
             view: AddrSpan::null(),
         }
     }
+
     #[inline]
     const fn is_null(&self) -> bool {
         self.view.is_null()
     }
+
     #[inline]
-    fn from_raw(offset: Offset, size: Size) -> Self {
-        Self {
-            view: AddrSpan::new(offset, size),
-        }
-    }
-    #[inline]
-    unsafe fn from_ptr(base_ptr: *const u8, ptr: *const u8, size: Size) -> Self {
+    const unsafe fn from_ptr(ptr: *const u8, base_ptr: *const u8, size: Size) -> Self {
         let offset = unsafe { ptr.byte_offset_from_unsigned(base_ptr) };
         Self {
             view: AddrSpan::new(offset, size),
         }
     }
+
     #[inline]
     const unsafe fn as_nonnull(&self, base_ptr: *const u8) -> NonNull<u8> {
         if self.is_null() {
             return NonNull::dangling();
         }
         unsafe { self.view.as_nonnull(base_ptr) }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct Config {
-    forward: Offset,
-    size: Size,
-}
-
-impl Config {
-    #[inline]
-    pub const fn new(size: Size) -> Self {
-        Self { forward: 0, size }
-    }
-
-    #[inline]
-    pub const fn with_bound(self, bound: Size) -> Self {
-        Self {
-            size: self.size.min(bound),
-            ..self
-        }
-    }
-
-    #[inline]
-    pub const fn with_offset(self, forward: Offset) -> Self {
-        Self { forward, ..self }
-    }
-}
-
-impl<const LS: usize, const BPL: usize, const LD: usize> header::Layout for TalckMeta<LS, BPL, LD> {
-    type Config = Config;
-
-    const MAGIC: header::Magic = 0x1234;
-
-    fn init(&mut self, conf: Self::Config) -> header::Status {
-        let ptr = &raw mut *self;
-        unsafe { ptr.write(Self::null()) };
-        let inits_ptr = unsafe {
-            ptr.byte_add(Self::SIZE + conf.forward)
-                .cast::<u8>()
-                .align_up_of::<Self>()
-        };
-        unsafe {
-            let _ = self
-                .talc
-                .as_mut_unchecked()
-                .claim(inits_ptr.cast(), conf.size);
-        }
-        header::Status::Initialized
-    }
-
-    fn attach(&self) -> header::Status {
-        header::Status::Initialized
-    }
-}
-
-impl<
-    H: const Deref<Target = Header<LS, BPL, LD>>,
-    const LS: usize,
-    const BPL: usize,
-    const LD: usize,
-> Talc<H, LS, BPL, LD>
-{
-    #[inline]
-    pub const fn header(&self) -> &Header<LS, BPL, LD> {
-        &self.header
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>, const LS: usize, const BPL: usize, const LD: usize>
-    MapTalc<LS, BPL, LD, S, M>
-{
-    #[inline]
-    pub const fn from_handle(handle: MapHeader<LS, BPL, LD, S, M>) -> Self {
-        let bins = handle.bins();
-        Self {
-            header: handle,
-            bins,
-        }
-    }
-
-    #[inline]
-    pub fn from_layout(area: MapLayout<S, M>, conf: Config) -> Result<Self, mem::Error<S, M>> {
-        let mut area = area;
-        let reserve = area.reserve::<Header<LS, BPL, LD>>()?;
-        let conf = conf.with_bound(area.rest_size());
-        #[cfg(feature = "tracing")]
-        tracing::debug!("[Talc]: with conf: {:?}", conf);
-
-        let handle = area.commit(reserve, conf)?;
-        Ok(Self::from_handle(handle))
-    }
-}
-
-impl<S: AddrSpec, M: Mmap<S>, const LS: usize, const BPL: usize, const LD: usize>
-    TryFrom<MapLayout<S, M>> for MapTalc<LS, BPL, LD, S, M>
-{
-    type Error = mem::Error<S, M>;
-
-    fn try_from(area: MapLayout<S, M>) -> Result<Self, Self::Error> {
-        use crate::mem::MemOps;
-        let size = area.size();
-        Self::from_layout(area, Config::new(size))
     }
 }

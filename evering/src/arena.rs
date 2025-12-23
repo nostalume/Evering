@@ -777,7 +777,7 @@ unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for A
     }
 
     #[inline]
-    fn malloc_by(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
+    fn alloc(&self, layout: core::alloc::Layout) -> Result<Meta, Error> {
         let size = cap_bound_ok(layout.size())?;
         let align = cap_bound_ok(layout.align())?;
         self.alloc(size, align)
@@ -785,7 +785,7 @@ unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemAlloc for A
 }
 
 unsafe impl<H: const Deref<Target = Header<S>>, S: Strategy> mem::MemDealloc for Arena<H, S> {
-    fn demalloc(&self, meta: Meta, _layout: alloc::Layout) -> bool {
+    fn dealloc(&self, meta: Meta, _layout: alloc::Layout) -> bool {
         self.dealloc(meta)
     }
 }
@@ -1328,14 +1328,10 @@ impl<H: const Deref<Target = Header<S>>, S: Strategy> Arena<H, S> {
                 Ok(_) => {
                     if let Some((alloc_seg, rem_seg)) = self.split_segment(cur_seg) {
                         rem_seg.init_node(prev);
-                        // let next = self.next_segment_node(prev.load());
-                        // let _ = self.merge_segment(next, self.next_segment_node(next.load()));
                         #[cfg(feature = "tracing")]
                         tracing::debug!("[Arena]: allocate as segment with split: {:?}", alloc_seg);
                         return Ok(self.meta(alloc_seg, align));
                     }
-                    // let next = self.next_segment_node(prev.load());
-                    // let _ = self.merge_segment(next, self.next_segment_node(next.load()));
                     #[cfg(feature = "tracing")]
                     tracing::debug!("[Arena]: allocate as segment: {:?}", cur_seg);
                     return Ok(self.meta(cur_seg, align));

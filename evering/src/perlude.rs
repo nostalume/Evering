@@ -1,17 +1,96 @@
 #![allow(unused_imports)]
 
 pub mod talc {
-    use crate::talc;
+    use core::marker::PhantomData;
+
+    use crate::{
+        mem::{self, AddrSpec, MapLayout, MemOps, Mmap},
+        mod_channel,
+        msg::Envelope,
+        numeric::Id,
+        reg, talc,
+    };
+    use channel::{MsgDuplex, MsgDuplexPeek, MsgDuplexView};
+
+    pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
+
+    mod_channel! {
+        channel,
+        meta: crate::talc::Meta,
+    }
+
+    pub trait MemAllocator = mem::MemAllocator<Meta = talc::Meta>;
 
     pub type Meta = talc::Meta;
-    // pub type Span = talc::SpanMeta;
 
-    pub type AllocHeader<const LS: usize, const BPL: usize, const LD: usize> =
-        talc::Header<LS, BPL, LD>;
-    pub type RefAlloc<'a, const LS: usize, const BPL: usize, const LD: usize> =
-        talc::RefTalc<'a, LS, BPL, LD>;
-    pub type MapAlloc<const LS: usize, const BPL: usize, const LD: usize, S, M> =
-        talc::MapTalc<LS, BPL, LD, S, M>;
+    pub type AllocConfig = talc::Config;
+    pub type AllocHeader = talc::Header<talc::Normal>;
+    pub type RefAlloc<'a> = talc::RefTalc<'a, talc::Normal>;
+    pub type MapAlloc<S, M> = talc::MapTalc<talc::Normal, S, M>;
+
+    pub type RegistryHeader<H, const N: usize> = reg::Header<MsgDuplex<H>, N>;
+    pub type MapRegistry<H, const N: usize, S, M> = reg::MapRegistry<MsgDuplex<H>, N, S, M>;
+
+    pub struct SessionBy<H: Envelope, const N: usize> {
+        _marker: PhantomData<H>,
+    }
+
+    pub struct Session<H: Envelope, const N: usize, S: AddrSpec, M: Mmap<S>> {
+        pub alloc: MapAlloc<S, M>,
+        pub reg: MapRegistry<H, N, S, M>,
+    }
+
+    impl<H: Envelope, const N: usize> SessionBy<H, N> {
+        pub fn from<S: AddrSpec, M: Mmap<S>>(
+            area: MapLayout<S, M>,
+        ) -> Result<Session<H, N, S, M>, mem::Error<S, M>> {
+            let conf = AllocConfig::new(area.size());
+            Self::from_config(area, conf)
+        }
+
+        pub fn from_config<S: AddrSpec, M: Mmap<S>>(
+            area: MapLayout<S, M>,
+            conf: AllocConfig,
+        ) -> Result<Session<H, N, S, M>, mem::Error<S, M>> {
+            let mut area = area;
+            let reg = area.push::<RegistryHeader<H, N>>(())?;
+            let areserve = area.reserve::<AllocHeader>()?;
+            let conf = conf.with_bound(area.rest_size());
+            let alloc = area.commit(areserve, conf)?;
+            let alloc = MapAlloc::from_handle(alloc);
+            Ok(Session { alloc, reg })
+        }
+    }
+
+    impl<H: Envelope, const N: usize, S: AddrSpec, M: Mmap<S>> TryFrom<MapLayout<S, M>>
+        for Session<H, N, S, M>
+    {
+        type Error = mem::Error<S, M>;
+
+        fn try_from(value: MapLayout<S, M>) -> Result<Self, Self::Error> {
+            SessionBy::from(value)
+        }
+    }
+
+    impl<H: Envelope, const N: usize, S: AddrSpec, M: Mmap<S>> Session<H, N, S, M> {
+        pub fn prepare(&self, cap: usize) -> Option<Id> {
+            let Ok((id, _)) = self.reg.prepare(cap, self.alloc.as_ref()) else {
+                return None;
+            };
+
+            Some(id)
+        }
+
+        pub fn peek(&self, id: Id) -> Option<MsgDuplexPeek<'_, H>> {
+            let (duplex, _) = self.reg.peek(id, self.alloc.clone());
+            duplex
+        }
+
+        pub fn acquire(&self, id: Id) -> Option<MsgDuplexView<H, S, M>> {
+            let (duplex, _) = self.reg.view(id, self.alloc.clone());
+            duplex
+        }
+    }
 }
 
 pub mod arena {
@@ -27,11 +106,15 @@ pub mod arena {
     };
     use channel::{MsgDuplex, MsgDuplexPeek, MsgDuplexView};
 
+    mod_channel! {
+        channel,
+        meta:crate::arena::Meta,
+    }
+
     pub use crate::arena::{Config, Optimistic, Pessimistic};
     pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
 
-    pub trait MemAllocator: mem::MemAllocator<Meta = arena::Meta> {}
-    impl<T: mem::MemAllocator<Meta = arena::Meta>> MemAllocator for T {}
+    trait MemAllocator = mem::MemAllocator<Meta = arena::Meta>;
 
     pub type AllocMetaConfig = arena::MetaConfig;
     pub type AllocHeader<G> = arena::Header<G>;
@@ -40,11 +123,6 @@ pub mod arena {
 
     pub type RegistryHeader<H, const N: usize> = reg::Header<MsgDuplex<H>, N>;
     pub type MapRegistry<H, const N: usize, S, M> = reg::MapRegistry<MsgDuplex<H>, N, S, M>;
-
-    mod_channel! {
-        channel,
-        meta:crate::arena::Meta,
-    }
 
     pub struct SessionBy<G: Strategy, H: Envelope, const N: usize> {
         _marker: PhantomData<(G, H)>,
@@ -70,12 +148,9 @@ pub mod arena {
             let mut area = area;
             let reg = area.push::<RegistryHeader<H, N>>(())?;
 
-            let offset = area.cur_offset();
-            let size = cap_bound(area.size() - offset);
+            let size = cap_bound(area.rest_size());
             let conf = AllocMetaConfig::default::<G>();
             let alloc = area.push::<AllocHeader<G>>(conf)?;
-
-            let _ = area.finish();
 
             let alloc = MapAlloc::from_conf(alloc, size, aconf);
             Ok(Session { alloc, reg })
@@ -129,38 +204,20 @@ macro_rules! mod_channel {
     (
         $modname:ident,
         meta:$meta:ty,
-        // type injection
-        // $({
-        //     $(type $name:ident = $ty:ty);* $(;)?
-        // })?
     ) => {
         pub mod $modname {
-            // use crate::mem::{self};
-
-            // pub use crate::mem::{Access, Accessible, MapBuilder, MemAllocInfo};
-
-            // pub type Meta = $meta;
-            // pub type Span = SpanOf<Meta>;
-
-            // $(
-            //     $( pub type $name = $ty; )*
-            // )?
-
-            // pub trait MemAllocator: mem::MemAllocator<Meta = Meta> {}
-            // impl<T: mem::MemAllocator<Meta = Meta>> MemAllocator for T {}
-
             type Meta = $meta;
 
-            use crate::channel::driver::CachePoolHandle;
-            use crate::channel::{Receiver, Sender};
-            use crate::channel::{cross, driver};
-            use crate::msg::Envelope;
-            use crate::reg::{Entry, MapEntry};
-            use crate::token;
+            use $crate::channel::driver::CachePoolHandle;
+            use $crate::channel::{Receiver, Sender};
+            use $crate::channel::{cross, driver};
+            use $crate::msg::Envelope;
+            use $crate::reg::{Entry, MapEntry};
+            use $crate::token;
 
-            pub use crate::channel::driver::{Completer, Submitter, TryCompState};
-            pub use crate::channel::{QueueChannel, TryRecvError, TrySendError};
-            pub use crate::token::{ReqId, ReqNull};
+            pub use $crate::channel::driver::{Completer, Submitter, TryCompState};
+            pub use $crate::channel::{QueueChannel, TryRecvError, TrySendError};
+            pub use $crate::token::{ReqId, ReqNull};
 
             pub type Token = token::Token<Meta>;
             pub type MsgToken<H> = token::PackToken<H, Meta>;
@@ -191,59 +248,16 @@ macro_rules! mod_channel {
             pub type RefOp<'a, H, const N: usize> = driver::RefOp<'a, MsgToken<H>, N>;
             pub type OwnOp<H, const N: usize> = driver::OwnOp<MsgToken<H>, N>;
 
-            pub trait MsgSender<H: Envelope>:
-                Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel
-            {
-            }
-
-            impl<
-                H: Envelope,
-                T: Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel,
-            > MsgSender<H> for T
-            {
-            }
-
-            pub trait MsgReceiver<H: Envelope>:
-                Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel
-            {
-            }
-
-            impl<
-                H: Envelope,
-                T: Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel,
-            > MsgReceiver<H> for T
-            {
-            }
+            pub trait MsgSender<H: Envelope> =
+                Sender<Item = MsgToken<H>, TryError = TrySendError<MsgToken<H>>> + QueueChannel;
+            pub trait MsgReceiver<H: Envelope> =
+                Receiver<Item = MsgToken<H>, TryError = TryRecvError> + QueueChannel;
 
             pub type CachePool<H, const N: usize> = CachePoolHandle<MsgToken<H>, N>;
-
-            pub trait MsgSubmitter<H: Envelope, const N: usize>:
-                Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel
-            {
-            }
-
-            impl<
-                H: Envelope,
-                const N: usize,
-                T: Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel,
-            > MsgSubmitter<H, N> for T
-            {
-            }
-
-            pub trait MsgCompleter<H: Envelope, const N: usize>:
-                Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel
-            {
-            }
-
-            impl<
-                H: Envelope,
-                const N: usize,
-                T: Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel,
-            > MsgCompleter<H, N> for T
-            {
-            }
+            pub trait MsgSubmitter<H: Envelope, const N: usize> =
+                Submitter<OwnOp<H, N>, MsgToken<H>, Error = TrySubmitError<H>> + QueueChannel;
+            pub trait MsgCompleter<H: Envelope, const N: usize> =
+                Completer<MsgToken<H>, Error = TryRecvError> + QueueChannel;
         }
     };
 }
-
-pub use arena::{Session, SessionBy};
