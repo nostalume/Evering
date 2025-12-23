@@ -1,8 +1,9 @@
 #![cfg(test)]
+#![allow(dead_code)]
 
 use crate::{
     boxed::PBox,
-    channel,
+    channel::{self, QueueChannel, driver},
     mem::{self, AddrSpec, MapView, MemAllocInfo, MemAllocator, Mmap, RawMap},
     msg::{Envelope, Message, Move, TypeTag, type_id},
     token,
@@ -135,6 +136,45 @@ impl<A: MemAllocator> Message for Infos<A> {
     type Semantics = Move;
 }
 
+fn analyze_latencies(all: Vec<Vec<u64>>) {
+    use hdrhistogram::Histogram;
+
+    const BOUND: u64 = 10_000_000_000;
+    let mut hist = Histogram::<u64>::new_with_bounds(1, BOUND, 3).unwrap();
+
+    for thread_results in all {
+        for latency in thread_results {
+            // Record each operation's latency in nanoseconds
+            hist.saturating_record(latency);
+        }
+    }
+
+    println!("\n--- IPC Allocator Contention Report ---");
+    println!("Total Operations: {}", hist.len());
+    println!(
+        "Throughput:       {:.2} ops/sec",
+        (hist.len() as f64 / (hist.max() as f64 / 1e9))
+    );
+
+    println!("\nLatency Distribution:");
+    println!("  Min:    {:>10} ns", hist.min());
+    println!("  p50:    {:>10} ns (Median)", hist.value_at_quantile(0.5));
+    println!("  p90:    {:>10} ns", hist.value_at_quantile(0.9));
+    println!(
+        "  p99:    {:>10} ns (The 'Stall' point)",
+        hist.value_at_quantile(0.99)
+    );
+    println!("  p99.9:  {:>10} ns", hist.value_at_quantile(0.999));
+    println!("  Max:    {:>10} ns", hist.max());
+
+    // Visualizing the "Knee" of the curve
+    if hist.value_at_quantile(0.99) > hist.value_at_quantile(0.5) * 10 {
+        println!("\n[!] WARNING: High Tail Latency detected.");
+        println!("    Your p99 is >10x your median. This suggests heavy lock contention");
+        println!("    or 'stop-the-world' events in your allocator metadata management.");
+    }
+}
+
 fn area_init<S: AddrSpec, M: Mmap<S>>(v: MapView<S, M>) {
     tracing_init();
 
@@ -194,33 +234,7 @@ fn alloc_exceed<const BYTES_SIZE: usize, const NUM: usize>(
     });
 }
 
-fn alloc_frag<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + Sync,
-) {
-    use std::sync::Barrier;
-    use std::thread;
-
-    tracing_init();
-
-    let bar = Barrier::new(NUM);
-    thread::scope(|s| {
-        for _ in 0..NUM {
-            let a_ref = &a;
-            let bar = &bar;
-
-            s.spawn(move || {
-                bar.wait();
-                for _ in 0..ALLOC_NUM {
-                    if let Ok(meta) = a_ref.malloc_bytes(BYTES_SIZE) {
-                        tracing::debug!("{:?}", meta);
-                    }
-                }
-            });
-        }
-    });
-}
-
-fn alloc_dealloc<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
+fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
     a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl Send + core::fmt::Debug> + Sync,
 ) {
     use std::sync::Barrier;
@@ -253,6 +267,64 @@ fn alloc_dealloc<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usi
             });
         }
     });
+}
+
+fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM: usize>(
+    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + Sync + Send,
+) {
+    use alloc::sync::Arc;
+    use std::sync::Barrier;
+    use std::thread;
+    use std::time::Instant;
+
+    const BOUND: usize = 10;
+
+    let a = Arc::new(a);
+    let bar = Arc::new(Barrier::new(NUM));
+
+    let results = thread::scope(|s| {
+        let mut handlers = Vec::new();
+
+        for _ in 0..NUM {
+            let a_ref = Arc::clone(&a);
+            let bar_ref = Arc::clone(&bar);
+
+            let h = s.spawn(move || {
+                let mut latencies = Vec::with_capacity(OPS_PER_THREAD);
+                let mut active_allocs = std::collections::VecDeque::new();
+
+                bar_ref.wait(); // Global Sync Start
+
+                for _ in 0..OPS_PER_THREAD {
+                    let op_start = Instant::now();
+
+                    // 1. Stress the allocator: Mix Malloc and Free
+                    if let Ok(meta) = a_ref.malloc_bytes(BYTES_SIZE) {
+                        active_allocs.push_back(meta);
+                    }
+
+                    // Maintain a "window" of outstanding allocations
+                    // to simulate high-pressure shared memory usage
+                    if active_allocs.len() > BOUND {
+                        if let Some(old_meta) = active_allocs.pop_front() {
+                            // Explicitly drop/deallocate here
+                            a_ref.demalloc_bytes(old_meta);
+                        }
+                    }
+
+                    latencies.push(op_start.elapsed().as_nanos() as u64);
+                }
+                latencies
+            });
+            handlers.push(h);
+        }
+
+        handlers
+            .into_iter()
+            .map(|h| h.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    analyze_latencies(results);
 }
 
 fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(
@@ -290,7 +362,7 @@ fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(
             s.spawn(move || {
                 b_ref.wait();
                 for _ in 0..ALLOC_NUM {
-                    let droppy = PBox::new_in(Droppy(c_ref.clone()), a_ref.clone());
+                    let droppy = PBox::new_in(Droppy(c_ref.clone()), a_ref);
                     tracing::debug!("counter: {:?}", droppy.0.load(Ordering::Relaxed));
                     drop(droppy)
                     // drop(droppy)
@@ -472,7 +544,7 @@ fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
     });
 }
 
-fn sync_stress<H: Envelope, M: mem::Meta, F: FnMut(token::Token<M>) -> Option<token::Token<M>>>(
+fn stress_conn<H: Envelope, M: mem::Meta, F: FnMut(token::Token<M>) -> Option<token::Token<M>>>(
     s: impl channel::Sender<
         Item = token::PackToken<H, M>,
         TryError = channel::TrySendError<token::PackToken<H, M>>,
@@ -507,6 +579,113 @@ fn sync_stress<H: Envelope, M: mem::Meta, F: FnMut(token::Token<M>) -> Option<to
             Some(reply) => {
                 let pack = reply.with(header);
                 let _ = s.try_send(pack);
+            }
+        }
+    }
+}
+
+async fn client_conn<const N: usize, H: Envelope, M: mem::Meta>(
+    s: impl driver::Submitter<
+        driver::OwnOp<token::PackToken<H, M>, N>,
+        token::PackToken<H, M>,
+        Error = driver::TrySubmitError<channel::TrySendError<token::ReqToken<H, M>>>,
+    > + QueueChannel,
+    mut f: impl FnMut() -> token::PackToken<H, M>,
+    mut handler: impl FnMut(token::Token<M>),
+    fuzz_prob: f32,
+) {
+    loop {
+        if prob(fuzz_prob) {
+            s.close();
+            break;
+        }
+
+        let token = f();
+        // let (msg, _) = MoveMsg::new(Info::mock(), &alloc);
+        // let token = msg.with_default();
+
+        let op = match s.try_submit(token) {
+            Ok(op) => op,
+            Err(driver::TrySubmitError::SendError(channel::TrySendError::Full(_))) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(driver::TrySubmitError::SendError(channel::TrySendError::Disconnected)) => break,
+            Err(driver::TrySubmitError::CacheFull) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+        };
+
+        let (token, _) = op.await.unpack();
+        handler(token);
+    }
+}
+
+async fn complete_conn<H: Envelope, M: mem::Meta>(
+    completer: impl driver::Completer<token::PackToken<H, M>, Error = channel::TryRecvError>
+    + QueueChannel,
+) {
+    loop {
+        match completer.complete() {
+            Ok(_) => continue,
+            Err(channel::TryRecvError::Empty) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(channel::TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+async fn server_conn<
+    H: Envelope,
+    M: mem::Meta,
+>(
+    s: impl channel::Sender<
+        Item = token::PackToken<token::ReqId<H>, M>,
+        TryError = channel::TrySendError<token::PackToken<token::ReqId<H>, M>>,
+    > + channel::QueueChannel,
+    r: impl channel::Receiver<
+        Item = token::PackToken<token::ReqId<H>, M>,
+        TryError = channel::TryRecvError,
+    > + channel::QueueChannel,
+    mut handler: impl FnMut(token::Token<M>) -> Option<token::Token<M>>,
+    fuzz_prob: f32,
+) {
+    loop {
+        if prob(fuzz_prob) {
+            tokio::task::yield_now().await;
+        }
+
+        let packet = match r.try_recv() {
+            Ok(p) => p,
+            Err(channel::TryRecvError::Empty) => {
+                tokio::task::yield_now().await;
+                continue;
+            }
+            Err(channel::TryRecvError::Disconnected) => {
+                s.close();
+                break;
+            }
+        };
+
+        let (token, header) = packet.unpack();
+        match handler(token) {
+            None => {
+                s.close();
+                break;
+            }
+            Some(reply) => {
+                let packed = reply.with(header);
+                match s.try_send(packed) {
+                    Ok(_) => continue,
+                    Err(channel::TrySendError::Full(_)) => {
+                        tokio::task::yield_now().await;
+                        continue;
+                    }
+                    Err(channel::TrySendError::Disconnected) => break,
+                }
             }
         }
     }

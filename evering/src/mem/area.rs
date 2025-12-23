@@ -370,6 +370,11 @@ impl<S: AddrSpec, M: Mmap<S>> MapLayout<S, M> {
     }
 
     #[inline]
+    pub fn rest_size(&self) -> usize {
+        self.area.size() - self.offset
+    }
+
+    #[inline]
     pub fn reserve<T: Layout>(&mut self) -> Result<Reserve<T>, Error<S, M>> {
         let (ptr, next) = unsafe { self.as_raw().reserve::<T>(self.offset) }?;
         let reserve = Reserve { ptr, next };

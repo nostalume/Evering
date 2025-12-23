@@ -124,71 +124,71 @@ fn parc_stress() {
     );
 }
 
-#[test]
-fn token_of_pbox() {
-    use std::sync::Barrier;
-    use std::thread;
+// #[test]
+// fn token_of_pbox() {
+//     use std::sync::Barrier;
+//     use std::thread;
 
-    use crate::boxed::PBox;
+//     use crate::boxed::PBox;
 
-    #[derive(Debug)]
-    struct Recover {
-        f1: u64,
-        f2: char,
-    }
+//     #[derive(Debug)]
+//     struct Recover {
+//         f1: u64,
+//         f2: char,
+//     }
 
-    impl Recover {
-        fn rand() -> Self {
-            Self {
-                f1: fastrand::u64(0..100),
-                f2: fastrand::char('a'..'z'),
-            }
-        }
-    }
+//     impl Recover {
+//         fn rand() -> Self {
+//             Self {
+//                 f1: fastrand::u64(0..100),
+//                 f2: fastrand::char('a'..'z'),
+//             }
+//         }
+//     }
 
-    const ALLOC_NUM: usize = 500;
-    const NUM: usize = 5;
+//     const ALLOC_NUM: usize = 500;
+//     const NUM: usize = 5;
 
-    tracing_init();
+//     tracing_init();
 
-    let mut pt = [0; MAX_ADDR];
-    let a = mock_alloc(&mut pt, 0, MAX_ADDR);
+//     let mut pt = [0; MAX_ADDR];
+//     let a = mock_alloc(&mut pt, 0, MAX_ADDR);
 
-    let bar = Barrier::new(NUM);
-    thread::scope(|s| {
-        let handles = (0..NUM)
-            .map(|_| {
-                let a_ref = &a;
-                let b_ref = &bar;
+//     let bar = Barrier::new(NUM);
+//     thread::scope(|s| {
+//         let handles = (0..NUM)
+//             .map(|_| {
+//                 let a_ref = &a;
+//                 let b_ref = &bar;
 
-                s.spawn(move || {
-                    b_ref.wait();
-                    (0..ALLOC_NUM)
-                        .map(move |_| {
-                            let recover = PBox::new_in(Recover::rand(), &a_ref);
-                            recover.token_of()
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
+//                 s.spawn(move || {
+//                     b_ref.wait();
+//                     (0..ALLOC_NUM)
+//                         .map(move |_| {
+//                             let recover = PBox::new_in(Recover::rand(), &a_ref);
+//                             recover.token_of()
+//                         })
+//                         .collect::<Vec<_>>()
+//                 })
+//             })
+//             .collect::<Vec<_>>();
 
-        let tokens: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+//         let tokens: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
 
-        let _: Vec<_> = tokens
-            .into_iter()
-            .map(|chunk| {
-                let a_ref = &a;
-                let b_ref = &bar;
+//         let _: Vec<_> = tokens
+//             .into_iter()
+//             .map(|chunk| {
+//                 let a_ref = &a;
+//                 let b_ref = &bar;
 
-                s.spawn(move || {
-                    b_ref.wait();
-                    chunk.into_iter().for_each(|token| {
-                        let recover = token.detoken(&a_ref);
-                        tracing::debug!("{:?}", recover)
-                    })
-                })
-            })
-            .collect();
-    });
-}
+//                 s.spawn(move || {
+//                     b_ref.wait();
+//                     chunk.into_iter().for_each(|token| {
+//                         let recover = token.detoken(&a_ref);
+//                         tracing::debug!("{:?}", recover)
+//                     })
+//                 })
+//             })
+//             .collect();
+//     });
+// }

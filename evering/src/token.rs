@@ -28,7 +28,7 @@ impl<T> PointeeIn for [T] {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Metadata {
+pub enum Metadata {
     Sized,
     Slice(usize),
 }

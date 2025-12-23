@@ -28,6 +28,7 @@ nix = { workspace = true, optional = true, features = ["fs", "mman"] }
 
 [dev-dependencies]
 crossbeam-queue = "0.3"
+hdrhistogram.workspace = true
 fastrand.workspace = true
 tokio.workspace = true
 

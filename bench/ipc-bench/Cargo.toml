@@ -7,7 +7,7 @@ edition.workspace = true
 
 [features]
 default = []
-tracing = ["evering/tracing"]
+tracing = ["evering/tracing", "dep:tracing", "dep:tracing-subscriber"]
 
 [dependencies]
 nix.workspace = true
@@ -19,10 +19,10 @@ evering = { workspace = true, features = ["unix"] }
 tokio.workspace = true
 monoio = { version = "0.2.4", features = ["sync"] }
 
-criterion = { version = "0.7.0", features = ["html_reports"] }
+criterion = { version = "0.8.1", features = ["html_reports"] }
 
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing = { version = "0.1", optional = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"], optional = true }
 
 [dependencies.shmipc]
 git = "https://github.com/cloudwego/shmipc-rs"

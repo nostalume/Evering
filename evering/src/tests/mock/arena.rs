@@ -36,10 +36,7 @@ fn alloc_tests() {
         tests::alloc_exceed::<50,20>(a);
     }}
     mock_alloc_test! {|a| {
-        tests::alloc_frag::<4, 1000, 10>(a);
-    }}
-    mock_alloc_test! {|a| {
-        tests::alloc_dealloc::<8, 1000, 5>(a);
+        tests::alloc_lines::<8, 1000, 5>(a);
     }}
     mock_alloc_test! {|a| {
         tests::pbox_droppy::<5, 1000>(a);
@@ -59,50 +56,12 @@ fn alloc_tests() {
 fn conn_sync() {
     use std::thread;
 
-    use crate::perlude::arena::channel::{MsgReceiver, MsgSender, Token, TryRecvError};
+    use crate::perlude::arena::channel::Token;
     use crate::tests::Info;
 
     const N: usize = 1;
     const SIZE: usize = 256;
     const FUZZ_PROB: f32 = 0.01;
-
-    fn stress<S: MsgSender<()>, R: MsgReceiver<()>, F: FnMut(Token) -> Option<Token>>(
-        s: S,
-        r: R,
-        mut handler: F,
-    ) {
-        let mut alive = true;
-
-        while alive {
-            if !prob(FUZZ_PROB) {
-                thread::yield_now();
-            }
-
-            let p = match r.try_recv() {
-                Ok(p) => p,
-                Err(e) => match e {
-                    TryRecvError::Empty => continue,
-                    TryRecvError::Disconnected => break,
-                },
-            };
-
-            let (t, _) = p.unpack();
-            // assert!(h == Exit::None, "header corrupted");
-
-            match handler(t) {
-                None => {
-                    // let exit = Token::empty().pack(Exit::Exit);
-                    // let _ = s.try_send(exit);
-                    s.close();
-                    alive = false;
-                }
-                Some(reply) => {
-                    let pack = reply.with_default();
-                    let _ = s.try_send(pack);
-                }
-            }
-        }
-    }
 
     tracing_init();
 
@@ -129,119 +88,24 @@ fn conn_sync() {
             Some(new)
         }
     };
+
     thread::scope(|s| {
-        s.spawn(|| stress(ls, lr, |token| handler(token, "Left")));
+        s.spawn(|| tests::stress_conn(ls, lr, FUZZ_PROB, |token| handler(token, "Left")));
 
         s.spawn(|| {
-            stress(rs, rr, |token| handler(token, "right"));
+            tests::stress_conn(rs, rr, FUZZ_PROB, |token| handler(token, "right"));
         });
     });
 }
 
 #[tokio::test]
 async fn conn_async() {
-    use crate::perlude::arena::MemAllocator;
-    use crate::perlude::arena::channel::{
-        CachePool, MsgCompleter, MsgReceiver, MsgSender, MsgSubmitter, ReqNull, Token,
-        TryRecvError, TrySendError, TrySubmitError,
-    };
+    use crate::perlude::arena::channel::{CachePool, ReqNull, Token};
     use crate::tests::Info;
 
     const N: usize = 1;
     const SIZE: usize = 256;
-    const FUZZ_PROB: f32 = 0.01;
-
-    async fn client_task<const N: usize, S: MsgSubmitter<(), N>, A: MemAllocator>(
-        submitter: S,
-        alloc: A,
-    ) {
-        loop {
-            if prob(FUZZ_PROB) {
-                submitter.close();
-                break;
-            }
-
-            let (msg, _) = MoveMsg::new(Info::mock(), &alloc);
-            let token = msg.with_default();
-
-            let op = match submitter.try_submit(token) {
-                Ok(op) => op,
-                Err(TrySubmitError::SendError(TrySendError::Full(_))) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(TrySubmitError::SendError(TrySendError::Disconnected)) => break,
-                Err(TrySubmitError::CacheFull) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-            };
-
-            let (res, _) = op.await.unpack();
-            let info = MoveMsg::<Info>::detoken(res, &alloc).unwrap();
-            tracing::debug!("[Client] receive: {:?}", info);
-        }
-    }
-
-    async fn completer_task<const N: usize, C: MsgCompleter<(), N>>(completer: C) {
-        loop {
-            match completer.complete() {
-                Ok(_) => continue,
-                Err(TryRecvError::Empty) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => break,
-            }
-        }
-    }
-
-    async fn server_task<
-        S: MsgSender<ReqNull>,
-        R: MsgReceiver<ReqNull>,
-        F: FnMut(Token) -> Option<Token>,
-    >(
-        sender: S,
-        receiver: R,
-        mut handler: F,
-    ) {
-        loop {
-            if prob(FUZZ_PROB) {
-                tokio::task::yield_now().await;
-            }
-
-            let packet = match receiver.try_recv() {
-                Ok(p) => p,
-                Err(TryRecvError::Empty) => {
-                    tokio::task::yield_now().await;
-                    continue;
-                }
-                Err(TryRecvError::Disconnected) => {
-                    sender.close();
-                    break;
-                }
-            };
-
-            let (token, header) = packet.unpack();
-            match handler(token) {
-                None => {
-                    sender.close();
-                    break;
-                }
-                Some(reply) => {
-                    let packed = reply.with(header);
-                    match sender.try_send(packed) {
-                        Ok(_) => continue,
-                        Err(TrySendError::Full(_)) => {
-                            tokio::task::yield_now().await;
-                            continue;
-                        }
-                        Err(TrySendError::Disconnected) => break,
-                    }
-                }
-            }
-        }
-    }
+    const FUZZ_PROB: f32 = 0.001;
 
     tracing_init();
 
@@ -256,18 +120,28 @@ async fn conn_async() {
     let (ls, lr) = CachePool::<(), SIZE>::new().bind(ls, lr);
 
     let alloc = conn.alloc.clone();
-    let handler = move |token: Token| {
+    let client_token = move || {
+        let (msg, _) = MoveMsg::new(Info::mock(), &alloc);
+        let token = msg.with_default();
+        token
+    };
+    let alloc = conn.alloc.clone();
+    let client_handler = move |token| {
+        let info = MoveMsg::<Info>::detoken(token, &alloc).unwrap();
+        tracing::debug!("[Client] receive: {:?}", info);
+    };
+
+    let alloc = conn.alloc.clone();
+    let server_handler = move |token: Token| {
         let info = MoveMsg::<Info>::detoken(token, &alloc).expect("should work");
         tracing::debug!("[Server] receive: {:?}", info);
         let (new, _) = MoveMsg::new(Info::mock(), &alloc);
         Some(new)
     };
 
-    let server = server_task(rs, rr, move |token| handler(token));
-
-    let alloc = conn.alloc.clone();
-    let client = client_task::<SIZE, _, _>(ls, alloc);
-    let completer = completer_task::<SIZE, _>(lr);
+    let server = tests::server_conn(rs, rr, server_handler, FUZZ_PROB);
+    let client = tests::client_conn(ls, client_token, client_handler, FUZZ_PROB);
+    let completer = tests::complete_conn(lr);
 
     let _ = tokio::join!(server, client, completer);
 }

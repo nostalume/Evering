@@ -76,7 +76,7 @@ impl<T: Layout + core::fmt::Debug> core::fmt::Debug for Header<T> {
     }
 }
 
-impl<T: Layout> Deref for Header<T> {
+impl<T: Layout> const Deref for Header<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
