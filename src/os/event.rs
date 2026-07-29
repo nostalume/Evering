@@ -55,6 +55,17 @@ impl Notify for Ring {
     }
 }
 
+impl Ring {
+    /// Reconstructs a notification owner received from another process.
+    ///
+    /// # Safety
+    ///
+    /// `handle` must be an owned handle to a manual-reset event.
+    pub unsafe fn from_owned_handle(handle: RawHandle) -> Self {
+        Self(Arc::new(Handle(handle.cast())))
+    }
+}
+
 impl Event {
     /// Reconstructs an event owner received from another process.
     ///

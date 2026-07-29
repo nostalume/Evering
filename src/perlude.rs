@@ -333,6 +333,22 @@ pub mod talc {
             unsafe { self.dir.assume_dead(peer) }
         }
 
+        /// Marks `peer` dead using terminal evidence from a retained child.
+        ///
+        /// # Safety
+        ///
+        /// The caller must prove that `peer` is the exact participant owned by
+        /// `exit`, and that no inherited or duplicated mapping authority can
+        /// access this session after that child terminated.
+        #[cfg(feature = "process")]
+        pub unsafe fn assume_exited(
+            &self,
+            peer: Peer,
+            _exit: &crate::process::Exit<'_>,
+        ) -> Option<Recovery<'_>> {
+            unsafe { self.assume_dead(peer) }
+        }
+
         fn scan_recovery(&self, dead: u8, live: u8, repair: bool) -> bool {
             self.dir
                 .scan::<MsgDuplex<H>>(|id| {

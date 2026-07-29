@@ -17,6 +17,8 @@ pub mod msg;
 pub mod notify;
 pub mod os;
 pub mod perlude;
+#[cfg(feature = "process")]
+pub mod process;
 #[cfg(feature = "tokio")]
 pub mod runtime;
 mod schema;

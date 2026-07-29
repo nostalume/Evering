@@ -11,6 +11,9 @@ use std::{
 
 use crate::mem::{Access, Map, Request, Source};
 
+#[cfg(feature = "process")]
+pub mod process;
+
 type Addr = usize;
 
 fn shm_path<P: AsRef<Path> + ?Sized>(name: &P) -> PathBuf {

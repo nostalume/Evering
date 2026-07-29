@@ -41,6 +41,18 @@ impl Notify for Ring {
     }
 }
 
+impl Ring {
+    /// Reconstructs a notification owner received from another process.
+    ///
+    /// # Safety
+    ///
+    /// `fd` must be an owned descriptor for an eventfd created without
+    /// semaphore mode.
+    pub unsafe fn from_owned_fd(fd: OwnedFd) -> Self {
+        Self(unsafe { EventFd::from_owned_fd(fd) })
+    }
+}
+
 impl Event {
     /// Reconstructs an event owner received from another process.
     ///
