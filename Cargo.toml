@@ -38,24 +38,17 @@ nix = { version = "0.30.1", optional = true, default-features = false }
 windows-sys = { version = "0.61.2", optional = true, default-features = false }
 
 [dev-dependencies]
-bytes = "1.10.1"
-bytesize = "2.1.0"
-criterion = { version = "0.8.1", features = ["html_reports"] }
 fastrand = "2.3.0"
 hdrhistogram = "7.5.4"
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-[target.'cfg(unix)'.dev-dependencies]
-monoio = { version = "0.2.4", features = ["sync"] }
-shmipc = { git = "https://github.com/cloudwego/shmipc-rs", rev = "de966a6ca2d76d574b943f6fd4d3abfa6ff2df5f" }
-
 [[bench]]
 name = "ipc"
 path = "benches/ipc.rs"
 harness = false
-required-features = ["map"]
+required-features = ["os"]
 
 [package.metadata.docs.rs]
 all-features = true
