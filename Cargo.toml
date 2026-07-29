@@ -1,32 +1,68 @@
-[workspace]
-resolver = "3"
-members = ["evering", "bench/ipc-bench"]
-
-[workspace.package]
+[package]
+name = "evering"
 version = "0.1.0"
 authors = ["Nostalgia <Nostalume@outlook.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
+description = "Typed shared-memory communication across processes"
+repository = "https://github.com/nostalume/evering"
 
-[workspace.dependencies]
-tokio = { version = "1.47.1", features = ["full"] }
-nix = "0.30.1"
+[features]
+default = ["std"]
+std = []
+map = ["std", "dep:nix", "nix/fs", "nix/mman", "dep:windows-sys",
+    "windows-sys/Win32_Foundation", "windows-sys/Win32_System_Memory"]
+notify = ["std", "dep:nix", "nix/event", "dep:windows-sys",
+    "windows-sys/Win32_Foundation", "windows-sys/Win32_Security",
+    "windows-sys/Win32_System_Threading"]
+process = [
+    "map", "nix/process", "nix/signal", "nix/socket", "nix/uio",
+    "windows-sys/Win32_Security", "windows-sys/Win32_System_IO",
+    "windows-sys/Win32_System_Threading",
+]
+os = ["map", "notify", "process"]
+tokio = ["std", "notify", "dep:tokio"]
+tracing = ["std", "dep:tracing"]
 
+[dependencies]
+bitflags = "2.10.0"
 crossbeam-utils = { version = "0.8", default-features = false }
-lock_api = "0.4.14"
-spin = { version = "0.10.0", features = ["lock_api"] }
+tokio = { version = "1.47.1", optional = true, default-features = false, features = ["net", "rt", "sync", "time"] }
+tracing = { version = "0.1", optional = true }
 
-hdrhistogram = "7.5.4"
-fastrand = "2.3.0"
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.30.1", optional = true, default-features = false }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", optional = true, default-features = false }
+
+[dev-dependencies]
 bytes = "1.10.1"
 bytesize = "2.1.0"
+criterion = { version = "0.8.1", features = ["html_reports"] }
+fastrand = "2.3.0"
+hdrhistogram = "7.5.4"
+tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread", "sync", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-evering = { path = "evering" }
+[target.'cfg(unix)'.dev-dependencies]
+monoio = { version = "0.2.4", features = ["sync"] }
+shmipc = { git = "https://github.com/cloudwego/shmipc-rs", rev = "de966a6ca2d76d574b943f6fd4d3abfa6ff2df5f" }
+
+[[bench]]
+name = "ipc"
+path = "benches/ipc.rs"
+harness = false
+required-features = ["map"]
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
 
 [profile.bench]
-opt-level = 3          # Maximum optimizations for performance
-debug = false          # Disable debug info to reduce binary size and overhead
-strip = true           # Strip symbols for smaller binaries (optional but recommended)
-lto = true             # Link-time optimization for further speed gains
-codegen-units = 1      # Single codegen unit for better inlining (can slow compile time)
-panic = "abort"        # Faster panics in benchmarks (optional)
+opt-level = 3
+debug = false
+strip = true
+lto = true
+codegen-units = 1
