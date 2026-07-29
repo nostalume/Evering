@@ -2,7 +2,7 @@
 
 #[cfg(all(feature = "map", unix))]
 pub mod unix;
-#[cfg(all(feature = "process", windows))]
+#[cfg(all(feature = "map", windows))]
 pub mod windows;
 
 #[cfg(all(feature = "notify", target_os = "linux"))]
