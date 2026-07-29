@@ -1,6 +1,6 @@
 # Talc Module Design
 
-This document describes the structural organization of the talc module (`evering/src/talc.rs`) and how it enables efficient, relocatable memory allocation in the Evering framework.
+This document describes the structural organization of the talc module (`src/talc.rs`) and how it enables efficient, relocatable memory allocation in the Evering framework.
 
 ## Module Responsibilities
 

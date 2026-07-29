@@ -1,6 +1,6 @@
 # Message Module Design
 
-This document describes the structural organization of the message module (`evering/src/msg.rs`) and how it supports safe, type-aware inter-process communication in the Evering framework.
+This document describes the structural organization of the message module (`src/msg.rs`) and how it supports safe, type-aware inter-process communication in the Evering framework.
 
 ## Module Responsibilities
 

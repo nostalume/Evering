@@ -1,6 +1,6 @@
 # Token Module Design
 
-This document describes the structural organization of the token module (`evering/src/token.rs`) and how it enables safe type-erased inter-process communication in the Evering framework.
+This document describes the structural organization of the token module (`src/token.rs`) and how it enables safe type-erased inter-process communication in the Evering framework.
 
 ## Module Responsibilities
 

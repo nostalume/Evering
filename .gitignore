@@ -1,3 +1,4 @@
 /target
 .vscode/
 rustc-ice*
+/.codex/plans/

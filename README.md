@@ -14,7 +14,7 @@
 
 ## Bench
 
-The [bench](./bench/ipc-bench/) result is below:
+The legacy [benchmark](./benches/ipc.rs) result is below:
 
 ![bench](./docs/assets/ipc-bench.png)
 
