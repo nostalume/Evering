@@ -15,6 +15,31 @@ pub fn distribute(total: u64, workers: usize) -> Result<Vec<u64>, WorkError> {
         .collect())
 }
 
+pub fn payload(seed: u64, operation: u64, len: usize) -> Vec<u8> {
+    (0..len)
+        .map(|index| payload_byte(seed, operation, index))
+        .collect()
+}
+
+pub fn response(mut request: Vec<u8>) -> Vec<u8> {
+    request.iter_mut().for_each(|byte| *byte ^= 0xa5);
+    request
+}
+
+pub fn valid_response(seed: u64, operation: u64, expected_len: usize, response: &[u8]) -> bool {
+    response.len() == expected_len
+        && response
+            .iter()
+            .enumerate()
+            .all(|(index, byte)| *byte == payload_byte(seed, operation, index) ^ 0xa5)
+}
+
+fn payload_byte(seed: u64, operation: u64, index: usize) -> u8 {
+    seed.wrapping_add(operation.rotate_left(17))
+        .wrapping_add((index as u64).wrapping_mul(0x9e37_79b9))
+        .to_le_bytes()[index & 7]
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Status {
     Ok,

@@ -119,9 +119,11 @@ their APIs are stale and the old runner changes transport, process topology,
 runtime, connection count, and queue policy simultaneously. They may be
 reintroduced only as newly reviewed baselines; old numbers are discarded.
 
-The first portable OS baseline is a framed local byte stream: Unix domain
-socket on Unix and named pipe on Windows. It measures an OS-mediated transport,
-not a competing shared-memory library.
+The first portable OS baseline is a framed TCP byte stream over numeric IPv4
+loopback on every supported hosted platform. It measures one portable
+kernel-mediated transport, not a competing shared-memory library. Unix-domain
+sockets and Windows named pipes remain separate, platform-specific factors;
+they must not be substituted into this baseline under the same transport name.
 
 ## Trial order and stopping
 

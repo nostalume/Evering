@@ -1,11 +1,36 @@
 #[path = "../benches/ipc/model.rs"]
 mod model;
+#[path = "../benches/ipc/stream.rs"]
+mod stream;
 
 #[test]
 fn producer_shares_conserve_exact_requested_work() {
     let shares = model::distribute(7, 3).unwrap();
     assert_eq!(shares, [3, 2, 2]);
     assert_eq!(shares.iter().sum::<u64>(), 7);
+}
+
+#[test]
+fn deterministic_validation_checks_every_response_byte() {
+    let mut response = model::response(model::payload(7, 11, 4096));
+    assert!(model::valid_response(7, 11, 4096, &response));
+    response[2047] ^= 1;
+    assert!(!model::valid_response(7, 11, 4096, &response));
+    let truncated = model::response(model::payload(7, 11, 2048));
+    assert!(!model::valid_response(7, 11, 4096, &truncated));
+}
+
+#[test]
+fn framed_stream_round_trip_validates_complete_payload() {
+    use std::net::{Shutdown, TcpListener, TcpStream};
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let worker = std::thread::spawn(move || stream::serve(listener.accept().unwrap().0).unwrap());
+    let mut client = TcpStream::connect(address).unwrap();
+    assert!(stream::round_trip(&mut client, 7, 11, 4096).unwrap());
+    client.shutdown(Shutdown::Write).unwrap();
+    worker.join().unwrap();
 }
 
 fn successful_trial() -> model::Trial {
