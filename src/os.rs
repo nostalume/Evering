@@ -2,6 +2,8 @@
 
 #[cfg(all(feature = "map", unix))]
 pub mod unix;
+#[cfg(all(feature = "process", windows))]
+pub mod windows;
 
 #[cfg(all(feature = "notify", target_os = "linux"))]
 #[path = "os/eventfd.rs"]

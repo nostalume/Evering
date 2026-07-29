@@ -6,6 +6,8 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
+#[cfg(feature = "process")]
+use evering::process::Supervisor;
 use evering::{
     Layout, LayoutContext, LayoutField, LayoutStatus, MapError, MapLayout, Peer, RcHeader,
     RegionAdmission, RegionId, Repr, Request, SchemaId, SchemaKey, SharedSchema, Source,
@@ -196,7 +198,10 @@ fn recv_bounded<T>(
             Err(TryRecvError::Disconnected) => panic!("peer disconnected while receiving"),
         }
         if let Some(child) = child.as_deref_mut() {
-            assert!(child.running(), "child exited before responding");
+            if !child.running() {
+                return recv()
+                    .unwrap_or_else(|_| panic!("child exited without publishing a response"));
+            }
         }
         assert!(Instant::now() < deadline, "queue remained empty");
         thread::yield_now();
@@ -337,36 +342,47 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
     let id = session.prepare(QUEUE_CAPACITY).expect("prepare channel");
     let view = session.acquire(id).expect("acquire channel");
     let (_, recv) = view.lsplit();
-    let mut child = ChildGuard(
-        Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("dead_process_membership_is_reaped_after_a_complete_layout_scan")
-            .arg("--nocapture")
-            .env(ROLE, "announce-peer-and-exit")
-            .env(SHM_NAME, &name)
-            .env(REGION_SIZE_ENV, REGION_SIZE.to_string())
-            .env(ENTRY_SLAB, id.slab().to_string())
-            .env(ENTRY_INDEX, id.entry().to_string())
-            .env(ENTRY_GENERATION, id.generation().to_string())
-            .env(ENTRY_CAPACITY, id.capacity().to_string())
-            .env(PARENT_BASE, parent_base.to_string())
-            .spawn()
-            .expect("spawn doomed peer"),
-    );
+    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    command
+        .arg("--exact")
+        .arg("dead_process_membership_is_reaped_after_a_complete_layout_scan")
+        .arg("--nocapture")
+        .env(ROLE, "announce-peer-and-exit")
+        .env(SHM_NAME, &name)
+        .env(REGION_SIZE_ENV, REGION_SIZE.to_string())
+        .env(ENTRY_SLAB, id.slab().to_string())
+        .env(ENTRY_INDEX, id.entry().to_string())
+        .env(ENTRY_GENERATION, id.generation().to_string())
+        .env(ENTRY_CAPACITY, id.capacity().to_string())
+        .env(PARENT_BASE, parent_base.to_string());
+    #[cfg(feature = "process")]
+    let mut child = Supervisor::spawn(&mut command).expect("spawn doomed peer");
+    #[cfg(not(feature = "process"))]
+    let mut child = ChildGuard(command.spawn().expect("spawn doomed peer"));
+
+    #[cfg(feature = "process")]
+    let exit = child.wait().expect("wait for child");
+    #[cfg(feature = "process")]
+    let status = exit.status();
+    #[cfg(not(feature = "process"))]
+    let status = child.wait();
+    assert_eq!(status.code(), Some(77), "child must skip Rust destructors");
 
     let deadline = Instant::now() + TIMEOUT;
     let heap = session.heap();
     let mut identity = [0_u64; 2];
     for part in &mut identity {
-        let record = recv_bounded(|| recv.try_recv(), deadline, Some(&mut child));
+        let record = recv_bounded(|| recv.try_recv(), deadline, None);
         let (_, value) = heap.open::<(), u64>(record).expect("open identity");
         *part = *value;
     }
     drop(recv);
-    let status = child.wait();
-    assert_eq!(status.code(), Some(77), "child must skip Rust destructors");
 
     let peer = Peer::from_parts(identity[0] as u8, identity[1] as usize);
+    #[cfg(feature = "process")]
+    let recovery =
+        unsafe { session.assume_exited(peer, &exit) }.expect("mark exact dead generation");
+    #[cfg(not(feature = "process"))]
     let recovery = unsafe { session.assume_dead(peer) }.expect("mark exact dead generation");
     assert!(session.reap(recovery).is_ok(), "complete coupled recovery");
     let replacement = joiner_session(&name, parent_base);

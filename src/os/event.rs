@@ -1,6 +1,6 @@
 use std::{
     io,
-    os::windows::io::{AsRawHandle, RawHandle},
+    os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle},
     sync::Arc,
 };
 
@@ -98,5 +98,17 @@ impl AsRawHandle for Event {
 impl AsRawHandle for Ring {
     fn as_raw_handle(&self) -> RawHandle {
         self.0.0.cast()
+    }
+}
+
+impl AsHandle for Event {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        unsafe { BorrowedHandle::borrow_raw(self.as_raw_handle()) }
+    }
+}
+
+impl AsHandle for Ring {
+    fn as_handle(&self) -> BorrowedHandle<'_> {
+        unsafe { BorrowedHandle::borrow_raw(self.as_raw_handle()) }
     }
 }

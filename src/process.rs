@@ -63,6 +63,12 @@ impl Supervisor {
         self.child.id()
     }
 
+    #[cfg(windows)]
+    pub(crate) fn handle(&self) -> windows_sys::Win32::Foundation::HANDLE {
+        use std::os::windows::io::AsRawHandle;
+        self.child.as_raw_handle().cast()
+    }
+
     pub fn try_wait(&mut self) -> io::Result<Option<Exit<'_>>> {
         if self.status.is_none() {
             self.status = self.child.try_wait()?;
