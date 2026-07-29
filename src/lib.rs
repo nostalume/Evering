@@ -14,8 +14,11 @@ mod dir;
 mod header;
 mod mem;
 pub mod msg;
+pub mod notify;
 pub mod os;
 pub mod perlude;
+#[cfg(feature = "tokio")]
+pub mod runtime;
 mod schema;
 mod talc;
 mod tests;
@@ -45,6 +48,7 @@ pub use mem::{
     RegionCloseError, Request, Source,
 };
 pub use msg::{Encoded, Repr};
+pub use notify::{Async, Done, Listen, Notify, RecvError, SendError};
 pub use schema::{
     LayoutContext, LayoutId, LayoutInfo, RegionAdmission, RegionId, SchemaId, SchemaKey,
     SharedSchema,
