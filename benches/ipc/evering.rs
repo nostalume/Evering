@@ -162,12 +162,14 @@ fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), Strin
 
     let socket = Socket::bind(address).map_err(|error| error.to_string())?;
     let (bootstrap, resources) = socket
-        .recv(1)
+        .recv(3)
         .map_err(|error| error.to_string())?
         .into_parts();
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).map_err(|error| error.to_string())?;
+    let _parent_event = unsafe { evering::os::Event::from_owned_fd(resources.remove(0)) };
+    let _child_ring = unsafe { evering::os::Ring::from_owned_fd(resources.remove(0)) };
     let session = open_session(source, extent)?;
     Ok((session, id))
 }
@@ -175,15 +177,20 @@ fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), Strin
 #[cfg(windows)]
 fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), String> {
     use evering::os::windows::{Section, process::Socket};
+    use std::os::windows::io::AsRawHandle;
 
     let socket = Socket::connect(address).map_err(|error| error.to_string())?;
     let (bootstrap, resources) = socket
-        .recv(1)
+        .recv(3)
         .map_err(|error| error.to_string())?
         .into_parts();
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
+    let _parent_event =
+        unsafe { evering::os::Event::from_owned_handle(resources.remove(0).as_raw_handle()) };
+    let _child_ring =
+        unsafe { evering::os::Ring::from_owned_handle(resources.remove(0).as_raw_handle()) };
     let session = open_session(source, extent)?;
     Ok((session, id))
 }
@@ -197,6 +204,12 @@ struct Setup {
     session: Session<Envelope>,
     id: Id<Envelope>,
     child: Supervisor,
+    _notify: (
+        evering::os::Ring,
+        evering::os::Event,
+        evering::os::Ring,
+        evering::os::Event,
+    ),
     #[cfg(unix)]
     socket_path: std::path::PathBuf,
 }
@@ -211,6 +224,7 @@ impl Drop for Setup {
 #[cfg(unix)]
 fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, String> {
     use evering::os::unix::{UnixFd, process::Socket};
+    use std::os::fd::AsFd;
 
     let source =
         UnixFd::memfd("evering-bench", extent, false).map_err(|error| error.to_string())?;
@@ -243,13 +257,19 @@ fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, Str
             Err(error) => return Err(error.to_string()),
         }
     };
+    let (parent_ring, parent_event) = evering::os::event().map_err(|error| error.to_string())?;
+    let (child_ring, child_event) = evering::os::event().map_err(|error| error.to_string())?;
     socket
-        .send(&bootstrap(id, extent)?, &[source.as_fd()])
+        .send(
+            &bootstrap(id, extent)?,
+            &[source.as_fd(), parent_event.as_fd(), child_ring.as_fd()],
+        )
         .map_err(|error| error.to_string())?;
     Ok(Setup {
         session,
         id,
         child,
+        _notify: (parent_ring, parent_event, child_ring, child_event),
         socket_path: path,
     })
 }
@@ -271,10 +291,25 @@ fn setup(extent: usize, capacity: usize, _deadline: Instant) -> Result<Setup, St
     let id = session
         .prepare(capacity)
         .ok_or("could not create channel")?;
+    let (parent_ring, parent_event) = evering::os::event().map_err(|error| error.to_string())?;
+    let (child_ring, child_event) = evering::os::event().map_err(|error| error.to_string())?;
     socket
-        .send(&child, &bootstrap(id, extent)?, &[source.as_handle()])
+        .send(
+            &child,
+            &bootstrap(id, extent)?,
+            &[
+                source.as_handle(),
+                parent_event.as_handle(),
+                child_ring.as_handle(),
+            ],
+        )
         .map_err(|error| error.to_string())?;
-    Ok(Setup { session, id, child })
+    Ok(Setup {
+        session,
+        id,
+        child,
+        _notify: (parent_ring, parent_event, child_ring, child_event),
+    })
 }
 
 pub fn run(
