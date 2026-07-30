@@ -132,10 +132,7 @@ impl<T> Rel<T> {
 
 impl<T: ?Sized> Clone for Rel<T> {
     fn clone(&self) -> Self {
-        Self {
-            offset: self.offset,
-            _marker: self._marker,
-        }
+        *self
     }
 }
 
@@ -763,7 +760,7 @@ impl Geometry {
             return Err(GeometryError::Invalid);
         }
         let exponential = self.bin_count() - self.linear as usize;
-        if exponential % self.divisions() != 0 {
+        if !exponential.is_multiple_of(self.divisions()) {
             return Err(GeometryError::Invalid);
         }
         let covered_log = self.exponential_log as usize + exponential / self.divisions() - 1;
@@ -1298,7 +1295,7 @@ impl TalckMeta {
 
     #[inline]
     unsafe fn claim(&mut self, conf: Config) -> Result<(), ()> {
-        unsafe { self.talc_mut().claim(conf) }
+        unsafe { self.talc.get_mut().claim(conf) }
     }
 }
 
@@ -1309,8 +1306,8 @@ impl TalckMeta {
     }
 
     #[inline]
-    const unsafe fn talc_mut(&self) -> &mut TalcMeta {
-        unsafe { self.talc.as_mut_unchecked() }
+    const fn talc_ptr(&self) -> *mut TalcMeta {
+        self.talc.get()
     }
 }
 
@@ -1394,8 +1391,7 @@ impl<H: const Deref<Target = Header>> Talc<H> {
     ) -> Result<Meta, MutationError> {
         debug_assert!(mutation.owns(&self.header.mutation, self.owner));
         unsafe {
-            self.header
-                .talc_mut()
+            (&mut *self.header.talc_ptr())
                 .allocate(layout, self.geometry)
                 .map(|ptr| Meta::from_ptr(ptr.as_ptr(), self.base_ptr(), layout.size()))
                 .map_err(|_| MutationError::Exhausted)
@@ -1410,9 +1406,7 @@ impl<H: const Deref<Target = Header>> Talc<H> {
     ) {
         debug_assert!(mutation.owns(&self.header.mutation, self.owner));
         unsafe {
-            self.header
-                .talc_mut()
-                .deallocate(ptr, layout.size(), self.geometry);
+            (&mut *self.header.talc_ptr()).deallocate(ptr, layout.size(), self.geometry);
         }
     }
 
@@ -1661,7 +1655,7 @@ unsafe impl<H: const Deref<Target = Header>> mem::MemDealloc for Talc<H> {
         crash_after(FREE_CLAIMED);
         unsafe {
             core::ptr::drop_in_place(pointer);
-            self.header.talc_mut().deallocate(
+            (&mut *self.header.talc_ptr()).deallocate(
                 meta.as_nonnull(self.base_ptr()),
                 layout.size(),
                 self.geometry,
@@ -1718,7 +1712,7 @@ unsafe impl<H: const Deref<Target = Header>> mem::TransferAllocator for Talc<H> 
             return Err(mem::TransferError::WrongExtent);
         }
         let pointer = unsafe { self.base_ptr().add(meta.view.start_offset) } as *mut u8;
-        if pointer.addr() % expected.align() != 0 {
+        if !pointer.addr().is_multiple_of(expected.align()) {
             return Err(mem::TransferError::Misaligned);
         }
         NonNull::new(pointer).ok_or(mem::TransferError::Null)
