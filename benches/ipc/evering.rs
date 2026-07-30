@@ -114,6 +114,13 @@ where
     .map_err(|error| format!("{error:?}"))
 }
 
+fn runtime() -> Result<tokio::runtime::Runtime, String> {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|error| error.to_string())
+}
+
 fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
     let view = session
         .acquire(id)
@@ -157,7 +164,17 @@ fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
 }
 
 #[cfg(unix)]
-fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), String> {
+fn open_worker(
+    address: &str,
+) -> Result<
+    (
+        Session<Envelope>,
+        Id<Envelope>,
+        evering::os::Ring,
+        evering::runtime::Wait,
+    ),
+    String,
+> {
     use evering::os::unix::{UnixFd, process::Socket};
 
     let socket = Socket::bind(address).map_err(|error| error.to_string())?;
@@ -168,14 +185,25 @@ fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), Strin
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).map_err(|error| error.to_string())?;
-    let _parent_event = unsafe { evering::os::Event::from_owned_fd(resources.remove(0)) };
-    let _child_ring = unsafe { evering::os::Ring::from_owned_fd(resources.remove(0)) };
+    let parent_event = unsafe { evering::os::Event::from_owned_fd(resources.remove(0)) };
+    let child_ring = unsafe { evering::os::Ring::from_owned_fd(resources.remove(0)) };
     let session = open_session(source, extent)?;
-    Ok((session, id))
+    let wait = evering::runtime::Wait::new(parent_event).map_err(|error| error.to_string())?;
+    Ok((session, id, child_ring, wait))
 }
 
 #[cfg(windows)]
-fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), String> {
+fn open_worker(
+    address: &str,
+) -> Result<
+    (
+        Session<Envelope>,
+        Id<Envelope>,
+        evering::os::Ring,
+        evering::runtime::Wait,
+    ),
+    String,
+> {
     use evering::os::windows::{Section, process::Socket};
     use std::os::windows::io::AsRawHandle;
 
@@ -187,16 +215,20 @@ fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), Strin
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
-    let _parent_event =
+    let parent_event =
         unsafe { evering::os::Event::from_owned_handle(resources.remove(0).as_raw_handle()) };
-    let _child_ring =
+    let child_ring =
         unsafe { evering::os::Ring::from_owned_handle(resources.remove(0).as_raw_handle()) };
     let session = open_session(source, extent)?;
-    Ok((session, id))
+    let wait = evering::runtime::Wait::new(parent_event).map_err(|error| error.to_string())?;
+    Ok((session, id, child_ring, wait))
 }
 
 pub fn worker(address: &str) -> Result<(), String> {
-    let (session, id) = open_worker(address)?;
+    let runtime = runtime()?;
+    let entered = runtime.enter();
+    let (session, id, _ring, _wait) = open_worker(address)?;
+    drop(entered);
     serve(session, id)
 }
 
@@ -204,12 +236,8 @@ struct Setup {
     session: Session<Envelope>,
     id: Id<Envelope>,
     child: Supervisor,
-    _notify: (
-        evering::os::Ring,
-        evering::os::Event,
-        evering::os::Ring,
-        evering::os::Event,
-    ),
+    _runtime: tokio::runtime::Runtime,
+    _notify: (evering::os::Ring, evering::runtime::Wait),
     #[cfg(unix)]
     socket_path: std::path::PathBuf,
 }
@@ -226,6 +254,8 @@ fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, Str
     use evering::os::unix::{UnixFd, process::Socket};
     use std::os::fd::AsFd;
 
+    let runtime = runtime()?;
+    let entered = runtime.enter();
     let source =
         UnixFd::memfd("evering-bench", extent, false).map_err(|error| error.to_string())?;
     let session = create_session(source.borrow(), extent)?;
@@ -265,11 +295,14 @@ fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, Str
             &[source.as_fd(), parent_event.as_fd(), child_ring.as_fd()],
         )
         .map_err(|error| error.to_string())?;
+    let wait = evering::runtime::Wait::new(child_event).map_err(|error| error.to_string())?;
+    drop(entered);
     Ok(Setup {
         session,
         id,
         child,
-        _notify: (parent_ring, parent_event, child_ring, child_event),
+        _runtime: runtime,
+        _notify: (parent_ring, wait),
         socket_path: path,
     })
 }
@@ -280,6 +313,8 @@ fn setup(extent: usize, capacity: usize, _deadline: Instant) -> Result<Setup, St
 
     use evering::os::windows::{Section, process::Listener};
 
+    let runtime = runtime()?;
+    let entered = runtime.enter();
     let listener = Listener::bind().map_err(|error| error.to_string())?;
     let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
     command.args(["worker-evering", listener.name()]);
@@ -304,11 +339,14 @@ fn setup(extent: usize, capacity: usize, _deadline: Instant) -> Result<Setup, St
             ],
         )
         .map_err(|error| error.to_string())?;
+    let wait = evering::runtime::Wait::new(child_event).map_err(|error| error.to_string())?;
+    drop(entered);
     Ok(Setup {
         session,
         id,
         child,
-        _notify: (parent_ring, parent_event, child_ring, child_event),
+        _runtime: runtime,
+        _notify: (parent_ring, wait),
     })
 }
 
