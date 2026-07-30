@@ -90,7 +90,7 @@ pub(super) fn parse(bytes: &[u8]) -> Result<(Id<Envelope>, usize), String> {
     Ok((Id::new(region, slab, entry, generation, capacity), extent))
 }
 
-fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
+fn serve(session: Session<Envelope>, id: Id<Envelope>, fault: Option<&str>) -> Result<(), String> {
     let view = session
         .acquire(id)
         .ok_or("worker could not acquire channel")?;
@@ -108,13 +108,19 @@ fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
             }
         };
         let heap = session.heap();
-        let (header, mut value) = heap
+        let (mut header, mut value) = heap
             .open::<Envelope, [u8]>(record)
             .map_err(|_| "worker rejected message identity")?;
         match header.kind {
             DATA => value.iter_mut().for_each(|byte| *byte ^= 0xa5),
             BARRIER if value.is_empty() => {}
             _ => return Err("worker rejected message envelope".into()),
+        }
+        if fault == Some("early") {
+            return Ok(());
+        }
+        if fault == Some("invalid") && header.kind == DATA {
+            header.operation = header.operation.wrapping_add(1);
         }
         let mut record = value.token_of().pack(header);
         loop {
@@ -176,7 +182,14 @@ fn open_worker(address: &str) -> Result<(Session<Envelope>, Id<Envelope>), Strin
 
 pub fn worker(address: &str) -> Result<(), String> {
     let (session, id) = open_worker(address)?;
-    serve(session, id)
+    let fault = std::env::var("EVERING_BENCH_FAULT").ok();
+    if fault
+        .as_deref()
+        .is_some_and(|value| value != "early" && value != "invalid")
+    {
+        return Err("EVERING_BENCH_FAULT must be early or invalid".into());
+    }
+    serve(session, id, fault.as_deref())
 }
 
 struct Setup {
