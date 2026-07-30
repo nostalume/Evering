@@ -1,3 +1,5 @@
+#[path = "ipc/evering.rs"]
+mod evering;
 #[path = "ipc/model.rs"]
 mod model;
 #[path = "ipc/stream.rs"]
@@ -148,13 +150,17 @@ fn execute(
         status: Status::Unsupported,
         error: None,
     };
-    if scheduled.arm != Arm::Stream {
-        return Trial {
-            error: Some("Evering transport is not implemented".into()),
-            ..trial
-        };
-    }
-    match stream::run(&trial.cell, requested, warmup, seed, timeout) {
+    let result = match scheduled.arm {
+        Arm::Stream => stream::run(&trial.cell, requested, warmup, seed, timeout),
+        Arm::Evering(Policy::Busy) => evering::run(&trial.cell, requested, warmup, seed, timeout),
+        Arm::Evering(_) => {
+            return Trial {
+                error: Some("Evering policy is not implemented".into()),
+                ..trial
+            };
+        }
+    };
+    match result {
         Ok(counts) => Trial {
             accepted: counts.accepted,
             completed: counts.completed,
@@ -166,7 +172,7 @@ fn execute(
             ..trial
         },
         Err(error) => {
-            let counts = error.counts;
+            let counts = *error.counts;
             Trial {
                 accepted: counts.accepted,
                 completed: counts.completed,
@@ -181,16 +187,28 @@ fn execute(
     }
 }
 
-fn record(
-    path: &str,
-    mode: &str,
+struct Record<'a> {
+    path: &'a str,
+    mode: &'a str,
     selected: Vec<Scheduled>,
     blocks: u32,
     seed: u64,
     requested: u64,
     warmup: u64,
     timeout_ms: u64,
-) -> Result<(), String> {
+}
+
+fn record(input: Record<'_>) -> Result<(), String> {
+    let Record {
+        path,
+        mode,
+        selected,
+        blocks,
+        seed,
+        requested,
+        warmup,
+        timeout_ms,
+    } = input;
     if blocks == 0 || requested == 0 || timeout_ms == 0 {
         return Err("blocks, operations, and timeout must be nonzero".into());
     }
@@ -225,6 +243,7 @@ fn dispatch() -> Result<(), String> {
         .collect();
     match args.as_slice() {
         [command, address] if command == "worker-stream" => stream::worker(address),
+        [command, address] if command == "worker-evering" => evering::worker(address),
         [command, blocks, seed] if command == "plan" => {
             let blocks = number(blocks, "blocks")?;
             let seed = number(seed, "seed")?;
@@ -271,27 +290,55 @@ fn dispatch() -> Result<(), String> {
             let warmup = number(warmup, "warmup")?;
             let timeout = number(timeout, "timeout")?;
             let selected = schedule(&contrasts(), blocks, seed);
-            record(
-                path, "run", selected, blocks, seed, requested, warmup, timeout,
-            )
+            record(Record {
+                path,
+                mode: "run",
+                selected,
+                blocks,
+                seed,
+                requested,
+                warmup,
+                timeout_ms: timeout,
+            })
         }
         [command, path] if command == "smoke" => {
-            let contrast = contrast(64, 8, 8, Policy::Notified);
-            record(
+            let boundary = contrast(0, 1, 1, Policy::Busy);
+            let windowed = contrast(64 * 1024, 8, 3, Policy::Busy);
+            record(Record {
                 path,
-                "smoke",
-                vec![Scheduled {
-                    block: 0,
-                    order: 0,
-                    contrast,
-                    arm: Arm::Stream,
-                }],
-                1,
-                7,
-                100,
-                10,
-                5000,
-            )
+                mode: "smoke",
+                selected: vec![
+                    Scheduled {
+                        block: 0,
+                        order: 0,
+                        contrast: boundary,
+                        arm: Arm::Evering(Policy::Busy),
+                    },
+                    Scheduled {
+                        block: 0,
+                        order: 1,
+                        contrast: boundary,
+                        arm: Arm::Stream,
+                    },
+                    Scheduled {
+                        block: 0,
+                        order: 2,
+                        contrast: windowed,
+                        arm: Arm::Evering(Policy::Busy),
+                    },
+                    Scheduled {
+                        block: 0,
+                        order: 3,
+                        contrast: windowed,
+                        arm: Arm::Stream,
+                    },
+                ],
+                blocks: 1,
+                seed: 7,
+                requested: 101,
+                warmup: 10,
+                timeout_ms: 5000,
+            })
         }
         _ => Err("usage: ipc plan <blocks> <seed> | ipc validate <file> | \
              ipc run <file> <blocks> <seed> <operations> <warmup> <timeout-ms> | \

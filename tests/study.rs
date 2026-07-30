@@ -1,9 +1,35 @@
+#[cfg(feature = "process")]
+#[allow(dead_code)]
+#[path = "../benches/ipc/evering.rs"]
+mod evering;
 #[allow(dead_code)]
 #[path = "../benches/ipc/model.rs"]
 mod model;
 #[allow(dead_code)]
 #[path = "../benches/ipc/stream.rs"]
 mod stream;
+
+#[cfg(feature = "process")]
+#[test]
+fn evering_bootstrap_binds_region_channel_and_extent() {
+    use ::evering::perlude::talc::Id;
+
+    let id = Id::new(evering::REGION, 2, 3, 4, 5);
+    let encoded = evering::bootstrap(id, 4096).unwrap();
+    assert_eq!(evering::parse(encoded.as_ref()).unwrap(), (id, 4096));
+    let mut invalid = encoded.into_boxed();
+    invalid[0] ^= 1;
+    assert!(evering::parse(&invalid).is_err());
+    assert!(
+        evering::parse(
+            evering::bootstrap(Id::new(evering::REGION, 2, 3, 4, 0), 4096)
+                .unwrap()
+                .as_ref()
+        )
+        .is_err()
+    );
+    assert!(evering::parse(evering::bootstrap(id, 0).unwrap().as_ref()).is_err());
+}
 
 #[test]
 fn deterministic_validation_checks_every_response_byte() {

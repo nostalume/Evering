@@ -32,14 +32,14 @@ pub struct Counts {
 pub struct RunError {
     pub status: Status,
     pub message: String,
-    pub counts: Counts,
+    pub counts: Box<Counts>,
 }
 
 fn fail(status: Status, message: impl ToString, counts: Option<&Counts>) -> RunError {
     RunError {
         status,
         message: message.to_string(),
-        counts: counts.cloned().unwrap_or_default(),
+        counts: Box::new(counts.cloned().unwrap_or_default()),
     }
 }
 
