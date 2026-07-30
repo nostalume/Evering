@@ -96,7 +96,8 @@ observed terminal state.
 - Both arms use the same exact requested count and deterministic payloads.
 - Capacity is the maximum application-visible outstanding record count.
 - Stream batching is `min(capacity, in_flight, remaining)`.
-- The stream uses one connection and records actual socket-buffer sizes.
+- The stream uses one connection, enables `TCP_NODELAY` on both endpoints, and
+  records actual socket-buffer sizes.
 - Evering records actual shared extent and admitted allocator geometry.
 - No equal-memory claim is made unless all relevant buffers and bounds were
   observed. Otherwise memory comparability is explicitly unavailable.

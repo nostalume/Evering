@@ -3,13 +3,12 @@ use std::{
     net::TcpStream,
 };
 
-#[cfg(not(feature = "process"))]
 use super::model::Status;
 #[cfg(any(feature = "process", test))]
 use std::time::Instant;
 #[cfg(feature = "process")]
 use {
-    super::model::{Cell, Observed, Status, payload, valid_response, window},
+    super::model::{Cell, Observed, payload, valid_response, window},
     evering::process::Supervisor,
     std::{
         net::{Shutdown, TcpListener},
@@ -138,12 +137,12 @@ fn read_frame_until(stream: &TcpStream, deadline: Instant) -> io::Result<(u64, V
 }
 
 pub fn serve(mut stream: TcpStream) -> io::Result<()> {
+    stream.set_nodelay(true)?;
     while let Some((operation, mut request)) = read_frame(&mut stream)? {
-        if operation == u64::MAX && request.is_empty() {
-            continue;
-        }
         request.iter_mut().for_each(|byte| *byte ^= 0xa5);
-        write_frame(&mut stream, operation, &request)?;
+        if operation != u64::MAX || !request.is_empty() {
+            write_frame(&mut stream, operation, &request)?;
+        }
     }
     Ok(())
 }
@@ -207,7 +206,8 @@ pub fn run(
         }
     };
     stream
-        .set_nonblocking(true)
+        .set_nodelay(true)
+        .and_then(|()| stream.set_nonblocking(true))
         .map_err(|error| fail(Status::SetupError, error, None))?;
     let socket = socket2::SockRef::from(&stream);
     let socket_send = socket
