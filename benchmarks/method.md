@@ -215,13 +215,17 @@ validation.
 The runner creates a no-overwrite `.partial` artifact in the final directory.
 It flushes and `sync_data`s metadata, then appends, flushes, and `sync_data`s
 each independently valid trial. After all rows validate, it writes the footer,
-flushes and `sync_all`s, then atomically renames to a no-overwrite final name.
-Persistence is outside measured time.
+flushes and `sync_all`s, atomically publishes the same inode with a
+same-directory no-overwrite hard link, then removes the partial name.
+Unsupported hard-link publication fails without copying or overwriting
+evidence. Persistence is outside measured time.
 
 An interrupted prefix remains readable but incomplete. Any mandatory scheduled
 and supported arm that fails makes the command exit nonzero after preserving
 the partial evidence. Declared unsupported optional arms do not fail the run.
 A rerun never overwrites existing partial or final evidence.
+A `.partial` path is never authoritative, including the crash cut after its
+footer is durable but before final-name publication.
 
 ## Analysis
 

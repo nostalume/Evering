@@ -19,13 +19,25 @@ fn deterministic_validation_checks_every_response_byte() {
 
 #[test]
 fn framed_stream_round_trip_validates_complete_payload() {
+    use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
     let worker = std::thread::spawn(move || stream::serve(listener.accept().unwrap().0).unwrap());
     let mut client = TcpStream::connect(address).unwrap();
-    assert!(stream::round_trip(&mut client, 7, 11, 4096).unwrap());
+    let payload = model::payload(7, 11, 4096);
+    client.write_all(&11_u64.to_le_bytes()).unwrap();
+    client
+        .write_all(&(payload.len() as u32).to_le_bytes())
+        .unwrap();
+    client.write_all(&payload).unwrap();
+    let mut header = [0; 12];
+    client.read_exact(&mut header).unwrap();
+    let mut response = vec![0; u32::from_le_bytes(header[8..].try_into().unwrap()) as usize];
+    client.read_exact(&mut response).unwrap();
+    assert_eq!(u64::from_le_bytes(header[..8].try_into().unwrap()), 11);
+    assert!(model::valid_response(7, 11, 4096, &response));
     client.shutdown(Shutdown::Write).unwrap();
     worker.join().unwrap();
 }
@@ -48,30 +60,52 @@ fn successful_trial() -> model::Trial {
         completed: 7,
         validated: 7,
         elapsed_ns: Some(1),
+        phase_ns: [1; 3],
+        observed: Some(model::Observed {
+            payload: 64,
+            capacity: 8,
+            in_flight: 3,
+            batch: 3,
+            topology: "1c1w".into(),
+            transport: "shared-memory".into(),
+            extent: Some(4096),
+            allocator: Some("adaptive".into()),
+            socket_send: None,
+            socket_recv: None,
+        }),
         status: model::Status::Ok,
         error: None,
     }
 }
 
 fn study(trials: Vec<model::Trial>) -> model::Study {
-    model::Study {
+    let expected = trials.len();
+    let mut study = model::Study {
         meta: model::Meta {
-            format: 1,
+            format: 2,
             revision: "abc123".into(),
             dirty: false,
+            diff: "clean".into(),
             target: "x86_64-test".into(),
             os: "test".into(),
             arch: "x86_64".into(),
             rustc: "rustc-test".into(),
             command: "study --seed 7".into(),
             started: "0".into(),
+            mode: "test".into(),
             seed: 7,
             warmup: 1,
             blocks: 1,
             timeout_ms: 1000,
+            schedule: 0,
+            expected,
+            host: "test-host".into(),
+            spin: 0,
         },
         trials,
-    }
+    };
+    study.meta.schedule = model::trial_schedule_id(&study.trials);
+    study
 }
 
 fn contrast(policy: model::Policy) -> model::Contrast {
@@ -130,6 +164,7 @@ fn baseline_cannot_claim_an_evering_policy() {
     let mut trial = successful_trial();
     trial.cell.implementation = "os-stream".into();
     trial.cell.policy = "notified".into();
+    trial.observed = Some(stream_observed());
     assert_eq!(
         model::validate_trial(&trial).unwrap_err(),
         model::TrialError::InvalidCell
@@ -141,29 +176,27 @@ fn baseline_rows_keep_the_candidate_contrast_identity() {
     let mut busy = successful_trial();
     busy.cell.implementation = "os-stream".into();
     busy.cell.policy = "blocking".into();
+    busy.observed = Some(stream_observed());
     let mut notified = busy.clone();
     notified.order = 1;
     notified.cell.candidate = "notified".into();
     let evidence = study(vec![busy, notified]);
     assert!(model::validate_study(&evidence).is_ok());
-    assert_eq!(
-        model::decode(&model::encode(&evidence).unwrap()).unwrap(),
-        evidence
-    );
 }
 
-#[test]
-fn mandatory_failure_is_not_a_successful_run() {
-    let success = successful_trial();
-    assert!(model::mandatory_success(core::slice::from_ref(&success)));
-    let mut failed = success;
-    failed.status = model::Status::Unsupported;
-    failed.accepted = 0;
-    failed.completed = 0;
-    failed.validated = 0;
-    failed.elapsed_ns = None;
-    failed.error = Some("not implemented".into());
-    assert!(!model::mandatory_success(&[failed]));
+fn stream_observed() -> model::Observed {
+    model::Observed {
+        payload: 64,
+        capacity: 8,
+        in_flight: 3,
+        batch: 3,
+        topology: "1c1w".into(),
+        transport: "ipv4-loopback".into(),
+        extent: None,
+        allocator: None,
+        socket_send: Some(4096),
+        socket_recv: Some(4096),
+    }
 }
 
 #[test]
@@ -188,36 +221,201 @@ fn study_rejects_duplicate_block_cell_rows() {
 }
 
 #[test]
-fn raw_schema_round_trips_without_losing_environment_or_trials() {
-    let study = study(vec![successful_trial()]);
-    let encoded = model::encode(&study).unwrap();
-    assert_eq!(model::decode(&encoded).unwrap(), study);
+fn recorder_persists_each_row_before_final_publication() {
+    use std::fs;
+
+    let root = std::env::temp_dir().join(format!(
+        "evering-study-{}-{}",
+        std::process::id(),
+        std::thread::current().name().unwrap_or("row")
+    ));
+    fs::create_dir_all(&root).unwrap();
+    let final_path = root.join("evidence.tsv");
+    let partial_path = root.join("evidence.tsv.partial");
+    let evidence = study(vec![successful_trial()]);
+
+    let mut recorder = model::Recorder::create(&final_path, evidence.meta.clone()).unwrap();
+    recorder.append(evidence.trials[0].clone()).unwrap();
+    assert!(!final_path.exists());
+    assert_eq!(
+        model::decode_prefix(&fs::read_to_string(&partial_path).unwrap()).unwrap(),
+        evidence
+    );
+    recorder.finish().unwrap();
+    assert!(!partial_path.exists());
+    let complete = fs::read_to_string(&final_path).unwrap();
+    assert_eq!(model::decode(&complete).unwrap(), evidence);
+    let footer = format!("END\t{}\t", evidence.meta.schedule);
+    let mismatched = complete.replacen(
+        &footer,
+        &format!("END\t{}\t", evidence.meta.schedule.wrapping_add(1)),
+        1,
+    );
+    assert_eq!(
+        model::decode(&mismatched).unwrap_err(),
+        model::CodecError::Study(model::StudyError::Incomplete)
+    );
+    assert!(model::Recorder::create(&final_path, evidence.meta).is_err());
+
+    fs::remove_file(final_path).unwrap();
+    fs::remove_dir(root).unwrap();
 }
 
 #[test]
-fn raw_schema_rejects_truncation_unknown_versions_and_control_bytes() {
-    let study = study(vec![successful_trial()]);
-    let mut encoded = model::encode(&study).unwrap();
-    encoded.truncate(encoded.find("\nTRIAL").unwrap());
-    assert_eq!(
-        model::decode(&encoded).unwrap_err(),
-        model::CodecError::Study(model::StudyError::IncompleteBlock)
-    );
+fn dropped_recorder_leaves_a_valid_incomplete_prefix() {
+    use std::{fs, io::Write};
 
-    let encoded = model::encode(&study)
+    let root = std::env::temp_dir().join(format!("evering-study-drop-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let final_path = root.join("evidence.tsv");
+    let partial_path = root.join("evidence.tsv.partial");
+    let evidence = study(vec![successful_trial()]);
+    let mut recorder = model::Recorder::create(&final_path, evidence.meta).unwrap();
+    recorder.append(evidence.trials[0].clone()).unwrap();
+    drop(recorder);
+
+    fs::OpenOptions::new()
+        .append(true)
+        .open(&partial_path)
         .unwrap()
-        .replacen("META\t1\t", "META\t2\t", 1);
+        .write_all(b"TRIA")
+        .unwrap();
+    let prefix = fs::read_to_string(&partial_path).unwrap();
+    assert!(model::decode_prefix(&prefix).is_ok());
     assert_eq!(
-        model::decode(&encoded).unwrap_err(),
-        model::CodecError::Study(model::StudyError::Format)
+        model::decode(&prefix).unwrap_err(),
+        model::CodecError::Study(model::StudyError::Incomplete)
+    );
+    assert!(!final_path.exists());
+    assert!(model::Recorder::create(&final_path, study(Vec::new()).meta).is_err());
+
+    fs::remove_file(partial_path).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn partial_path_never_authorizes_complete_evidence_at_any_persistence_cut() {
+    use std::{fs, io::Write};
+
+    let root = std::env::temp_dir().join(format!("evering-study-cuts-{}", std::process::id()));
+    fs::create_dir_all(&root).unwrap();
+    let final_path = root.join("evidence.tsv");
+    let partial_path = root.join("evidence.tsv.partial");
+    let mut second = successful_trial();
+    second.order = 1;
+    second.cell.candidate = "adaptive".into();
+    second.cell.policy = "adaptive".into();
+    let evidence = study(vec![successful_trial(), second]);
+    let mut recorder = model::Recorder::create(&final_path, evidence.meta.clone()).unwrap();
+    assert_eq!(model::load(&partial_path).unwrap().study.trials.len(), 0);
+    for (index, trial) in evidence.trials.iter().cloned().enumerate() {
+        recorder.append(trial).unwrap();
+        let loaded = model::load(&partial_path).unwrap();
+        assert!(!loaded.complete);
+        assert_eq!(loaded.study.trials.len(), index + 1);
+    }
+    drop(recorder);
+    writeln!(
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&partial_path)
+            .unwrap(),
+        "END\t{}\t{}",
+        evidence.meta.schedule,
+        evidence.meta.expected
+    )
+    .unwrap();
+    let loaded = model::load(&partial_path).unwrap();
+    assert!(!loaded.complete);
+    assert_eq!(loaded.study, evidence);
+
+    fs::remove_file(partial_path).unwrap();
+    fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn actual_configuration_is_required_after_setup() {
+    let mut trial = successful_trial();
+    trial.observed = None;
+    assert_eq!(
+        model::validate_trial(&trial).unwrap_err(),
+        model::TrialError::MissingObserved
+    );
+    trial.status = model::Status::TimedError;
+    trial.elapsed_ns = None;
+    trial.error = Some("timed out".into());
+    assert_eq!(
+        model::validate_trial(&trial).unwrap_err(),
+        model::TrialError::MissingObserved
+    );
+}
+
+#[test]
+fn v2_rejects_corrupt_metadata_schedule_footer_and_elapsed_value() {
+    assert_eq!(
+        model::decode_prefix("META\t2").unwrap_err(),
+        model::CodecError::Syntax
+    );
+    let mut zero = successful_trial();
+    zero.elapsed_ns = Some(0);
+    assert_eq!(
+        model::validate_trial(&zero).unwrap_err(),
+        model::TrialError::ZeroElapsed
     );
 
-    let mut study = study;
-    study.trials[0].error = Some("line\nbreak".into());
+    let first = successful_trial();
+    let mut second = first.clone();
+    second.order = 1;
+    second.cell.candidate = "adaptive".into();
+    second.cell.policy = "adaptive".into();
+    let mut missing = study(vec![first, second]);
+    missing.trials.pop();
     assert_eq!(
-        model::encode(&study).unwrap_err(),
-        model::CodecError::Study(model::StudyError::Trial(model::TrialError::InvalidCell))
+        model::validate_study(&missing).unwrap_err(),
+        model::StudyError::Incomplete
     );
+
+    let root = std::env::temp_dir().join(format!("evering-study-footer-{}", std::process::id()));
+    std::fs::create_dir_all(&root).unwrap();
+    let final_path = root.join("evidence.tsv");
+    let evidence = study(vec![successful_trial()]);
+    let mut recorder = model::Recorder::create(&final_path, evidence.meta).unwrap();
+    recorder.append(evidence.trials[0].clone()).unwrap();
+    recorder.finish().unwrap();
+    let mut complete = std::fs::read_to_string(&final_path).unwrap();
+    complete.truncate(complete.len() - 2);
+    assert!(model::decode(&complete).is_err());
+    std::fs::remove_file(final_path).unwrap();
+    std::fs::remove_dir(root).unwrap();
+}
+
+#[test]
+fn stalled_peer_exhausts_one_absolute_deadline() {
+    use std::{
+        io::ErrorKind,
+        net::{TcpListener, TcpStream},
+        sync::mpsc,
+        time::{Duration, Instant},
+    };
+
+    let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
+    let address = listener.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let peer = std::thread::spawn(move || {
+        let _stream = listener.accept().unwrap().0;
+        ready_tx.send(()).unwrap();
+        release_rx.recv().unwrap();
+    });
+    let stream = TcpStream::connect(address).unwrap();
+    ready_rx.recv().unwrap();
+    stream.set_nonblocking(true).unwrap();
+    let deadline = Instant::now() + Duration::from_millis(10);
+    let error = stream::read_until(&stream, &mut [0], deadline).unwrap_err();
+    assert_eq!(error.kind(), ErrorKind::TimedOut);
+    assert!(Instant::now() < deadline + Duration::from_millis(100));
+    release_tx.send(()).unwrap();
+    peer.join().unwrap();
 }
 
 #[test]
@@ -232,6 +430,8 @@ fn study_requires_complete_blocks_and_environment_identity() {
     first.cell.capacity = 16;
     first.order = 1;
     study.trials.push(first);
+    study.meta.expected = 3;
+    study.meta.schedule = model::trial_schedule_id(&study.trials);
     assert_eq!(
         model::validate_study(&study).unwrap_err(),
         model::StudyError::IncompleteBlock

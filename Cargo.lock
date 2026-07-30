@@ -86,6 +86,7 @@ dependencies = [
  "fastrand",
  "hdrhistogram",
  "nix",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

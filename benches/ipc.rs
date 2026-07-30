@@ -4,15 +4,15 @@ mod model;
 mod stream;
 
 use std::{
-    env, fs,
-    io::Write,
+    env,
+    path::Path,
     process::{Command, ExitCode},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use model::{
-    Arm, Contrast, ContrastKey, Meta, Policy, Scheduled, Status, Study, Trial, decode, encode,
-    mandatory_success, schedule,
+    Arm, Contrast, ContrastKey, Meta, Policy, Recorder, Scheduled, Status, Trial, load, schedule,
+    schedule_id,
 };
 
 fn contrast(payload: u64, capacity: u64, in_flight: u64, candidate: Policy) -> Contrast {
@@ -47,11 +47,8 @@ fn contrasts() -> Vec<Contrast> {
     result
 }
 
-fn number<T: core::str::FromStr>(value: Option<String>, name: &str) -> Result<T, String> {
-    value
-        .ok_or_else(|| format!("missing {name}"))?
-        .parse()
-        .map_err(|_| format!("invalid {name}"))
+fn number<T: core::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
+    value.parse().map_err(|_| format!("invalid {name}"))
 }
 
 fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
@@ -67,17 +64,42 @@ fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
         .map_err(|error| error.to_string())
 }
 
-fn metadata(seed: u64, warmup: u64, blocks: u32, timeout_ms: u64) -> Result<Meta, String> {
+fn digest(bytes: &[u8]) -> String {
+    format!(
+        "{:016x}",
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
+        })
+    )
+}
+
+fn metadata(
+    mode: &str,
+    seed: u64,
+    warmup: u64,
+    blocks: u32,
+    timeout_ms: u64,
+    schedule: u64,
+    expected: usize,
+) -> Result<Meta, String> {
     let rustc = output("rustc", &["--version", "--verbose"])?;
     let target = rustc
         .lines()
         .find_map(|line| line.strip_prefix("host: "))
         .ok_or("rustc omitted host target")?
         .to_owned();
+    let state = output("git", &["status", "--porcelain"])?;
+    let diff = output("git", &["diff", "HEAD", "--no-ext-diff", "--binary"])?;
+    let host = if cfg!(windows) {
+        output("cmd", &["/c", "ver"])?
+    } else {
+        output("uname", &["-srvmo"])?
+    };
     Ok(Meta {
-        format: 1,
+        format: 2,
         revision: output("git", &["rev-parse", "HEAD"])?,
-        dirty: !output("git", &["status", "--porcelain"])?.is_empty(),
+        dirty: !state.is_empty(),
+        diff: digest(format!("{state}\n{diff}").as_bytes()),
         target,
         os: env::consts::OS.into(),
         arch: env::consts::ARCH.into(),
@@ -88,10 +110,19 @@ fn metadata(seed: u64, warmup: u64, blocks: u32, timeout_ms: u64) -> Result<Meta
             .map_err(|error| error.to_string())?
             .as_millis()
             .to_string(),
+        mode: mode.into(),
         seed,
         warmup,
         blocks,
         timeout_ms,
+        schedule,
+        expected,
+        host: format!(
+            "{};profile=bench;cpu=unavailable;topology=logical:{};affinity=uncontrolled;power=unavailable;page=unavailable",
+            host.replace(['\t', '\n', '\r'], " "),
+            std::thread::available_parallelism().map_or(0, usize::from)
+        ),
+        spin: 0,
     })
 }
 
@@ -112,6 +143,8 @@ fn execute(
         completed: 0,
         validated: 0,
         elapsed_ns: None,
+        phase_ns: [0; 3],
+        observed: None,
         status: Status::Unsupported,
         error: None,
     };
@@ -127,22 +160,30 @@ fn execute(
             completed: counts.completed,
             validated: counts.validated,
             elapsed_ns: Some(counts.elapsed_ns),
+            phase_ns: counts.phase_ns,
+            observed: counts.observed,
             status: Status::Ok,
             ..trial
         },
-        Err(error) => Trial {
-            accepted: error.accepted,
-            completed: error.completed,
-            validated: error.validated,
-            status: error.status,
-            error: Some(error.message),
-            ..trial
-        },
+        Err(error) => {
+            let counts = error.counts;
+            Trial {
+                accepted: counts.accepted,
+                completed: counts.completed,
+                validated: counts.validated,
+                status: error.status,
+                error: Some(error.message),
+                phase_ns: counts.phase_ns,
+                observed: counts.observed,
+                ..trial
+            }
+        }
     }
 }
 
 fn record(
     path: &str,
+    mode: &str,
     selected: Vec<Scheduled>,
     blocks: u32,
     seed: u64,
@@ -153,42 +194,40 @@ fn record(
     if blocks == 0 || requested == 0 || timeout_ms == 0 {
         return Err("blocks, operations, and timeout must be nonzero".into());
     }
-    let meta = metadata(seed, warmup, blocks, timeout_ms)?;
+    let meta = metadata(
+        mode,
+        seed,
+        warmup,
+        blocks,
+        timeout_ms,
+        schedule_id(&selected),
+        selected.len(),
+    )?;
     let timeout = Duration::from_millis(timeout_ms);
-    let trials: Vec<Trial> = selected
-        .into_iter()
-        .map(|scheduled| execute(scheduled, requested, warmup, seed, timeout))
-        .collect();
-    let all_ok = mandatory_success(&trials);
-    let encoded = encode(&Study { meta, trials }).map_err(|error| format!("{error:?}"))?;
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
-        .map_err(|error| format!("open evidence: {error}"))?;
-    file.write_all(encoded.as_bytes())
-        .map_err(|error| error.to_string())?;
-    all_ok
-        .then_some(())
-        .ok_or_else(|| "mandatory trial failed; inspect the evidence record".into())
+    let mut recorder = Recorder::create(Path::new(path), meta)?;
+    let mut all_ok = true;
+    for scheduled in selected {
+        let trial = execute(scheduled, requested, warmup, seed, timeout);
+        all_ok &= trial.status == Status::Ok;
+        recorder.append(trial)?;
+    }
+    if all_ok {
+        recorder.finish()
+    } else {
+        Err("mandatory trial failed; inspect the partial evidence record".into())
+    }
 }
 
 fn dispatch() -> Result<(), String> {
-    let mut args = env::args().skip(1).filter(|argument| argument != "--bench");
-    match args.next().as_deref() {
-        Some("worker-stream") => {
-            let address = args.next().ok_or("missing worker address")?;
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
-            stream::worker(&address)
-        }
-        Some("plan") => {
-            let blocks = number(args.next(), "blocks")?;
-            let seed = number(args.next(), "seed")?;
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
+    let args: Vec<_> = env::args()
+        .skip(1)
+        .filter(|argument| argument != "--bench")
+        .collect();
+    match args.as_slice() {
+        [command, address] if command == "worker-stream" => stream::worker(address),
+        [command, blocks, seed] if command == "plan" => {
+            let blocks = number(blocks, "blocks")?;
+            let seed = number(seed, "seed")?;
             println!(
                 "block\torder\timplementation\tpolicy\tcandidate\tpayload\tcapacity\tin_flight\tmemory"
             );
@@ -209,42 +248,38 @@ fn dispatch() -> Result<(), String> {
             }
             Ok(())
         }
-        Some("validate") => {
-            let path = args.next().ok_or("missing evidence path")?;
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
-            let study = decode(&fs::read_to_string(path).map_err(|error| error.to_string())?)
-                .map_err(|error| format!("{error:?}"))?;
+        [command, path] if command == "validate" => {
+            let loaded = load(Path::new(path))?;
+            let study = loaded.study;
+            let state = if loaded.complete {
+                "complete"
+            } else {
+                "partial"
+            };
             println!(
-                "valid: {} blocks, {} trials, revision {}",
+                "valid {state}: {} blocks, {} trials, revision {}",
                 study.meta.blocks,
                 study.trials.len(),
                 study.meta.revision
             );
             Ok(())
         }
-        Some("run") => {
-            let path = args.next().ok_or("missing evidence path")?;
-            let blocks = number(args.next(), "blocks")?;
-            let seed = number(args.next(), "seed")?;
-            let requested = number(args.next(), "operations")?;
-            let warmup = number(args.next(), "warmup")?;
-            let timeout = number(args.next(), "timeout")?;
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
+        [command, path, blocks, seed, requested, warmup, timeout] if command == "run" => {
+            let blocks = number(blocks, "blocks")?;
+            let seed = number(seed, "seed")?;
+            let requested = number(requested, "operations")?;
+            let warmup = number(warmup, "warmup")?;
+            let timeout = number(timeout, "timeout")?;
             let selected = schedule(&contrasts(), blocks, seed);
-            record(&path, selected, blocks, seed, requested, warmup, timeout)
+            record(
+                path, "run", selected, blocks, seed, requested, warmup, timeout,
+            )
         }
-        Some("smoke") => {
-            let path = args.next().ok_or("missing evidence path")?;
-            if args.next().is_some() {
-                return Err("unexpected argument".into());
-            }
+        [command, path] if command == "smoke" => {
             let contrast = contrast(64, 8, 8, Policy::Notified);
             record(
-                &path,
+                path,
+                "smoke",
                 vec![Scheduled {
                     block: 0,
                     order: 0,
@@ -266,11 +301,9 @@ fn dispatch() -> Result<(), String> {
 }
 
 fn main() -> ExitCode {
-    match dispatch() {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(error) => {
-            eprintln!("{error}");
-            ExitCode::FAILURE
-        }
+    if let Err(error) = dispatch() {
+        eprintln!("{error}");
+        return ExitCode::FAILURE;
     }
+    ExitCode::SUCCESS
 }
