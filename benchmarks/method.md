@@ -1,222 +1,368 @@
 # Evering IPC study method
 
-This document defines the experiment before performance results are collected.
-It is a validity contract, not a claim that Evering is faster or slower than
-another transport.
+This document fixes the experiment before substantive performance evidence is
+collected. It is a validity contract, not a claim that Evering is universally
+faster or slower than another transport.
 
-## Question
+## Question and claim boundary
 
-Under which declared payload, queue, concurrency, waiting, memory, and platform
-conditions does an Evering request/response channel change latency, throughput,
-CPU demand, or recovery behavior relative to a maintained OS transport?
+The core study asks:
 
-The study separates two questions:
+> Under which declared payload, capacity, in-flight, waiting, memory, and
+> platform conditions does an Evering two-process request/response channel
+> change throughput or recovery behavior relative to a matched blocking OS
+> stream?
 
-1. What does each Evering mechanism cost in isolation?
-2. What does a complete two-process request/response workflow cost under
-   matched logical work?
+Latency and CPU cost are reportable only when the same admitted instrumentation
+observes both arms in a separate mode. Queue, allocation, notification, and
+process-exchange measurements can bound an explanation of a whole-system
+difference; they do not prove its cause.
 
-An observed difference is attributed to a mechanism only when an isolated
-factor and an appropriate counter change together. Otherwise it is reported as
-an implementation-level difference under the tested conditions.
+The core study does not compare threads with processes, pool platforms, treat a
+runtime as a transport, silently substitute unsupported behavior, or add an
+optional comparator before the matched experiment is complete.
 
 ## Logical operation
 
-One accepted operation consists of exactly one request record containing:
+One accepted operation is exactly one request with:
 
 - a monotonically assigned operation number;
 - the declared payload length;
 - deterministic payload bytes derived from the study seed and operation
   number.
 
-One completed operation consists of exactly one response carrying the same
-operation number and a deterministic transform of the request payload. A
-completed operation becomes validated only after the coordinator checks the
-entire response. Sampling bytes is not valid evidence.
+One completed operation is exactly one response carrying the same operation
+number and the declared deterministic transform of the complete request.
+Validation checks every response byte.
 
-Every cell must report identical `accepted`, `completed`, and `validated`
-counts. A mismatch invalidates the cell; it is never recorded as slow success.
+A successful trial satisfies:
 
-## Process and timing boundary
+`requested = accepted = completed = validated`
 
-The process study always uses one coordinator process and one worker process.
-Threads or tasks inside either process are a declared factor. An
-implementation that cannot support the selected topology is recorded as
-unsupported.
+A mismatch is a phase-specific failure with no performance value. Submitted
+work is never treated as completed work.
 
-Excluded setup:
+## Contrast, arm, and block
 
-- resource creation, mapping, and typed admission;
-- child spawn and handle exchange;
-- runtime construction and registration;
-- allocation of fixed study buffers;
-- warm-up operations;
-- start-barrier arrival.
+A `ContrastKey` identifies semantic workload only:
 
-The clock starts when both processes have completed warm-up and the coordinator
-releases the start barrier. It stops after the coordinator has validated the
-last of the exact requested operations. Queue contention, backpressure,
-notification, request allocation, response allocation, and payload copying
-belong inside this interval when the selected implementation requires them.
+- platform and target;
+- payload;
+- application-visible capacity;
+- maximum in-flight operations;
+- topology;
+- shared extent and allocator geometry where applicable.
 
-Excluded drain:
+A `Contrast` combines that key with exactly two named arms:
 
-- cooperative channel close;
-- remaining notification consumption;
-- child wait or forced termination;
-- unmapping and resource destruction;
-- result serialization.
+- candidate: Evering with one of `busy`, `adaptive`, or `notified`;
+- baseline: framed IPv4 loopback with policy `blocking`.
 
-Setup, timed work, and drain failures have distinct statuses. A failed setup or
-drain cannot produce a timed sample.
+Implementation and arm policy are not fields of `ContrastKey`. The blocking
+baseline is never duplicated under fake Evering policy labels.
 
-## Factors
+One independent unit is one fresh coordinator/worker process trial for one arm.
+Each block has exactly one trial for both arms of every registered contrast.
+The seed deterministically randomizes contrast order, then arm order inside
+each contrast. It never changes membership, work, or identity. A process is not
+reused across independent units.
 
-The screening matrix varies:
+## Process and phase boundary
 
-| Factor | Screening values |
-| --- | --- |
-| Platform | Windows, openSUSE Tumbleweed |
-| Implementation | Evering, one maintained OS baseline |
-| Waiting policy | busy, adaptive, OS-notified |
-| Payload bytes | 0, 64, 1 KiB, 16 KiB, 64 KiB |
-| Queue capacity | 1, 8, 256 |
-| In-flight operations | 1, 8, 64 |
-| Operations per trial | fixed exactly by the cell |
-| Trial order | seeded randomized blocks |
+The core topology is one coordinator process, one worker process, and one
+connection or typed request/response channel pair. Producer-count and
+multi-worker claims require a separately registered experiment.
 
-Unsupported implementation/policy pairs are explicit cells. They are not
-silently replaced by another policy. A focused matrix may reduce factor values
-only after screening, and its selection must be recorded before focused trials
-run.
+Every trial has:
 
-The memory extent is derived from the payload, capacity, and fixed protocol
-overhead, then recorded. It is not selected independently per implementation.
-Automatic allocator geometry is used unless allocator geometry is itself the
-declared factor.
+1. setup: resource creation, mapping/admission, child spawn, handle exchange,
+   runtime registration, and fixed-buffer allocation;
+2. warmup/readiness: identical logical warmup followed by acknowledgement from
+   both processes;
+3. barrier: one release after both acknowledgements;
+4. timed work: exact admitted requests, backpressure, allocation/copy required
+   by the arm, response completion, and full validation;
+5. drain: close, remaining notification consumption, child wait or exact
+   kill-and-wait, reclamation, and unmapping;
+6. evidence persistence outside the timed interval.
 
-## Evering waiting policies
+The clock starts at barrier release and stops after validation of the last
+requested response. Setup, timed, and drain each have one absolute deadline.
+An I/O retry cannot restart a phase timeout. Every spawned child reaches one
+observed terminal state.
 
-- **busy** retries the same nonblocking shared operation without an OS wait;
-- **adaptive** performs a recorded bounded spin/yield phase, then uses the same
-  OS notification path as notified mode;
-- **OS-notified** retries shared state, waits on the directional notification,
-  clears it, and immediately retries authoritative shared state.
+## Work and resource equivalence
 
-All policies use the same shared layouts, payload representation, operation
-numbering, validation, and close behavior. Notification remains advisory and
-does not alter the shared schema.
+- Both arms use the same exact requested count and deterministic payloads.
+- Capacity is the maximum application-visible outstanding record count.
+- Stream batching is `min(capacity, in_flight, remaining)`.
+- The stream uses one connection and records actual socket-buffer sizes.
+- Evering records actual shared extent and admitted allocator geometry.
+- No equal-memory claim is made unless all relevant buffers and bounds were
+  observed. Otherwise memory comparability is explicitly unavailable.
+- Unsupported arm/condition pairs remain explicit without timing.
+- Setup, warmup, drain, error, and validation rules are identical in meaning,
+  even when their transport mechanics differ.
 
-## Baseline admission
+## Registered matrices
 
-A baseline is admitted only when it is maintained on the tested platform and
-can implement the same two-process topology, exact operation count, payload
-validation, backpressure bound, and timing boundary. Its source revision,
-configuration, and unsupported cells are recorded.
+Reference values are payload 1024 bytes, capacity 8, in-flight 8, automatic
+allocator geometry, and the actual resulting shared extent.
 
-The historical `shmipc` Git revision and Monoio comparison are not admitted:
-their APIs are stale and the old runner changes transport, process topology,
-runtime, connection count, and queue policy simultaneously. They may be
-reintroduced only as newly reviewed baselines; old numbers are discarded.
+### Smoke
 
-The first portable OS baseline is a framed TCP byte stream over numeric IPv4
-loopback on every supported hosted platform. It measures one portable
-kernel-mediated transport, not a competing shared-memory library. Unix-domain
-sockets and Windows named pipes remain separate, platform-specific factors;
-they must not be substituted into this baseline under the same transport name.
+Smoke runs 100 operations as a correctness check only. It produces no
+performance claim.
 
-## Trial order and stopping
+### Screening
 
-Each block contains one trial for every supported cell selected into that
-block. A recorded seed deterministically shuffles cell order within every
-block. Trial count is fixed before execution; results do not stop when a
-preferred confidence interval or ranking appears.
+Screening uses these 23 contrasts:
 
-Warm-up count, measured operation count, blocks, seed, adaptive-spin bound, and
-timeouts are command inputs and are copied into raw evidence. Dividing work
-among producers uses quotient plus remainder, so the sum is always the exact
-requested count, including counts smaller than producer count.
+- all 15 combinations of payload `[0, 64, 1024, 16384, 65536]` and Evering
+  policy `[busy, adaptive, notified]` at capacity 8 and in-flight 8;
+- capacity `[1, 256]` at payload 1024, in-flight 8, notified;
+- in-flight `[1, 64]` at payload 1024, capacity 8, notified;
+- boundary pairs `(capacity, in-flight)` of `(1,1)`, `(1,64)`, `(256,1)`, and
+  `(256,64)` at payload 1024, notified.
 
-## Raw evidence
+Screening uses 10 complete paired blocks per platform. Its intervals and
+capacity/in-flight observations are descriptive.
 
-Raw evidence is append-only tab-separated text with a format version. One file
-starts with one metadata row followed by trial rows in actual execution order.
-Fields contain no tabs or newlines.
+### Focused confirmation
 
-Metadata records:
+The focused family is fixed before screening: the 15 payload × Evering-policy
+contrasts at capacity 8 and in-flight 8. It uses 30 complete paired blocks per
+platform. Capacity, in-flight, memory-geometry, or topology confirmation
+requires a later preregistered family.
 
-- format version and generating command;
-- source revision and dirty state;
-- target triple, operating system, architecture, Rust version;
-- wall-clock start, seed, warm-up count, timeout, and block count.
+Windows and openSUSE Tumbleweed are separate families and separate analyses.
 
-Trial records:
+## Pilot and stopping
 
-- block and order within block;
-- implementation and waiting policy;
-- payload, capacity, in-flight bound, memory extent;
-- requested, accepted, completed, and validated operation counts;
-- elapsed nanoseconds and terminal status;
-- setup, timed, or drain error text when present.
+Before screening, an excluded pilot runs both arms and selects one exact
+operation count per contrast so the faster arm is expected to run for at least
+250 ms without approaching the timed deadline. That count is identical for
+both arms and frozen before block 0.
 
-The validator rejects unknown format versions, missing metadata, duplicate
-block/cell pairs, impossible counts, zero elapsed time for successful measured
-work, unsupported cells carrying timings, and errors recorded as success.
-Raw rows are never deleted by analysis.
+Pilot rows are not evidence. Trial counts, seeds, operation counts, warmup,
+adaptive-spin bound, and deadlines are fixed before execution. There is no
+data-dependent stopping, post-hoc outlier deletion, or conversion of screening
+into confirmation.
 
-## Measurements and analysis
+## Waiting policies
 
-Every supported process cell records wall time and derives operations per
-second. Platform tools may additionally collect process CPU time, voluntary and
-involuntary context switches, syscalls, page faults, and peak resident memory.
-Unavailable counters remain absent; they are not synthesized.
+- `busy` retries the same nonblocking shared operation without an OS wait.
+- `adaptive` performs a recorded bounded spin, then follows the notified path.
+- `notified` performs check-arm-recheck through the shipped sticky
+  notification and immediately retries authoritative shared state after wake.
+- `blocking` is the framed stream's kernel-mediated blocking behavior.
 
-Kernel microbenchmarks separately measure:
+The three Evering policies share layouts, payload representation, operation
+path, counts, validation, close, and cleanup. They differ only at retry.
+Notification is advisory: it never publishes, consumes, closes, rolls back a
+committed record, or proves peer death.
 
-- reserve and publish;
-- claim and recycle;
-- shared allocation and release;
-- synchronous adapter fast-path wrapping;
-- one doorbell notification syscall.
+## Evidence format v2
 
-Analysis reports per-cell median and distribution-free bootstrap confidence
-intervals, paired within-block ratios against the baseline, and crossover
-tables over payload and in-flight count. It retains regressions, null results,
-unsupported cells, and invalid trials. Claims cite the raw file, source
-revision, seed, exact cell, and interval.
+One parser owns the tab-separated format. Fields cannot contain tabs, newlines,
+or carriage returns.
 
-No result from one platform, payload, policy, concurrency, or memory extent is
-generalized beyond that condition. A causal explanation requires agreement
-between the isolated microbenchmark and relevant process counters.
+`validate_prefix` admits metadata and each independently valid row from an
+interrupted artifact. `validate_complete` additionally requires the footer,
+the exact registered schedule, every arm pair and block, and terminal
+consistency. Analysis accepts only `validate_complete`.
+
+### Metadata row
+
+The metadata records:
+
+- format version and exact generating command;
+- source revision, dirty-state flag, and dirty-diff digest;
+- build profile, Rust compiler, target triple, OS/kernel build, and page size;
+- CPU model/topology, declared affinity, and observable governor/power policy;
+- dependency and admitted-comparator versions;
+- wall-clock start, seed, mode, schedule identity, blocks, warmup, and
+  operation-count policy;
+- absolute setup, timed, and drain deadlines;
+- adaptive-spin bound.
+
+An unavailable environmental observation is encoded explicitly as unavailable,
+not omitted or invented.
+
+### Trial row
+
+Every trial records:
+
+- contrast, arm, block, and actual order;
+- requested and actual payload, capacity, in-flight, batch, topology, policy,
+  transport, shared extent, allocator geometry, and socket-buffer observations;
+- phase durations;
+- requested, accepted, completed, and validated counts;
+- `success`, `unsupported`, or exact setup/timed/drain failure;
+- elapsed nanoseconds only for valid success;
+- optional symmetric process CPU/counter measurements;
+- fallback, coalescing, retry, and health observations required to interpret
+  the selected arm.
+
+### Footer
+
+The footer records schedule identity, expected and written row counts, and
+terminal completion. A missing or mismatched footer prevents complete
+validation.
+
+### Persistence and exit
+
+The runner creates a no-overwrite `.partial` artifact in the final directory.
+It flushes and `sync_data`s metadata, then appends, flushes, and `sync_data`s
+each independently valid trial. After all rows validate, it writes the footer,
+flushes and `sync_all`s, then atomically renames to a no-overwrite final name.
+Persistence is outside measured time.
+
+An interrupted prefix remains readable but incomplete. Any mandatory scheduled
+and supported arm that fails makes the command exit nonzero after preserving
+the partial evidence. Declared unsupported optional arms do not fail the run.
+A rerun never overwrites existing partial or final evidence.
+
+## Analysis
+
+For each complete paired block:
+
+`log_ratio = ln(evering_operations_per_second / baseline_operations_per_second)`
+
+The point estimate is `exp(median(log_ratio))`.
+
+The deterministic percentile bootstrap resamples complete paired blocks 10,000
+times. Its seed is derived from the study seed and stable contrast encoding.
+Screening reports descriptive 95% intervals.
+
+For a focused family of `m` contrasts, each contrast uses the two-sided
+Bonferroni bootstrap tails `0.05 / (2m)`, providing at least 95% familywise
+coverage.
+
+The practical-equivalence band is `[0.95, 1.05]`:
+
+- interval wholly inside the band: practically equivalent;
+- interval wholly above 1.05: candidate directionally faster;
+- interval wholly below 0.95: candidate directionally slower;
+- otherwise: inconclusive.
+
+A sustained crossover is the first ordered payload whose complete interval
+establishes one direction and whose next larger payload establishes the same
+direction. The largest payload alone cannot establish a sustained crossover.
+
+Analysis resamples blocks, never individual rows; rejects incomplete pairs,
+mixed platforms, mixed targets, or changed focused families; never mutates raw
+evidence; and produces deterministic Markdown with traceable artifact,
+contrast, and block identities.
+
+Latency ratios, combined coordinator-plus-worker CPU ns/op, logical GiB/s, and
+kernel counters are secondary only when collected symmetrically. Instrumented
+throughput, latency, and counter runs are separate when instrumentation changes
+the primary path.
+
+## Mechanism measurements
+
+Mechanism evidence is separate from IPC trials. Registered operations are:
+
+- reserve/publish;
+- claim/recycle;
+- shared allocate/release;
+- notification signal/consume;
+- one complete process exchange.
+
+Each row names whether it is same-process, cross-thread, or cross-process,
+records exact iterations and state reset, and includes a non-elided control
+loop using `std::hint::black_box`. Net and gross costs are reported; negative
+subtracted time is not manufactured into zero or a positive result.
+
+Mechanism rows cannot be decoded or reported as whole-system throughput. An
+association between mechanism and process evidence supports only a bounded
+explanation.
 
 ## Recovery experiment
 
-Recovery is a correctness study, not a throughput sample. The coordinator
-records accepted operation numbers, terminates the exact retained worker at a
-seeded transition, waits for terminal status, explicitly admits death, repairs,
-and classifies every accepted operation as validated, recovered loss, or
-protocol failure.
+Recovery is correctness evidence, not a throughput sample. One fresh worker is
+terminated at each registered cut:
 
-The invariant is conservation:
+- before publish;
+- after publish;
+- after claim;
+- before recycle.
 
-`accepted = validated + recovered loss`
+After terminal `Exit` from the exact retained `Supervisor`, the coordinator
+admits death, rechecks and drains authoritative shared state once, repairs,
+reaps, and classifies each accepted operation.
 
-No timeout, notification error, pipe closure, or PID observation authorizes
-recovery. Recovery trials report transition, seed, exact exit status, repaired
-layouts, conservation counts, and any quarantined allocation.
+Valid recovery satisfies:
+
+`accepted = validated + recovered_loss`
+
+Duplicate and fabricated records are zero. Timeout, notification error, pipe
+closure, PID, or heartbeat never authorizes death admission. Recovery records
+the cut, exact exit status, counts, duration, repaired layouts, quarantined
+bytes, and success of a subsequent clean attach/run.
 
 ## Invalidity rules
 
-A trial is invalid when any of these occurs:
+A trial has no performance value when:
 
-- setup/timed/drain boundaries differ from the declared implementation path;
-- accepted, completed, or validated work differs from the requested count;
-- a response operation number or payload is wrong or duplicated;
-- the child is not waited;
+- phase boundaries differ from the declared arm;
+- requested/accepted/completed/validated conservation fails;
+- a response number or payload is wrong, duplicate, or fabricated;
+- the child is not exactly waited or killed-and-waited;
+- a phase exceeds its absolute deadline;
 - resource, queue, or task growth exceeds its declared bound;
-- timeout or comparator error is converted to elapsed time;
-- the environment or source revision is missing;
-- trial order cannot be reproduced from the recorded seed;
-- a counter collection mode changes only one implementation's workload.
+- fallback, timeout, comparator error, or unsupported behavior is encoded as
+  elapsed success;
+- metadata, schedule, arm pair, environment, or revision is absent or
+  inconsistent;
+- the operation count/order cannot be reproduced;
+- instrumentation changes one arm only.
 
-Invalid and unsupported rows remain in the raw file with no performance value.
+Invalid and unsupported rows remain in partial evidence with a reason and no
+elapsed performance value. No post-hoc exclusion is permitted.
+
+## Comparator admission
+
+The mandatory baseline is the real two-process framed IPv4-loopback stream.
+Platform-native Unix-domain sockets and Windows named pipes are separate
+transport factors, not aliases of the portable baseline.
+
+Optional whole-system admission order is current `shmipc` on Linux, then
+iceoryx2 only for a named cross-platform middleware question. Every admitted
+row records exact version, runtime, geometry, capacity, batching, allocation,
+and fallback behavior. Fallback is invalid or a separately named arm.
+
+Monoio is a runtime-driver candidate, not an IPC comparator. It may enter a
+separate Linux/macOS study only over the same transport, topology, connection
+count, work, validation, and bounds. No optional dependency is added before a
+written equivalence/admission review.
+
+## Evidence retention and reporting
+
+Pilot and unreferenced exploratory artifacts remain ignored. Every artifact
+cited by `benchmarks/report.md` is copied unchanged into
+`benchmarks/evidence/`, revalidated there, and committed with the report. If a
+cited artifact exceeds 5 MiB, publication stops until a content-addressed
+external archive is approved.
+
+Each report claim names artifact, revision, platform, target, topology,
+payload, capacity, in-flight, candidate/baseline policies, extent/geometry,
+block count, estimator, familywise interval, and decision. Negative, null,
+unsupported, invalid, and inconclusive results remain visible. No claim
+generalizes beyond its recorded conditions.
+
+## Core completion
+
+Core completion requires:
+
+- evidence v2, deterministic paired scheduling, absolute lifecycle deadlines,
+  process-crash persistence, and complete validation;
+- matched Evering busy/adaptive/notified and blocking-stream arms;
+- native registered analysis;
+- mechanism and recovery evidence;
+- 10-block screening and 30-block focused families on Windows and Tumbleweed;
+- a checked-in condition-qualified report and every cited evidence artifact.
+
+Optional comparators, runtime drivers, latency distributions, process counters,
+plots, and hosted regression tracking are not core-completion requirements.
