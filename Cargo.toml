@@ -22,6 +22,7 @@ process = [
     "windows-sys/Win32_System_Threading",
 ]
 os = ["map", "notify", "process"]
+benchmark = ["os", "tokio"]
 tokio = ["std", "notify", "dep:tokio"]
 tracing = ["std", "dep:tracing"]
 
@@ -49,7 +50,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 name = "ipc"
 path = "benches/ipc.rs"
 harness = false
-required-features = ["os"]
+required-features = ["benchmark"]
 
 [package.metadata.docs.rs]
 all-features = true
