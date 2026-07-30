@@ -260,9 +260,11 @@ fn directory_grows_past_its_first_slab_and_reopens_every_layout() {
         }
 
         fn attach(&self, value: &Self::Config) -> Status {
-            (self.0 == *value)
-                .then_some(Status::Initialized)
-                .unwrap_or(Status::Corrupted)
+            if self.0 == *value {
+                Status::Initialized
+            } else {
+                Status::Corrupted
+            }
         }
     }
 

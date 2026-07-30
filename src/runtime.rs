@@ -228,8 +228,9 @@ mod tests {
 
         let event = super::Wait::new(event).unwrap();
 
-        let cancelled = event.ready();
-        drop(cancelled);
+        {
+            let _cancelled = event.ready();
+        }
         ring.notify().unwrap();
         event.ready().await.unwrap();
         event.clear().unwrap();

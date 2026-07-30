@@ -52,6 +52,12 @@ pub unsafe trait Layout: SharedSchema + Sized {
 
     fn info(conf: &Self::Config, ctx: LayoutContext) -> Self::Info;
 
+    /// Initializes a previously uninitialized layout body.
+    ///
+    /// # Safety
+    ///
+    /// `destination` must be valid, properly aligned, writable storage for one
+    /// `Self`. No live value may currently occupy that storage.
     unsafe fn init(destination: *mut Self, conf: Self::Config) -> Status;
     fn attach(&self, conf: &Self::Config) -> Status;
 }

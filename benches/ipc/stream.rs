@@ -229,12 +229,8 @@ pub fn run(
         socket_recv: Some(socket_recv),
     };
     let mut counts = Counts {
-        accepted: 0,
-        completed: 0,
-        validated: 0,
-        elapsed_ns: 0,
-        phase_ns: [0; 3],
         observed: Some(observed),
+        ..Counts::default()
     };
     for operation in requested..requested.saturating_add(warmup) {
         if !exchange(
@@ -246,11 +242,7 @@ pub fn run(
         )
         .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?
         {
-            return Err(fail(
-                Status::SetupError,
-                "warmup validation failed",
-                Some(&counts),
-            ));
+            return Err(fail(Status::SetupError, "warmup", Some(&counts)));
         }
     }
     write_frame_until(&stream, u64::MAX, &[], setup_deadline)
@@ -278,11 +270,8 @@ pub fn run(
             if operation != expected
                 || !valid_response(seed, operation, cell.payload as usize, &bytes)
             {
-                return Err(fail(
-                    Status::TimedError,
-                    format!("invalid response for operation {expected}"),
-                    Some(&counts),
-                ));
+                let message = format!("invalid response {expected}");
+                return Err(fail(Status::TimedError, message, Some(&counts)));
             }
             counts.validated += 1;
         }
@@ -305,21 +294,13 @@ pub fn run(
             child
                 .kill_wait()
                 .map_err(|error| fail(Status::DrainError, error, Some(&counts)))?;
-            return Err(fail(
-                Status::DrainError,
-                "worker exceeded drain deadline",
-                Some(&counts),
-            ));
+            return Err(fail(Status::DrainError, "timeout", Some(&counts)));
         }
         std::thread::yield_now();
     };
     counts.phase_ns[2] = drain_started.elapsed().as_nanos().max(1) as u64;
     if !exit.success() {
-        return Err(fail(
-            Status::DrainError,
-            "worker failed during drain",
-            Some(&counts),
-        ));
+        return Err(fail(Status::DrainError, "exit", Some(&counts)));
     }
     Ok(counts)
 }

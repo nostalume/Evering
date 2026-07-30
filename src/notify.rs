@@ -53,9 +53,24 @@ pub struct Done<T, E> {
 
 /// A send that did not commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SendError<T, E> {
-    Disconnected(T),
-    Wait { value: T, error: E },
+pub enum SendError<E> {
+    Disconnected,
+    Wait(E),
+}
+
+/// Caller-owned state for a send that may suspend before committing.
+#[derive(Debug)]
+#[must_use = "an uncommitted send still owns its value"]
+pub struct Pending<T>(Option<T>);
+
+impl<T> Pending<T> {
+    pub const fn new(value: T) -> Self {
+        Self(Some(value))
+    }
+
+    pub fn into_inner(self) -> Option<T> {
+        self.0
+    }
 }
 
 /// A receive that did not commit.
@@ -111,8 +126,12 @@ where
     N: Notify,
     L: Listen,
 {
-    pub async fn send(&self, mut value: V) -> Result<Done<(), N::Error>, SendError<V, L::Error>> {
+    pub async fn send(
+        &self,
+        pending: &mut Pending<V>,
+    ) -> Result<Done<(), N::Error>, SendError<L::Error>> {
         loop {
+            let value = pending.0.take().expect("cannot resend a committed value");
             match self.inner.try_send(value) {
                 Ok(()) => {
                     return Ok(Done {
@@ -121,15 +140,16 @@ where
                     });
                 }
                 Err(TrySendError::Disconnected(returned)) => {
-                    return Err(SendError::Disconnected(returned));
+                    pending.0 = Some(returned);
+                    return Err(SendError::Disconnected);
                 }
                 Err(TrySendError::Full(returned)) => {
-                    value = returned;
+                    pending.0 = Some(returned);
                     if let Err(error) = self.listen.ready().await {
-                        return Err(SendError::Wait { value, error });
+                        return Err(SendError::Wait(error));
                     }
                     if let Err(error) = self.listen.clear() {
-                        return Err(SendError::Wait { value, error });
+                        return Err(SendError::Wait(error));
                     }
                 }
             }
@@ -164,7 +184,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{Async, Done, Listen, Notify, RecvError, SendError};
+    use super::{Async, Done, Listen, Notify, Pending, RecvError, SendError};
     use crate::channel::{Receiver, Sender, TryRecvError, TrySendError};
     use core::{
         cell::Cell,
@@ -238,6 +258,80 @@ mod tests {
         }
     }
 
+    struct Never;
+
+    impl Listen for Never {
+        type Error = u8;
+        type Ready<'a> = core::future::Pending<Result<(), u8>>;
+
+        fn ready(&self) -> Self::Ready<'_> {
+            core::future::pending()
+        }
+
+        fn clear(&self) -> Result<(), Self::Error> {
+            unreachable!("permanently pending readiness cannot be cleared")
+        }
+    }
+
+    struct Full<'a>(&'a Cell<usize>);
+
+    impl Sender for Full<'_> {
+        type Item = u8;
+        type TryError = TrySendError<u8>;
+
+        fn try_send(&self, item: u8) -> Result<(), Self::TryError> {
+            self.0.set(self.0.get() + 1);
+            Err(TrySendError::Full(item))
+        }
+    }
+
+    struct Closed<'a>(&'a Latch);
+
+    impl Sender for Closed<'_> {
+        type Item = u8;
+        type TryError = TrySendError<u8>;
+
+        fn try_send(&self, item: u8) -> Result<(), Self::TryError> {
+            if self.0.ready.get() {
+                Err(TrySendError::Disconnected(item))
+            } else {
+                Err(TrySendError::Full(item))
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_send_keeps_caller_owned_value() {
+        let tries = Cell::new(0);
+        let mut value = Pending::new(73);
+        let send = Async::new(Full(&tries), Bell(Ok(())), Never);
+
+        assert!(
+            tokio::time::timeout(core::time::Duration::from_millis(1), send.send(&mut value))
+                .await
+                .is_err()
+        );
+        assert_eq!(tries.get(), 1);
+        assert_eq!(value.into_inner(), Some(73));
+    }
+
+    #[tokio::test]
+    async fn close_while_waiting_keeps_caller_owned_value() {
+        let latch = Latch {
+            ready: Cell::new(false),
+            clears: Cell::new(0),
+            error: None,
+        };
+        let mut value = Pending::new(31);
+        let result = Async::new(Closed(&latch), Bell(Ok(())), &latch)
+            .send(&mut value)
+            .await;
+
+        assert_eq!(result, Err(SendError::Disconnected));
+        assert_eq!(value.into_inner(), Some(31));
+        assert_eq!(latch.clears.get(), 1);
+    }
+
     #[tokio::test]
     async fn full_and_empty_wait_clear_and_retry_authoritative_state() {
         let tx_latch = Latch {
@@ -249,7 +343,10 @@ mod tests {
             latch: &tx_latch,
             tries: Cell::new(0),
         };
-        let sent = Async::new(tx, Bell(Ok(())), &tx_latch).send(17).await;
+        let mut value = Pending::new(17);
+        let sent = Async::new(tx, Bell(Ok(())), &tx_latch)
+            .send(&mut value)
+            .await;
         assert_eq!(
             sent,
             Ok(Done {
@@ -257,6 +354,7 @@ mod tests {
                 notified: Ok(())
             })
         );
+        assert_eq!(value.into_inner(), None);
         assert_eq!(tx_latch.clears.get(), 1);
 
         let rx_latch = Latch {
@@ -284,6 +382,7 @@ mod tests {
             clears: Cell::new(0),
             error: Some(7),
         };
+        let mut value = Pending::new(41);
         let result = Async::new(
             Tx {
                 latch: &latch,
@@ -292,15 +391,10 @@ mod tests {
             Bell(Ok(())),
             &latch,
         )
-        .send(41)
+        .send(&mut value)
         .await;
-        assert_eq!(
-            result,
-            Err(SendError::Wait {
-                value: 41,
-                error: 7
-            })
-        );
+        assert_eq!(result, Err(SendError::Wait(7)));
+        assert_eq!(value.into_inner(), Some(41));
     }
 
     #[tokio::test]
@@ -310,6 +404,7 @@ mod tests {
             clears: Cell::new(0),
             error: None,
         };
+        let mut value = Pending::new(53);
         let sent = Async::new(
             Tx {
                 latch: &latch,
@@ -318,7 +413,7 @@ mod tests {
             Bell(Err(9)),
             &latch,
         )
-        .send(53)
+        .send(&mut value)
         .await;
         assert_eq!(
             sent,
@@ -327,6 +422,7 @@ mod tests {
                 notified: Err(9)
             })
         );
+        assert_eq!(value.into_inner(), None);
 
         let _ = RecvError::<u8>::Disconnected;
     }

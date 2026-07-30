@@ -97,7 +97,7 @@ fn canonical(control: u16) -> bool {
 }
 
 fn owned(base: u16, complete: bool, owner: u8) -> u16 {
-    base | u16::from(complete) * COMPLETE | ((owner as u16 + 1) << SOURCE_SHIFT)
+    base | (u16::from(complete) * COMPLETE) | ((owner as u16 + 1) << SOURCE_SHIFT)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -387,7 +387,7 @@ fn replay(seed: u64, steps: usize) -> Result<(), (usize, &'static str)> {
         };
         let complete = random.next() & 1 != 0;
         let mut control = owned(base, complete, source);
-        if random.next() % 3 == 0 {
+        if random.next().is_multiple_of(3) {
             control |= ((live as u16 + 1) << REAPER_SHIFT) & REAPER_MASK;
         }
         let turn = (random.next() as usize) & !3;

@@ -1,3 +1,5 @@
+#[path = "ipc/analysis.rs"]
+mod analysis;
 #[path = "ipc/evering.rs"]
 mod evering;
 #[path = "ipc/model.rs"]
@@ -124,7 +126,7 @@ fn metadata(
             host.replace(['\t', '\n', '\r'], " "),
             std::thread::available_parallelism().map_or(0, usize::from)
         ),
-        spin: 0,
+        spin: evering::ADAPTIVE_SPINS as u32,
     })
 }
 
@@ -152,13 +154,7 @@ fn execute(
     };
     let result = match scheduled.arm {
         Arm::Stream => stream::run(&trial.cell, requested, warmup, seed, timeout),
-        Arm::Evering(Policy::Busy) => evering::run(&trial.cell, requested, warmup, seed, timeout),
-        Arm::Evering(_) => {
-            return Trial {
-                error: Some("Evering policy is not implemented".into()),
-                ..trial
-            };
-        }
+        Arm::Evering(policy) => evering::run(policy, &trial.cell, requested, warmup, seed, timeout),
     };
     match result {
         Ok(counts) => Trial {
@@ -243,7 +239,11 @@ fn dispatch() -> Result<(), String> {
         .collect();
     match args.as_slice() {
         [command, address] if command == "worker-stream" => stream::worker(address),
-        [command, address] if command == "worker-evering" => evering::worker(address),
+        [command, address, policy, timeout] if command == "worker-evering" => evering::worker(
+            address,
+            policy,
+            Duration::from_millis(number(timeout, "timeout")?),
+        ),
         [command, blocks, seed] if command == "plan" => {
             let blocks = number(blocks, "blocks")?;
             let seed = number(seed, "seed")?;
@@ -283,6 +283,10 @@ fn dispatch() -> Result<(), String> {
             );
             Ok(())
         }
+        [command, paths @ ..] if command == "analyze" && !paths.is_empty() => {
+            print!("{}", analysis::command(paths)?);
+            Ok(())
+        }
         [command, path, blocks, seed, requested, warmup, timeout] if command == "run" => {
             let blocks = number(blocks, "blocks")?;
             let seed = number(seed, "seed")?;
@@ -302,37 +306,27 @@ fn dispatch() -> Result<(), String> {
             })
         }
         [command, path] if command == "smoke" => {
-            let boundary = contrast(0, 1, 1, Policy::Busy);
-            let windowed = contrast(64 * 1024, 8, 3, Policy::Busy);
+            let selected = [
+                contrast(0, 1, 1, Policy::Busy),
+                contrast(0, 1, 1, Policy::Adaptive),
+                contrast(64 * 1024, 8, 3, Policy::Notified),
+            ]
+            .into_iter()
+            .flat_map(|contrast| {
+                [Arm::Evering(contrast.candidate), Arm::Stream].map(move |arm| (contrast, arm))
+            })
+            .enumerate()
+            .map(|(order, (contrast, arm))| Scheduled {
+                block: 0,
+                order: order as u32,
+                contrast,
+                arm,
+            })
+            .collect();
             record(Record {
                 path,
                 mode: "smoke",
-                selected: vec![
-                    Scheduled {
-                        block: 0,
-                        order: 0,
-                        contrast: boundary,
-                        arm: Arm::Evering(Policy::Busy),
-                    },
-                    Scheduled {
-                        block: 0,
-                        order: 1,
-                        contrast: boundary,
-                        arm: Arm::Stream,
-                    },
-                    Scheduled {
-                        block: 0,
-                        order: 2,
-                        contrast: windowed,
-                        arm: Arm::Evering(Policy::Busy),
-                    },
-                    Scheduled {
-                        block: 0,
-                        order: 3,
-                        contrast: windowed,
-                        arm: Arm::Stream,
-                    },
-                ],
+                selected,
                 blocks: 1,
                 seed: 7,
                 requested: 101,
@@ -340,10 +334,12 @@ fn dispatch() -> Result<(), String> {
                 timeout_ms: 5000,
             })
         }
-        _ => Err("usage: ipc plan <blocks> <seed> | ipc validate <file> | \
+        _ => Err(
+            "usage: ipc plan <blocks> <seed> | ipc validate <file> | ipc analyze <file>... | \
              ipc run <file> <blocks> <seed> <operations> <warmup> <timeout-ms> | \
              ipc smoke <file>"
-            .into()),
+                .into(),
+        ),
     }
 }
 

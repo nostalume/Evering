@@ -361,16 +361,16 @@ impl<P: Repr, M: Meta> PackToken<P, M> {
                 record: Self { header, token },
             });
         }
-        if layout.size() != 0 {
-            if let Err(meta) = alloc.dealloc(token.meta, layout) {
-                return Err(DiscardError {
-                    kind: TransferError::Busy,
-                    record: Self {
-                        header,
-                        token: Token { meta, ..token },
-                    },
-                });
-            }
+        if layout.size() != 0
+            && let Err(meta) = alloc.dealloc(token.meta, layout)
+        {
+            return Err(DiscardError {
+                kind: TransferError::Busy,
+                record: Self {
+                    header,
+                    token: Token { meta, ..token },
+                },
+            });
         }
         Ok(header)
     }

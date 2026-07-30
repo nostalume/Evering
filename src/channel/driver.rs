@@ -625,7 +625,7 @@ where
     }
 }
 
-impl<'a, S: super::Sender, U, const N: usize> Submitter<OwnOp<U, N>, U> for Sx<S, U, N>
+impl<S: super::Sender, U, const N: usize> Submitter<OwnOp<U, N>, U> for Sx<S, U, N>
 where
     S::Item: Identifier<U>,
     S::TryError: SendRejection<S::Item>,
@@ -691,7 +691,7 @@ where
     }
 }
 
-impl<'a, R: super::Receiver, U, const N: usize> Completer<U> for Cx<R, U, N>
+impl<R: super::Receiver, U, const N: usize> Completer<U> for Cx<R, U, N>
 where
     R::Item: Identifier<U>,
 {
@@ -724,7 +724,7 @@ mod tests {
         let completed = cache.complete(0, VALUE);
         assert_eq!(completed, Completion::Stored { woke: false });
         let waker = Waker::noop();
-        let mut ctx = Context::from_waker(&waker);
+        let mut ctx = Context::from_waker(waker);
         match cache.poll(&mut ctx) {
             Poll::Ready(v) => {
                 assert_eq!(v, VALUE)
@@ -757,7 +757,7 @@ mod tests {
 
         let handle = std::thread::spawn(move || {
             let waker = Waker::noop();
-            let mut ctx = Context::from_waker(&waker);
+            let mut ctx = Context::from_waker(waker);
             loop {
                 match cache2.poll(&mut ctx) {
                     Poll::Ready(v) => return v,

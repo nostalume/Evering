@@ -1,7 +1,13 @@
+#[allow(dead_code)]
+#[path = "../benches/ipc/analysis.rs"]
+mod analysis;
 #[cfg(feature = "process")]
 #[allow(dead_code)]
 #[path = "../benches/ipc/evering.rs"]
 mod evering;
+#[allow(dead_code)]
+#[path = "../benches/ipc/micro.rs"]
+mod micro;
 #[allow(dead_code)]
 #[path = "../benches/ipc/model.rs"]
 mod model;
@@ -223,6 +229,208 @@ fn stream_observed() -> model::Observed {
         socket_send: Some(4096),
         socket_recv: Some(4096),
     }
+}
+
+fn paired_study(ratios: &[(u64, f64)]) -> model::Study {
+    let mut trials = Vec::new();
+    for (block, &(payload, ratio)) in ratios.iter().enumerate() {
+        let mut candidate = successful_trial();
+        candidate.block = block as u32;
+        candidate.order = u32::from(block % 2 != 0);
+        candidate.cell.payload = payload;
+        candidate.observed.as_mut().unwrap().payload = payload;
+        candidate.elapsed_ns = Some(1_000_000);
+        let mut baseline = candidate.clone();
+        baseline.order = 1 - candidate.order;
+        baseline.cell.implementation = "os-stream".into();
+        baseline.cell.policy = "blocking".into();
+        baseline.observed = Some(stream_observed());
+        baseline.observed.as_mut().unwrap().payload = payload;
+        baseline.elapsed_ns = Some((ratio * 1_000_000.0) as u64);
+        trials.extend([candidate, baseline]);
+    }
+    let mut evidence = study(trials);
+    evidence.meta.blocks = ratios.len() as u32;
+    evidence.meta.schedule = model::trial_schedule_id(&evidence.trials);
+    evidence
+}
+
+fn family_study(entries: &[(u64, f64)]) -> model::Study {
+    let mut trials = Vec::new();
+    for &(payload, ratio) in entries {
+        let mut pair = paired_study(&[(payload, ratio)]).trials;
+        pair[0].order = trials.len() as u32;
+        pair[1].order = pair[0].order + 1;
+        trials.extend(pair);
+    }
+    study(trials)
+}
+
+#[test]
+fn paired_analysis_is_order_independent_and_hand_checked() {
+    let evidence = paired_study(&[(64, 2.0), (64, 2.0), (64, 2.0)]);
+    let analysis = analysis::analyze(core::slice::from_ref(&evidence)).unwrap();
+    assert_eq!(analysis.estimates.len(), 1);
+    let estimate = &analysis.estimates[0];
+    assert_eq!(estimate.blocks, 3);
+    assert_eq!(estimate.decision, analysis::Decision::Faster);
+    assert!((estimate.effect - 2.0).abs() < 1e-12);
+    assert!((estimate.low - 2.0).abs() < 1e-12);
+    assert!((estimate.high - 2.0).abs() < 1e-12);
+
+    let mut reversed = evidence.clone();
+    reversed.trials.reverse();
+    reversed.meta.schedule = model::trial_schedule_id(&reversed.trials);
+    assert_eq!(
+        analysis::analyze(&[reversed]).unwrap().estimates,
+        analysis.estimates
+    );
+}
+
+#[test]
+fn analysis_classifies_registered_band_and_rejects_bad_admission() {
+    let equivalent = paired_study(&[(64, 0.97), (64, 1.0), (64, 1.03)]);
+    let inconclusive = paired_study(&[(64, 0.90), (64, 1.0), (64, 1.10)]);
+    let slower = paired_study(&[(64, 0.8), (64, 0.8), (64, 0.8)]);
+    assert_eq!(
+        analysis::analyze(&[equivalent]).unwrap().estimates[0].decision,
+        analysis::Decision::Equivalent
+    );
+    assert_eq!(
+        analysis::analyze(&[inconclusive]).unwrap().estimates[0].decision,
+        analysis::Decision::Inconclusive
+    );
+    assert_eq!(
+        analysis::analyze(&[slower]).unwrap().estimates[0].decision,
+        analysis::Decision::Slower
+    );
+
+    let mut failed = paired_study(&[(64, 1.0)]);
+    failed.trials[0].status = model::Status::TimedError;
+    failed.trials[0].elapsed_ns = None;
+    failed.trials[0].error = Some("timeout".into());
+    failed.meta.schedule = model::trial_schedule_id(&failed.trials);
+    assert_eq!(
+        analysis::analyze(&[failed]).unwrap_err(),
+        analysis::Error::Pair
+    );
+
+    let first = paired_study(&[(64, 1.0)]);
+    let mut other_platform = first.clone();
+    other_platform.meta.os = "other".into();
+    assert_eq!(
+        analysis::analyze(&[first.clone(), other_platform]).unwrap_err(),
+        analysis::Error::Environment
+    );
+    assert_eq!(
+        analysis::analyze(&[first, paired_study(&[(128, 1.0)])]).unwrap_err(),
+        analysis::Error::Family
+    );
+
+    let mut missing = paired_study(&[(64, 1.0)]);
+    missing.trials.pop();
+    assert_eq!(
+        analysis::analyze(&[missing]).unwrap_err(),
+        analysis::Error::Study(model::StudyError::Incomplete)
+    );
+    let mut duplicate = paired_study(&[(64, 1.0)]);
+    duplicate.trials.push(duplicate.trials[0].clone());
+    duplicate.meta.expected += 1;
+    duplicate.meta.schedule = model::trial_schedule_id(&duplicate.trials);
+    assert_eq!(
+        analysis::analyze(&[duplicate]).unwrap_err(),
+        analysis::Error::Study(model::StudyError::DuplicateCell)
+    );
+}
+
+#[test]
+fn analysis_reports_only_sustained_crossover_and_stable_markdown() {
+    let sustained = family_study(&[(0, 1.0), (64, 1.2), (128, 1.3)]);
+    let analysis = analysis::analyze(core::slice::from_ref(&sustained)).unwrap();
+    assert_eq!(
+        analysis.crossovers,
+        vec![(model::Policy::Busy, 64, analysis::Decision::Faster)]
+    );
+    let markdown = analysis.markdown();
+    assert_eq!(
+        markdown,
+        format!(
+            "# IPC analysis\n\nEnvironment: `test` on `x86_64-test`. Family: 3. \
+             Evidence: abc123:{}#0..1.\n\n\
+             | policy | payload | capacity | in-flight | memory | blocks | effect | interval | decision |\n\
+             |---|---:|---:|---:|---:|---:|---:|---:|---|\n\
+             | Busy | 0 | 8 | 3 | 4096 | 1 | 1.000000 | [1.000000, 1.000000] | Equivalent |\n\
+             | Busy | 64 | 8 | 3 | 4096 | 1 | 1.200000 | [1.200000, 1.200000] | Faster |\n\
+             | Busy | 128 | 8 | 3 | 4096 | 1 | 1.300000 | [1.300000, 1.300000] | Faster |\n\n\
+             Crossover: Busy at 64 bytes (Faster).\n",
+            sustained.meta.schedule
+        )
+    );
+
+    let terminal = family_study(&[(0, 1.0), (64, 1.0), (128, 1.3)]);
+    assert!(
+        analysis::analyze(&[terminal])
+            .unwrap()
+            .crossovers
+            .is_empty()
+    );
+}
+
+#[test]
+fn micro_evidence_requires_one_reset_transition_per_iteration() {
+    use std::time::Duration;
+
+    let row = micro::measure(micro::Mechanism::ReservePublish, 3, "capacity=8", |_| {
+        Ok(micro::Sample {
+            elapsed: Duration::from_nanos(7),
+            operations: 1,
+            reset: true,
+        })
+    })
+    .unwrap();
+    assert_eq!(row.iterations, 3);
+    assert_eq!(row.gross_ns, 21);
+    assert_eq!(row.net_ns, 21_i128 - row.control_ns as i128);
+    assert!(
+        row.encode()
+            .starts_with("MICRO\treserve-publish\tsame-process\t")
+    );
+    assert!(model::decode(&row.encode()).is_err());
+
+    for sample in [
+        micro::Sample {
+            elapsed: Duration::ZERO,
+            operations: 0,
+            reset: true,
+        },
+        micro::Sample {
+            elapsed: Duration::from_nanos(1),
+            operations: 1,
+            reset: false,
+        },
+    ] {
+        assert!(
+            micro::measure(micro::Mechanism::ClaimRecycle, 1, "capacity=8", |_| {
+                Ok(sample)
+            })
+            .is_err()
+        );
+    }
+    let negative = micro::measure(micro::Mechanism::SignalConsume, 1, "sticky=native", |_| {
+        Ok(micro::Sample {
+            elapsed: Duration::ZERO,
+            operations: 1,
+            reset: true,
+        })
+    })
+    .unwrap();
+    assert_eq!(negative.net_ns, -(negative.control_ns as i128));
+    assert!(
+        micro::measure(micro::Mechanism::AllocateRelease, 1, "bytes=64", |_| {
+            Err("failed operation".into())
+        })
+        .is_err()
+    );
 }
 
 #[test]

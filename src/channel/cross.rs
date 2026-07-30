@@ -16,6 +16,7 @@ use crate::schema::{
 use crate::token::PackToken;
 
 type Item<H, M> = PackToken<H, M>;
+pub type Endpoints<H, M> = (QueueTx<Handle<H, M>>, QueueRx<Handle<H, M>>);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {
@@ -223,17 +224,17 @@ impl<H: Repr, M: Meta> View<H, M> {
         }
     }
 
-    pub fn endpoints(self, side: Side) -> (QueueTx<Handle<H, M>>, QueueRx<Handle<H, M>>) {
+    pub fn endpoints(self, side: Side) -> Endpoints<H, M> {
         let tx = self.endpoint(side);
         let rx = self.endpoint(side.opposite());
         (QueueTx { tx }, QueueRx { rx })
     }
 
-    pub fn lsplit(self) -> (QueueTx<Handle<H, M>>, QueueRx<Handle<H, M>>) {
+    pub fn lsplit(self) -> Endpoints<H, M> {
         self.endpoints(Side::Left)
     }
 
-    pub fn rsplit(self) -> (QueueTx<Handle<H, M>>, QueueRx<Handle<H, M>>) {
+    pub fn rsplit(self) -> Endpoints<H, M> {
         self.endpoints(Side::Right)
     }
 
@@ -254,7 +255,7 @@ impl<H: Repr, M: Meta> View<H, M> {
         for side in [Side::Left, Side::Right] {
             let handle = self.endpoint(side);
             for index in 0..self.capacity {
-                match (&handle).repair(index, dead, live) {
+                match handle.repair(index, dead, live) {
                     Repair::None => {}
                     Repair::Recovered => result = Repair::Recovered,
                     other => return other,

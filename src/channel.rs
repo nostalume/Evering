@@ -30,7 +30,7 @@ const RESERVED_MASK: u16 = 1 << 15;
 #[cfg(test)]
 static EXIT_AFTER_REAPER: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix, feature = "map"))]
 pub(crate) fn exit_after_reaper(owner: u8) {
     EXIT_AFTER_REAPER.store(owner + 1, Ordering::Relaxed);
 }
@@ -50,7 +50,7 @@ pub(crate) const RECV_FINISHED: usize = 6;
 #[cfg(test)]
 static CLOSE_CRASH: AtomicU8 = AtomicU8::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix, feature = "map"))]
 pub(crate) fn crash_close_for_test(point: usize) {
     CLOSE_CRASH.store(point as u8, Ordering::Relaxed);
 }
@@ -114,6 +114,7 @@ pub enum ReserveError {
     Closed,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimError {
     Empty,
     Busy,
@@ -652,9 +653,13 @@ impl<T: Queue> QueueChannel for QueueTx<T> {
 }
 
 impl<T: Queue> QueueTx<T> {
+    pub fn reserve(&self) -> Result<Reserved<'_, T>, ReserveError> {
+        self.tx.reserve()
+    }
+
     #[inline(always)]
     pub fn try_send(&self, value: T::Item) -> Result<(), TrySendError<T::Item>> {
-        match self.tx.reserve() {
+        match self.reserve() {
             Ok(reserved) => {
                 reserved.stage(value).publish();
                 Ok(())
@@ -696,9 +701,13 @@ impl<T: Queue> QueueChannel for QueueRx<T> {
 }
 
 impl<T: Queue> QueueRx<T> {
+    pub fn claim(&self) -> Result<Claim<'_, T>, ClaimError> {
+        self.rx.claim()
+    }
+
     #[inline(always)]
     pub fn try_recv(&self) -> Result<T::Item, TryRecvError> {
-        match self.rx.claim() {
+        match self.claim() {
             Ok(claim) => Ok(claim.take()),
             Err(ClaimError::Closed) => Err(TryRecvError::Disconnected),
             Err(ClaimError::Empty) if self.rx.terminal() => Err(TryRecvError::Disconnected),

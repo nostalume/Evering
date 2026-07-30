@@ -20,7 +20,7 @@ fn mock_alloc(name: &str, size: usize) -> UnixAlloc {
 #[test]
 fn layout_order_is_rejected_at_the_first_unexpected_record() {
     const SIZE: usize = 1 << 19;
-    const REGION: RegionId = RegionId::new(0x4f52_4445_52, 1);
+    const REGION: RegionId = RegionId::new(0x004f_5244_4552, 1);
     let fd = UnixFd::memfd("layout-order", SIZE, false).expect("create shared memory");
     let created = crate::perlude::talc::SessionBy::<()>::create(
         fd.dup().expect("duplicate shared-memory handle"),

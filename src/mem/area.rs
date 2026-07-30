@@ -9,6 +9,9 @@ use crate::{
     schema::{LayoutContext, RegionAdmission, RegionId},
 };
 
+type Release = unsafe fn(NonNull<u8>, usize) -> bool;
+type MapParts = (NonNull<u8>, usize, Access, Release);
+
 /// Linear owner of one process-local mapping.
 pub struct Map {
     start: NonNull<u8>,
@@ -124,14 +127,7 @@ impl Map {
         }
     }
 
-    fn into_parts(
-        mut self,
-    ) -> (
-        NonNull<u8>,
-        usize,
-        Access,
-        unsafe fn(NonNull<u8>, usize) -> bool,
-    ) {
+    fn into_parts(mut self) -> MapParts {
         let release = self.release.take().expect("live map has release authority");
         (self.start, self.len, self.access, release)
     }

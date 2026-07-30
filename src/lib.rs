@@ -41,7 +41,10 @@ mod token;
 /// # }
 /// ```
 pub use boxed::PBox;
-pub use channel::{QueueChannel, Receiver, Sender, TryRecvError, TrySendError};
+pub use channel::{
+    Claim, ClaimError, QueueChannel, Receiver, ReserveError, Reserved, Sender, Staged,
+    TryRecvError, TrySendError,
+};
 #[doc(hidden)]
 pub use header::AdmitLayout;
 pub use header::{Layout, Magic as LayoutMagic, RcHeader, Status as LayoutStatus};
@@ -50,7 +53,7 @@ pub use mem::{
     RegionCloseError, Request, Source,
 };
 pub use msg::{Encoded, Repr};
-pub use notify::{Async, Done, Listen, Notify, RecvError, SendError};
+pub use notify::{Async, Done, Listen, Notify, Pending, RecvError, SendError};
 pub use schema::{
     LayoutContext, LayoutId, LayoutInfo, RegionAdmission, RegionId, SchemaId, SchemaKey,
     SharedSchema,

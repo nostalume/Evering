@@ -39,7 +39,7 @@ pub struct Cell {
     pub memory: u64,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Policy {
     Busy,
     Adaptive,
@@ -52,7 +52,7 @@ pub enum Arm {
     Stream,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct ContrastKey {
     pub payload: u64,
     pub capacity: u64,
@@ -60,7 +60,7 @@ pub struct ContrastKey {
     pub memory: u64,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Contrast {
     pub key: ContrastKey,
     pub candidate: Policy,

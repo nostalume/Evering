@@ -193,6 +193,13 @@ return already-moved input. The result reports the committed value separately
 from notification health. Close follows the same order: publish the shared gate
 transition, then advise the peer to recheck it.
 
+An asynchronous send borrows a process-local pending owner. Every rejected
+attempt and every suspension restores the exact uncommitted token there;
+publication empties it before notification. Cancelling the wait therefore
+releases only local runtime state and leaves uncommitted ownership reclaimable.
+Deadlines and bounded spinning belong to the runtime policy around this
+adapter, not to the shared queue or notification protocol.
+
 Linux uses an event counter, other Unix targets use a nonblocking socket latch,
 and Windows uses a manual-reset event. Runtime registration and cancellation
 are process-local. Readiness may coalesce or be spurious, and clearing may

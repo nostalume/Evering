@@ -63,7 +63,7 @@ pub(crate) const GROW_CLEARED: usize = 17;
 #[cfg(test)]
 static CRASH_AFTER: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(test)]
+#[cfg(all(test, unix, feature = "map"))]
 pub(crate) fn crash_after_for_test(point: usize) {
     CRASH_AFTER.store(point, Ordering::Relaxed);
 }

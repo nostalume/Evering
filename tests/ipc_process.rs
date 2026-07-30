@@ -197,11 +197,10 @@ fn recv_bounded<T>(
             Err(TryRecvError::Empty) => {}
             Err(TryRecvError::Disconnected) => panic!("peer disconnected while receiving"),
         }
-        if let Some(child) = child.as_deref_mut() {
-            if !child.running() {
-                return recv()
-                    .unwrap_or_else(|_| panic!("child exited without publishing a response"));
-            }
+        if let Some(child) = child.as_deref_mut()
+            && !child.running()
+        {
+            return recv().unwrap_or_else(|_| panic!("child exited without publishing a response"));
         }
         assert!(Instant::now() < deadline, "queue remained empty");
         thread::yield_now();

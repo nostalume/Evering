@@ -226,10 +226,8 @@ unsafe impl<F: AsFd> Source for UnixFd<F> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
-    #![cfg(target_os = "linux")]
-
     use super::UnixFd;
 
     use crate::mem::{Access, Map, Request, Source};

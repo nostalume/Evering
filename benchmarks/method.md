@@ -259,6 +259,18 @@ mixed platforms, mixed targets, or changed focused families; never mutates raw
 evidence; and produces deterministic Markdown with traceable artifact,
 contrast, and block identities.
 
+`cargo bench --bench ipc --features benchmark -- analyze <evidence>...` performs
+that registered analysis without a statistics or dataframe dependency. Every
+input must be a complete v2 artifact with the same target, OS, architecture,
+host controls, toolchain, mode, seed, warmup, spin policy, and contrast family.
+The report identifies each artifact schedule and block range, renders all
+condition columns, and reports only sustained crossovers.
+
+The timed execution/transport core retains its 2,000 nonblank, noncomment line
+ceiling. Offline native analysis and its command admission have a separate
+270-line ceiling because they do not participate in the timed path; tests are
+accounted separately from both.
+
 Latency ratios, combined coordinator-plus-worker CPU ns/op, logical GiB/s, and
 kernel counters are secondary only when collected symmetrically. Instrumented
 throughput, latency, and counter runs are separate when instrumentation changes
@@ -283,28 +295,55 @@ Mechanism rows cannot be decoded or reported as whole-system throughput. An
 association between mechanism and process evidence supports only a bounded
 explanation.
 
+Run the registered external harness with
+`cargo test --release --all-features --test micro -- --nocapture`. It emits
+`MICRO` rows for all five boundaries. Platform/session/process setup and state
+reset live in the external test harness and remain outside each measured
+transition; this avoids duplicating the IPC runner and preserves the shared
+micro/recovery production ceiling. The harness is diagnostic evidence, not a
+throughput claim or a retained report artifact.
+
+The allocation row measures the public typed 64-byte heap
+allocate/initialize/release surface. It does not claim to isolate raw Talc
+mutation from mandatory typed initialization or admission; any narrower
+allocator claim requires a separately registered internal instrumentation
+surface.
+
 ## Recovery experiment
 
 Recovery is correctness evidence, not a throughput sample. One fresh worker is
-terminated at each registered cut:
+terminated at each distinct shared-memory cut:
 
+- after reserve, before a value is staged;
 - before publish;
 - after publish;
 - after claim;
-- before recycle.
+
+“After claim” and “before recycle” name the same durable claimed state because
+the safe `Claim::take` transition couples moving the value with recycling the
+slot. They are one registered cut. The study does not add an otherwise
+unobservable lifecycle state merely to split those procedural labels.
 
 After terminal `Exit` from the exact retained `Supervisor`, the coordinator
 admits death, rechecks and drains authoritative shared state once, repairs,
 reaps, and classifies each accepted operation.
+
+Run `cargo test --release --all-features --test recovery_process --
+--nocapture`. Each `RECOVERY` row records the cut, exact exit code, accepted,
+validated, recovered-loss, duplicate, and fabricated counts, followed by
+recovery nanoseconds. The notification only releases the advisory wait; the
+retained `Exit` remains the sole death evidence.
 
 Valid recovery satisfies:
 
 `accepted = validated + recovered_loss`
 
 Duplicate and fabricated records are zero. Timeout, notification error, pipe
-closure, PID, or heartbeat never authorizes death admission. Recovery records
-the cut, exact exit status, counts, duration, repaired layouts, quarantined
-bytes, and success of a subsequent clean attach/run.
+closure, PID, or heartbeat never authorizes death admission. The current
+public reap result proves complete repair or returns its still-live authority;
+it does not expose layout or quarantine counters. The harness therefore does
+not manufacture those values. It instead verifies channel removal, dead-slot
+reuse at a newer generation, and a subsequent clean attach/exchange/removal.
 
 ## Invalidity rules
 

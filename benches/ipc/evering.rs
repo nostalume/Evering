@@ -12,7 +12,7 @@ use evering::{
 };
 
 use super::{
-    model::{Cell, Observed, Status, payload, valid_response, window},
+    model::{Cell, Observed, Policy, Status, payload, valid_response, window},
     stream::{Counts, RunError},
 };
 
@@ -21,6 +21,7 @@ const MAGIC: u64 = 0x4556_4552_4245_4e31;
 const DATA: u64 = 0;
 const BARRIER: u64 = 1;
 const BOOTSTRAP_LEN: usize = 56;
+pub(super) const ADAPTIVE_SPINS: usize = 64;
 #[cfg(unix)]
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
 
@@ -41,6 +42,10 @@ fn fail(status: Status, message: impl ToString, counts: Option<&Counts>) -> RunE
         message: message.to_string(),
         counts: Box::new(counts.cloned().unwrap_or_default()),
     }
+}
+
+fn text(error: impl ToString) -> String {
+    error.to_string()
 }
 
 fn put_u64(bytes: &mut Vec<u8>, value: u64) {
@@ -118,25 +123,135 @@ fn runtime() -> Result<tokio::runtime::Runtime, String> {
     tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
-        .map_err(|error| error.to_string())
+        .map_err(text)
 }
 
-fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
+#[derive(Clone, Copy)]
+struct Local<'a> {
+    ring: &'a evering::os::Ring,
+    wait: &'a evering::runtime::Wait,
+    runtime: &'a tokio::runtime::Runtime,
+}
+
+fn signal<const WAIT: bool>(ring: &evering::os::Ring) -> bool {
+    !WAIT || evering::Notify::notify(ring).is_ok()
+}
+
+fn retry_send<const SPINS: usize, const WAIT: bool, S, V>(
+    endpoint: &S,
+    local: Local<'_>,
+    deadline: Instant,
+    value: V,
+) -> Result<bool, (V, String)>
+where
+    S: evering::Sender<Item = V, TryError = TrySendError<V>> + Clone,
+{
+    let mut pending = evering::Pending::new(value);
+    let mut spins = SPINS;
+    loop {
+        let value = pending.into_inner().unwrap();
+        match endpoint.try_send(value) {
+            Ok(()) => return Ok(signal::<WAIT>(local.ring)),
+            Err(TrySendError::Disconnected(value)) => return Err((value, "disconnected".into())),
+            Err(TrySendError::Full(value)) if Instant::now() >= deadline => {
+                return Err((value, "timeout".into()));
+            }
+            Err(TrySendError::Full(value)) if spins > 0 => {
+                pending = evering::Pending::new(value);
+                if WAIT {
+                    spins -= 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            Err(TrySendError::Full(value)) => {
+                pending = evering::Pending::new(value);
+                let async_endpoint = evering::Async::new(endpoint.clone(), local.ring, local.wait);
+                let send = async_endpoint.send(&mut pending);
+                let timeout = {
+                    let _entered = local.runtime.enter();
+                    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), send)
+                };
+                return match local.runtime.block_on(timeout) {
+                    Ok(Ok(done)) => Ok(done.notified.is_ok()),
+                    Ok(Err(_)) => Err((pending.into_inner().unwrap(), "wait failed".into())),
+                    Err(_) => Err((pending.into_inner().unwrap(), "timeout".into())),
+                };
+            }
+        }
+    }
+}
+
+fn retry_recv<const SPINS: usize, const WAIT: bool, R>(
+    endpoint: &R,
+    local: Local<'_>,
+    deadline: Instant,
+) -> Result<(R::Item, bool), String>
+where
+    R: evering::Receiver<TryError = TryRecvError> + Clone,
+{
+    let mut spins = SPINS;
+    loop {
+        match endpoint.try_recv() {
+            Ok(value) => return Ok((value, signal::<WAIT>(local.ring))),
+            Err(TryRecvError::Disconnected) => return Err("sender disconnected".into()),
+            Err(TryRecvError::Empty) if Instant::now() >= deadline => return Err("timeout".into()),
+            Err(TryRecvError::Empty) if spins > 0 => {
+                if WAIT {
+                    spins -= 1;
+                    std::hint::spin_loop();
+                } else {
+                    std::thread::yield_now();
+                }
+            }
+            Err(TryRecvError::Empty) => {
+                let async_endpoint = evering::Async::new(endpoint.clone(), local.ring, local.wait);
+                let recv = async_endpoint.recv();
+                let timeout = {
+                    let _entered = local.runtime.enter();
+                    tokio::time::timeout(deadline.saturating_duration_since(Instant::now()), recv)
+                };
+                return match local.runtime.block_on(timeout) {
+                    Ok(Ok(done)) => Ok((done.value, done.notified.is_ok())),
+                    Ok(Err(evering::RecvError::Disconnected)) => Err("sender disconnected".into()),
+                    Ok(Err(error)) => Err(format!("receive wait failed: {error:?}")),
+                    Err(_) => Err("timeout".into()),
+                };
+            }
+        }
+    }
+}
+
+fn serve<const SPINS: usize, const WAIT: bool>(
+    session: Session<Envelope>,
+    id: Id<Envelope>,
+    ring: evering::os::Ring,
+    wait: evering::runtime::Wait,
+    runtime: &tokio::runtime::Runtime,
+    timeout: Duration,
+) -> Result<(), String> {
     let view = session
         .acquire(id)
         .ok_or("worker could not acquire channel")?;
     let (tx, rx) = view.rsplit();
+    let local = Local {
+        ring: &ring,
+        wait: &wait,
+        runtime,
+    };
     loop {
-        let record = match rx.try_recv() {
+        let deadline = Instant::now() + timeout;
+        let (record, received) = match retry_recv::<SPINS, WAIT, _>(&rx, local, deadline) {
             Ok(record) => record,
-            Err(TryRecvError::Empty) => {
-                std::thread::yield_now();
-                continue;
-            }
-            Err(TryRecvError::Disconnected) => {
+            Err(error) if error == "sender disconnected" => {
                 tx.close();
+                if !signal::<WAIT>(&ring) {
+                    return Err("notify".into());
+                }
                 return Ok(());
             }
+            Err(error) => return Err(error),
         };
         let heap = session.heap();
         let (header, mut value) = heap
@@ -147,18 +262,16 @@ fn serve(session: Session<Envelope>, id: Id<Envelope>) -> Result<(), String> {
             BARRIER if value.is_empty() => {}
             _ => return Err("worker rejected message envelope".into()),
         }
-        let mut record = value.token_of().pack(header);
-        loop {
-            match tx.try_send(record) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) => {
-                    record = returned;
-                    std::thread::yield_now();
-                }
-                Err(TrySendError::Disconnected(_)) => {
-                    return Err("parent closed response receiver".into());
-                }
+        let record = value.token_of().pack(header);
+        let sent = match retry_send::<SPINS, WAIT, _, _>(&tx, local, deadline, record) {
+            Ok(sent) => sent,
+            Err((record, error)) => {
+                let _ = session.heap().discard(record);
+                return Err(error);
             }
+        };
+        if !received || !sent {
+            return Err("notification failed after commit".into());
         }
     }
 }
@@ -177,18 +290,15 @@ fn open_worker(
 > {
     use evering::os::unix::{UnixFd, process::Socket};
 
-    let socket = Socket::bind(address).map_err(|error| error.to_string())?;
-    let (bootstrap, resources) = socket
-        .recv(3)
-        .map_err(|error| error.to_string())?
-        .into_parts();
+    let socket = Socket::bind(address).map_err(text)?;
+    let (bootstrap, resources) = socket.recv(3).map_err(text)?.into_parts();
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
-    let source = UnixFd::from_fd(resources.remove(0)).map_err(|error| error.to_string())?;
+    let source = UnixFd::from_fd(resources.remove(0)).map_err(text)?;
     let parent_event = unsafe { evering::os::Event::from_owned_fd(resources.remove(0)) };
     let child_ring = unsafe { evering::os::Ring::from_owned_fd(resources.remove(0)) };
     let session = open_session(source, extent)?;
-    let wait = evering::runtime::Wait::new(parent_event).map_err(|error| error.to_string())?;
+    let wait = evering::runtime::Wait::new(parent_event).map_err(text)?;
     Ok((session, id, child_ring, wait))
 }
 
@@ -205,39 +315,49 @@ fn open_worker(
     String,
 > {
     use evering::os::windows::{Section, process::Socket};
-    use std::os::windows::io::AsRawHandle;
+    use std::os::windows::io::IntoRawHandle;
 
-    let socket = Socket::connect(address).map_err(|error| error.to_string())?;
-    let (bootstrap, resources) = socket
-        .recv(3)
-        .map_err(|error| error.to_string())?
-        .into_parts();
+    let socket = Socket::connect(address).map_err(text)?;
+    let (bootstrap, resources) = socket.recv(3).map_err(text)?.into_parts();
     let (id, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
     let parent_event =
-        unsafe { evering::os::Event::from_owned_handle(resources.remove(0).as_raw_handle()) };
+        unsafe { evering::os::Event::from_owned_handle(resources.remove(0).into_raw_handle()) };
     let child_ring =
-        unsafe { evering::os::Ring::from_owned_handle(resources.remove(0).as_raw_handle()) };
+        unsafe { evering::os::Ring::from_owned_handle(resources.remove(0).into_raw_handle()) };
     let session = open_session(source, extent)?;
-    let wait = evering::runtime::Wait::new(parent_event).map_err(|error| error.to_string())?;
+    let wait = evering::runtime::Wait::new(parent_event).map_err(text)?;
     Ok((session, id, child_ring, wait))
 }
 
-pub fn worker(address: &str) -> Result<(), String> {
+fn worker_with<const SPINS: usize, const WAIT: bool>(
+    address: &str,
+    timeout: Duration,
+) -> Result<(), String> {
     let runtime = runtime()?;
     let entered = runtime.enter();
-    let (session, id, _ring, _wait) = open_worker(address)?;
+    let (session, id, ring, wait) = open_worker(address)?;
     drop(entered);
-    serve(session, id)
+    serve::<SPINS, WAIT>(session, id, ring, wait, &runtime, timeout)
+}
+
+pub fn worker(address: &str, policy: &str, timeout: Duration) -> Result<(), String> {
+    match policy {
+        "busy" => worker_with::<{ usize::MAX }, false>(address, timeout),
+        "adaptive" => worker_with::<ADAPTIVE_SPINS, true>(address, timeout),
+        "notified" => worker_with::<0, true>(address, timeout),
+        _ => Err("unknown Evering retry policy".into()),
+    }
 }
 
 struct Setup {
     session: Session<Envelope>,
     id: Id<Envelope>,
     child: Supervisor,
-    _runtime: tokio::runtime::Runtime,
-    _notify: (evering::os::Ring, evering::runtime::Wait),
+    runtime: tokio::runtime::Runtime,
+    ring: evering::os::Ring,
+    wait: evering::runtime::Wait,
     #[cfg(unix)]
     socket_path: std::path::PathBuf,
 }
@@ -250,14 +370,19 @@ impl Drop for Setup {
 }
 
 #[cfg(unix)]
-fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, String> {
+fn setup(
+    extent: usize,
+    capacity: usize,
+    deadline: Instant,
+    policy: &str,
+    timeout: Duration,
+) -> Result<Setup, String> {
     use evering::os::unix::{UnixFd, process::Socket};
     use std::os::fd::AsFd;
 
     let runtime = runtime()?;
     let entered = runtime.enter();
-    let source =
-        UnixFd::memfd("evering-bench", extent, false).map_err(|error| error.to_string())?;
+    let source = UnixFd::memfd("evering-bench", extent, false).map_err(text)?;
     let session = create_session(source.borrow(), extent)?;
     let id = session
         .prepare(capacity)
@@ -267,67 +392,75 @@ fn setup(extent: usize, capacity: usize, deadline: Instant) -> Result<Setup, Str
         std::process::id(),
         NEXT_SOCKET.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
-    command.args(["worker-evering", path.to_string_lossy().as_ref()]);
-    let mut child = Supervisor::spawn(&mut command).map_err(|error| error.to_string())?;
+    let mut command = Command::new(std::env::current_exe().map_err(text)?);
+    let timeout = timeout.as_millis().to_string();
+    command.args([
+        "worker-evering",
+        path.to_string_lossy().as_ref(),
+        policy,
+        &timeout,
+    ]);
+    let mut child = Supervisor::spawn(&mut command).map_err(text)?;
     let socket = loop {
         match Socket::connect(&path) {
             Ok(socket) => break socket,
-            Err(error) if Instant::now() < deadline => {
-                if child
-                    .try_wait()
-                    .map_err(|error| error.to_string())?
-                    .is_some()
-                {
+            Err(_) if Instant::now() < deadline => {
+                if child.try_wait().map_err(text)?.is_some() {
                     return Err("worker exited during setup".into());
                 }
-                let _ = error;
                 std::thread::yield_now();
             }
             Err(error) => return Err(error.to_string()),
         }
     };
-    let (parent_ring, parent_event) = evering::os::event().map_err(|error| error.to_string())?;
-    let (child_ring, child_event) = evering::os::event().map_err(|error| error.to_string())?;
+    let (parent_ring, parent_event) = evering::os::event().map_err(text)?;
+    let (child_ring, child_event) = evering::os::event().map_err(text)?;
     socket
         .send(
             &bootstrap(id, extent)?,
             &[source.as_fd(), parent_event.as_fd(), child_ring.as_fd()],
         )
-        .map_err(|error| error.to_string())?;
-    let wait = evering::runtime::Wait::new(child_event).map_err(|error| error.to_string())?;
+        .map_err(text)?;
+    let wait = evering::runtime::Wait::new(child_event).map_err(text)?;
     drop(entered);
     Ok(Setup {
         session,
         id,
         child,
-        _runtime: runtime,
-        _notify: (parent_ring, wait),
+        runtime,
+        ring: parent_ring,
+        wait,
         socket_path: path,
     })
 }
 
 #[cfg(windows)]
-fn setup(extent: usize, capacity: usize, _deadline: Instant) -> Result<Setup, String> {
+fn setup(
+    extent: usize,
+    capacity: usize,
+    _deadline: Instant,
+    policy: &str,
+    timeout: Duration,
+) -> Result<Setup, String> {
     use std::os::windows::io::AsHandle;
 
     use evering::os::windows::{Section, process::Listener};
 
     let runtime = runtime()?;
     let entered = runtime.enter();
-    let listener = Listener::bind().map_err(|error| error.to_string())?;
-    let mut command = Command::new(std::env::current_exe().map_err(|error| error.to_string())?);
-    command.args(["worker-evering", listener.name()]);
-    let child = Supervisor::spawn(&mut command).map_err(|error| error.to_string())?;
-    let socket = listener.accept(&child).map_err(|error| error.to_string())?;
-    let source = Section::anonymous(extent, Access::READ | Access::WRITE)
-        .map_err(|error| error.to_string())?;
+    let listener = Listener::bind().map_err(text)?;
+    let mut command = Command::new(std::env::current_exe().map_err(text)?);
+    let timeout = timeout.as_millis().to_string();
+    command.args(["worker-evering", listener.name(), policy, &timeout]);
+    let child = Supervisor::spawn(&mut command).map_err(text)?;
+    let socket = listener.accept(&child).map_err(text)?;
+    let source = Section::anonymous(extent, Access::READ | Access::WRITE).map_err(text)?;
     let session = create_session(source.borrow(), extent)?;
     let id = session
         .prepare(capacity)
         .ok_or("could not create channel")?;
-    let (parent_ring, parent_event) = evering::os::event().map_err(|error| error.to_string())?;
-    let (child_ring, child_event) = evering::os::event().map_err(|error| error.to_string())?;
+    let (parent_ring, parent_event) = evering::os::event().map_err(text)?;
+    let (child_ring, child_event) = evering::os::event().map_err(text)?;
     socket
         .send(
             &child,
@@ -338,19 +471,20 @@ fn setup(extent: usize, capacity: usize, _deadline: Instant) -> Result<Setup, St
                 child_ring.as_handle(),
             ],
         )
-        .map_err(|error| error.to_string())?;
-    let wait = evering::runtime::Wait::new(child_event).map_err(|error| error.to_string())?;
+        .map_err(text)?;
+    let wait = evering::runtime::Wait::new(child_event).map_err(text)?;
     drop(entered);
     Ok(Setup {
         session,
         id,
         child,
-        _runtime: runtime,
-        _notify: (parent_ring, wait),
+        runtime,
+        ring: parent_ring,
+        wait,
     })
 }
 
-pub fn run(
+fn run_with<const SPINS: usize, const WAIT: bool>(
     cell: &Cell,
     requested: u64,
     warmup: u64,
@@ -368,58 +502,47 @@ pub fn run(
         return Err(fail(Status::SetupError, "in-flight must be nonzero", None));
     }
     let setup_deadline = Instant::now() + timeout;
-    let mut setup = setup(extent, capacity, setup_deadline)
-        .map_err(|error| fail(Status::SetupError, error, None))?;
+    let setup = setup(extent, capacity, setup_deadline, &cell.policy, timeout);
+    let mut setup = setup.map_err(|error| fail(Status::SetupError, error, None))?;
     let view = setup
         .session
         .acquire(setup.id)
         .ok_or_else(|| fail(Status::SetupError, "parent could not acquire channel", None))?;
     let (tx, rx) = view.lsplit();
+    let local = Local {
+        ring: &setup.ring,
+        wait: &setup.wait,
+        runtime: &setup.runtime,
+    };
     let send_one = |operation: u64, len: usize, kind: u64, deadline: Instant| {
-        let mut record = setup
+        let record = setup
             .session
             .heap()
             .copy(&payload(seed, operation, len))
             .map_err(|error| format!("allocate request: {error:?}"))?
             .pack(Envelope { kind, operation });
-        loop {
-            match tx.try_send(record) {
-                Ok(()) => break,
-                Err(TrySendError::Full(returned)) if Instant::now() < deadline => {
-                    record = returned;
-                    std::thread::yield_now();
-                }
-                Err(TrySendError::Full(returned)) => {
-                    let _ = setup.session.heap().discard(returned);
-                    return Err("request send timed out".to_owned());
-                }
-                Err(TrySendError::Disconnected(returned)) => {
-                    let _ = setup.session.heap().discard(returned);
-                    return Err("worker closed request receiver".to_owned());
-                }
+        match retry_send::<SPINS, WAIT, _, _>(&tx, local, deadline, record) {
+            Ok(notified) => Ok(notified),
+            Err((record, error)) => {
+                let _ = setup.session.heap().discard(record);
+                Err(error)
             }
         }
-        Ok(())
     };
-    let recv_one = |operation: u64, len: usize, kind: u64, deadline: Instant| {
-        let record = loop {
-            match rx.try_recv() {
-                Ok(record) => break record,
-                Err(TryRecvError::Empty) if Instant::now() < deadline => std::thread::yield_now(),
-                Err(TryRecvError::Empty) => return Err("response receive timed out".to_owned()),
-                Err(TryRecvError::Disconnected) => {
-                    return Err("worker closed response sender".to_owned());
-                }
-            }
+    let recv_one =
+        |operation: u64, len: usize, kind: u64, deadline: Instant| -> Result<_, String> {
+            let (record, notified) = retry_recv::<SPINS, WAIT, _>(&rx, local, deadline)?;
+            let heap = setup.session.heap();
+            let (header, value) = heap
+                .open::<Envelope, [u8]>(record)
+                .map_err(|_| "parent rejected message identity".to_owned())?;
+            Ok((
+                header.kind == kind
+                    && header.operation == operation
+                    && (kind == BARRIER || valid_response(seed, operation, len, &value)),
+                notified,
+            ))
         };
-        let heap = setup.session.heap();
-        let (header, value) = heap
-            .open::<Envelope, [u8]>(record)
-            .map_err(|_| "parent rejected message identity".to_owned())?;
-        Ok(header.kind == kind
-            && header.operation == operation
-            && (kind == BARRIER || valid_response(seed, operation, len, &value)))
-    };
     let geometry = evering::perlude::talc::Geometry::auto(extent).ok();
     let mut counts = Counts {
         observed: Some(Observed {
@@ -437,28 +560,23 @@ pub fn run(
         ..Counts::default()
     };
     for operation in requested..requested.saturating_add(warmup) {
-        send_one(operation, payload_len, DATA, setup_deadline)
+        let sent = send_one(operation, payload_len, DATA, setup_deadline)
             .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?;
-        if !recv_one(operation, payload_len, DATA, setup_deadline)
-            .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?
-        {
-            return Err(fail(
-                Status::SetupError,
-                "warmup validation failed",
-                Some(&counts),
-            ));
+        if !sent {
+            return Err(fail(Status::SetupError, "notify", Some(&counts)));
+        }
+        let (valid, notified) = recv_one(operation, payload_len, DATA, setup_deadline)
+            .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?;
+        if !valid || !notified {
+            return Err(fail(Status::SetupError, "warmup failed", Some(&counts)));
         }
     }
-    send_one(u64::MAX, 0, BARRIER, setup_deadline)
+    let sent = send_one(u64::MAX, 0, BARRIER, setup_deadline)
         .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?;
-    if !recv_one(u64::MAX, 0, BARRIER, setup_deadline)
-        .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?
-    {
-        return Err(fail(
-            Status::SetupError,
-            "barrier validation failed",
-            Some(&counts),
-        ));
+    let (valid, notified) = recv_one(u64::MAX, 0, BARRIER, setup_deadline)
+        .map_err(|error| fail(Status::SetupError, error, Some(&counts)))?;
+    if !sent || !valid || !notified {
+        return Err(fail(Status::SetupError, "barrier failed", Some(&counts)));
     }
     counts.phase_ns[0] = began.elapsed().as_nanos().max(1) as u64;
     let started = Instant::now();
@@ -467,27 +585,33 @@ pub fn run(
         let batch = window(requested - counts.accepted, cell.capacity, cell.in_flight);
         let first = counts.accepted;
         for operation in first..first + batch {
-            send_one(operation, payload_len, DATA, deadline)
+            let notified = send_one(operation, payload_len, DATA, deadline)
                 .map_err(|error| fail(Status::TimedError, error, Some(&counts)))?;
             counts.accepted += 1;
+            if !notified {
+                return Err(fail(Status::TimedError, "notify", Some(&counts)));
+            }
         }
         for operation in first..first + batch {
-            let valid = recv_one(operation, payload_len, DATA, deadline)
+            let (valid, notified) = recv_one(operation, payload_len, DATA, deadline)
                 .map_err(|error| fail(Status::TimedError, error, Some(&counts)))?;
             counts.completed += 1;
-            if !valid {
-                return Err(fail(
-                    Status::TimedError,
-                    format!("invalid response for operation {operation}"),
-                    Some(&counts),
-                ));
+            counts.validated += u64::from(valid);
+            if !notified {
+                return Err(fail(Status::TimedError, "notify", Some(&counts)));
             }
-            counts.validated += 1;
+            if !valid {
+                let message = format!("invalid response {operation}");
+                return Err(fail(Status::TimedError, message, Some(&counts)));
+            }
         }
     }
     counts.elapsed_ns = started.elapsed().as_nanos().max(1) as u64;
     counts.phase_ns[1] = counts.elapsed_ns;
     tx.close();
+    if !signal::<WAIT>(&setup.ring) {
+        return Err(fail(Status::DrainError, "notify", Some(&counts)));
+    }
     drop((tx, rx));
     let drain = Instant::now();
     let drain_deadline = drain + timeout;
@@ -508,35 +632,38 @@ pub fn run(
                 .child
                 .kill_wait()
                 .map_err(|error| fail(Status::DrainError, error, Some(&counts)))?;
-            return Err(fail(
-                Status::DrainError,
-                "worker exceeded drain deadline",
-                Some(&counts),
-            ));
+            return Err(fail(Status::DrainError, "timeout", Some(&counts)));
         }
         std::thread::yield_now();
     };
     if !exit.success() {
-        return Err(fail(
-            Status::DrainError,
-            "worker failed during drain",
-            Some(&counts),
-        ));
+        return Err(fail(Status::DrainError, "exit", Some(&counts)));
     }
-    let view = setup.session.acquire(setup.id).ok_or_else(|| {
-        fail(
-            Status::DrainError,
-            "channel disappeared during drain",
-            Some(&counts),
-        )
-    })?;
-    setup.session.remove(setup.id, view).map_err(|_| {
-        fail(
-            Status::DrainError,
-            "channel remained busy during drain",
-            Some(&counts),
-        )
-    })?;
+    let view = setup
+        .session
+        .acquire(setup.id)
+        .ok_or_else(|| fail(Status::DrainError, "channel disappeared", Some(&counts)))?;
+    setup
+        .session
+        .remove(setup.id, view)
+        .map_err(|_| fail(Status::DrainError, "channel remained busy", Some(&counts)))?;
     counts.phase_ns[2] = drain.elapsed().as_nanos().max(1) as u64;
     Ok(counts)
+}
+
+pub fn run(
+    policy: Policy,
+    cell: &Cell,
+    requested: u64,
+    warmup: u64,
+    seed: u64,
+    timeout: Duration,
+) -> Result<Counts, RunError> {
+    match policy {
+        Policy::Busy => run_with::<{ usize::MAX }, false>(cell, requested, warmup, seed, timeout),
+        Policy::Adaptive => {
+            run_with::<ADAPTIVE_SPINS, true>(cell, requested, warmup, seed, timeout)
+        }
+        Policy::Notified => run_with::<0, true>(cell, requested, warmup, seed, timeout),
+    }
 }

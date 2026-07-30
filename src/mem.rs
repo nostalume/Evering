@@ -191,6 +191,13 @@ unsafe impl<A: TransferAllocator> TransferAllocator for &A {
 // pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
 // impl<A: MemAllocator2> MemAllocator2 for &A {}
 
+/// Allocates region-relative blocks whose metadata may cross a process boundary.
+///
+/// # Safety
+///
+/// Implementors must return metadata that denotes storage within `base_ptr`'s
+/// region, remains valid at another mapping base, and satisfies the requested
+/// layout until it is successfully deallocated.
 pub unsafe trait MemAlloc {
     type Meta: Meta;
     type Error;
@@ -206,6 +213,13 @@ pub unsafe trait MemAlloc {
     }
 }
 
+/// Releases blocks allocated by the same region-relative allocator.
+///
+/// # Safety
+///
+/// Implementors must reject foreign, stale, or layout-mismatched metadata
+/// without releasing storage and must make each successful release observable
+/// exactly once to all participating processes.
 pub unsafe trait MemDealloc: MemAlloc {
     fn dealloc(&self, meta: Self::Meta, layout: Layout) -> Result<(), Self::Meta>;
 
@@ -258,6 +272,13 @@ unsafe impl<A: MemDealloc> MemDealloc for &A {
     }
 }
 
+/// Exposes the bounds of one contiguous memory region.
+///
+/// # Safety
+///
+/// `start_ptr` and `size` must describe one live contiguous allocation for the
+/// duration of the implementation value. Mutable access must remain subject to
+/// the owner's aliasing and synchronization rules.
 pub unsafe trait MemOps {
     /// Returns the start pointer of the memory block.
     fn start_ptr(&self) -> *const u8;

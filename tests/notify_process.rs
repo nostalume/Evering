@@ -6,6 +6,7 @@ use evering::{Listen, Notify, os, runtime};
 
 const CHILD: &str = "EVERING_NOTIFY_CHILD";
 const HANDLE: &str = "EVERING_NOTIFY_HANDLE";
+const EXIT_CHILD: &str = "EVERING_NOTIFY_EXIT_CHILD";
 
 #[test]
 fn wait_cross_process() {
@@ -69,4 +70,39 @@ fn wait_cross_process() {
     std::thread::sleep(Duration::from_millis(20));
     ring.notify().unwrap();
     assert!(child.wait().unwrap().success());
+}
+
+#[test]
+fn peer_exit_cancels_wait_without_fabricating_readiness() {
+    if env::var_os(EXIT_CHILD).is_some() {
+        return;
+    }
+
+    let (_ring, event) = os::event().unwrap();
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let entered = runtime.enter();
+    let wait = runtime::Wait::new(event).unwrap();
+    drop(entered);
+
+    let mut child = Command::new(env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("peer_exit_cancels_wait_without_fabricating_readiness")
+        .arg("--nocapture")
+        .env(EXIT_CHILD, "1")
+        .spawn()
+        .unwrap();
+    let (exited, status) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let _ = exited.send(child.wait());
+    });
+
+    runtime.block_on(async {
+        tokio::select! {
+            result = wait.ready() => panic!("peer exit fabricated readiness: {result:?}"),
+            result = status => assert!(result.unwrap().unwrap().success()),
+        }
+    });
 }

@@ -40,6 +40,8 @@ pub mod talc {
     type MapAlloc = talc::MapTalc;
     type MsgDuplex<H> = cross::Duplex<H, Meta>;
     type MsgDuplexView<H> = cross::View<H, Meta>;
+    type Opened<'a, P, T> = Result<(P, PBox<'a, T>), OpenError<PackToken<P, Meta>>>;
+    type RemoveError<H> = (MsgDuplexView<H>, Option<PackToken<H, Meta>>);
 
     #[derive(Clone)]
     pub struct Heap<'a> {
@@ -80,10 +82,7 @@ pub mod talc {
                 .map(|token| token.pack(Encoded::new(schema)))
         }
 
-        pub fn open_encoded(
-            &self,
-            record: PackToken<Encoded, Meta>,
-        ) -> Result<(Encoded, PBox<'_, [u8]>), OpenError<PackToken<Encoded, Meta>>> {
+        pub fn open_encoded(&self, record: PackToken<Encoded, Meta>) -> Opened<'_, Encoded, [u8]> {
             self.open::<Encoded, [u8]>(record)
         }
 
@@ -94,10 +93,7 @@ pub mod talc {
             record.discard_with(self.alloc.clone())
         }
 
-        pub fn open<P, T>(
-            &self,
-            record: PackToken<P, Meta>,
-        ) -> Result<(P, PBox<'_, T>), OpenError<PackToken<P, Meta>>>
+        pub fn open<P, T>(&self, record: PackToken<P, Meta>) -> Opened<'_, P, T>
         where
             P: Repr,
             T: ?Sized + Repr + Shape,
@@ -288,11 +284,7 @@ pub mod talc {
         ///
         /// On contention the view is returned for retry. If discarding a
         /// queued record fails, that record is returned with the view.
-        pub fn remove(
-            &self,
-            id: Id<H>,
-            view: MsgDuplexView<H>,
-        ) -> Result<(), (MsgDuplexView<H>, Option<PackToken<H, Meta>>)> {
+        pub fn remove(&self, id: Id<H>, view: MsgDuplexView<H>) -> Result<(), RemoveError<H>> {
             if view.capacity() != id.capacity
                 || !self.dir.matches(id.inner, view.layout_id())
                 || !view.is_unique()

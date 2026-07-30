@@ -146,8 +146,7 @@ fn area_init(v: MapView) {
 
     tracing::debug!("area header: {:?}, {:?}", v.header(), v.header().status());
     tracing::debug!("[Area]: {:?}", v);
-    let v2 = v.clone();
-    tracing::debug!("[Area]: header: {:?}", v2);
+    tracing::debug!("[Area]: header: {:?}", v);
 }
 
 fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
@@ -221,11 +220,11 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
 
                     // Maintain a "window" of outstanding allocations
                     // to simulate high-pressure shared memory usage
-                    if active_allocs.len() > BOUND {
-                        if let Some(old_meta) = active_allocs.pop_front() {
-                            // Explicitly drop/deallocate here
-                            let _ = a_ref.dealloc_bytes(old_meta);
-                        }
+                    if active_allocs.len() > BOUND
+                        && let Some(old_meta) = active_allocs.pop_front()
+                    {
+                        // Explicitly drop/deallocate here
+                        let _ = a_ref.dealloc_bytes(old_meta);
                     }
 
                     latencies.push(op_start.elapsed().as_nanos() as u64);
@@ -389,7 +388,7 @@ fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
         fn rand() -> Self {
             Self {
                 f1: fastrand::u64(0..100),
-                f2: fastrand::char('a'..'z'),
+                f2: fastrand::char('a'..='z'),
             }
         }
     }
