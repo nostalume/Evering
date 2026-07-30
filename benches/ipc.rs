@@ -10,31 +10,41 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-use model::{Cell, Meta, Status, Study, Trial, decode, encode, schedule};
+use model::{
+    Arm, Contrast, ContrastKey, Meta, Policy, Scheduled, Status, Study, Trial, decode, encode,
+    mandatory_success, schedule,
+};
 
-fn cells() -> Vec<Cell> {
-    let mut cells = Vec::new();
-    for implementation in ["evering", "os-stream"] {
-        for policy in ["busy", "adaptive", "notified"] {
-            for payload in [0_u64, 64, 1024, 16 * 1024, 64 * 1024] {
-                for capacity in [1_u64, 8, 256] {
-                    for in_flight in [1_u64, 8, 64] {
-                        let working = payload.max(64) * capacity * 2;
-                        let memory = (working + 4 * 1024 * 1024).next_multiple_of(4096);
-                        cells.push(Cell {
-                            implementation: implementation.into(),
-                            policy: policy.into(),
-                            payload,
-                            capacity,
-                            in_flight,
-                            memory,
-                        });
-                    }
-                }
-            }
+fn contrast(payload: u64, capacity: u64, in_flight: u64, candidate: Policy) -> Contrast {
+    let working = payload.max(64) * capacity * 2;
+    Contrast {
+        key: ContrastKey {
+            payload,
+            capacity,
+            in_flight,
+            memory: (working + 4 * 1024 * 1024).next_multiple_of(4096),
+        },
+        candidate,
+    }
+}
+
+fn contrasts() -> Vec<Contrast> {
+    let mut result = Vec::with_capacity(23);
+    for payload in [0, 64, 1024, 16 * 1024, 64 * 1024] {
+        for policy in [Policy::Busy, Policy::Adaptive, Policy::Notified] {
+            result.push(contrast(payload, 8, 8, policy));
         }
     }
-    cells
+    for capacity in [1, 256] {
+        result.push(contrast(1024, capacity, 8, Policy::Notified));
+    }
+    for in_flight in [1, 64] {
+        result.push(contrast(1024, 8, in_flight, Policy::Notified));
+    }
+    for (capacity, in_flight) in [(1, 1), (1, 64), (256, 1), (256, 64)] {
+        result.push(contrast(1024, capacity, in_flight, Policy::Notified));
+    }
+    result
 }
 
 fn number<T: core::str::FromStr>(value: Option<String>, name: &str) -> Result<T, String> {
@@ -86,75 +96,70 @@ fn metadata(seed: u64, warmup: u64, blocks: u32, timeout_ms: u64) -> Result<Meta
 }
 
 fn execute(
-    block: u32,
-    order: u32,
-    cell: Cell,
+    scheduled: Scheduled,
     requested: u64,
     warmup: u64,
     seed: u64,
     timeout: Duration,
 ) -> Trial {
-    if cell.implementation != "os-stream" || cell.policy != "notified" {
+    let cell = scheduled.contrast.cell(scheduled.arm);
+    let trial = Trial {
+        block: scheduled.block,
+        order: scheduled.order,
+        cell,
+        requested,
+        accepted: 0,
+        completed: 0,
+        validated: 0,
+        elapsed_ns: None,
+        status: Status::Unsupported,
+        error: None,
+    };
+    if scheduled.arm != Arm::Stream {
         return Trial {
-            block,
-            order,
-            cell,
-            requested,
-            accepted: 0,
-            completed: 0,
-            validated: 0,
-            elapsed_ns: None,
-            status: Status::Unsupported,
-            error: Some("implementation/policy is not implemented".into()),
+            error: Some("Evering transport is not implemented".into()),
+            ..trial
         };
     }
-    match stream::run(&cell, requested, warmup, seed, timeout) {
+    match stream::run(&trial.cell, requested, warmup, seed, timeout) {
         Ok(counts) => Trial {
-            block,
-            order,
-            cell,
-            requested,
             accepted: counts.accepted,
             completed: counts.completed,
             validated: counts.validated,
             elapsed_ns: Some(counts.elapsed_ns),
             status: Status::Ok,
-            error: None,
+            ..trial
         },
         Err(error) => Trial {
-            block,
-            order,
-            cell,
-            requested,
             accepted: error.accepted,
             completed: error.completed,
             validated: error.validated,
-            elapsed_ns: None,
             status: error.status,
             error: Some(error.message),
+            ..trial
         },
     }
 }
 
 fn record(
     path: &str,
-    selected: Vec<Cell>,
+    selected: Vec<Scheduled>,
     blocks: u32,
     seed: u64,
     requested: u64,
     warmup: u64,
     timeout_ms: u64,
-) -> Result<bool, String> {
+) -> Result<(), String> {
     if blocks == 0 || requested == 0 || timeout_ms == 0 {
         return Err("blocks, operations, and timeout must be nonzero".into());
     }
     let meta = metadata(seed, warmup, blocks, timeout_ms)?;
     let timeout = Duration::from_millis(timeout_ms);
-    let trials: Vec<Trial> = schedule(&selected, blocks, seed)
+    let trials: Vec<Trial> = selected
         .into_iter()
-        .map(|(block, order, cell)| execute(block, order, cell, requested, warmup, seed, timeout))
+        .map(|scheduled| execute(scheduled, requested, warmup, seed, timeout))
         .collect();
-    let all_ok = trials.iter().all(|trial| trial.status == Status::Ok);
+    let all_ok = mandatory_success(&trials);
     let encoded = encode(&Study { meta, trials }).map_err(|error| format!("{error:?}"))?;
     let mut file = fs::OpenOptions::new()
         .write(true)
@@ -163,7 +168,9 @@ fn record(
         .map_err(|error| format!("open evidence: {error}"))?;
     file.write_all(encoded.as_bytes())
         .map_err(|error| error.to_string())?;
-    Ok(all_ok)
+    all_ok
+        .then_some(())
+        .ok_or_else(|| "mandatory trial failed; inspect the evidence record".into())
 }
 
 fn dispatch() -> Result<(), String> {
@@ -182,12 +189,18 @@ fn dispatch() -> Result<(), String> {
             if args.next().is_some() {
                 return Err("unexpected argument".into());
             }
-            println!("block\torder\timplementation\tpolicy\tpayload\tcapacity\tin_flight\tmemory");
-            for (block, order, cell) in schedule(&cells(), blocks, seed) {
+            println!(
+                "block\torder\timplementation\tpolicy\tcandidate\tpayload\tcapacity\tin_flight\tmemory"
+            );
+            for entry in schedule(&contrasts(), blocks, seed) {
+                let cell = entry.contrast.cell(entry.arm);
                 println!(
-                    "{block}\t{order}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+                    entry.block,
+                    entry.order,
                     cell.implementation,
                     cell.policy,
+                    cell.candidate,
                     cell.payload,
                     cell.capacity,
                     cell.in_flight,
@@ -221,32 +234,29 @@ fn dispatch() -> Result<(), String> {
             if args.next().is_some() {
                 return Err("unexpected argument".into());
             }
-            record(&path, cells(), blocks, seed, requested, warmup, timeout).map(|_| ())
+            let selected = schedule(&contrasts(), blocks, seed);
+            record(&path, selected, blocks, seed, requested, warmup, timeout)
         }
         Some("smoke") => {
             let path = args.next().ok_or("missing evidence path")?;
             if args.next().is_some() {
                 return Err("unexpected argument".into());
             }
-            let all_ok = record(
+            let contrast = contrast(64, 8, 8, Policy::Notified);
+            record(
                 &path,
-                vec![Cell {
-                    implementation: "os-stream".into(),
-                    policy: "notified".into(),
-                    payload: 64,
-                    capacity: 8,
-                    in_flight: 8,
-                    memory: 4 * 1024 * 1024,
+                vec![Scheduled {
+                    block: 0,
+                    order: 0,
+                    contrast,
+                    arm: Arm::Stream,
                 }],
                 1,
                 7,
                 100,
                 10,
                 5000,
-            )?;
-            all_ok
-                .then_some(())
-                .ok_or_else(|| "smoke trial did not succeed; inspect the evidence record".into())
+            )
         }
         _ => Err("usage: ipc plan <blocks> <seed> | ipc validate <file> | \
              ipc run <file> <blocks> <seed> <operations> <warmup> <timeout-ms> | \

@@ -12,7 +12,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use super::model::{Cell, Status, payload, response, valid_response};
+#[cfg(feature = "process")]
+use super::model::{Cell, window};
+use super::model::{Status, payload, valid_response};
 
 pub struct Counts {
     pub accepted: u64,
@@ -82,8 +84,9 @@ pub fn round_trip(
 }
 
 pub fn serve(mut stream: TcpStream) -> io::Result<()> {
-    while let Some((operation, request)) = read_frame(&mut stream)? {
-        write_frame(&mut stream, operation, &response(request))?;
+    while let Some((operation, mut request)) = read_frame(&mut stream)? {
+        request.iter_mut().for_each(|byte| *byte ^= 0xa5);
+        write_frame(&mut stream, operation, &request)?;
     }
     Ok(())
 }
@@ -158,7 +161,7 @@ pub fn run(
     };
     let started = Instant::now();
     while counts.accepted < requested {
-        let batch = (requested - counts.accepted).min(cell.in_flight);
+        let batch = window(requested - counts.accepted, cell.capacity, cell.in_flight);
         let first = counts.accepted;
         for operation in first..first + batch {
             write_frame(

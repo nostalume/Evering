@@ -1,29 +1,7 @@
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WorkError {
-    NoWorkers,
-}
-
-pub fn distribute(total: u64, workers: usize) -> Result<Vec<u64>, WorkError> {
-    if workers == 0 {
-        return Err(WorkError::NoWorkers);
-    }
-    let workers = workers as u64;
-    let quotient = total / workers;
-    let remainder = total % workers;
-    Ok((0..workers)
-        .map(|worker| quotient + u64::from(worker < remainder))
-        .collect())
-}
-
 pub fn payload(seed: u64, operation: u64, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| payload_byte(seed, operation, index))
         .collect()
-}
-
-pub fn response(mut request: Vec<u8>) -> Vec<u8> {
-    request.iter_mut().for_each(|byte| *byte ^= 0xa5);
-    request
 }
 
 pub fn valid_response(seed: u64, operation: u64, expected_len: usize, response: &[u8]) -> bool {
@@ -54,33 +32,116 @@ pub enum Status {
 pub struct Cell {
     pub implementation: String,
     pub policy: String,
+    pub candidate: String,
     pub payload: u64,
     pub capacity: u64,
     pub in_flight: u64,
     pub memory: u64,
 }
 
-pub fn schedule(cells: &[Cell], blocks: u32, seed: u64) -> Vec<(u32, u32, Cell)> {
-    let mut state = seed;
-    let mut result = Vec::with_capacity(cells.len() * blocks as usize);
-    for block in 0..blocks {
-        let mut shuffled = cells.to_vec();
-        for index in (1..shuffled.len()).rev() {
-            state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
-            let mut random = state;
-            random = (random ^ (random >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-            random = (random ^ (random >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-            random ^= random >> 31;
-            shuffled.swap(index, random as usize % (index + 1));
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Policy {
+    Busy,
+    Adaptive,
+    Notified,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub enum Arm {
+    Evering(Policy),
+    Stream,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct ContrastKey {
+    pub payload: u64,
+    pub capacity: u64,
+    pub in_flight: u64,
+    pub memory: u64,
+}
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+pub struct Contrast {
+    pub key: ContrastKey,
+    pub candidate: Policy,
+}
+
+impl Contrast {
+    pub fn cell(self, arm: Arm) -> Cell {
+        let (implementation, policy) = match arm {
+            Arm::Evering(Policy::Busy) => ("evering", "busy"),
+            Arm::Evering(Policy::Adaptive) => ("evering", "adaptive"),
+            Arm::Evering(Policy::Notified) => ("evering", "notified"),
+            Arm::Stream => ("os-stream", "blocking"),
+        };
+        Cell {
+            implementation: implementation.into(),
+            policy: policy.into(),
+            candidate: match self.candidate {
+                Policy::Busy => "busy",
+                Policy::Adaptive => "adaptive",
+                Policy::Notified => "notified",
+            }
+            .into(),
+            payload: self.key.payload,
+            capacity: self.key.capacity,
+            in_flight: self.key.in_flight,
+            memory: self.key.memory,
         }
-        result.extend(
-            shuffled
-                .into_iter()
-                .enumerate()
-                .map(|(order, cell)| (block, order as u32, cell)),
-        );
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Scheduled {
+    pub block: u32,
+    pub order: u32,
+    pub contrast: Contrast,
+    pub arm: Arm,
+}
+
+fn random(state: &mut u64) -> u64 {
+    *state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    let mut value = *state;
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+pub fn schedule(contrasts: &[Contrast], blocks: u32, seed: u64) -> Vec<Scheduled> {
+    let mut state = seed;
+    let mut result = Vec::with_capacity(contrasts.len() * blocks as usize * 2);
+    for block in 0..blocks {
+        let mut shuffled = contrasts.to_vec();
+        for index in (1..shuffled.len()).rev() {
+            let selected = random(&mut state) as usize % (index + 1);
+            shuffled.swap(index, selected);
+        }
+        let mut order = 0;
+        for contrast in shuffled {
+            let mut arms = [Arm::Evering(contrast.candidate), Arm::Stream];
+            if random(&mut state) & 1 == 1 {
+                arms.reverse();
+            }
+            for arm in arms {
+                result.push(Scheduled {
+                    block,
+                    order,
+                    contrast,
+                    arm,
+                });
+                order += 1;
+            }
+        }
     }
     result
+}
+
+pub fn window(remaining: u64, capacity: u64, in_flight: u64) -> u64 {
+    remaining.min(capacity).min(in_flight)
+}
+
+pub fn mandatory_success(trials: &[Trial]) -> bool {
+    trials.iter().all(|trial| trial.status == Status::Ok)
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,11 +211,21 @@ pub enum CodecError {
 }
 
 pub fn validate_trial(trial: &Trial) -> Result<(), TrialError> {
+    let candidate = trial.cell.candidate.as_str();
+    let valid_candidate = matches!(candidate, "busy" | "adaptive" | "notified");
+    let valid_arm = match (
+        trial.cell.implementation.as_str(),
+        trial.cell.policy.as_str(),
+    ) {
+        ("evering", policy) => policy == candidate,
+        ("os-stream", "blocking") => true,
+        _ => false,
+    };
     if trial.cell.capacity == 0
         || trial.cell.in_flight == 0
         || trial.cell.memory == 0
-        || trial.cell.implementation.is_empty()
-        || trial.cell.policy.is_empty()
+        || !valid_candidate
+        || !valid_arm
         || trial
             .error
             .as_deref()
@@ -288,11 +359,12 @@ pub fn encode(study: &Study) -> Result<String, CodecError> {
     for trial in &study.trials {
         writeln!(
             output,
-            "TRIAL\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
+            "TRIAL\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             trial.block,
             trial.order,
             trial.cell.implementation,
             trial.cell.policy,
+            trial.cell.candidate,
             trial.cell.payload,
             trial.cell.capacity,
             trial.cell.in_flight,
@@ -341,7 +413,7 @@ pub fn decode(input: &str) -> Result<Study, CodecError> {
     let mut trials = Vec::new();
     for line in lines {
         let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() != 16 || fields[0] != "TRIAL" {
+        if fields.len() != 17 || fields[0] != "TRIAL" {
             return Err(CodecError::Syntax);
         }
         trials.push(Trial {
@@ -350,22 +422,23 @@ pub fn decode(input: &str) -> Result<Study, CodecError> {
             cell: Cell {
                 implementation: fields[3].into(),
                 policy: fields[4].into(),
-                payload: number(fields[5])?,
-                capacity: number(fields[6])?,
-                in_flight: number(fields[7])?,
-                memory: number(fields[8])?,
+                candidate: fields[5].into(),
+                payload: number(fields[6])?,
+                capacity: number(fields[7])?,
+                in_flight: number(fields[8])?,
+                memory: number(fields[9])?,
             },
-            requested: number(fields[9])?,
-            accepted: number(fields[10])?,
-            completed: number(fields[11])?,
-            validated: number(fields[12])?,
-            elapsed_ns: if fields[13].is_empty() {
+            requested: number(fields[10])?,
+            accepted: number(fields[11])?,
+            completed: number(fields[12])?,
+            validated: number(fields[13])?,
+            elapsed_ns: if fields[14].is_empty() {
                 None
             } else {
-                Some(number(fields[13])?)
+                Some(number(fields[14])?)
             },
-            status: parse_status(fields[14])?,
-            error: (!fields[15].is_empty()).then(|| fields[15].into()),
+            status: parse_status(fields[15])?,
+            error: (!fields[16].is_empty()).then(|| fields[16].into()),
         });
     }
     let study = Study { meta, trials };

@@ -1,22 +1,19 @@
+#[allow(dead_code)]
 #[path = "../benches/ipc/model.rs"]
 mod model;
+#[allow(dead_code)]
 #[path = "../benches/ipc/stream.rs"]
 mod stream;
 
 #[test]
-fn producer_shares_conserve_exact_requested_work() {
-    let shares = model::distribute(7, 3).unwrap();
-    assert_eq!(shares, [3, 2, 2]);
-    assert_eq!(shares.iter().sum::<u64>(), 7);
-}
-
-#[test]
 fn deterministic_validation_checks_every_response_byte() {
-    let mut response = model::response(model::payload(7, 11, 4096));
+    let mut response = model::payload(7, 11, 4096);
+    response.iter_mut().for_each(|byte| *byte ^= 0xa5);
     assert!(model::valid_response(7, 11, 4096, &response));
     response[2047] ^= 1;
     assert!(!model::valid_response(7, 11, 4096, &response));
-    let truncated = model::response(model::payload(7, 11, 2048));
+    let mut truncated = model::payload(7, 11, 2048);
+    truncated.iter_mut().for_each(|byte| *byte ^= 0xa5);
     assert!(!model::valid_response(7, 11, 4096, &truncated));
 }
 
@@ -40,6 +37,7 @@ fn successful_trial() -> model::Trial {
         cell: model::Cell {
             implementation: "evering".into(),
             policy: "busy".into(),
+            candidate: "busy".into(),
             payload: 64,
             capacity: 8,
             in_flight: 3,
@@ -76,25 +74,108 @@ fn study(trials: Vec<model::Trial>) -> model::Study {
     }
 }
 
-fn cells() -> Vec<model::Cell> {
-    (1..=5)
-        .map(|capacity| model::Cell {
-            implementation: "evering".into(),
-            policy: "busy".into(),
+fn contrast(policy: model::Policy) -> model::Contrast {
+    model::Contrast {
+        key: model::ContrastKey {
             payload: 64,
-            capacity,
-            in_flight: 1,
+            capacity: 8,
+            in_flight: 3,
             memory: 4096,
-        })
-        .collect()
+        },
+        candidate: policy,
+    }
+}
+
+#[test]
+fn schedule_keeps_exact_candidate_baseline_pairs() {
+    use model::{Arm, Policy};
+
+    let contrasts = [contrast(Policy::Busy), contrast(Policy::Notified)];
+    let scheduled = model::schedule(&contrasts, 3, 7);
+    for block in 0..3 {
+        for contrast in &contrasts {
+            let arms: Vec<_> = scheduled
+                .iter()
+                .filter(|trial| trial.block == block && trial.contrast == *contrast)
+                .map(|trial| trial.arm)
+                .collect();
+            assert_eq!(arms.len(), 2);
+            assert!(arms.contains(&Arm::Evering(contrast.candidate)));
+            assert!(arms.contains(&Arm::Stream));
+        }
+    }
+}
+
+#[test]
+fn schedule_randomizes_arm_order_without_changing_membership() {
+    let contrasts = [contrast(model::Policy::Adaptive)];
+    let first = model::schedule(&contrasts, 8, 7);
+    let second = model::schedule(&contrasts, 8, 8);
+    assert_eq!(first.len(), second.len());
+    assert_ne!(
+        first.iter().map(|entry| entry.arm).collect::<Vec<_>>(),
+        second.iter().map(|entry| entry.arm).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn stream_window_obeys_capacity_and_in_flight() {
+    assert_eq!(model::window(100, 1, 64), 1);
+    assert_eq!(model::window(100, 8, 64), 8);
+    assert_eq!(model::window(3, 8, 64), 3);
+}
+
+#[test]
+fn baseline_cannot_claim_an_evering_policy() {
+    let mut trial = successful_trial();
+    trial.cell.implementation = "os-stream".into();
+    trial.cell.policy = "notified".into();
+    assert_eq!(
+        model::validate_trial(&trial).unwrap_err(),
+        model::TrialError::InvalidCell
+    );
+}
+
+#[test]
+fn baseline_rows_keep_the_candidate_contrast_identity() {
+    let mut busy = successful_trial();
+    busy.cell.implementation = "os-stream".into();
+    busy.cell.policy = "blocking".into();
+    let mut notified = busy.clone();
+    notified.order = 1;
+    notified.cell.candidate = "notified".into();
+    let evidence = study(vec![busy, notified]);
+    assert!(model::validate_study(&evidence).is_ok());
+    assert_eq!(
+        model::decode(&model::encode(&evidence).unwrap()).unwrap(),
+        evidence
+    );
+}
+
+#[test]
+fn mandatory_failure_is_not_a_successful_run() {
+    let success = successful_trial();
+    assert!(model::mandatory_success(core::slice::from_ref(&success)));
+    let mut failed = success;
+    failed.status = model::Status::Unsupported;
+    failed.accepted = 0;
+    failed.completed = 0;
+    failed.validated = 0;
+    failed.elapsed_ns = None;
+    failed.error = Some("not implemented".into());
+    assert!(!model::mandatory_success(&[failed]));
 }
 
 #[test]
 fn seeded_blocks_are_reproducible_but_not_fixed_order() {
-    let cells = cells();
-    let first = model::schedule(&cells, 2, 7);
-    assert_eq!(first, model::schedule(&cells, 2, 7));
-    assert_ne!(first, model::schedule(&cells, 2, 8));
+    let contrasts = [
+        contrast(model::Policy::Busy),
+        contrast(model::Policy::Adaptive),
+        contrast(model::Policy::Notified),
+    ];
+    let first = model::schedule(&contrasts, 2, 7);
+    assert_eq!(first, model::schedule(&contrasts, 2, 7));
+    assert_ne!(first, model::schedule(&contrasts, 2, 8));
 }
 
 #[test]
@@ -222,14 +303,4 @@ fn every_failure_phase_has_no_performance_value() {
         trial.error = Some("phase failed".into());
         assert!(model::validate_trial(&trial).is_ok());
     }
-}
-
-#[test]
-fn zero_workers_is_rejected_and_small_work_is_not_truncated() {
-    assert_eq!(
-        model::distribute(1, 0).unwrap_err(),
-        model::WorkError::NoWorkers
-    );
-    assert_eq!(model::distribute(2, 4).unwrap(), [1, 1, 0, 0]);
-    assert_eq!(model::distribute(0, 3).unwrap(), [0, 0, 0]);
 }
