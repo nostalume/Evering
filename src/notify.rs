@@ -1,6 +1,11 @@
 use core::future::Future;
 
-use crate::channel::{Receiver, Sender, TryRecvError, TrySendError};
+use crate::{
+    AdoptError, Block, PoolRef, ReceiveError, Received, Rx, Transfer, TrySendError, Tx,
+    channel::TransferReserved, layout::Repr, token::Shape,
+};
+
+const LOCAL_RETRY_LIMIT: usize = 32;
 
 /// Sends an advisory notification after shared state has committed.
 pub trait Notify {
@@ -9,421 +14,179 @@ pub trait Notify {
     fn notify(&self) -> Result<(), Self::Error>;
 }
 
-impl<T: Notify + ?Sized> Notify for &T {
-    type Error = T::Error;
-
-    fn notify(&self) -> Result<(), Self::Error> {
-        T::notify(self)
-    }
-}
-
-/// Waits for and clears sticky advisory readiness.
-pub trait Listen {
+/// Observes and consumes sticky advisory readiness in one operation.
+pub trait Wait {
     type Error;
-    type Ready<'a>: Future<Output = Result<(), Self::Error>>
-    where
-        Self: 'a;
 
-    fn ready(&self) -> Self::Ready<'_>;
-    fn clear(&self) -> Result<(), Self::Error>;
-}
-
-impl<T: Listen + ?Sized> Listen for &T {
-    type Error = T::Error;
-    type Ready<'a>
-        = T::Ready<'a>
-    where
-        Self: 'a;
-
-    fn ready(&self) -> Self::Ready<'_> {
-        T::ready(self)
-    }
-
-    fn clear(&self) -> Result<(), Self::Error> {
-        T::clear(self)
-    }
+    fn wait(&self) -> impl Future<Output = Result<(), Self::Error>> + '_;
 }
 
 /// A committed shared operation and the health of its advisory notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Done<T, E> {
+pub struct Committed<T, E> {
     pub value: T,
     pub notified: Result<(), E>,
 }
 
-/// A send that did not commit.
+/// An asynchronous operation that did not commit.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum SendError<E> {
-    Disconnected,
+pub enum ProgressError<E> {
+    Busy,
+    Closed,
     Wait(E),
 }
 
-/// Caller-owned state for a send that may suspend before committing.
-#[derive(Debug)]
-#[must_use = "an uncommitted send still owns its value"]
-pub struct Pending<T>(Option<T>);
+/// Borrowed process-local progress capabilities for concrete Channel endpoints.
+pub struct Signals<'a, N: ?Sized, W: ?Sized> {
+    notify: &'a N,
+    wait: &'a W,
+}
 
-impl<T> Pending<T> {
-    pub const fn new(value: T) -> Self {
-        Self(Some(value))
-    }
-
-    pub fn into_inner(self) -> Option<T> {
-        self.0
+fn committed<N: Notify + ?Sized, T>(notify: &N, value: T) -> Committed<T, N::Error> {
+    Committed {
+        value,
+        notified: notify.notify(),
     }
 }
 
-/// A receive that did not commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RecvError<E> {
-    Disconnected,
-    Wait(E),
-}
-
-/// Adds advisory waiting to an unchanged nonblocking endpoint.
-pub struct Async<T, N, L> {
-    inner: T,
-    notify: N,
-    listen: L,
-}
-
-impl<T, N, L> Async<T, N, L> {
-    pub const fn new(inner: T, notify: N, listen: L) -> Self {
-        Self {
-            inner,
-            notify,
-            listen,
-        }
-    }
-
-    pub fn into_parts(self) -> (T, N, L) {
-        (self.inner, self.notify, self.listen)
+impl<'a, N: ?Sized, W: ?Sized> Signals<'a, N, W> {
+    pub const fn new(notify: &'a N, wait: &'a W) -> Self {
+        Self { notify, wait }
     }
 }
 
-impl<T, N, L> Async<T, N, L>
-where
-    T: crate::channel::QueueChannel,
-    N: Notify,
-{
-    /// Closes the shared endpoint, then advises its peer to recheck the gate.
-    pub fn close(&self) -> Done<(), N::Error> {
-        self.inner.close();
-        Done {
-            value: (),
-            notified: self.notify.notify(),
-        }
-    }
-
-    pub fn is_closed(&self) -> bool {
-        self.inner.is_close()
-    }
+#[must_use = "dropping an unused permit cancels its Queue reservation"]
+pub struct Permit<'n, 'q, H: Repr, N: Notify + ?Sized> {
+    reserved: Option<TransferReserved<'q, H>>,
+    notify: &'n N,
 }
 
-impl<T, N, L, V> Async<T, N, L>
-where
-    T: Sender<Item = V, TryError = TrySendError<V>>,
-    N: Notify,
-    L: Listen,
-{
-    pub async fn send(
+impl<N: Notify + ?Sized, W: Wait + ?Sized> Signals<'_, N, W> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "pre-commit failure returns the exact linear Transfer"
+    )]
+    pub fn try_send<'p, H: Repr>(
         &self,
-        pending: &mut Pending<V>,
-    ) -> Result<Done<(), N::Error>, SendError<L::Error>> {
+        tx: &Tx<H>,
+        value: Transfer<'p, H>,
+    ) -> Result<Committed<(), N::Error>, TrySendError<Transfer<'p, H>>> {
+        tx.try_send(value).map(|()| committed(self.notify, ()))
+    }
+
+    pub async fn reserve<'q, H: Repr>(
+        &self,
+        tx: &'q Tx<H>,
+    ) -> Result<Permit<'_, 'q, H, N>, ProgressError<W::Error>> {
+        let mut retries = 0;
         loop {
-            let value = pending.0.take().expect("cannot resend a committed value");
-            match self.inner.try_send(value) {
-                Ok(()) => {
-                    return Ok(Done {
-                        value: (),
-                        notified: self.notify.notify(),
+            match tx.reserve() {
+                Ok(reserved) => {
+                    return Ok(Permit {
+                        reserved: Some(reserved),
+                        notify: self.notify,
                     });
                 }
-                Err(TrySendError::Disconnected(returned)) => {
-                    pending.0 = Some(returned);
-                    return Err(SendError::Disconnected);
+                Err(crate::SendReserveError::Closed) => return Err(ProgressError::Closed),
+                Err(crate::SendReserveError::Busy) if retries == LOCAL_RETRY_LIMIT - 1 => {
+                    return Err(ProgressError::Busy);
                 }
-                Err(TrySendError::Full(returned)) => {
-                    pending.0 = Some(returned);
-                    if let Err(error) = self.listen.ready().await {
-                        return Err(SendError::Wait(error));
-                    }
-                    if let Err(error) = self.listen.clear() {
-                        return Err(SendError::Wait(error));
-                    }
+                Err(crate::SendReserveError::Busy) => {
+                    retries += 1;
+                    core::hint::spin_loop();
+                }
+                Err(crate::SendReserveError::Full) => {
+                    retries = 0;
+                    self.wait.wait().await.map_err(ProgressError::Wait)?;
                 }
             }
         }
+    }
+
+    pub async fn claim<'q, H: Repr>(
+        &self,
+        rx: &'q Rx<H>,
+    ) -> Result<Received<'q, H>, ProgressError<W::Error>> {
+        let mut retries = 0;
+        loop {
+            match rx.claim() {
+                Ok(received) => return Ok(received),
+                Err(ReceiveError::Closed) => return Err(ProgressError::Closed),
+                Err(ReceiveError::Busy) if retries == LOCAL_RETRY_LIMIT - 1 => {
+                    return Err(ProgressError::Busy);
+                }
+                Err(ReceiveError::Busy) => {
+                    retries += 1;
+                    core::hint::spin_loop();
+                }
+                Err(ReceiveError::Empty) => {
+                    retries = 0;
+                    self.wait.wait().await.map_err(ProgressError::Wait)?;
+                }
+            }
+        }
+    }
+
+    #[expect(
+        clippy::type_complexity,
+        reason = "the result exposes both committed notification health and retained claim authority"
+    )]
+    pub fn adopt<'q, 'p, H, T>(
+        &self,
+        received: Received<'q, H>,
+        pool: PoolRef<'p>,
+    ) -> Result<Committed<(H, Block<'p, T>), N::Error>, AdoptError<'q, H>>
+    where
+        H: Repr,
+        T: Repr + Shape + ?Sized,
+    {
+        received
+            .adopt(pool)
+            .map(|value| committed(self.notify, value))
+    }
+
+    pub fn discard<'q, H: Repr>(
+        &self,
+        received: Received<'q, H>,
+        pool: PoolRef<'_>,
+    ) -> Result<Committed<H, N::Error>, AdoptError<'q, H>> {
+        received
+            .discard(pool)
+            .map(|value| committed(self.notify, value))
+    }
+
+    pub fn close_tx<H: Repr>(&self, tx: &Tx<H>) -> Committed<(), N::Error> {
+        tx.close();
+        committed(self.notify, ())
+    }
+
+    pub fn close_rx<H: Repr>(&self, rx: &Rx<H>) -> Committed<(), N::Error> {
+        rx.close();
+        committed(self.notify, ())
     }
 }
 
-impl<T, N, L, V> Async<T, N, L>
-where
-    T: Receiver<Item = V, TryError = TryRecvError>,
-    N: Notify,
-    L: Listen,
-{
-    pub async fn recv(&self) -> Result<Done<V, N::Error>, RecvError<L::Error>> {
-        loop {
-            match self.inner.try_recv() {
-                Ok(value) => {
-                    return Ok(Done {
-                        value,
-                        notified: self.notify.notify(),
-                    });
-                }
-                Err(TryRecvError::Disconnected) => return Err(RecvError::Disconnected),
-                Err(TryRecvError::Empty) => {
-                    self.listen.ready().await.map_err(RecvError::Wait)?;
-                    self.listen.clear().map_err(RecvError::Wait)?;
-                }
-            }
-        }
+impl<H: Repr, N: Notify + ?Sized> Permit<'_, '_, H, N> {
+    fn rollback(&mut self) {
+        drop(self.reserved.take());
+    }
+
+    pub fn send<'p>(mut self, value: Transfer<'p, H>) -> Committed<(), N::Error> {
+        self.reserved.take().unwrap().stage(value).publish();
+        committed(self.notify, ())
+    }
+
+    pub fn cancel(mut self) -> Committed<(), N::Error> {
+        self.rollback();
+        committed(self.notify, ())
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{Async, Done, Listen, Notify, Pending, RecvError, SendError};
-    use crate::channel::{Receiver, Sender, TryRecvError, TrySendError};
-    use core::{
-        cell::Cell,
-        future::{Ready, ready},
-    };
-
-    struct Bell(Result<(), u8>);
-
-    impl Notify for Bell {
-        type Error = u8;
-
-        fn notify(&self) -> Result<(), Self::Error> {
-            self.0
+impl<H: Repr, N: Notify + ?Sized> Drop for Permit<'_, '_, H, N> {
+    fn drop(&mut self) {
+        if self.reserved.is_some() {
+            self.rollback();
+            let _ = self.notify.notify();
         }
-    }
-
-    struct Latch {
-        ready: Cell<bool>,
-        clears: Cell<usize>,
-        error: Option<u8>,
-    }
-
-    impl Listen for Latch {
-        type Error = u8;
-        type Ready<'a> = Ready<Result<(), u8>>;
-
-        fn ready(&self) -> Self::Ready<'_> {
-            self.ready.set(true);
-            ready(self.error.map_or(Ok(()), Err))
-        }
-
-        fn clear(&self) -> Result<(), Self::Error> {
-            self.clears.set(self.clears.get() + 1);
-            Ok(())
-        }
-    }
-
-    struct Tx<'a> {
-        latch: &'a Latch,
-        tries: Cell<usize>,
-    }
-
-    impl Sender for Tx<'_> {
-        type Item = u8;
-        type TryError = TrySendError<u8>;
-
-        fn try_send(&self, item: u8) -> Result<(), Self::TryError> {
-            self.tries.set(self.tries.get() + 1);
-            if self.latch.ready.get() {
-                Ok(())
-            } else {
-                Err(TrySendError::Full(item))
-            }
-        }
-    }
-
-    struct Rx<'a> {
-        latch: &'a Latch,
-    }
-
-    impl Receiver for Rx<'_> {
-        type Item = u8;
-        type TryError = TryRecvError;
-
-        fn try_recv(&self) -> Result<u8, Self::TryError> {
-            if self.latch.ready.get() {
-                Ok(29)
-            } else {
-                Err(TryRecvError::Empty)
-            }
-        }
-    }
-
-    struct Never;
-
-    impl Listen for Never {
-        type Error = u8;
-        type Ready<'a> = core::future::Pending<Result<(), u8>>;
-
-        fn ready(&self) -> Self::Ready<'_> {
-            core::future::pending()
-        }
-
-        fn clear(&self) -> Result<(), Self::Error> {
-            unreachable!("permanently pending readiness cannot be cleared")
-        }
-    }
-
-    struct Full<'a>(&'a Cell<usize>);
-
-    impl Sender for Full<'_> {
-        type Item = u8;
-        type TryError = TrySendError<u8>;
-
-        fn try_send(&self, item: u8) -> Result<(), Self::TryError> {
-            self.0.set(self.0.get() + 1);
-            Err(TrySendError::Full(item))
-        }
-    }
-
-    struct Closed<'a>(&'a Latch);
-
-    impl Sender for Closed<'_> {
-        type Item = u8;
-        type TryError = TrySendError<u8>;
-
-        fn try_send(&self, item: u8) -> Result<(), Self::TryError> {
-            if self.0.ready.get() {
-                Err(TrySendError::Disconnected(item))
-            } else {
-                Err(TrySendError::Full(item))
-            }
-        }
-    }
-
-    #[tokio::test]
-    async fn cancelled_send_keeps_caller_owned_value() {
-        let tries = Cell::new(0);
-        let mut value = Pending::new(73);
-        let send = Async::new(Full(&tries), Bell(Ok(())), Never);
-
-        assert!(
-            tokio::time::timeout(core::time::Duration::from_millis(1), send.send(&mut value))
-                .await
-                .is_err()
-        );
-        assert_eq!(tries.get(), 1);
-        assert_eq!(value.into_inner(), Some(73));
-    }
-
-    #[tokio::test]
-    async fn close_while_waiting_keeps_caller_owned_value() {
-        let latch = Latch {
-            ready: Cell::new(false),
-            clears: Cell::new(0),
-            error: None,
-        };
-        let mut value = Pending::new(31);
-        let result = Async::new(Closed(&latch), Bell(Ok(())), &latch)
-            .send(&mut value)
-            .await;
-
-        assert_eq!(result, Err(SendError::Disconnected));
-        assert_eq!(value.into_inner(), Some(31));
-        assert_eq!(latch.clears.get(), 1);
-    }
-
-    #[tokio::test]
-    async fn full_and_empty_wait_clear_and_retry_authoritative_state() {
-        let tx_latch = Latch {
-            ready: Cell::new(false),
-            clears: Cell::new(0),
-            error: None,
-        };
-        let tx = Tx {
-            latch: &tx_latch,
-            tries: Cell::new(0),
-        };
-        let mut value = Pending::new(17);
-        let sent = Async::new(tx, Bell(Ok(())), &tx_latch)
-            .send(&mut value)
-            .await;
-        assert_eq!(
-            sent,
-            Ok(Done {
-                value: (),
-                notified: Ok(())
-            })
-        );
-        assert_eq!(value.into_inner(), None);
-        assert_eq!(tx_latch.clears.get(), 1);
-
-        let rx_latch = Latch {
-            ready: Cell::new(false),
-            clears: Cell::new(0),
-            error: None,
-        };
-        let received = Async::new(Rx { latch: &rx_latch }, Bell(Ok(())), &rx_latch)
-            .recv()
-            .await;
-        assert_eq!(
-            received,
-            Ok(Done {
-                value: 29,
-                notified: Ok(())
-            })
-        );
-        assert_eq!(rx_latch.clears.get(), 1);
-    }
-
-    #[tokio::test]
-    async fn wait_failure_preserves_uncommitted_send_ownership() {
-        let latch = Latch {
-            ready: Cell::new(false),
-            clears: Cell::new(0),
-            error: Some(7),
-        };
-        let mut value = Pending::new(41);
-        let result = Async::new(
-            Tx {
-                latch: &latch,
-                tries: Cell::new(0),
-            },
-            Bell(Ok(())),
-            &latch,
-        )
-        .send(&mut value)
-        .await;
-        assert_eq!(result, Err(SendError::Wait(7)));
-        assert_eq!(value.into_inner(), Some(41));
-    }
-
-    #[tokio::test]
-    async fn post_commit_notify_failure_is_not_a_precommit_error() {
-        let latch = Latch {
-            ready: Cell::new(true),
-            clears: Cell::new(0),
-            error: None,
-        };
-        let mut value = Pending::new(53);
-        let sent = Async::new(
-            Tx {
-                latch: &latch,
-                tries: Cell::new(0),
-            },
-            Bell(Err(9)),
-            &latch,
-        )
-        .send(&mut value)
-        .await;
-        assert_eq!(
-            sent,
-            Ok(Done {
-                value: (),
-                notified: Err(9)
-            })
-        );
-        assert_eq!(value.into_inner(), None);
-
-        let _ = RecvError::<u8>::Disconnected;
     }
 }

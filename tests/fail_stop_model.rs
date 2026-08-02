@@ -223,6 +223,67 @@ fn consumer_recovery_never_advances_a_turn_twice() {
     );
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct OrderingContract {
+    publish_release: bool,
+    claim_acquire: bool,
+    recycle_release: bool,
+    reserve_acquire: bool,
+}
+
+impl OrderingContract {
+    const fn payload_visible(self) -> bool {
+        self.publish_release && self.claim_acquire
+    }
+
+    const fn overwrite_after_recycle(self) -> bool {
+        self.recycle_release && self.reserve_acquire
+    }
+}
+
+#[test]
+fn queue_visibility_rejects_each_weakened_happens_before_edge() {
+    let required = OrderingContract {
+        publish_release: true,
+        claim_acquire: true,
+        recycle_release: true,
+        reserve_acquire: true,
+    };
+    assert!(required.payload_visible());
+    assert!(required.overwrite_after_recycle());
+
+    for weakened in [
+        OrderingContract {
+            publish_release: false,
+            ..required
+        },
+        OrderingContract {
+            claim_acquire: false,
+            ..required
+        },
+    ] {
+        assert!(
+            !weakened.payload_visible(),
+            "unpublished payload became readable"
+        );
+    }
+    for weakened in [
+        OrderingContract {
+            recycle_release: false,
+            ..required
+        },
+        OrderingContract {
+            reserve_acquire: false,
+            ..required
+        },
+    ] {
+        assert!(
+            !weakened.overwrite_after_recycle(),
+            "producer overwrote storage before consumer completion"
+        );
+    }
+}
+
 #[test]
 fn a_dead_reaper_can_be_replaced_without_changing_source_evidence() {
     let control = owned(PRODUCER, true, 3) | ((REAPER_OWNER.slot as u16 + 1) << REAPER_SHIFT);
@@ -237,6 +298,72 @@ fn a_dead_reaper_can_be_replaced_without_changing_source_evidence() {
         recover_queue(control, SOURCE_OWNER.slot, 6, 8, 12, 4),
         QueueRecovery::Busy(REAPER_OWNER.slot)
     );
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PoolAuthority {
+    Free(u16),
+    Local(u16, u8),
+    Detached(u16),
+}
+
+fn reap_pool(authority: &mut PoolAuthority, dead: u8) {
+    if let PoolAuthority::Local(generation, owner) = *authority
+        && owner == dead
+    {
+        *authority = PoolAuthority::Free(generation);
+    }
+}
+
+fn release_transfer(authority: &mut PoolAuthority, generation: u16, source: u8) -> bool {
+    let current = match *authority {
+        PoolAuthority::Free(current)
+        | PoolAuthority::Local(current, _)
+        | PoolAuthority::Detached(current) => current,
+    };
+    if generation == 0 || current < generation {
+        return false;
+    }
+    if current > generation || matches!(*authority, PoolAuthority::Free(_)) {
+        return true;
+    }
+    if matches!(*authority, PoolAuthority::Local(_, owner) if owner != source) {
+        return false;
+    }
+    *authority = PoolAuthority::Free(generation);
+    true
+}
+
+#[test]
+fn pool_and_queue_scan_order_have_the_same_release_result() {
+    for detached in [false, true] {
+        let initial = if detached {
+            PoolAuthority::Detached(7)
+        } else {
+            PoolAuthority::Local(7, SOURCE_OWNER.slot)
+        };
+        let mut queue_first = initial;
+        assert!(release_transfer(&mut queue_first, 7, SOURCE_OWNER.slot));
+        reap_pool(&mut queue_first, SOURCE_OWNER.slot);
+
+        let mut pool_first = initial;
+        reap_pool(&mut pool_first, SOURCE_OWNER.slot);
+        assert!(release_transfer(&mut pool_first, 7, SOURCE_OWNER.slot));
+        assert_eq!(queue_first, PoolAuthority::Free(7));
+        assert_eq!(pool_first, queue_first);
+    }
+}
+
+#[test]
+fn replacement_reaper_uses_original_source_and_stale_generation_is_harmless() {
+    let mut interrupted = PoolAuthority::Local(7, SOURCE_OWNER.slot);
+    assert!(release_transfer(&mut interrupted, 7, SOURCE_OWNER.slot));
+    assert_eq!(interrupted, PoolAuthority::Free(7));
+
+    let mut reused = PoolAuthority::Local(8, SOURCE_OWNER.slot);
+    assert!(release_transfer(&mut reused, 7, SOURCE_OWNER.slot));
+    assert_eq!(reused, PoolAuthority::Local(8, SOURCE_OWNER.slot));
+    assert!(!release_transfer(&mut reused, 0, SOURCE_OWNER.slot));
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

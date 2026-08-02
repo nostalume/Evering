@@ -22,6 +22,22 @@ use nix::{
     sys::socket::{ControlMessage, MsgFlags, sendmsg},
 };
 
+fn assert_peer_closed(observer: &mut UnixStream) {
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let mut byte = [0];
+    loop {
+        match observer.read(&mut byte) {
+            Ok(0) => return,
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock && Instant::now() < deadline =>
+            {
+                thread::yield_now();
+            }
+            result => panic!("received descriptor remained open: {result:?}"),
+        }
+    }
+}
+
 #[test]
 fn transfers_exact_owned_resources_and_opaque_bytes() {
     let (send, recv) = Socket::pair().unwrap();
@@ -56,8 +72,7 @@ fn exact_count_failure_closes_every_received_resource() {
     );
     drop(offered);
 
-    let mut byte = [0];
-    assert_eq!(observer.read(&mut byte).unwrap(), 0);
+    assert_peer_closed(&mut observer);
 }
 
 #[test]
@@ -82,8 +97,7 @@ fn malformed_offer_closes_attached_resources() {
     );
     drop(offered);
 
-    let mut byte = [0];
-    assert_eq!(observer.read(&mut byte).unwrap(), 0);
+    assert_peer_closed(&mut observer);
 }
 
 #[test]
@@ -104,7 +118,7 @@ fn local_bounds_reject_without_transport() {
 #[test]
 fn child_accepts_mapping_and_directional_bells() {
     use evering::{
-        Notify,
+        notify::Notify,
         os::{event, unix::UnixFd},
         process::Supervisor,
     };

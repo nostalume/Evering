@@ -1,946 +1,1168 @@
-use core::cell::UnsafeCell;
-use core::mem::MaybeUninit;
-use core::sync::atomic::{self, AtomicU8, AtomicU16, AtomicUsize, Ordering};
+use core::alloc::Layout as AllocLayout;
+use core::marker::PhantomData;
+use core::mem::ManuallyDrop;
+use core::mem::offset_of;
+use core::ptr::NonNull;
+use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-use crossbeam_utils::CachePadded;
+use alloc::sync::Arc;
 
-pub mod cross;
-pub mod driver;
-
-/// One shared queue position. Control owns bytes before either cursor moves.
-#[repr(C)]
-pub struct Slot<T> {
-    turn: AtomicUsize,
-    control: AtomicU16,
-    value: UnsafeCell<MaybeUninit<T>>,
-}
-
-const EMPTY: u16 = 0;
-const PRODUCER: u16 = 1;
-const AVAILABLE: u16 = 2;
-const CONSUMER: u16 = 3;
-const BASE_MASK: u16 = 0b11;
-const COMPLETE: u16 = 1 << 2;
-const SOURCE_SHIFT: u32 = 3;
-const SOURCE_MASK: u16 = 0x3f << SOURCE_SHIFT;
-const REAPER_SHIFT: u32 = 9;
-const REAPER_MASK: u16 = 0x3f << REAPER_SHIFT;
-const RESERVED_MASK: u16 = 1 << 15;
-
-#[cfg(test)]
-static EXIT_AFTER_REAPER: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(all(test, unix, feature = "map"))]
-pub(crate) fn exit_after_reaper(owner: u8) {
-    EXIT_AFTER_REAPER.store(owner + 1, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-pub(crate) const SEND_CLOSING: usize = 1;
-#[cfg(test)]
-pub(crate) const SEND_CLOSED: usize = 2;
-#[cfg(test)]
-pub(crate) const SEND_FINISHED: usize = 3;
-#[cfg(test)]
-pub(crate) const RECV_CLOSING: usize = 4;
-#[cfg(test)]
-pub(crate) const RECV_CLOSED: usize = 5;
-#[cfg(test)]
-pub(crate) const RECV_FINISHED: usize = 6;
-#[cfg(test)]
-static CLOSE_CRASH: AtomicU8 = AtomicU8::new(0);
-
-#[cfg(all(test, unix, feature = "map"))]
-pub(crate) fn crash_close_for_test(point: usize) {
-    CLOSE_CRASH.store(point as u8, Ordering::Relaxed);
-}
-
-#[cfg(test)]
-fn crash_close(point: usize) {
-    if CLOSE_CRASH.load(Ordering::Relaxed) == point as u8 {
-        std::process::exit(140 + point as i32);
-    }
-}
-
-const _: () = {
-    assert!(crate::header::PARTICIPANT_CAPACITY <= 63);
-    assert!(BASE_MASK & (COMPLETE | SOURCE_MASK | REAPER_MASK | RESERVED_MASK) == 0);
-    assert!(COMPLETE & (SOURCE_MASK | REAPER_MASK | RESERVED_MASK) == 0);
-    assert!(SOURCE_MASK & (REAPER_MASK | RESERVED_MASK) == 0);
-    assert!(REAPER_MASK & RESERVED_MASK == 0);
+use crate::header::{self, RcHeader, RecoveryContext};
+use crate::mem::Mapped;
+use crate::msg::Repr;
+use crate::queue::{
+    Claim, ClaimError, Header, Queue, Repair, ReserveError, Reserved, Slot, Staged,
+    repair_slot_with,
 };
+use crate::schema::{
+    LayoutContext, LayoutInfo, SchemaKey, SharedSchema, compose_schema, schema_id,
+};
+use crate::token::Token;
 
-impl<T> Slot<T> {
-    const fn new(turn: usize) -> Self {
+pub use crate::queue::{ReserveError as SendReserveError, TrySendError};
+
+type Item<H> = Token<H>;
+type ClosedMap<H> = (Mapped<RcHeader<Duplex<H>>>, usize, usize, u8);
+
+const ROLE_SLOT_BITS: usize = usize::BITS.trailing_zeros() as usize;
+const ROLE_GENERATION_SHIFT: usize = 1 + ROLE_SLOT_BITS;
+const ROLE_SLOT_MASK: usize = ((1 << ROLE_SLOT_BITS) - 1) << 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(transparent)]
+struct RoleWord(usize);
+
+impl RoleWord {
+    const MAX_GENERATION: usize = usize::MAX >> ROLE_GENERATION_SHIFT;
+
+    const fn new(generation: usize, participant: Option<u8>, terminal: bool) -> Option<Self> {
+        if generation > Self::MAX_GENERATION {
+            return None;
+        }
+        let slot = match participant {
+            Some(participant) if (participant as usize) < crate::header::PARTICIPANT_CAPACITY => {
+                participant as usize + 1
+            }
+            Some(_) => return None,
+            None => 0,
+        };
+        Some(Self(
+            (generation << ROLE_GENERATION_SHIFT) | (slot << 1) | terminal as usize,
+        ))
+    }
+
+    const fn parts(self) -> (usize, Option<u8>, bool) {
+        let generation = self.0 >> ROLE_GENERATION_SHIFT;
+        let slot = (self.0 & ROLE_SLOT_MASK) >> 1;
+        let participant = if slot == 0 {
+            None
+        } else {
+            Some((slot - 1) as u8)
+        };
+        (generation, participant, self.0 & 1 != 0)
+    }
+
+    const fn next_unowned(self, terminal: bool) -> Option<Self> {
+        let (generation, _, _) = self.parts();
+        let Some(generation) = generation.checked_add(1) else {
+            return None;
+        };
+        Self::new(generation, None, terminal)
+    }
+}
+
+fn recover_role(role: &AtomicUsize, dead: u8) {
+    let mut raw = role.load(Ordering::Acquire);
+    loop {
+        let current = RoleWord(raw);
+        let (generation, owner, terminal) = current.parts();
+        if owner != Some(dead) {
+            return;
+        }
+        let released = if terminal {
+            RoleWord::new(generation, None, true).unwrap()
+        } else {
+            current
+                .next_unowned(false)
+                .unwrap_or_else(|| RoleWord::new(generation, None, true).unwrap())
+        };
+        match role.compare_exchange_weak(raw, released.0, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => return,
+            Err(observed) => raw = observed,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(C)]
+pub struct Info {
+    capacity: u64,
+}
+
+impl SharedSchema for Info {
+    const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.duplex.info"), 1);
+}
+
+unsafe impl LayoutInfo for Info {}
+
+pub(crate) type Config = usize;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeometryError {
+    ZeroCapacity,
+    Overflow,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Geometry {
+    pub(crate) layout: AllocLayout,
+    slots: usize,
+    capacity: usize,
+    one_lap: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub struct Id<H: Repr> {
+    pub(crate) inner: crate::dir::Id<Duplex<H>>,
+    pub(crate) capacity: usize,
+}
+
+impl<H: Repr> Copy for Id<H> {}
+
+impl<H: Repr> Clone for Id<H> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<H: Repr> Id<H> {
+    pub const fn new(
+        region: crate::schema::RegionId,
+        slab: u32,
+        entry: u32,
+        generation: usize,
+        capacity: usize,
+    ) -> Self {
         Self {
-            turn: AtomicUsize::new(turn),
-            control: AtomicU16::new(EMPTY),
-            value: UnsafeCell::new(MaybeUninit::uninit()),
+            inner: crate::dir::Id::from_parts(region, slab, entry, generation),
+            capacity,
+        }
+    }
+
+    pub const fn region(self) -> crate::schema::RegionId {
+        self.inner.parts().0
+    }
+
+    pub const fn slab(self) -> u32 {
+        self.inner.parts().1
+    }
+
+    pub const fn entry(self) -> u32 {
+        self.inner.parts().2
+    }
+
+    pub const fn generation(self) -> usize {
+        self.inner.parts().3
+    }
+
+    pub const fn capacity(self) -> usize {
+        self.capacity
+    }
+}
+
+pub struct Port<H: Repr> {
+    pub(crate) id: Id<H>,
+    pub(crate) role: usize,
+    pub(crate) generation: usize,
+}
+
+impl<H: Repr> Port<H> {
+    pub(crate) const fn new(id: Id<H>, role: usize, generation: usize) -> Self {
+        Self {
+            id,
+            role,
+            generation,
+        }
+    }
+
+    pub const fn region(&self) -> crate::schema::RegionId {
+        self.id.region()
+    }
+
+    pub const fn id(&self) -> Id<H> {
+        self.id
+    }
+
+    pub const fn role(&self) -> u8 {
+        self.role as u8
+    }
+
+    pub const fn generation(&self) -> usize {
+        self.generation
+    }
+
+    pub const fn from_parts(id: Id<H>, role: u8, generation: usize) -> Option<Self> {
+        if role >= 2 || generation == 0 || generation > RoleWord::MAX_GENERATION {
+            return None;
+        }
+        Some(Self {
+            id,
+            role: role as usize,
+            generation,
+        })
+    }
+}
+
+impl<H: Repr> core::fmt::Debug for Port<H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Port")
+            .field("region", &self.region())
+            .field("role", &self.role)
+            .field("generation", &self.generation)
+            .finish()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum InviteError {
+    Occupied,
+    Terminal,
+    Busy,
+    Retired,
+}
+
+pub(crate) enum CloseError {
+    Busy,
+    Evidence,
+}
+
+#[repr(C)]
+pub struct Duplex<H: Repr> {
+    lifecycle: AtomicU8,
+    roles: [AtomicUsize; 2],
+    left: Header,
+    right: Header,
+    _item: PhantomData<fn() -> Item<H>>,
+}
+
+impl<H: Repr> Duplex<H> {
+    fn blank() -> Self {
+        Self {
+            lifecycle: AtomicU8::new(0),
+            roles: [const { AtomicUsize::new(0) }; 2],
+            left: Header::new(),
+            right: Header::new(),
+            _item: PhantomData,
+        }
+    }
+
+    pub(crate) fn geometry(capacity: usize) -> Result<Geometry, GeometryError> {
+        if capacity == 0 {
+            return Err(GeometryError::ZeroCapacity);
+        }
+        let count = capacity.checked_mul(2).ok_or(GeometryError::Overflow)?;
+        let slots =
+            AllocLayout::array::<Slot<Item<H>>>(count).map_err(|_| GeometryError::Overflow)?;
+        let (layout, slots) = AllocLayout::new::<RcHeader<Self>>()
+            .extend(slots)
+            .map_err(|_| GeometryError::Overflow)?;
+        let one_lap = capacity
+            .checked_add(1)
+            .and_then(usize::checked_next_power_of_two)
+            .ok_or(GeometryError::Overflow)?;
+        Ok(Geometry {
+            layout: layout.pad_to_align(),
+            slots,
+            capacity,
+            one_lap,
+        })
+    }
+}
+
+impl<H: Repr> SharedSchema for Duplex<H> {
+    const SCHEMA: SchemaKey = compose_schema(
+        SchemaKey::new(schema_id("evering.duplex"), 5),
+        <Token<H> as SharedSchema>::SCHEMA,
+    );
+}
+
+unsafe impl<H: Repr> header::Layout for Duplex<H> {
+    type Config = Config;
+    type Info = Info;
+
+    const MAGIC: header::Magic = 0xD0A1;
+
+    fn storage(conf: &Config) -> Option<AllocLayout> {
+        Self::geometry(*conf).ok().map(|geometry| geometry.layout)
+    }
+
+    fn info(conf: &Config, _: LayoutContext) -> Info {
+        match Self::geometry(*conf) {
+            Ok(_) => Info {
+                capacity: *conf as u64,
+            },
+            Err(_) => Info { capacity: 0 },
+        }
+    }
+
+    unsafe fn init(destination: *mut Self, conf: Config) -> header::Status {
+        let () = <Item<H> as Repr>::VALID;
+        let Ok(geometry) = Self::geometry(conf) else {
+            return header::Status::Corrupted;
+        };
+        let base = destination
+            .cast::<u8>()
+            .wrapping_sub(offset_of!(RcHeader<Self>, inner));
+        let slots = base.wrapping_add(geometry.slots).cast::<Slot<Item<H>>>();
+        unsafe {
+            destination.write(Self::blank());
+            for direction in 0..2 {
+                for index in 0..geometry.capacity {
+                    slots
+                        .add(direction * geometry.capacity + index)
+                        .write(Slot::new(index));
+                }
+            }
+        }
+        header::Status::Initialized
+    }
+
+    fn attach(&self, conf: &Config) -> header::Status {
+        if Self::geometry(*conf).is_ok() {
+            header::Status::Initialized
+        } else {
+            header::Status::Corrupted
+        }
+    }
+
+    fn recover(context: RecoveryContext<'_, Self>) -> bool {
+        let Ok(capacity) = usize::try_from(context.info.capacity) else {
+            return false;
+        };
+        let Ok(geometry) = Self::geometry(capacity) else {
+            return false;
+        };
+        if geometry.layout.size() != context.extent {
+            return false;
+        }
+        let slots = unsafe {
+            core::slice::from_raw_parts(
+                context.base.add(geometry.slots).cast::<Slot<Item<H>>>(),
+                capacity * 2,
+            )
+        };
+        for (header, start) in [(&context.layout.left, 0), (&context.layout.right, capacity)] {
+            let slots = &slots[start..start + capacity];
+            for index in 0..capacity {
+                if matches!(
+                    repair_slot_with(
+                        header,
+                        slots,
+                        geometry.one_lap,
+                        index,
+                        context.dead,
+                        context.live,
+                        |token, owner| {
+                            crate::pool::release_token(context.directory, token, Some(owner))
+                        },
+                    ),
+                    Repair::Busy(_) | Repair::Corrupted
+                ) {
+                    return false;
+                }
+            }
+        }
+        for role in &context.layout.roles {
+            recover_role(role, context.dead);
+        }
+        true
+    }
+}
+
+struct Role<H: Repr> {
+    id: Id<H>,
+    mapped: Mapped<RcHeader<Duplex<H>>>,
+    routes: [Route<H>; 2],
+    capacity: usize,
+    one_lap: usize,
+    index: usize,
+    generation: usize,
+    owner: u8,
+}
+
+struct Route<H: Repr> {
+    header: NonNull<Header>,
+    slots: NonNull<Slot<Item<H>>>,
+    send_field: u32,
+    recv_field: u32,
+}
+
+// Mapped owns the allocation, while Queue atomics admit every slot access.
+unsafe impl<H: Repr> Send for Role<H> {}
+unsafe impl<H: Repr> Sync for Role<H> {}
+
+impl<H: Repr> Role<H> {
+    fn route(&self, direction: usize) -> &Route<H> {
+        &self.routes[direction]
+    }
+}
+
+fn routes<H: Repr>(
+    mapped: &Mapped<RcHeader<Duplex<H>>>,
+    slots: NonNull<Slot<Item<H>>>,
+    capacity: usize,
+) -> [Route<H>; 2] {
+    [
+        Route {
+            header: NonNull::from(&mapped.left),
+            slots,
+            send_field: 0,
+            recv_field: 6,
+        },
+        Route {
+            header: NonNull::from(&mapped.right),
+            slots: unsafe { NonNull::new_unchecked(slots.as_ptr().add(capacity)) },
+            send_field: 4,
+            recv_field: 2,
+        },
+    ]
+}
+
+impl<H: Repr> Drop for Role<H> {
+    fn drop(&mut self) {
+        let authority = &self.mapped.roles[self.index];
+        let mut raw = authority.load(Ordering::Acquire);
+        loop {
+            let current = RoleWord(raw);
+            let (generation, owner, terminal) = current.parts();
+            if generation != self.generation || owner != Some(self.owner) {
+                return;
+            }
+            let released = if terminal {
+                RoleWord::new(generation, None, true).unwrap()
+            } else {
+                current
+                    .next_unowned(false)
+                    .unwrap_or_else(|| RoleWord::new(generation, None, true).unwrap())
+            };
+            match authority.compare_exchange_weak(
+                raw,
+                released.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(observed) => raw = observed,
+            }
         }
     }
 }
 
-const fn owned(base: u16, complete: bool, owner: u8) -> u16 {
-    base | if complete { COMPLETE } else { 0 } | (((owner as u16) + 1) << SOURCE_SHIFT)
+pub struct Channel<H: Repr> {
+    role: Arc<Role<H>>,
 }
 
-const fn base(control: u16) -> u16 {
-    control & BASE_MASK
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RoleAdmitError {
+    Stale,
+    Occupied,
+    Terminal,
+    Orphaned,
+    Open,
 }
 
-const fn canonical(control: u16) -> bool {
-    if control & RESERVED_MASK != 0 {
-        return false;
-    }
-    let source = (control & SOURCE_MASK) >> SOURCE_SHIFT;
-    let reaper = (control & REAPER_MASK) >> REAPER_SHIFT;
-    match base(control) {
-        EMPTY => control == EMPTY,
-        PRODUCER | CONSUMER => {
-            source != 0
-                && source as usize <= crate::header::PARTICIPANT_CAPACITY
-                && reaper as usize <= crate::header::PARTICIPANT_CAPACITY
+impl<H: Repr> Clone for Channel<H> {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role.clone(),
         }
-        AVAILABLE => source == 0 && reaper == 0,
-        _ => false,
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReserveError {
-    Full,
-    Busy,
-    Contended,
-    Closed,
-}
+impl<H: Repr> Channel<H> {
+    fn from_parts(
+        mapped: Mapped<RcHeader<Duplex<H>>>,
+        geometry: Geometry,
+        id: Id<H>,
+        index: usize,
+        generation: usize,
+        owner: u8,
+    ) -> Self {
+        let base = mapped.pointer().cast::<u8>();
+        let slots = unsafe { NonNull::new_unchecked(base.as_ptr().add(geometry.slots).cast()) };
+        Self {
+            role: Arc::new(Role {
+                id,
+                routes: routes(&mapped, slots, geometry.capacity),
+                mapped,
+                capacity: geometry.capacity,
+                one_lap: geometry.one_lap,
+                index,
+                generation,
+                owner,
+            }),
+        }
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ClaimError {
-    Empty,
-    Busy,
-    Closed,
-}
+    pub fn id(&self) -> Id<H> {
+        self.role.id
+    }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum Repair {
-    None,
-    Recovered,
-    Busy(u8),
-    Corrupted,
-}
+    pub(crate) fn is_unique(&self) -> bool {
+        Arc::strong_count(&self.role) == 1
+    }
 
-#[must_use]
-pub struct Reserved<'a, Q: Queue + ?Sized> {
-    slot: &'a Slot<Q::Item>,
-    done: bool,
-}
+    pub(crate) fn peer_is_unowned(&self) -> bool {
+        let peer = 1 - self.role.index;
+        RoleWord(self.role.mapped.roles[peer].load(Ordering::Acquire))
+            .parts()
+            .1
+            .is_none()
+    }
 
-#[must_use]
-pub struct Staged<'a, Q: Queue + ?Sized> {
-    reserved: Reserved<'a, Q>,
-}
+    pub(crate) fn layout_id(&self) -> crate::schema::LayoutId {
+        self.role.mapped.layout_id()
+    }
 
-impl<'a, Q: Queue + ?Sized> Reserved<'a, Q> {
-    pub fn stage(self, value: Q::Item) -> Staged<'a, Q> {
-        unsafe { (*self.slot.value.get()).write(value) };
-        self.slot.control.store(
-            owned(PRODUCER, true, self.reserved_owner()),
+    pub(crate) fn into_closed_mapped(self) -> Result<ClosedMap<H>, Self> {
+        let authority = RoleWord(self.role.mapped.roles[self.role.index].load(Ordering::Acquire));
+        let (_, owner, terminal) = authority.parts();
+        if owner.is_some() || !terminal {
+            return Err(self);
+        }
+        match Arc::try_unwrap(self.role) {
+            Ok(role) => {
+                // The unique role is terminal and unowned, so its Drop has no
+                // authority to release. Move the mapping out without adding an
+                // Option branch to every queue hot-path access.
+                let role = ManuallyDrop::new(role);
+                Ok((
+                    unsafe { core::ptr::read(&role.mapped) },
+                    role.index,
+                    role.generation,
+                    role.owner,
+                ))
+            }
+            Err(role) => Err(Self { role }),
+        }
+    }
+
+    pub(crate) fn closed(
+        mapped: Mapped<RcHeader<Duplex<H>>>,
+        geometry: Geometry,
+        id: Id<H>,
+        index: usize,
+        generation: usize,
+        owner: u8,
+    ) -> Self {
+        Self::from_parts(mapped, geometry, id, index, generation, owner)
+    }
+
+    pub(crate) fn creator(
+        mapped: Mapped<RcHeader<Duplex<H>>>,
+        geometry: Geometry,
+        id: Id<H>,
+    ) -> (Self, usize) {
+        let owner = mapped.peer().slot();
+        let generation = 1;
+        mapped.roles[0].store(
+            RoleWord::new(generation, Some(owner), false).unwrap().0,
             Ordering::Release,
         );
-        Staged { reserved: self }
+        mapped.roles[1].store(
+            RoleWord::new(generation, None, false).unwrap().0,
+            Ordering::Release,
+        );
+        (
+            Self::from_parts(mapped, geometry, id, 0, generation, owner),
+            generation,
+        )
     }
 
-    fn reserved_owner(&self) -> u8 {
-        let source = (self.slot.control.load(Ordering::Relaxed) & SOURCE_MASK) >> SOURCE_SHIFT;
-        debug_assert_ne!(source, 0);
-        (source - 1) as u8
+    pub(crate) fn adopt(
+        mapped: Mapped<RcHeader<Duplex<H>>>,
+        port: &Port<H>,
+    ) -> Result<Self, RoleAdmitError> {
+        let index = port.role;
+        let generation = port.generation;
+        if index >= 2 {
+            return Err(RoleAdmitError::Open);
+        }
+        let capacity =
+            usize::try_from(mapped.layout_info().capacity).map_err(|_| RoleAdmitError::Open)?;
+        let geometry = Duplex::<H>::geometry(capacity).map_err(|_| RoleAdmitError::Open)?;
+        mapped
+            .offset_of(mapped.pointer().cast(), geometry.layout.size())
+            .map_err(|_| RoleAdmitError::Open)?;
+        let owner = mapped.peer().slot();
+        let authority = &mapped.roles[index];
+        let expected = RoleWord::new(generation, None, false)
+            .ok_or(RoleAdmitError::Stale)?
+            .0;
+        let claimed = RoleWord::new(generation, Some(owner), false)
+            .ok_or(RoleAdmitError::Open)?
+            .0;
+        if let Err(observed) =
+            authority.compare_exchange(expected, claimed, Ordering::AcqRel, Ordering::Acquire)
+        {
+            let (observed_generation, observed_owner, terminal) = RoleWord(observed).parts();
+            return Err(if terminal {
+                RoleAdmitError::Terminal
+            } else if observed_generation != generation {
+                RoleAdmitError::Stale
+            } else if observed_owner.is_some() {
+                RoleAdmitError::Occupied
+            } else {
+                RoleAdmitError::Open
+            });
+        }
+
+        let (_, issuer, issuer_terminal) =
+            RoleWord(mapped.roles[1 - index].load(Ordering::Acquire)).parts();
+        if issuer_terminal || issuer.is_none() {
+            let current = RoleWord(claimed);
+            let released = current
+                .next_unowned(false)
+                .unwrap_or_else(|| RoleWord::new(generation, None, true).unwrap());
+            let _ = authority.compare_exchange(
+                claimed,
+                released.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            );
+            return Err(RoleAdmitError::Orphaned);
+        }
+
+        Ok(Self::from_parts(
+            mapped, geometry, port.id, index, generation, owner,
+        ))
     }
 
-    fn skip(&mut self) {
-        self.slot.control.store(AVAILABLE, Ordering::Release);
-        self.done = true;
+    pub fn split(&self) -> (Tx<H>, Rx<H>) {
+        (
+            Tx(Endpoint {
+                role: self.role.clone(),
+                direction: self.role.index,
+            }),
+            Rx(Endpoint {
+                role: self.role.clone(),
+                direction: 1 - self.role.index,
+            }),
+        )
     }
-}
 
-impl<Q: Queue + ?Sized> Drop for Reserved<'_, Q> {
-    fn drop(&mut self) {
-        if !self.done {
-            self.skip();
+    pub fn invite(&self) -> Result<Port<H>, InviteError> {
+        let issuer = RoleWord(self.role.mapped.roles[self.role.index].load(Ordering::Acquire));
+        let (issuer_generation, issuer_owner, issuer_terminal) = issuer.parts();
+        if issuer_generation != self.role.generation
+            || issuer_owner != Some(self.role.owner)
+            || issuer_terminal
+        {
+            return Err(InviteError::Terminal);
+        }
+        let index = 1 - self.role.index;
+        let authority = &self.role.mapped.roles[index];
+        let raw = authority.load(Ordering::Acquire);
+        let current = RoleWord(raw);
+        let (generation, owner, terminal) = current.parts();
+        if terminal {
+            return Err(InviteError::Terminal);
+        }
+        if owner.is_some() {
+            return Err(InviteError::Occupied);
+        }
+        let Some(next) = current.next_unowned(false) else {
+            let retired = RoleWord::new(generation, None, true).unwrap();
+            return match authority.compare_exchange(
+                raw,
+                retired.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => Err(InviteError::Retired),
+                Err(_) => Err(InviteError::Busy),
+            };
+        };
+        authority
+            .compare_exchange(raw, next.0, Ordering::AcqRel, Ordering::Acquire)
+            .map_err(|_| InviteError::Busy)?;
+        Ok(Port::new(self.role.id, index, next.parts().0))
+    }
+
+    pub(crate) fn close_with(
+        &self,
+        mut release: impl FnMut(&Token<H>) -> bool,
+    ) -> Result<(), CloseError> {
+        let authority = &self.role.mapped.roles[self.role.index];
+        let mut raw = authority.load(Ordering::Acquire);
+        loop {
+            let current = RoleWord(raw);
+            let (generation, owner, terminal) = current.parts();
+            if generation != self.role.generation || owner != Some(self.role.owner) {
+                return if terminal && owner.is_none() {
+                    Ok(())
+                } else {
+                    Err(CloseError::Busy)
+                };
+            }
+            if terminal {
+                break;
+            }
+            let closing = RoleWord::new(generation, owner, true).unwrap();
+            match authority.compare_exchange_weak(
+                raw,
+                closing.0,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(observed) => raw = observed,
+            }
+        }
+
+        let handles = [
+            Rx(Endpoint {
+                role: self.role.clone(),
+                direction: 0,
+            }),
+            Rx(Endpoint {
+                role: self.role.clone(),
+                direction: 1,
+            }),
+        ];
+        for handle in &handles {
+            handle.0.close_send();
+        }
+        for handle in &handles {
+            loop {
+                match Queue::claim(&handle.0) {
+                    Ok(claim) => {
+                        if !release(claim.item()) {
+                            // The Queue remains authoritative until its storage
+                            // evidence has been resolved and released.
+                            core::mem::forget(claim);
+                            return Err(CloseError::Evidence);
+                        }
+                        let _ = claim.take();
+                    }
+                    Err(ClaimError::Empty) => break,
+                    Err(ClaimError::Busy | ClaimError::Closed) => {
+                        return Err(CloseError::Busy);
+                    }
+                }
+            }
+            if !handle.0.send_closed() || !handle.0.is_empty() {
+                return Err(CloseError::Busy);
+            }
+        }
+        for handle in &handles {
+            handle.0.close_recv();
+            if !handle.0.recv_closed() {
+                return Err(CloseError::Busy);
+            }
+        }
+
+        let owned = RoleWord::new(self.role.generation, Some(self.role.owner), true)
+            .unwrap()
+            .0;
+        let terminal = RoleWord::new(self.role.generation, None, true).unwrap().0;
+        match authority.compare_exchange(owned, terminal, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Ok(()),
+            Err(observed) => {
+                let (_, owner, terminal) = RoleWord(observed).parts();
+                if terminal && owner.is_none() {
+                    Ok(())
+                } else {
+                    Err(CloseError::Busy)
+                }
+            }
         }
     }
 }
 
-impl<Q: Queue + ?Sized> Staged<'_, Q> {
-    pub fn publish(mut self) {
-        self.reserved
-            .slot
-            .control
-            .store(AVAILABLE | COMPLETE, Ordering::Release);
-        self.reserved.done = true;
-    }
+struct Endpoint<H: Repr> {
+    role: Arc<Role<H>>,
+    direction: usize,
+}
 
-    #[cfg(test)]
-    pub fn cancel(mut self) -> Q::Item {
-        let value = unsafe { self.reserved.slot.value.get().read().assume_init() };
-        self.reserved.skip();
-        value
+pub struct Tx<H: Repr>(Endpoint<H>);
+
+pub struct Rx<H: Repr>(Endpoint<H>);
+
+impl<H: Repr> Clone for Endpoint<H> {
+    fn clone(&self) -> Self {
+        Self {
+            role: self.role.clone(),
+            direction: self.direction,
+        }
     }
 }
 
-impl<Q: Queue + ?Sized> Drop for Staged<'_, Q> {
-    fn drop(&mut self) {
-        if !self.reserved.done {
-            unsafe { (*self.reserved.slot.value.get()).assume_init_drop() };
-            self.reserved.skip();
-        }
+impl<H: Repr> Clone for Tx<H> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
     }
+}
+
+impl<H: Repr> Clone for Rx<H> {
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
+
+/// A queue claim whose payload remains governed by Pool ownership.
+///
+/// Dropping this value deliberately retains the shared claim. Explicit
+/// `adopt` or `discard` is required before the queue slot can be recycled.
+#[must_use = "a received transfer must be adopted or discarded"]
+pub struct Received<'a, H: Repr> {
+    claim: Option<Claim<'a, Token<H>>>,
 }
 
 #[must_use]
-pub struct Claim<'a, Q: Queue + ?Sized> {
-    slot: &'a Slot<Q::Item>,
-    next_turn: usize,
-    initialized: bool,
-    done: bool,
+pub struct TransferReserved<'a, H: Repr> {
+    reserved: Reserved<'a, Token<H>>,
 }
 
-impl<Q: Queue + ?Sized> Claim<'_, Q> {
-    fn recycle(&mut self) {
-        self.slot.turn.store(self.next_turn, Ordering::Release);
-        self.slot.control.store(EMPTY, Ordering::Release);
-        self.done = true;
-    }
-
-    pub fn take(mut self) -> Q::Item {
-        debug_assert!(self.initialized);
-        let value = unsafe { self.slot.value.get().read().assume_init() };
-        self.initialized = false;
-        self.recycle();
-        value
-    }
+#[must_use]
+pub struct TransferStaged<'a, 'p, H: Repr> {
+    staged: Staged<'a, Token<H>>,
+    allocation: crate::pool::Allocation<'p>,
 }
 
-impl<Q: Queue + ?Sized> Drop for Claim<'_, Q> {
-    fn drop(&mut self) {
-        if !self.done {
-            if self.initialized {
-                unsafe { (*self.slot.value.get()).assume_init_drop() };
-            }
-            self.recycle();
-        }
-    }
-}
-
-pub struct Header {
-    head: CachePadded<AtomicUsize>,
-    tail: CachePadded<AtomicUsize>,
-}
-
-impl Header {
-    pub(crate) const fn new() -> Self {
-        Self {
-            head: CachePadded::new(AtomicUsize::new(0)),
-            tail: CachePadded::new(AtomicUsize::new(0)),
-        }
-    }
-}
-
-pub trait Queue {
-    type Item;
-
-    fn header(&self) -> &Header;
-    fn buf(&self) -> &[Slot<Self::Item>];
-    fn lifecycle(&self) -> &AtomicU8;
-    fn send_field(&self) -> u32;
-    fn recv_field(&self) -> u32;
-    fn owner(&self) -> u8;
-    fn one_lap(&self) -> usize;
-}
-
-pub trait QueueOps: Queue {
-    fn reserve(&self) -> Result<Reserved<'_, Self>, ReserveError>
-    where
-        Self: Sized,
-    {
-        let header = self.header();
-        if self.state() != 0 {
-            return Err(ReserveError::Closed);
-        }
-        let tail = header.tail.load(Ordering::Relaxed);
-        let one_lap = self.one_lap();
-        let index = tail & (one_lap - 1);
-        let lap = tail & !(one_lap - 1);
-        let new_tail = if index + 1 < self.capacity() {
-            tail + 1
-        } else {
-            lap.wrapping_add(one_lap)
-        };
-        let slot = &self.buf()[index];
-        if slot
-            .control
-            .compare_exchange(
-                EMPTY,
-                owned(PRODUCER, false, self.owner()),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            atomic::fence(Ordering::SeqCst);
-            return if header.head.load(Ordering::Relaxed).wrapping_add(one_lap) == tail {
-                Err(ReserveError::Full)
-            } else {
-                Err(ReserveError::Busy)
-            };
-        }
-        if slot.turn.load(Ordering::Acquire) != tail || header.tail.load(Ordering::Relaxed) != tail
-        {
-            slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Busy);
-        }
-        if self.state() != 0 {
-            slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Closed);
-        }
-        if header
-            .tail
-            .compare_exchange(tail, new_tail, Ordering::SeqCst, Ordering::Relaxed)
-            .is_err()
-        {
-            slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Contended);
-        }
-        Ok(Reserved { slot, done: false })
+impl<H: Repr> Tx<H> {
+    pub fn reserve(&self) -> Result<TransferReserved<'_, H>, ReserveError> {
+        Queue::reserve(&self.0).map(|reserved| TransferReserved { reserved })
     }
 
-    fn claim(&self) -> Result<Claim<'_, Self>, ClaimError>
-    where
-        Self: Sized,
-    {
-        if self.field_state(self.recv_field()) != 0 {
-            return Err(ClaimError::Closed);
-        }
-        let header = self.header();
-        let head = header.head.load(Ordering::Relaxed);
-        let buf = self.buf();
-        let one_lap = self.one_lap();
-        let index = head & (one_lap - 1);
-        let lap = head & !(one_lap - 1);
-        let slot = &buf[index];
-        let new = if index + 1 < self.capacity() {
-            head + 1
-        } else {
-            lap.wrapping_add(one_lap)
-        };
-        let available = slot.control.load(Ordering::Acquire);
-        if available != AVAILABLE && available != (AVAILABLE | COMPLETE) {
-            atomic::fence(Ordering::SeqCst);
-            return if header.tail.load(Ordering::Relaxed) == head {
-                Err(ClaimError::Empty)
-            } else {
-                Err(ClaimError::Busy)
-            };
-        }
-        let initialized = available & COMPLETE != 0;
-        if slot
-            .control
-            .compare_exchange(
-                available,
-                owned(CONSUMER, initialized, self.owner()),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
-            return Err(ClaimError::Busy);
-        }
-        if slot.turn.load(Ordering::Acquire) != head || header.head.load(Ordering::Relaxed) != head
-        {
-            slot.control.store(available, Ordering::Release);
-            return Err(ClaimError::Busy);
-        }
-        if header
-            .head
-            .compare_exchange(head, new, Ordering::SeqCst, Ordering::Relaxed)
-            .is_err()
-        {
-            slot.control.store(available, Ordering::Release);
-            return Err(ClaimError::Busy);
-        }
-        let mut claim = Claim {
-            slot,
-            next_turn: head.wrapping_add(one_lap),
-            initialized,
-            done: false,
-        };
-        if !initialized {
-            claim.recycle();
-            return Err(ClaimError::Busy);
-        }
-        Ok(claim)
-    }
-
-    fn repair(&self, index: usize, dead: u8, live: u8) -> Repair {
-        if dead as usize >= crate::header::PARTICIPANT_CAPACITY
-            || live as usize >= crate::header::PARTICIPANT_CAPACITY
-        {
-            return Repair::Corrupted;
-        }
-        let Some(slot) = self.buf().get(index) else {
-            return Repair::Corrupted;
-        };
-        let control = slot.control.load(Ordering::Acquire);
-        if !canonical(control) {
-            return Repair::Corrupted;
-        }
-        let source = ((control & SOURCE_MASK) >> SOURCE_SHIFT) as u8;
-        let reaper = ((control & REAPER_MASK) >> REAPER_SHIFT) as u8;
-        if !matches!(base(control), PRODUCER | CONSUMER) {
-            return Repair::None;
-        }
-        let next = if source == dead + 1 && reaper == live + 1 {
-            control
-        } else if reaper == dead + 1 {
-            (control & !REAPER_MASK) | (((live as u16) + 1) << REAPER_SHIFT)
-        } else if source == dead + 1 && reaper == 0 {
-            control | (((live as u16) + 1) << REAPER_SHIFT)
-        } else if source == dead + 1 {
-            return Repair::Busy(reaper - 1);
-        } else {
-            return Repair::None;
-        };
-        if next != control
-            && slot
-                .control
-                .compare_exchange(control, next, Ordering::AcqRel, Ordering::Acquire)
-                .is_err()
-        {
-            return Repair::Busy(live);
-        }
-        #[cfg(test)]
-        if next != control && EXIT_AFTER_REAPER.load(Ordering::Relaxed) == live + 1 {
-            std::process::exit(74);
-        }
-
-        let complete = control & COMPLETE;
-        match base(control) {
-            PRODUCER => {
-                let turn = slot.turn.load(Ordering::Acquire);
-                let tail = self.header().tail.load(Ordering::Acquire);
-                let distance = tail.wrapping_sub(turn);
-                if distance == 0 {
-                    if complete != 0 {
-                        return Repair::Corrupted;
-                    }
-                    slot.control.store(EMPTY, Ordering::Release);
-                } else if distance < 1usize << (usize::BITS - 1) {
-                    slot.control.store(AVAILABLE | complete, Ordering::Release);
-                } else {
-                    return Repair::Corrupted;
-                }
-            }
-            CONSUMER => {
-                let turn = slot.turn.load(Ordering::Acquire);
-                let head = self.header().head.load(Ordering::Acquire);
-                if head == turn {
-                    slot.control.store(AVAILABLE | complete, Ordering::Release);
-                } else {
-                    let distance = head.wrapping_sub(turn);
-                    if distance != 0 && distance < 1usize << (usize::BITS - 1) {
-                        slot.turn
-                            .store(turn.wrapping_add(self.one_lap()), Ordering::Release);
-                    }
-                    slot.control.store(EMPTY, Ordering::Release);
-                }
-            }
-            _ => unreachable!(),
-        }
-        Repair::Recovered
-    }
-
-    #[inline]
-    fn capacity(&self) -> usize {
-        self.buf().len()
-    }
-
-    fn is_empty(&self) -> bool {
-        let header = self.header();
-        let head = header.head.load(Ordering::SeqCst);
-        let tail = header.tail.load(Ordering::SeqCst);
-        tail == head
-    }
-
-    fn is_full(&self) -> bool {
-        let header = self.header();
-        let tail = header.tail.load(Ordering::SeqCst);
-        let head = header.head.load(Ordering::SeqCst);
-        head.wrapping_add(self.one_lap()) == tail
-    }
-
-    fn len(&self) -> usize {
-        let header = self.header();
-        let tail = header.tail.load(Ordering::SeqCst);
-        let head = header.head.load(Ordering::SeqCst);
-        let one_lap = self.one_lap();
-        let hix = head & (one_lap - 1);
-        let tix = tail & (one_lap - 1);
-        if hix < tix {
-            tix - hix
-        } else if hix > tix {
-            self.capacity() - hix + tix
-        } else if tail == head {
-            0
-        } else {
-            self.capacity()
-        }
-    }
-    fn field_state(&self, field: u32) -> u8 {
-        (self.lifecycle().load(Ordering::Acquire) >> field) & 0b11
-    }
-
-    fn state(&self) -> u8 {
-        self.field_state(self.send_field()) | self.field_state(self.recv_field())
-    }
-
-    fn close_field(&self, field: u32) {
-        self.lifecycle().fetch_or(1 << field, Ordering::AcqRel);
-    }
-
-    fn finish_field(&self, field: u32, owned_base: u16) -> u8 {
-        let state = self.field_state(field);
-        if state == 1
-            && self
-                .buf()
-                .iter()
-                .all(|slot| base(slot.control.load(Ordering::Acquire)) != owned_base)
-        {
-            self.lifecycle().fetch_or(2 << field, Ordering::AcqRel);
-            #[cfg(test)]
-            crash_close(if owned_base == PRODUCER {
-                SEND_FINISHED
-            } else {
-                RECV_FINISHED
-            });
-            3
-        } else {
-            state
-        }
-    }
-
-    fn close_send(&self) {
-        #[cfg(test)]
-        crash_close(SEND_CLOSING);
-        self.close_field(self.send_field());
-        #[cfg(test)]
-        crash_close(SEND_CLOSED);
-    }
-
-    fn close_recv(&self) {
-        #[cfg(test)]
-        crash_close(RECV_CLOSING);
-        self.close_field(self.recv_field());
-        #[cfg(test)]
-        crash_close(RECV_CLOSED);
-    }
-
-    fn send_closed(&self) -> bool {
-        self.finish_field(self.send_field(), PRODUCER) == 3
-    }
-
-    fn recv_closed(&self) -> bool {
-        self.finish_field(self.recv_field(), CONSUMER) == 3
-    }
-
-    fn terminal(&self) -> bool {
-        self.recv_closed() || (self.send_closed() && self.is_empty())
-    }
-}
-
-impl<T: Queue> QueueOps for T {}
-
-pub trait Sender {
-    type Item;
-    type TryError;
-
-    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError>;
-}
-
-pub trait Receiver {
-    type Item;
-    type TryError;
-
-    fn try_recv(&self) -> Result<Self::Item, Self::TryError>;
-}
-
-pub trait QueueChannel {
-    type Handle: Queue;
-
-    fn handle(&self) -> &Self::Handle;
-    fn close(&self);
-    fn is_close(&self) -> bool;
-
-    #[inline(always)]
-    fn capacity(&self) -> usize {
-        self.handle().capacity()
-    }
-
-    #[inline(always)]
-    fn is_empty(&self) -> bool {
-        self.handle().is_empty()
-    }
-
-    #[inline(always)]
-    fn is_full(&self) -> bool {
-        self.handle().is_full()
-    }
-
-    #[inline(always)]
-    fn len(&self) -> usize {
-        self.handle().len()
-    }
-}
-
-#[derive(Debug)]
-pub enum TrySendError<T> {
-    Full(T),
-    Disconnected(T),
-}
-
-#[derive(Debug)]
-pub enum TryRecvError {
-    Empty,
-    Disconnected,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct QueueTx<T: Queue> {
-    tx: T,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-#[repr(transparent)]
-pub struct QueueRx<T: Queue> {
-    rx: T,
-}
-
-impl<T: Queue> Sender for QueueTx<T> {
-    type Item = T::Item;
-
-    type TryError = TrySendError<T::Item>;
-
-    #[inline(always)]
-    fn try_send(&self, item: Self::Item) -> Result<(), Self::TryError> {
-        self.try_send(item)
-    }
-}
-
-impl<T: Queue> QueueChannel for QueueTx<T> {
-    type Handle = T;
-
-    #[inline(always)]
-    fn handle(&self) -> &Self::Handle {
-        &self.tx
-    }
-
-    fn close(&self) {
-        self.tx.close_send()
-    }
-
-    fn is_close(&self) -> bool {
-        self.tx.field_state(self.tx.send_field()) != 0
-    }
-}
-
-impl<T: Queue> QueueTx<T> {
-    pub fn reserve(&self) -> Result<Reserved<'_, T>, ReserveError> {
-        self.tx.reserve()
-    }
-
-    #[inline(always)]
-    pub fn try_send(&self, value: T::Item) -> Result<(), TrySendError<T::Item>> {
+    #[expect(
+        clippy::result_large_err,
+        reason = "the uncommitted linear transfer must be returned inline without allocation"
+    )]
+    pub fn try_send<'p>(
+        &self,
+        value: crate::Transfer<'p, H>,
+    ) -> Result<(), TrySendError<crate::Transfer<'p, H>>> {
         match self.reserve() {
             Ok(reserved) => {
                 reserved.stage(value).publish();
                 Ok(())
             }
             Err(ReserveError::Closed) => Err(TrySendError::Disconnected(value)),
-            Err(ReserveError::Full | ReserveError::Busy | ReserveError::Contended) => {
-                Err(TrySendError::Full(value))
-            }
+            Err(ReserveError::Full) => Err(TrySendError::Full(value)),
+            Err(ReserveError::Busy) => Err(TrySendError::Busy(value)),
+        }
+    }
+
+    pub fn close(&self) {
+        self.0.close_send();
+    }
+
+    pub fn is_close(&self) -> bool {
+        self.0.field_state(self.0.send_field()) != 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        Queue::capacity(&self.0)
+    }
+}
+
+impl<'a, H: Repr> TransferReserved<'a, H> {
+    pub fn stage<'p>(self, value: crate::Transfer<'p, H>) -> TransferStaged<'a, 'p, H> {
+        let (allocation, token) = value.into_parts();
+        TransferStaged {
+            staged: self.reserved.stage(token),
+            allocation,
         }
     }
 }
 
-impl<T: Queue> Receiver for QueueRx<T> {
-    type Item = T::Item;
+impl<'a, 'p, H: Repr> TransferStaged<'a, 'p, H> {
+    pub fn publish(mut self) {
+        assert!(
+            self.allocation.detach().is_ok(),
+            "linear transfer lost its Pool authority before publication"
+        );
+        self.staged.publish();
+    }
 
-    type TryError = TryRecvError;
-
-    #[inline(always)]
-    fn try_recv(&self) -> Result<Self::Item, Self::TryError> {
-        self.try_recv()
+    pub fn cancel(self) -> crate::Transfer<'p, H> {
+        let token = self.staged.cancel();
+        crate::Transfer::from_parts(self.allocation, token)
     }
 }
 
-impl<T: Queue> QueueChannel for QueueRx<T> {
-    type Handle = T;
-
-    #[inline(always)]
-    fn handle(&self) -> &Self::Handle {
-        &self.rx
+impl<H: Repr> Rx<H> {
+    pub fn claim(&self) -> Result<Received<'_, H>, ReceiveError> {
+        match Queue::claim(&self.0) {
+            Ok(claim) => Ok(Received { claim: Some(claim) }),
+            Err(ClaimError::Empty) if self.0.terminal() => Err(ReceiveError::Closed),
+            Err(ClaimError::Empty) => Err(ReceiveError::Empty),
+            Err(ClaimError::Busy) => Err(ReceiveError::Busy),
+            Err(ClaimError::Closed) => Err(ReceiveError::Closed),
+        }
     }
 
-    fn close(&self) {
-        self.rx.close_recv()
+    pub fn close(&self) {
+        self.0.close_recv();
     }
 
-    fn is_close(&self) -> bool {
-        self.rx.field_state(self.rx.recv_field()) != 0
+    pub fn is_close(&self) -> bool {
+        self.0.field_state(self.0.recv_field()) != 0
+    }
+
+    pub fn capacity(&self) -> usize {
+        Queue::capacity(&self.0)
     }
 }
 
-impl<T: Queue> QueueRx<T> {
-    pub fn claim(&self) -> Result<Claim<'_, T>, ClaimError> {
-        self.rx.claim()
+impl<H: Repr> Queue for Endpoint<H> {
+    type Item = Item<H>;
+
+    fn header(&self) -> &Header {
+        unsafe { self.role.route(self.direction).header.as_ref() }
     }
 
-    #[inline(always)]
-    pub fn try_recv(&self) -> Result<T::Item, TryRecvError> {
-        match self.claim() {
-            Ok(claim) => Ok(claim.take()),
-            Err(ClaimError::Closed) => Err(TryRecvError::Disconnected),
-            Err(ClaimError::Empty) if self.rx.terminal() => Err(TryRecvError::Disconnected),
-            Err(ClaimError::Empty | ClaimError::Busy) => Err(TryRecvError::Empty),
+    fn buf(&self) -> &[Slot<Self::Item>] {
+        unsafe {
+            core::slice::from_raw_parts(
+                self.role.route(self.direction).slots.as_ptr(),
+                self.role.capacity,
+            )
+        }
+    }
+
+    fn lifecycle(&self) -> &AtomicU8 {
+        &self.role.mapped.lifecycle
+    }
+
+    fn send_field(&self) -> u32 {
+        self.role.route(self.direction).send_field
+    }
+
+    fn recv_field(&self) -> u32 {
+        self.role.route(self.direction).recv_field
+    }
+
+    fn owner(&self) -> u8 {
+        self.role.owner
+    }
+
+    fn one_lap(&self) -> usize {
+        self.role.one_lap
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReceiveError {
+    Empty,
+    Busy,
+    Closed,
+}
+
+pub enum AdoptError<'a, H: Repr> {
+    Pool(Received<'a, H>),
+    Span(Received<'a, H>),
+    Type(Received<'a, H>),
+    Owned(Received<'a, H>),
+}
+
+impl<H: Repr> core::fmt::Debug for AdoptError<'_, H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Pool(_) => "Pool(..)",
+            Self::Span(_) => "Span(..)",
+            Self::Type(_) => "Type(..)",
+            Self::Owned(_) => "Owned(..)",
+        })
+    }
+}
+
+impl<'a, H: Repr> AdoptError<'a, H> {
+    pub fn into_received(self) -> Received<'a, H> {
+        match self {
+            Self::Pool(received)
+            | Self::Span(received)
+            | Self::Type(received)
+            | Self::Owned(received) => received,
+        }
+    }
+
+    fn from_pool(error: crate::pool::AdoptError, received: Received<'a, H>) -> Self {
+        match error {
+            crate::pool::AdoptError::Pool => Self::Pool(received),
+            crate::pool::AdoptError::Span => Self::Span(received),
+            crate::pool::AdoptError::Type => Self::Type(received),
+            crate::pool::AdoptError::Owned => Self::Owned(received),
+        }
+    }
+}
+
+impl<'a, H: Repr> Received<'a, H> {
+    fn claim(&self) -> &Claim<'a, Token<H>> {
+        self.claim.as_ref().unwrap()
+    }
+
+    fn take_claim(mut self) -> Claim<'a, Token<H>> {
+        self.claim.take().unwrap()
+    }
+
+    pub fn adopt<'p, T: Repr + crate::token::Shape + ?Sized>(
+        self,
+        pool: crate::PoolRef<'p>,
+    ) -> Result<(H, crate::Block<'p, T>), AdoptError<'a, H>> {
+        let block = match pool.adopt::<H, T>(self.claim().item()) {
+            Ok(block) => block,
+            Err(error) => return Err(AdoptError::from_pool(error, self)),
+        };
+        let transfer = self.take_claim().take();
+        Ok((transfer.header, block))
+    }
+
+    pub fn discard(self, pool: crate::PoolRef<'_>) -> Result<H, AdoptError<'a, H>> {
+        let allocation = match pool.takeover(self.claim().item()) {
+            Ok(allocation) => allocation,
+            Err(error) => return Err(AdoptError::from_pool(error, self)),
+        };
+        let transfer = self.take_claim().take();
+        drop(allocation);
+        Ok(transfer.header)
+    }
+}
+
+impl<H: Repr> Drop for Received<'_, H> {
+    fn drop(&mut self) {
+        if let Some(claim) = self.claim.take() {
+            core::mem::forget(claim);
         }
     }
 }
 
 #[cfg(test)]
-mod ownership_tests {
-    use super::{
-        AVAILABLE, BASE_MASK, COMPLETE, CONSUMER, EMPTY, Header, PRODUCER, Queue, QueueOps,
-        QueueRx, QueueTx, REAPER_MASK, RESERVED_MASK, SOURCE_MASK, Slot, TryRecvError,
-        TrySendError, canonical,
+mod tests {
+    use super::{Channel, Duplex, GeometryError, Id, Port, RoleWord, Rx, Tx, recover_role};
+    use crate::{
+        msg::Repr,
+        schema::{SchemaId, SchemaKey},
     };
-    use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
-    struct TestQueue {
-        header: Header,
-        slots: Box<[Slot<u64>]>,
-        lifecycle: AtomicU8,
-        one_lap: usize,
+    #[repr(C, align(64))]
+    struct Aligned([u8; 64]);
+
+    unsafe impl Repr for Aligned {
+        const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x414c_4947_4e45_4401), 1);
     }
 
-    unsafe impl Sync for TestQueue {}
+    struct NonClone;
 
-    impl TestQueue {
-        fn new(capacity: usize) -> Self {
-            Self {
-                header: Header::new(),
-                slots: (0..capacity).map(Slot::new).collect(),
-                lifecycle: AtomicU8::new(0),
-                one_lap: (capacity + 1).next_power_of_two(),
-            }
-        }
+    unsafe impl Repr for NonClone {
+        const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x4e4f_4e43_4c4f_4e45), 1);
     }
 
-    impl Queue for &TestQueue {
-        type Item = u64;
-        fn header(&self) -> &Header {
-            &self.header
-        }
-        fn buf(&self) -> &[Slot<Self::Item>] {
-            &self.slots
-        }
-        fn lifecycle(&self) -> &AtomicU8 {
-            &self.lifecycle
-        }
-        fn send_field(&self) -> u32 {
-            0
-        }
-        fn recv_field(&self) -> u32 {
-            2
-        }
-        fn owner(&self) -> u8 {
-            0
-        }
-        fn one_lap(&self) -> usize {
-            self.one_lap
-        }
+    fn parameterless_split<H: Repr>(channel: &Channel<H>) -> (Tx<H>, Rx<H>) {
+        channel.split()
     }
 
     #[test]
-    fn disconnected_send_returns_the_exact_item() {
-        let queue = TestQueue::new(1);
-        (&queue).close_send();
-        let sender = QueueTx { tx: &queue };
-        match sender.try_send(41) {
-            Err(TrySendError::Disconnected(value)) => assert_eq!(value, 41),
-            _ => panic!("closed queue must return the submitted item"),
-        }
-        let receiver = QueueRx { rx: &queue };
+    fn channel_split_has_no_runtime_side_argument() {
+        let _ = parameterless_split::<()>;
+        fn cloneable<T: Clone>() {}
+        cloneable::<Tx<NonClone>>();
+        cloneable::<Rx<NonClone>>();
+    }
+
+    #[test]
+    fn port_wire_reconstruction_rejects_invalid_authority_parts() {
+        let id = Id::<()>::new(crate::schema::RegionId::new(1, 2), 3, 4, 5, 8);
+        assert!(Port::from_parts(id, 0, 7).is_some());
+        assert!(Port::from_parts(id, 1, 7).is_some());
+        assert!(Port::from_parts(id, 2, 7).is_none());
+        assert!(Port::from_parts(id, 0, 0).is_none());
+        assert!(Port::from_parts(id, 0, RoleWord::MAX_GENERATION + 1).is_none());
+    }
+
+    #[test]
+    fn dynamic_geometry_rejects_invalid_capacity() {
         assert!(matches!(
-            receiver.try_recv(),
-            Err(super::TryRecvError::Disconnected)
+            Duplex::<()>::geometry(0),
+            Err(GeometryError::ZeroCapacity)
+        ));
+        assert!(matches!(
+            Duplex::<()>::geometry(usize::MAX),
+            Err(GeometryError::Overflow)
         ));
     }
 
     #[test]
-    fn close_becomes_terminal_only_after_drain() {
-        let empty = TestQueue::new(1);
-        (&empty).close_send();
-        assert!((&empty).terminal());
+    fn dynamic_geometry_accepts_non_power_of_two_capacity() {
+        let one = Duplex::<()>::geometry(1).unwrap();
+        let three = Duplex::<()>::geometry(3).unwrap();
+        assert!(three.layout.size() > one.layout.size());
+        assert_eq!(three.layout.size() % three.layout.align(), 0);
+        assert_eq!(three.capacity, 3);
+        assert_eq!(three.one_lap, 4);
 
-        let nonempty = TestQueue::new(1);
-        QueueTx { tx: &nonempty }.try_send(7).unwrap();
-        (&nonempty).close_send();
-        assert!(!(&nonempty).terminal());
-        assert_eq!(QueueRx { rx: &nonempty }.try_recv().unwrap(), 7);
-        assert!((&nonempty).terminal());
+        let aligned = Duplex::<Aligned>::geometry(3).unwrap();
+        assert!(aligned.layout.align() >= 64);
+        assert_eq!(aligned.slots % 64, 0);
     }
 
     #[test]
-    fn cancelled_reservations_commit_ordered_skips() {
-        let queue = TestQueue::new(2);
-        let queue_ref = &queue;
-        drop(queue_ref.reserve().expect("reserve first turn"));
-        let staged = queue_ref.reserve().expect("reserve second turn").stage(17);
-        assert_eq!(staged.cancel(), 17);
+    fn role_word_round_trips_canonical_authority() {
+        let open = RoleWord::new(7, None, false).unwrap();
+        assert_eq!(open.parts(), (7, None, false));
 
-        let receiver = QueueRx { rx: &queue };
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-        QueueTx { tx: &queue }.try_send(23).unwrap();
-        assert!(matches!(receiver.try_recv(), Err(TryRecvError::Empty)));
-        assert_eq!(receiver.try_recv().unwrap(), 23);
+        let owned = RoleWord::new(7, Some(3), false).unwrap();
+        assert_eq!(owned.parts(), (7, Some(3), false));
+
+        let closing = RoleWord::new(7, Some(3), true).unwrap();
+        assert_eq!(closing.parts(), (7, Some(3), true));
+
+        let terminal = RoleWord::new(7, None, true).unwrap();
+        assert_eq!(RoleWord(terminal.0).parts(), (7, None, true));
     }
 
     #[test]
-    fn close_accounts_for_every_racing_sender() {
-        use std::sync::Barrier;
-
-        const SENDERS: usize = 64;
-        let queue = TestQueue::new(128);
-        let barrier = Barrier::new(SENDERS + 2);
-        let accepted = AtomicUsize::new(0);
-        let rejected = AtomicUsize::new(0);
-
-        std::thread::scope(|scope| {
-            for value in 0..SENDERS as u64 {
-                let barrier = &barrier;
-                let queue = &queue;
-                let accepted = &accepted;
-                let rejected = &rejected;
-                scope.spawn(move || {
-                    barrier.wait();
-                    match (QueueTx { tx: queue }).try_send(value) {
-                        Ok(()) => {
-                            accepted.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(TrySendError::Disconnected(returned)) => {
-                            assert_eq!(returned, value);
-                            rejected.fetch_add(1, Ordering::Relaxed);
-                        }
-                        Err(TrySendError::Full(returned)) => {
-                            assert_eq!(returned, value);
-                            rejected.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                });
-            }
-            scope.spawn(|| {
-                barrier.wait();
-                (&queue).close_send();
-            });
-            barrier.wait();
-        });
-
-        let receiver = QueueRx { rx: &queue };
-        let mut received = 0;
-        loop {
-            match receiver.try_recv() {
-                Ok(_) => received += 1,
-                Err(super::TryRecvError::Disconnected) => break,
-                Err(super::TryRecvError::Empty) => std::thread::yield_now(),
-            }
-        }
-        assert_eq!(received, accepted.load(Ordering::Relaxed));
-        assert_eq!(received + rejected.load(Ordering::Relaxed), SENDERS);
+    fn role_generation_never_wraps() {
+        let last = RoleWord::new(RoleWord::MAX_GENERATION, Some(3), false).unwrap();
+        assert!(last.next_unowned(false).is_none());
+        assert!(RoleWord::new(RoleWord::MAX_GENERATION + 1, None, false).is_none());
     }
 
     #[test]
-    fn only_defined_control_encodings_are_canonical() {
-        for control in u16::MIN..=u16::MAX {
-            let source = control & SOURCE_MASK;
-            let reaper = control & REAPER_MASK;
-            let expected = control & RESERVED_MASK == 0
-                && match control & BASE_MASK {
-                    EMPTY => control == EMPTY,
-                    AVAILABLE => source == 0 && reaper == 0,
-                    PRODUCER | CONSUMER => {
-                        source != 0
-                            && (source >> super::SOURCE_SHIFT) as usize
-                                <= crate::header::PARTICIPANT_CAPACITY
-                            && (reaper >> super::REAPER_SHIFT) as usize
-                                <= crate::header::PARTICIPANT_CAPACITY
-                    }
-                    _ => false,
-                };
-            assert_eq!(canonical(control), expected, "{control:#018b}");
-        }
-        assert!(canonical(AVAILABLE | COMPLETE));
-    }
+    fn recovery_releases_only_the_dead_owner_after_repair() {
+        use core::sync::atomic::{AtomicUsize, Ordering};
 
-    #[test]
-    fn dead_reaper_is_replaced_without_losing_the_source_phase() {
-        let queue = TestQueue::new(1);
-        queue.slots[0].control.store(
-            super::owned(PRODUCER, false, 0) | (2 << super::REAPER_SHIFT),
-            Ordering::Release,
-        );
-        queue.header.tail.store(1, Ordering::Release);
-
-        assert_eq!((&queue).repair(0, 1, 2), super::Repair::Recovered);
-        assert_eq!(queue.slots[0].control.load(Ordering::Acquire), AVAILABLE);
-    }
-
-    #[test]
-    fn live_reaper_resumes_its_persisted_claim() {
-        let queue = TestQueue::new(1);
-        queue.slots[0].control.store(
-            super::owned(PRODUCER, false, 0) | (2 << super::REAPER_SHIFT),
-            Ordering::Release,
+        let active = AtomicUsize::new(RoleWord::new(7, Some(3), false).unwrap().0);
+        recover_role(&active, 3);
+        assert_eq!(
+            RoleWord(active.load(Ordering::Relaxed)).parts(),
+            (8, None, false)
         );
 
-        assert_eq!((&queue).repair(0, 0, 1), super::Repair::Recovered);
-        assert_eq!(queue.slots[0].control.load(Ordering::Acquire), EMPTY);
+        let closing = AtomicUsize::new(RoleWord::new(7, Some(3), true).unwrap().0);
+        recover_role(&closing, 3);
+        assert_eq!(
+            RoleWord(closing.load(Ordering::Relaxed)).parts(),
+            (7, None, true)
+        );
+
+        let live = AtomicUsize::new(RoleWord::new(7, Some(4), false).unwrap().0);
+        recover_role(&live, 3);
+        assert_eq!(
+            RoleWord(live.load(Ordering::Relaxed)).parts(),
+            (7, Some(4), false)
+        );
     }
 
     #[test]
-    fn repair_uses_cursor_commit_and_never_guesses_from_bytes() {
-        let before_send = TestQueue::new(1);
-        before_send.slots[0]
-            .control
-            .store(super::owned(PRODUCER, false, 0), Ordering::Release);
-        assert_eq!((&before_send).repair(0, 0, 1), super::Repair::Recovered);
-        assert_eq!(before_send.slots[0].control.load(Ordering::Acquire), EMPTY);
+    fn duplex_initializes_both_roles_open_unowned() {
+        use core::sync::atomic::Ordering;
 
-        let sent = TestQueue::new(1);
-        unsafe { (*sent.slots[0].value.get()).write(37) };
-        sent.slots[0]
-            .control
-            .store(super::owned(PRODUCER, true, 0), Ordering::Release);
-        sent.header.tail.store(1, Ordering::Release);
-        assert_eq!((&sent).repair(0, 0, 1), super::Repair::Recovered);
-        assert_eq!(QueueRx { rx: &sent }.try_recv().unwrap(), 37);
-
-        let taking = TestQueue::new(1);
-        taking.slots[0]
-            .control
-            .store(super::owned(CONSUMER, true, 0), Ordering::Release);
-        taking.header.head.store(1, Ordering::Release);
-        assert_eq!((&taking).repair(0, 0, 1), super::Repair::Recovered);
-        assert_eq!(taking.slots[0].turn.load(Ordering::Acquire), 2);
-        assert_eq!(taking.slots[0].control.load(Ordering::Acquire), EMPTY);
+        let duplex = Duplex::<()>::blank();
+        for role in &duplex.roles {
+            let word = RoleWord(role.load(Ordering::Relaxed));
+            assert_eq!(word.parts(), (0, None, false));
+        }
     }
 }

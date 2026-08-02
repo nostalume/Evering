@@ -100,9 +100,9 @@ impl MapDirectory {
         Directory::word_owner(self.inner.transaction.load(Ordering::Acquire))
     }
 
-    pub(crate) fn scan<L: Layout>(
+    pub(crate) fn scan(
         &self,
-        mut visit: impl FnMut(Id<L>) -> bool,
+        mut visit: impl FnMut(Id<()>, header::RecordedLayout) -> bool,
     ) -> Result<bool, Error> {
         let mut slab_index = 0u32;
         let mut slab = SlabRef::Root(&self.inner);
@@ -112,12 +112,25 @@ impl MapDirectory {
                 match word & STATE_MASK {
                     VACANT | QUARANTINED => {}
                     PUBLISHED => {
-                        if !visit(Id::from_parts(
-                            self.region_id(),
-                            slab_index,
-                            entry_index as u32,
-                            word >> STATE_BITS,
-                        )) {
+                        let offset = entry.offset.load(Ordering::Relaxed);
+                        let record = unsafe { self.ref_at::<header::Record>(offset) }
+                            .map_err(Error::Admission)?;
+                        let recorded = unsafe {
+                            header::recorded_at((record as *const header::Record).cast())
+                        }
+                        .map_err(crate::mem::ProjectionError::Admission)
+                        .map_err(Error::Admission)?;
+                        self.offset_of(core::ptr::NonNull::from(record).cast(), recorded.extent)
+                            .map_err(Error::Admission)?;
+                        if !visit(
+                            Id::from_parts(
+                                self.region_id(),
+                                slab_index,
+                                entry_index as u32,
+                                word >> STATE_BITS,
+                            ),
+                            recorded,
+                        ) {
                             return Ok(false);
                         }
                     }
@@ -132,25 +145,79 @@ impl MapDirectory {
         }
     }
 
-    pub(crate) fn info<L: Layout>(&self, id: Id<L>) -> Result<L::Info, Error> {
-        let offset = self.offset(id)?;
-        let pointer = unsafe {
-            self.ref_at::<header::RcHeader<L>>(offset)
-                .map_err(Error::Admission)?
+    pub(crate) unsafe fn recover_layout<L: Layout>(
+        &self,
+        id: Id<()>,
+        recorded: header::RecordedLayout,
+        dead: u8,
+        live: u8,
+    ) -> bool {
+        if recorded.mismatch::<L>().is_some() {
+            return false;
+        }
+        let Ok(offset) = self.offset(id) else {
+            return false;
+        };
+        let Ok(header) = (unsafe { self.ref_at::<header::RcHeader<L>>(offset) }) else {
+            return false;
         };
         let ctx = LayoutContext {
             region: self.region_id(),
             offset: offset as u64,
             allow_init: false,
         };
-        unsafe { header::RcHeader::<L>::inspect_at(pointer, ctx) }
-            .map_err(crate::mem::ProjectionError::Admission)
-            .map_err(Error::Admission)
+        if unsafe { header::RcHeader::<L>::inspect_at(header, ctx) }.is_err()
+            || !L::recover(header::RecoveryContext {
+                layout: &header.inner,
+                info: header.layout_info(),
+                extent: recorded.extent,
+                dead,
+                live,
+                base: core::ptr::from_ref(header).cast(),
+                directory: self,
+            })
+        {
+            return false;
+        }
+        header.recover_member(dead);
+        !header.has_member(dead)
     }
 
-    pub(crate) fn matches<L>(&self, id: Id<L>, layout: crate::LayoutId) -> bool {
+    pub(crate) fn matches<L>(&self, id: Id<L>, layout: crate::schema::LayoutId) -> bool {
         self.offset(id)
             .is_ok_and(|offset| layout.region == self.region_id() && layout.offset == offset as u64)
+    }
+
+    pub(crate) fn inspect_layout<L: Layout, R>(
+        &self,
+        layout: crate::schema::LayoutId,
+        inspect: impl FnOnce(&header::RcHeader<L>, usize) -> R,
+    ) -> Option<R> {
+        if layout.region != self.region_id() {
+            return None;
+        }
+        let mut found = None;
+        self.scan(|id, recorded| {
+            if recorded.mismatch::<L>().is_none()
+                && self
+                    .offset(id)
+                    .is_ok_and(|offset| offset as u64 == layout.offset)
+            {
+                found = Some((id, recorded));
+            }
+            true
+        })
+        .ok()?;
+        let (id, recorded) = found?;
+        let offset = self.offset(id).ok()?;
+        let header = unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.ok()?;
+        let context = LayoutContext {
+            region: self.region_id(),
+            offset: offset as u64,
+            allow_init: false,
+        };
+        unsafe { header::RcHeader::<L>::inspect_at(header, context) }.ok()?;
+        Some(inspect(header, recorded.extent))
     }
 
     pub(crate) fn open<L: Layout>(
@@ -161,6 +228,34 @@ impl MapDirectory {
         let offset = self.offset(id)?;
         self.admit_at::<header::RcHeader<L>>(offset, conf, false)
             .map_err(Error::Admission)
+    }
+
+    pub(crate) fn open_recorded<L: Layout, U>(
+        &self,
+        id: Id<L>,
+        discover: impl FnOnce(L::Info, usize) -> Option<(L::Config, U)>,
+    ) -> Option<(crate::mem::Mapped<header::RcHeader<L>>, U)> {
+        let offset = self.offset(id).ok()?;
+        let record = unsafe { self.ref_at::<header::Record>(offset) }.ok()?;
+        let recorded = unsafe { header::recorded_at(core::ptr::from_ref(record).cast()) }.ok()?;
+        self.offset_of(core::ptr::NonNull::from(record).cast(), recorded.extent)
+            .ok()?;
+        let header = unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.ok()?;
+        let info = unsafe {
+            header::RcHeader::<L>::inspect_at(
+                header,
+                LayoutContext {
+                    region: self.region_id(),
+                    offset: offset as u64,
+                    allow_init: false,
+                },
+            )
+        }
+        .ok()?;
+        let (conf, value) = discover(info, recorded.extent)?;
+        self.admit_at::<header::RcHeader<L>>(offset, conf, false)
+            .ok()
+            .map(|mapped| (mapped, value))
     }
 
     #[cfg(test)]
@@ -185,8 +280,7 @@ impl MapDirectory {
         if self.region_id() != heap.region_id() {
             return Err(Error::Stale);
         }
-        let header = core::alloc::Layout::new::<header::RcHeader<L>>();
-        if layout.size() < header.size() || layout.align() < header.align() {
+        if L::storage(&conf) != Some(layout) {
             return Err(Error::Stale);
         }
         let owner = self.peer().slot();
@@ -540,15 +634,11 @@ impl MapDirectory {
     pub(crate) fn recover(
         &self,
         heap: &crate::talc::MapTalc,
-        recovery: &crate::mem::Recovery<'_>,
+        dead: u8,
     ) -> Result<Recovered, Error> {
-        if self.region_id() != heap.region_id() || self.region_id() != recovery.region_id() {
+        if self.region_id() != heap.region_id() {
             return Err(Error::Stale);
         }
-        self.recover_slot(heap, recovery.slot())
-    }
-
-    fn recover_slot(&self, heap: &crate::talc::MapTalc, dead: u8) -> Result<Recovered, Error> {
         use crate::talc::MutationState;
 
         let word = self.inner.transaction.load(Ordering::Acquire);
@@ -641,12 +731,10 @@ impl MapDirectory {
             return Ok(Recovered::Released);
         }
         if matches!(operation, (REMOVE, VACANT, EVIDENCE | ROLLING_BACK)) {
-            match heap.mutation_state() {
-                MutationState::Clean => {}
-                MutationState::Owned(owner) => return Err(Error::Busy(owner)),
-                MutationState::Poisoned => {
-                    return Err(Error::Heap(crate::talc::MutationError::Poisoned));
-                }
+            if let MutationState::Owned(owner) = heap.mutation_state()
+                && owner != dead
+            {
+                return Err(Error::Busy(owner));
             }
             let mut transaction = self.transfer(word, dead, phase)?;
             transaction.clear_pending();
@@ -874,6 +962,24 @@ impl MapDirectory {
         entry
             .state
             .store((id.generation << STATE_BITS) | RELEASED, Ordering::Release);
+        self.inner
+            .pending_slab
+            .store(id.slab as usize, Ordering::Relaxed);
+        self.inner
+            .pending_entry
+            .store(id.entry as usize, Ordering::Relaxed);
+        self.inner.pending_kind.store(REMOVE, Ordering::Relaxed);
+        self.inner
+            .transaction
+            .store(Directory::owner_word(dead, EVIDENCE), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandon_vacant_remove_for_test<L>(&self, id: Id<L>, dead: u8) {
+        let entry = self.entry(id.slab, id.entry as usize).unwrap();
+        entry
+            .state
+            .store(id.generation << STATE_BITS, Ordering::Release);
         self.inner
             .pending_slab
             .store(id.slab as usize, Ordering::Relaxed);

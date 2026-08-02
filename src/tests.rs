@@ -2,7 +2,7 @@
 #![allow(dead_code)]
 
 use crate::{
-    mem::{self, Map, MapView, MemAllocator, MemOps, TransferAllocator},
+    mem::{Build, Map, MemOps},
     msg::Repr,
 };
 
@@ -98,8 +98,8 @@ impl Info {
 }
 
 unsafe impl Repr for Info {
-    const SCHEMA: crate::SchemaKey =
-        crate::SchemaKey::new(crate::schema::schema_id("evering.test.info"), 1);
+    const SCHEMA: crate::schema::SchemaKey =
+        crate::schema::SchemaKey::new(crate::schema::schema_id("evering.test.info"), 1);
 }
 
 fn analyze_latencies(all: Vec<Vec<u64>>) {
@@ -141,16 +141,14 @@ fn analyze_latencies(all: Vec<Vec<u64>>) {
     }
 }
 
-fn area_init(v: MapView) {
+fn area_init(v: Build) {
     tracing_init();
 
     tracing::debug!("area header: {:?}, {:?}", v.header(), v.header().status());
-    tracing::debug!("[Area]: {:?}", v);
-    tracing::debug!("[Area]: header: {:?}", v);
 }
 
 fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl Send + core::fmt::Debug> + Sync,
+    a: crate::talc::MapTalc,
 ) {
     use std::sync::Barrier;
     use std::thread;
@@ -158,8 +156,9 @@ fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize
     tracing_init();
 
     let bar = Barrier::new(NUM);
+    let layout = core::alloc::Layout::array::<u8>(BYTES_SIZE).unwrap();
     let mut metas: Vec<_> = (0..ALLOC_NUM)
-        .map(|_| a.alloc_bytes(BYTES_SIZE).unwrap())
+        .map(|_| a.allocate(layout).unwrap())
         .collect();
     thread::scope(|s| {
         for i in 0..NUM {
@@ -177,7 +176,7 @@ fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize
                 b_ref.wait();
                 for meta in chunk {
                     tracing::debug!("{:?}", meta);
-                    let _ = a_ref.dealloc_bytes(meta);
+                    let _ = a_ref.deallocate(a_ref.pointer(&meta), layout);
                 }
             });
         }
@@ -185,7 +184,7 @@ fn alloc_lines<const BYTES_SIZE: usize, const ALLOC_NUM: usize, const NUM: usize
 }
 
 fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug, Meta = impl core::fmt::Debug> + Sync + Send,
+    a: crate::talc::MapTalc,
 ) {
     use alloc::sync::Arc;
     use std::sync::Barrier;
@@ -214,7 +213,8 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
                     let op_start = Instant::now();
 
                     // 1. Stress the allocator: Mix Malloc and Free
-                    if let Ok(meta) = a_ref.alloc_bytes(BYTES_SIZE) {
+                    let layout = core::alloc::Layout::array::<u8>(BYTES_SIZE).unwrap();
+                    if let Ok(meta) = a_ref.allocate(layout) {
                         active_allocs.push_back(meta);
                     }
 
@@ -224,7 +224,7 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
                         && let Some(old_meta) = active_allocs.pop_front()
                     {
                         // Explicitly drop/deallocate here
-                        let _ = a_ref.dealloc_bytes(old_meta);
+                        let _ = a_ref.deallocate(a_ref.pointer(&old_meta), layout);
                     }
 
                     latencies.push(op_start.elapsed().as_nanos() as u64);
@@ -242,15 +242,13 @@ fn alloc_content<const BYTES_SIZE: usize, const OPS_PER_THREAD: usize, const NUM
     analyze_latencies(results);
 }
 
-fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug> + Sync,
-) {
+fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(a: crate::talc::MapTalc) {
     use std::sync::Arc;
     use std::sync::Barrier;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::thread;
 
-    use crate::boxed::PBoxIn;
+    use crate::boxed::PBox;
 
     tracing_init();
 
@@ -271,14 +269,14 @@ fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(
     thread::scope(|s| {
         for _ in 0..NUM {
             let c_ref = counter.clone();
-            let a_ref = &a;
+            let a_ref = a.as_ref();
             let b_ref = &bar;
 
             s.spawn(move || {
                 b_ref.wait();
                 for _ in 0..ALLOC_NUM {
                     let slot = loop {
-                        match PBoxIn::try_new_uninit_in(a_ref) {
+                        match PBox::try_uninit(a_ref.clone()) {
                             Ok(slot) => break slot,
                             Err(_) => thread::yield_now(),
                         }
@@ -300,13 +298,11 @@ fn pbox_droppy<const ALLOC_NUM: usize, const NUM: usize>(
 }
 
 /// Choose a smaller number due to large allocation.
-fn pbox_rand<const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl MemAllocator<Error = impl core::fmt::Debug> + Sync,
-) {
+fn pbox_rand<const ALLOC_NUM: usize, const NUM: usize>(a: crate::talc::MapTalc) {
     use std::sync::Barrier;
     use std::thread;
 
-    use crate::boxed::PBoxIn;
+    use crate::boxed::PBox;
 
     #[derive(Debug)]
     #[repr(C, align(64))]
@@ -328,14 +324,14 @@ fn pbox_rand<const ALLOC_NUM: usize, const NUM: usize>(
     let bar = Barrier::new(NUM);
     thread::scope(|s| {
         for _ in 0..NUM {
-            let a_ref = &a;
+            let a_ref = a.as_ref();
             let b_ref = &bar;
 
             s.spawn(move || {
                 b_ref.wait();
                 for _ in 0..ALLOC_NUM {
                     let b = loop {
-                        match PBoxIn::try_new_in(HighAlign(rand_num()), &a_ref) {
+                        match PBox::try_new_in(HighAlign(rand_num()), a_ref.clone()) {
                             Ok(value) => break value,
                             Err(_) => thread::yield_now(),
                         }
@@ -344,7 +340,7 @@ fn pbox_rand<const ALLOC_NUM: usize, const NUM: usize>(
 
                     let len = rand_len();
                     let mut slice_b = loop {
-                        match PBoxIn::try_new_slice_in(len, |_| rand_num(), &a_ref) {
+                        match PBox::try_new_slice_in(len, |_| rand_num(), a_ref.clone()) {
                             Ok(value) => break value,
                             Err(_) => thread::yield_now(),
                         }
@@ -367,74 +363,5 @@ fn pbox_rand<const ALLOC_NUM: usize, const NUM: usize>(
                 }
             });
         }
-    });
-}
-
-fn pbox_token<const ALLOC_NUM: usize, const NUM: usize>(
-    a: impl TransferAllocator<Error = impl core::fmt::Debug, Meta = impl Send + mem::Meta> + Sync,
-) {
-    use std::sync::Barrier;
-    use std::thread;
-
-    use crate::boxed::PBoxIn;
-
-    #[derive(Debug)]
-    struct Recover {
-        f1: u64,
-        f2: char,
-    }
-
-    impl Recover {
-        fn rand() -> Self {
-            Self {
-                f1: fastrand::u64(0..100),
-                f2: fastrand::char('a'..='z'),
-            }
-        }
-    }
-
-    tracing_init();
-
-    let bar = Barrier::new(NUM);
-    thread::scope(|s| {
-        let handles = (0..NUM)
-            .map(|_| {
-                let a_ref = &a;
-                let b_ref = &bar;
-
-                s.spawn(move || {
-                    b_ref.wait();
-                    (0..ALLOC_NUM)
-                        .map(move |_| {
-                            let recover = loop {
-                                match PBoxIn::try_new_in(Recover::rand(), &a_ref) {
-                                    Ok(recover) => break recover,
-                                    Err(_) => std::thread::yield_now(),
-                                }
-                            };
-                            recover.token_of()
-                        })
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect::<Vec<_>>();
-
-        let tokens: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
-
-        let _: Vec<_> = tokens
-            .into_iter()
-            .map(|chunk| {
-                let a_ref = &a;
-                let b_ref = &bar;
-
-                s.spawn(move || {
-                    b_ref.wait();
-                    chunk.into_iter().for_each(|token| {
-                        let recover = token.boxed(&a_ref);
-                        tracing::debug!("{:?}", recover)
-                    })
-                })
-            })
-            .collect();
     });
 }

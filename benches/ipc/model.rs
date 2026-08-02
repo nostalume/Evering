@@ -1,3 +1,7 @@
+use std::collections::HashSet;
+
+use super::drive::Path;
+
 pub fn payload(seed: u64, operation: u64, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| payload_byte(seed, operation, index))
@@ -18,7 +22,7 @@ fn payload_byte(seed: u64, operation: u64, index: usize) -> u8 {
         .to_le_bytes()[index & 7]
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Status {
     Ok,
     Unsupported,
@@ -28,75 +32,70 @@ pub enum Status {
     DrainError,
 }
 
-#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+#[derive(Clone, Debug, Hash, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Cell {
-    pub implementation: String,
-    pub policy: String,
-    pub candidate: String,
+    pub arm: String,
     pub payload: u64,
     pub capacity: u64,
     pub in_flight: u64,
     pub memory: u64,
 }
 
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Policy {
-    Busy,
-    Adaptive,
-    Notified,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
-pub enum Arm {
-    Evering(Policy),
-    Stream,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct ContrastKey {
-    pub payload: u64,
-    pub capacity: u64,
-    pub in_flight: u64,
-    pub memory: u64,
-}
-
-#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord)]
-pub struct Contrast {
-    pub key: ContrastKey,
-    pub candidate: Policy,
-}
-
-impl Contrast {
-    pub fn cell(self, arm: Arm) -> Cell {
-        let (implementation, policy) = match arm {
-            Arm::Evering(Policy::Busy) => ("evering", "busy"),
-            Arm::Evering(Policy::Adaptive) => ("evering", "adaptive"),
-            Arm::Evering(Policy::Notified) => ("evering", "notified"),
-            Arm::Stream => ("os-stream", "blocking"),
-        };
-        Cell {
-            implementation: implementation.into(),
-            policy: policy.into(),
-            candidate: match self.candidate {
-                Policy::Busy => "busy",
-                Policy::Adaptive => "adaptive",
-                Policy::Notified => "notified",
-            }
-            .into(),
-            payload: self.key.payload,
-            capacity: self.key.capacity,
-            in_flight: self.key.in_flight,
-            memory: self.key.memory,
+impl Cell {
+    pub fn condition(&self) -> Condition {
+        Condition {
+            payload: self.payload,
+            capacity: self.capacity,
+            in_flight: self.in_flight,
+            memory: self.memory,
         }
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(
+    Clone, Copy, Debug, Hash, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+)]
+pub struct Condition {
+    pub payload: u64,
+    pub capacity: u64,
+    pub in_flight: u64,
+    pub memory: u64,
+}
+
+impl Condition {
+    pub fn cell(self, arm: &super::family::Arm) -> Cell {
+        Cell {
+            arm: arm.key.into(),
+            payload: self.payload,
+            capacity: self.capacity,
+            in_flight: self.in_flight,
+            memory: self.memory,
+        }
+    }
+}
+
+pub fn condition(payload: u64, capacity: u64, in_flight: u64) -> Condition {
+    let working = payload.max(64) * capacity * 2;
+    Condition {
+        payload,
+        capacity,
+        in_flight,
+        memory: (working + 4 * 1024 * 1024).next_multiple_of(4096),
+    }
+}
+
+#[derive(Clone, Copy)]
 pub struct Scheduled {
     pub block: u32,
     pub order: u32,
-    pub contrast: Contrast,
-    pub arm: Arm,
+    pub condition: Condition,
+    pub arm: &'static super::family::Arm,
+}
+
+impl Scheduled {
+    pub fn cell(self) -> Cell {
+        self.condition.cell(self.arm)
+    }
 }
 
 fn random(state: &mut u64) -> u64 {
@@ -107,81 +106,70 @@ fn random(state: &mut u64) -> u64 {
     value ^ (value >> 31)
 }
 
-pub fn schedule(contrasts: &[Contrast], blocks: u32, seed: u64) -> Vec<Scheduled> {
+pub fn schedule(
+    members: &[(Condition, &'static super::family::Arm)],
+    blocks: u32,
+    seed: u64,
+) -> Vec<Scheduled> {
     let mut state = seed;
-    let mut result = Vec::with_capacity(contrasts.len() * blocks as usize * 2);
+    let mut result = Vec::with_capacity(members.len() * blocks as usize);
     for block in 0..blocks {
-        let mut shuffled = contrasts.to_vec();
+        let mut shuffled = members.to_vec();
         for index in (1..shuffled.len()).rev() {
             let selected = random(&mut state) as usize % (index + 1);
             shuffled.swap(index, selected);
         }
-        let mut order = 0;
-        for contrast in shuffled {
-            let mut arms = [Arm::Evering(contrast.candidate), Arm::Stream];
-            if random(&mut state) & 1 == 1 {
-                arms.reverse();
-            }
-            for arm in arms {
-                result.push(Scheduled {
-                    block,
-                    order,
-                    contrast,
-                    arm,
-                });
-                order += 1;
-            }
+        for (order, (condition, arm)) in shuffled.into_iter().enumerate() {
+            result.push(Scheduled {
+                block,
+                order: order as u32,
+                condition,
+                arm,
+            });
         }
     }
     result
 }
 
 pub fn schedule_id(entries: &[Scheduled]) -> u64 {
-    entries.iter().fold(0xcbf2_9ce4_8422_2325, |hash, entry| {
-        schedule_hash(
+    entries.iter().fold(OFFSET, |hash, entry| {
+        identity(
             hash,
-            [
-                entry.block as u64,
-                entry.order as u64,
-                entry.contrast.key.payload,
-                entry.contrast.key.capacity,
-                entry.contrast.key.in_flight,
-                entry.contrast.key.memory,
-                match entry.contrast.candidate {
-                    Policy::Busy => 0,
-                    Policy::Adaptive => 1,
-                    Policy::Notified => 2,
-                },
-                u64::from(matches!(entry.arm, Arm::Stream)),
-            ],
+            entry.block,
+            entry.order,
+            entry.condition,
+            entry.arm.key,
         )
     })
 }
 
-fn schedule_hash(hash: u64, values: [u64; 8]) -> u64 {
-    values.into_iter().fold(hash, |hash, value| {
+const OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
+fn identity(mut hash: u64, block: u32, order: u32, cell: Condition, arm: &str) -> u64 {
+    hash = [
+        block as u64,
+        order as u64,
+        cell.payload,
+        cell.capacity,
+        cell.in_flight,
+        cell.memory,
+    ]
+    .into_iter()
+    .fold(hash, |hash, value| {
         (hash ^ value).wrapping_mul(0x100_0000_01b3)
+    });
+    arm.as_bytes().iter().fold(hash, |hash, byte| {
+        (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
     })
 }
 
 pub fn trial_schedule_id(trials: &[Trial]) -> u64 {
-    trials.iter().fold(0xcbf2_9ce4_8422_2325, |hash, trial| {
-        schedule_hash(
+    trials.iter().fold(OFFSET, |hash, trial| {
+        identity(
             hash,
-            [
-                trial.block as u64,
-                trial.order as u64,
-                trial.cell.payload,
-                trial.cell.capacity,
-                trial.cell.in_flight,
-                trial.cell.memory,
-                match trial.cell.candidate.as_str() {
-                    "busy" => 0,
-                    "adaptive" => 1,
-                    _ => 2,
-                },
-                u64::from(trial.cell.implementation == "os-stream"),
-            ],
+            trial.block,
+            trial.order,
+            trial.cell.condition(),
+            &trial.cell.arm,
         )
     })
 }
@@ -190,12 +178,12 @@ pub fn window(remaining: u64, capacity: u64, in_flight: u64) -> u64 {
     remaining.min(capacity).min(in_flight)
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Observed {
     pub payload: u64,
     pub capacity: u64,
     pub in_flight: u64,
-    pub batch: u64,
+    pub window: u64,
     pub topology: String,
     pub transport: String,
     pub extent: Option<u64>,
@@ -204,7 +192,7 @@ pub struct Observed {
     pub socket_recv: Option<u64>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Trial {
     pub block: u32,
     pub order: u32,
@@ -216,13 +204,16 @@ pub struct Trial {
     pub elapsed_ns: Option<u64>,
     pub phase_ns: [u64; 3],
     pub observed: Option<Observed>,
+    pub path: Path,
     pub status: Status,
     pub error: Option<String>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Meta {
     pub format: u32,
+    pub family: String,
+    pub family_revision: u32,
     pub revision: String,
     pub dirty: bool,
     pub diff: String,
@@ -243,7 +234,7 @@ pub struct Meta {
     pub spin: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Study {
     pub meta: Meta,
     pub trials: Vec<Trial>,
@@ -266,6 +257,7 @@ pub enum TrialError {
 pub enum StudyError {
     Trial(TrialError),
     Format,
+    Family,
     Metadata,
     OutOfBlock,
     DuplicateCell,
@@ -281,21 +273,11 @@ pub enum CodecError {
 }
 
 pub fn validate_trial(trial: &Trial) -> Result<(), TrialError> {
-    let candidate = trial.cell.candidate.as_str();
-    let valid_candidate = matches!(candidate, "busy" | "adaptive" | "notified");
-    let valid_arm = match (
-        trial.cell.implementation.as_str(),
-        trial.cell.policy.as_str(),
-    ) {
-        ("evering", policy) => policy == candidate,
-        ("os-stream", "blocking") => true,
-        _ => false,
-    };
     if trial.cell.capacity == 0
         || trial.cell.in_flight == 0
         || trial.cell.memory == 0
-        || !valid_candidate
-        || !valid_arm
+        || trial.cell.arm.is_empty()
+        || trial.cell.arm.contains(['\t', '\n', '\r'])
         || trial
             .error
             .as_deref()
@@ -315,31 +297,16 @@ pub fn validate_trial(trial: &Trial) -> Result<(), TrialError> {
             observed.transport.as_str(),
             observed.allocator.as_deref().unwrap_or(""),
         ];
-        let valid_resource = if trial.cell.implementation == "os-stream" {
-            observed.extent.is_none()
-                && observed.allocator.is_none()
-                && observed.socket_send.is_some_and(|value| value > 0)
-                && observed.socket_recv.is_some_and(|value| value > 0)
-        } else {
-            observed.extent.is_some_and(|value| value > 0)
-                && observed
-                    .allocator
-                    .as_deref()
-                    .is_some_and(|value| !value.is_empty())
-                && observed.socket_send.is_none()
-                && observed.socket_recv.is_none()
-        };
-        if observed.capacity == 0
-            || observed.in_flight == 0
-            || observed.batch == 0
-            || observed.batch > observed.capacity.min(observed.in_flight)
+        if observed.payload != trial.cell.payload
+            || observed.capacity != trial.cell.capacity
+            || observed.in_flight != trial.cell.in_flight
+            || observed.window != window(trial.requested, trial.cell.capacity, trial.cell.in_flight)
             || text[..2]
                 .iter()
                 .any(|value| value.is_empty() || value.contains(['\t', '\n', '\r']))
             || text[2..]
                 .iter()
                 .any(|value| value.contains(['\t', '\n', '\r']))
-            || !valid_resource
         {
             return Err(TrialError::InvalidCell);
         }
@@ -386,11 +353,12 @@ pub fn validate_trial(trial: &Trial) -> Result<(), TrialError> {
     Ok(())
 }
 
-pub fn validate_prefix(study: &Study) -> Result<(), StudyError> {
-    use std::collections::HashSet;
+type Blocks = (Vec<HashSet<Cell>>, Vec<HashSet<u32>>);
 
+fn admit_prefix(study: &Study) -> Result<Blocks, StudyError> {
     let meta = &study.meta;
     let fields = [
+        &meta.family,
         &meta.revision,
         &meta.diff,
         &meta.target,
@@ -402,9 +370,12 @@ pub fn validate_prefix(study: &Study) -> Result<(), StudyError> {
         &meta.mode,
         &meta.host,
     ];
-    if meta.format != 2 {
+    if meta.format != 5 {
         return Err(StudyError::Format);
     }
+    let family = super::family::find(&meta.family)
+        .filter(|family| family.revision == meta.family_revision)
+        .ok_or(StudyError::Family)?;
     if meta.blocks == 0
         || meta.timeout_ms == 0
         || meta.expected == 0
@@ -419,6 +390,19 @@ pub fn validate_prefix(study: &Study) -> Result<(), StudyError> {
     let mut orders = vec![HashSet::new(); meta.blocks as usize];
     for trial in &study.trials {
         validate_trial(trial).map_err(StudyError::Trial)?;
+        let arm = family.arm(&trial.cell.arm).ok_or(StudyError::Family)?;
+        if trial
+            .observed
+            .as_ref()
+            .is_some_and(|observed| !arm.admits(observed))
+        {
+            return Err(StudyError::Trial(TrialError::InvalidCell));
+        }
+        if (trial.path.wait_returned && !trial.path.wait_entered)
+            || (trial.path.stale_wake && !trial.path.wait_returned)
+        {
+            return Err(StudyError::Format);
+        }
         let Some(block_cells) = cells.get_mut(trial.block as usize) else {
             return Err(StudyError::OutOfBlock);
         };
@@ -429,28 +413,21 @@ pub fn validate_prefix(study: &Study) -> Result<(), StudyError> {
             return Err(StudyError::DuplicateOrder);
         }
     }
-    Ok(())
+    Ok((cells, orders))
+}
+
+pub fn validate_prefix(study: &Study) -> Result<(), StudyError> {
+    admit_prefix(study).map(drop)
 }
 
 pub fn validate_study(study: &Study) -> Result<(), StudyError> {
-    use std::collections::HashSet;
-
-    validate_prefix(study)?;
-    if study.trials.len() != study.meta.expected {
+    let (cells, orders) = admit_prefix(study)?;
+    if study.trials.len() != study.meta.expected
+        || trial_schedule_id(&study.trials) != study.meta.schedule
+    {
         return Err(StudyError::Incomplete);
     }
-    if trial_schedule_id(&study.trials) != study.meta.schedule {
-        return Err(StudyError::Incomplete);
-    }
-    let mut cells = vec![HashSet::new(); study.meta.blocks as usize];
-    let mut orders = vec![HashSet::new(); study.meta.blocks as usize];
-    for trial in &study.trials {
-        cells[trial.block as usize].insert(trial.cell.clone());
-        orders[trial.block as usize].insert(trial.order);
-    }
-    let Some(expected) = cells.first() else {
-        return Err(StudyError::IncompleteBlock);
-    };
+    let expected = cells.first().ok_or(StudyError::IncompleteBlock)?;
     if expected.is_empty()
         || cells.iter().any(|block| block != expected)
         || orders.iter().any(|block| {
@@ -463,191 +440,73 @@ pub fn validate_study(study: &Study) -> Result<(), StudyError> {
     Ok(())
 }
 
-fn meta_line(meta: &Meta) -> String {
-    format!(
-        "META\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        meta.format,
-        meta.revision,
-        u8::from(meta.dirty),
-        meta.diff,
-        meta.target,
-        meta.os,
-        meta.arch,
-        meta.rustc,
-        meta.command,
-        meta.started,
-        meta.mode,
-        meta.seed,
-        meta.warmup,
-        meta.blocks,
-        meta.timeout_ms,
-        meta.schedule,
-        meta.expected,
-        meta.host,
-        meta.spin,
-    )
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+enum Line {
+    Header(Meta),
+    Trial(Trial),
+    End(End),
 }
 
-fn trial_line(trial: &Trial) -> String {
-    let observed = trial.observed.as_ref();
-    let observed_number = |field: fn(&Observed) -> Option<u64>| {
-        observed
-            .and_then(field)
-            .map_or(String::new(), |value| value.to_string())
-    };
-    format!(
-        "TRIAL\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
-        trial.block,
-        trial.order,
-        trial.cell.implementation,
-        trial.cell.policy,
-        trial.cell.candidate,
-        trial.cell.payload,
-        trial.cell.capacity,
-        trial.cell.in_flight,
-        trial.cell.memory,
-        trial.requested,
-        trial.accepted,
-        trial.completed,
-        trial.validated,
-        trial
-            .elapsed_ns
-            .map_or(String::new(), |value| value.to_string()),
-        trial.phase_ns[0],
-        trial.phase_ns[1],
-        trial.phase_ns[2],
-        observed.map_or(String::new(), |value| value.payload.to_string()),
-        observed.map_or(String::new(), |value| value.capacity.to_string()),
-        observed.map_or(String::new(), |value| value.in_flight.to_string()),
-        observed.map_or(String::new(), |value| value.batch.to_string()),
-        observed.map_or("", |value| value.topology.as_str()),
-        observed.map_or("", |value| value.transport.as_str()),
-        observed_number(|value| value.extent),
-        observed.map_or("", |value| value.allocator.as_deref().unwrap_or("")),
-        observed_number(|value| value.socket_send),
-        observed_number(|value| value.socket_recv),
-        status_name(trial.status),
-        trial.error.as_deref().unwrap_or(""),
-    )
+#[derive(serde::Deserialize, serde::Serialize)]
+struct End {
+    rows: usize,
+    schedule: u64,
+    digest: String,
 }
 
 pub fn decode(input: &str) -> Result<Study, CodecError> {
-    let input = input.strip_suffix('\n').unwrap_or(input);
-    let (prefix, footer) = input
-        .rsplit_once('\n')
-        .ok_or(CodecError::Study(StudyError::Incomplete))?;
-    if !footer.starts_with("END\t") {
-        return Err(CodecError::Study(StudyError::Incomplete));
-    }
-    let fields: Vec<_> = footer.split('\t').collect();
-    let study = decode_prefix(&(prefix.to_owned() + "\n"))?;
-    if fields.len() != 3
-        || fields[0] != "END"
-        || number::<u64>(fields[1])? != study.meta.schedule
-        || number::<usize>(fields[2])? != study.meta.expected
-    {
-        return Err(CodecError::Study(StudyError::Incomplete));
-    }
-    validate_study(&study).map_err(CodecError::Study)?;
-    Ok(study)
+    let (study, complete) = parse(input)?;
+    complete
+        .then_some(study)
+        .ok_or(CodecError::Study(StudyError::Incomplete))
 }
 
 pub fn decode_prefix(input: &str) -> Result<Study, CodecError> {
-    let input = if input.ends_with('\n') {
-        input
-    } else {
-        input
-            .rsplit_once('\n')
-            .map(|(complete, _)| complete)
-            .ok_or(CodecError::Syntax)?
-    };
-    let mut lines = input.lines();
-    let meta = lines.next().ok_or(CodecError::Syntax)?;
-    let fields: Vec<_> = meta.split('\t').collect();
-    if fields.len() != 20 || fields[0] != "META" {
+    parse(input).map(|(study, _)| study)
+}
+
+fn parse(input: &str) -> Result<(Study, bool), CodecError> {
+    if !input.ends_with('\n') {
         return Err(CodecError::Syntax);
     }
-    let meta = Meta {
-        format: number(fields[1])?,
-        revision: fields[2].into(),
-        dirty: match fields[3] {
-            "0" => false,
-            "1" => true,
-            _ => return Err(CodecError::Syntax),
-        },
-        diff: fields[4].into(),
-        target: fields[5].into(),
-        os: fields[6].into(),
-        arch: fields[7].into(),
-        rustc: fields[8].into(),
-        command: fields[9].into(),
-        started: fields[10].into(),
-        mode: fields[11].into(),
-        seed: number(fields[12])?,
-        warmup: number(fields[13])?,
-        blocks: number(fields[14])?,
-        timeout_ms: number(fields[15])?,
-        schedule: number(fields[16])?,
-        expected: number(fields[17])?,
-        host: fields[18].into(),
-        spin: number(fields[19])?,
-    };
+    let mut meta = None;
     let mut trials = Vec::new();
-    for line in lines {
-        let fields: Vec<_> = line.split('\t').collect();
-        if fields.len() != 30 || fields[0] != "TRIAL" {
-            return Err(CodecError::Syntax);
+    let mut end = None;
+    let mut digest = blake3::Hasher::new();
+    for raw in input.split_inclusive('\n') {
+        let line: Line = serde_json::from_str(raw.strip_suffix('\n').unwrap())
+            .map_err(|_| CodecError::Syntax)?;
+        match line {
+            Line::Header(value) if meta.is_none() && trials.is_empty() => {
+                meta = Some(value);
+                digest.update(raw.as_bytes());
+            }
+            Line::Trial(value) if meta.is_some() && end.is_none() => {
+                trials.push(value);
+                digest.update(raw.as_bytes());
+            }
+            Line::End(value) if meta.is_some() && end.is_none() => end = Some(value),
+            _ => return Err(CodecError::Syntax),
         }
-        let observed = if fields[18..28].iter().all(|field| field.is_empty()) {
-            None
-        } else {
-            Some(Observed {
-                payload: number(fields[18])?,
-                capacity: number(fields[19])?,
-                in_flight: number(fields[20])?,
-                batch: number(fields[21])?,
-                topology: fields[22].into(),
-                transport: fields[23].into(),
-                extent: optional_number(fields[24])?,
-                allocator: (!fields[25].is_empty()).then(|| fields[25].into()),
-                socket_send: optional_number(fields[26])?,
-                socket_recv: optional_number(fields[27])?,
-            })
-        };
-        trials.push(Trial {
-            block: number(fields[1])?,
-            order: number(fields[2])?,
-            cell: Cell {
-                implementation: fields[3].into(),
-                policy: fields[4].into(),
-                candidate: fields[5].into(),
-                payload: number(fields[6])?,
-                capacity: number(fields[7])?,
-                in_flight: number(fields[8])?,
-                memory: number(fields[9])?,
-            },
-            requested: number(fields[10])?,
-            accepted: number(fields[11])?,
-            completed: number(fields[12])?,
-            validated: number(fields[13])?,
-            elapsed_ns: if fields[14].is_empty() {
-                None
-            } else {
-                Some(number(fields[14])?)
-            },
-            phase_ns: [
-                number(fields[15])?,
-                number(fields[16])?,
-                number(fields[17])?,
-            ],
-            observed,
-            status: parse_status(fields[28])?,
-            error: (!fields[29].is_empty()).then(|| fields[29].into()),
-        });
     }
-    let study = Study { meta, trials };
+    let study = Study {
+        meta: meta.ok_or(CodecError::Syntax)?,
+        trials,
+    };
     validate_prefix(&study).map_err(CodecError::Study)?;
-    Ok(study)
+    if let Some(end) = end {
+        if end.rows != study.trials.len()
+            || end.schedule != study.meta.schedule
+            || end.digest != digest.finalize().to_hex().as_str()
+        {
+            return Err(CodecError::Study(StudyError::Incomplete));
+        }
+        validate_study(&study).map_err(CodecError::Study)?;
+        Ok((study, true))
+    } else {
+        Ok((study, false))
+    }
 }
 
 pub struct Loaded {
@@ -657,132 +516,94 @@ pub struct Loaded {
 
 pub fn load(path: &std::path::Path) -> Result<Loaded, String> {
     let input = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    let partial = path
-        .file_name()
-        .is_some_and(|name| name.to_string_lossy().ends_with(".partial"));
-    let study = if partial {
-        let trimmed = input.strip_suffix('\n').unwrap_or(&input);
-        let prefix = trimmed
-            .rsplit_once('\n')
-            .filter(|(_, line)| line.starts_with("END\t"))
-            .map_or_else(|| input.clone(), |(prefix, _)| format!("{prefix}\n"));
-        decode_prefix(&prefix)
-    } else {
-        decode(&input)
-    }
-    .map_err(|error| format!("{error:?}"))?;
-    Ok(Loaded {
-        study,
-        complete: !partial,
-    })
+    let (study, complete) = match decode(&input) {
+        Ok(study) => (study, true),
+        Err(CodecError::Study(StudyError::Incomplete)) => (
+            decode_prefix(&input).map_err(|error| format!("{error:?}"))?,
+            false,
+        ),
+        Err(error) => return Err(format!("{error:?}")),
+    };
+    Ok(Loaded { study, complete })
 }
 
-pub struct Recorder {
-    final_path: std::path::PathBuf,
-    partial_path: std::path::PathBuf,
-    file: Option<std::fs::File>,
-    study: Study,
-    failed: bool,
+pub(super) struct Journal {
+    file: std::fs::File,
+    digest: blake3::Hasher,
 }
 
-impl Recorder {
-    pub fn create(path: &std::path::Path, meta: Meta) -> Result<Self, String> {
-        use std::io::Write;
-
-        if path.exists() {
-            return Err("evidence already exists".into());
-        }
-        let partial_path = std::path::PathBuf::from(format!("{}.partial", path.display()));
-        let mut file = std::fs::OpenOptions::new()
+impl Journal {
+    pub(super) fn create(path: &std::path::Path) -> Result<Self, String> {
+        let file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&partial_path)
-            .map_err(|error| error.to_string())?;
-        let study = Study {
-            meta,
-            trials: Vec::new(),
-        };
-        validate_prefix(&study).map_err(|error| format!("{error:?}"))?;
-        file.write_all(meta_line(&study.meta).as_bytes())
-            .and_then(|()| file.sync_data())
+            .open(path)
             .map_err(|error| error.to_string())?;
         Ok(Self {
-            final_path: path.into(),
-            partial_path,
-            file: Some(file),
-            study,
-            failed: false,
+            file,
+            digest: blake3::Hasher::new(),
         })
     }
 
-    pub fn append(&mut self, trial: Trial) -> Result<(), String> {
+    pub(super) fn append(&mut self, value: &impl serde::Serialize) -> Result<(), String> {
         use std::io::Write;
-
-        self.study.trials.push(trial);
-        if let Err(error) = validate_prefix(&self.study) {
-            self.study.trials.pop();
-            return Err(format!("{error:?}"));
-        }
-        let file = self.file.as_mut().ok_or("recorder finished")?;
-        let result = file
-            .write_all(trial_line(self.study.trials.last().unwrap()).as_bytes())
-            .and_then(|()| file.sync_data())
-            .map_err(|error| error.to_string());
-        self.failed |= result.is_err();
-        result
+        let mut line = serde_json::to_vec(value).map_err(|error| error.to_string())?;
+        line.push(b'\n');
+        self.file
+            .write_all(&line)
+            .and_then(|()| self.file.sync_data())
+            .map_err(|error| error.to_string())?;
+        self.digest.update(&line);
+        Ok(())
     }
 
-    pub fn finish(mut self) -> Result<(), String> {
-        use std::io::Write;
+    pub(super) fn digest(&self) -> String {
+        self.digest.clone().finalize().to_hex().to_string()
+    }
 
-        if self.failed {
-            return Err("recorder failed".into());
-        }
-        validate_study(&self.study).map_err(|error| format!("{error:?}"))?;
-        let mut file = self.file.take().ok_or("recorder finished")?;
-        file.write_all(
-            format!(
-                "END\t{}\t{}\n",
-                self.study.meta.schedule, self.study.meta.expected
-            )
-            .as_bytes(),
-        )
-        .and_then(|()| file.sync_all())
-        .map_err(|error| error.to_string())?;
-        drop(file);
-        std::fs::hard_link(&self.partial_path, &self.final_path)
-            .and_then(|()| std::fs::remove_file(&self.partial_path))
+    pub(super) fn seal(mut self, value: &impl serde::Serialize) -> Result<(), String> {
+        use std::io::Write;
+        serde_json::to_writer(&mut self.file, value).map_err(|error| error.to_string())?;
+        self.file
+            .write_all(b"\n")
+            .and_then(|()| self.file.flush())
+            .and_then(|()| self.file.sync_all())
             .map_err(|error| error.to_string())
     }
 }
 
-fn number<T: core::str::FromStr>(value: &str) -> Result<T, CodecError> {
-    value.parse().map_err(|_| CodecError::Syntax)
-}
-
-fn optional_number<T: core::str::FromStr>(value: &str) -> Result<Option<T>, CodecError> {
-    (!value.is_empty()).then(|| number(value)).transpose()
-}
-
-fn status_name(status: Status) -> &'static str {
-    match status {
-        Status::Ok => "ok",
-        Status::Unsupported => "unsupported",
-        Status::Invalid => "invalid",
-        Status::SetupError => "setup-error",
-        Status::TimedError => "timed-error",
-        Status::DrainError => "drain-error",
+pub fn record(
+    path: &std::path::Path,
+    meta: Meta,
+    trials: impl IntoIterator<Item = Result<Trial, String>>,
+) -> Result<(), String> {
+    if meta.format != 5 {
+        return Err("recorder only writes evidence format 5".into());
     }
-}
-
-fn parse_status(value: &str) -> Result<Status, CodecError> {
-    match value {
-        "ok" => Ok(Status::Ok),
-        "unsupported" => Ok(Status::Unsupported),
-        "invalid" => Ok(Status::Invalid),
-        "setup-error" => Ok(Status::SetupError),
-        "timed-error" => Ok(Status::TimedError),
-        "drain-error" => Ok(Status::DrainError),
-        _ => Err(CodecError::Syntax),
+    let mut study = Study {
+        meta,
+        trials: Vec::new(),
+    };
+    validate_prefix(&study).map_err(|error| format!("{error:?}"))?;
+    let mut journal = Journal::create(path)?;
+    journal.append(&Line::Header(study.meta.clone()))?;
+    for trial in trials {
+        study.trials.push(trial?);
+        if let Err(error) = validate_prefix(&study) {
+            study.trials.pop();
+            return Err(format!("{error:?}"));
+        }
+        let trial = study.trials.last().unwrap();
+        journal.append(&Line::Trial(trial.clone()))?;
+        if trial.status != Status::Ok {
+            return Err("mandatory trial failed; inspect the unsealed evidence record".into());
+        }
     }
+    validate_study(&study).map_err(|error| format!("{error:?}"))?;
+    let end = End {
+        rows: study.trials.len(),
+        schedule: study.meta.schedule,
+        digest: journal.digest(),
+    };
+    journal.seal(&Line::End(end))
 }

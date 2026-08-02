@@ -1,15 +1,17 @@
 use crate::os::unix::UnixFd;
 
-use crate::perlude::talc::{Access, Request};
+use crate::mem::{Access, Request, Source};
+use crate::schema::{RegionAdmission, RegionId};
 use crate::tests;
-use crate::{RegionAdmission, RegionId};
 
 type UnixAlloc = crate::talc::MapTalc;
 fn mock_alloc(name: &str, size: usize) -> UnixAlloc {
     let fd = UnixFd::memfd(name, size, false).expect("should create");
-    crate::MapLayout::map(
-        fd,
-        Request::new(size, Access::WRITE | Access::READ),
+    let map = fd
+        .map(Request::new(size, Access::WRITE | Access::READ))
+        .unwrap();
+    crate::mem::Build::new(
+        map,
         RegionAdmission::Create(RegionId::new(0x5441_4c43, size as u64)),
     )
     .unwrap()
@@ -22,7 +24,7 @@ fn layout_order_is_rejected_at_the_first_unexpected_record() {
     const SIZE: usize = 1 << 19;
     const REGION: RegionId = RegionId::new(0x004f_5244_4552, 1);
     let fd = UnixFd::memfd("layout-order", SIZE, false).expect("create shared memory");
-    let created = crate::perlude::talc::SessionBy::<()>::create(
+    let created = crate::Session::create(
         fd.dup().expect("duplicate shared-memory handle"),
         Request::new(SIZE, Access::WRITE | Access::READ),
         REGION,
@@ -30,12 +32,11 @@ fn layout_order_is_rejected_at_the_first_unexpected_record() {
     .expect("record canonical layout order");
     drop(created);
 
-    let mut layout = crate::MapLayout::map(
-        fd,
-        Request::new(SIZE, Access::WRITE | Access::READ),
-        RegionAdmission::Expect(REGION),
-    )
-    .expect("map region");
+    let map = fd
+        .map(Request::new(SIZE, Access::WRITE | Access::READ))
+        .unwrap();
+    let mut layout =
+        crate::mem::Build::new(map, RegionAdmission::Expect(REGION)).expect("map region");
     let conf = crate::talc::Config::new(SIZE);
     let reserve = layout
         .reserve::<crate::talc::Header>()
@@ -49,11 +50,11 @@ fn layout_order_is_rejected_at_the_first_unexpected_record() {
 
     assert!(matches!(
         error,
-        crate::MapError::LayoutMismatch(crate::LayoutField::Magic)
+        crate::mem::Error::LayoutMismatch(crate::header::LayoutField::Magic)
     ));
     assert!(matches!(
         layout.push::<crate::dir::Header>(()),
-        Err(crate::MapError::PoisonedComposition)
+        Err(crate::mem::Error::PoisonedComposition)
     ));
 }
 
@@ -73,11 +74,10 @@ fn alloc_content() {
 }
 
 #[test]
-fn real_mapping_reuse_and_tokens() {
+fn real_mapping_reuse_and_boxes() {
     const NAME: &str = "talc-reuse";
     const SIZE: usize = 1 << 19;
 
     tests::alloc_lines::<2048, 200, 5>(mock_alloc(NAME, SIZE));
-    tests::pbox_token::<100, 5>(mock_alloc("talc-token", SIZE));
     tests::pbox_rand::<100, 1>(mock_alloc("talc-rand", SIZE));
 }

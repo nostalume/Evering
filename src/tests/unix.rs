@@ -1,25 +1,23 @@
 #![cfg(feature = "map")]
 #![cfg(test)]
 
-use crate::mem::{Access, MapLayout, MapView, Request};
+use crate::mem::{Access, Build, Request, Source};
 use crate::os::unix::UnixFd;
+use crate::schema::{RegionAdmission, RegionId};
 use crate::tests;
-use crate::{RegionAdmission, RegionId};
 
 mod recovery;
 mod talc;
 
-type UnixMapView = MapView;
-
-fn mock_view(name: &str, size: usize) -> UnixMapView {
+fn mock_view(name: &str, size: usize) -> Build {
     let fd = UnixFd::memfd(name, size, false).expect("should create");
-    MapLayout::map(
-        fd,
-        Request::new(size, Access::WRITE | Access::READ),
+    let map = fd
+        .map(Request::new(size, Access::WRITE | Access::READ))
+        .unwrap();
+    Build::new(
+        map,
         RegionAdmission::Create(RegionId::new(0x4556_4552, size as u64)),
     )
-    .unwrap()
-    .try_into()
     .unwrap()
 }
 

@@ -2,7 +2,7 @@ use core::{
     mem,
     ops::Deref,
     ptr,
-    sync::atomic::{AtomicU8, AtomicU16, AtomicUsize, Ordering},
+    sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
 use crate::schema::{
@@ -10,7 +10,76 @@ use crate::schema::{
 };
 
 pub type Magic = u16;
-type AtomicMagic = AtomicU16;
+
+const RECORD_FORMAT: u8 = 1;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AbiProfile {
+    pub word_bytes: u8,
+    pub atomic_bytes: u8,
+    pub little_endian: bool,
+}
+
+impl AbiProfile {
+    pub const NATIVE: Self = Self {
+        word_bytes: mem::size_of::<usize>() as u8,
+        atomic_bytes: mem::size_of::<AtomicUsize>() as u8,
+        little_endian: cfg!(target_endian = "little"),
+    };
+}
+
+#[repr(C)]
+pub(crate) struct Record {
+    status: AtomicU8,
+    format: u8,
+    profile: [u8; 3],
+    magic: [u8; 2],
+    revision: [u8; 4],
+    schema: [u8; 8],
+    extent: [u8; 8],
+    extent_align: [u8; 8],
+}
+
+impl Record {
+    unsafe fn initialize<L: Layout>(pointer: *mut Self, layout: core::alloc::Layout) {
+        unsafe {
+            ptr::addr_of_mut!((*pointer).format).write(RECORD_FORMAT);
+            ptr::addr_of_mut!((*pointer).profile).write([
+                AbiProfile::NATIVE.word_bytes,
+                AbiProfile::NATIVE.atomic_bytes,
+                AbiProfile::NATIVE.little_endian as u8,
+            ]);
+            ptr::addr_of_mut!((*pointer).magic).write(L::MAGIC.to_le_bytes());
+            ptr::addr_of_mut!((*pointer).revision).write(L::SCHEMA.revision.to_le_bytes());
+            ptr::addr_of_mut!((*pointer).schema).write(L::SCHEMA.id.0.to_le_bytes());
+            ptr::addr_of_mut!((*pointer).extent).write((layout.size() as u64).to_le_bytes());
+            ptr::addr_of_mut!((*pointer).extent_align).write((layout.align() as u64).to_le_bytes());
+        }
+    }
+
+    fn profile(&self) -> AbiProfile {
+        let [word_bytes, atomic_bytes, little_endian] = self.profile;
+        AbiProfile {
+            word_bytes,
+            atomic_bytes,
+            little_endian: little_endian != 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RecordedLayout {
+    pub(crate) schema: SchemaKey,
+    pub(crate) profile: AbiProfile,
+    pub(crate) magic: Magic,
+    pub(crate) extent: usize,
+    pub(crate) extent_align: usize,
+}
+
+const _: () = {
+    assert!(mem::align_of::<Record>() == 1);
+    assert!(mem::size_of::<Record>() == 35);
+};
 
 #[cfg(test)]
 static CLAIM_TEST_TARGET: AtomicUsize = AtomicUsize::new(0);
@@ -50,6 +119,11 @@ pub unsafe trait Layout: SharedSchema + Sized {
 
     const MAGIC: Magic;
 
+    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout> {
+        let _ = conf;
+        Some(core::alloc::Layout::new::<RcHeader<Self>>())
+    }
+
     fn info(conf: &Self::Config, ctx: LayoutContext) -> Self::Info;
 
     /// Initializes a previously uninitialized layout body.
@@ -60,10 +134,18 @@ pub unsafe trait Layout: SharedSchema + Sized {
     /// `Self`. No live value may currently occupy that storage.
     unsafe fn init(destination: *mut Self, conf: Self::Config) -> Status;
     fn attach(&self, conf: &Self::Config) -> Status;
+
+    /// Repairs ownership left by `context.dead()` and returns true only when
+    /// no such ownership remains in this layout body.
+    fn recover(_: RecoveryContext<'_, Self>) -> bool {
+        false
+    }
 }
 
 #[doc(hidden)]
 pub trait AdmitLayout: Layout {
+    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout>;
+
     unsafe fn admit(
         pointer: *mut Self,
         conf: Self::Config,
@@ -76,11 +158,8 @@ pub trait AdmitLayout: Layout {
 
 #[repr(C)]
 pub struct RcHeader<T: Layout> {
-    magic: AtomicMagic,
-    status: AtomicU8,
+    record: Record,
     members: AtomicUsize,
-    revision: u32,
-    schema: SchemaId,
     region: RegionId,
     offset: u64,
     header_size: u64,
@@ -98,6 +177,8 @@ pub struct RcHeader<T: Layout> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutField {
     State,
+    Format,
+    Profile,
     Magic,
     Revision,
     Schema,
@@ -105,6 +186,8 @@ pub enum LayoutField {
     Offset,
     HeaderSize,
     HeaderAlign,
+    Extent,
+    ExtentAlign,
     InfoSchema,
     InfoRevision,
     InfoSize,
@@ -123,6 +206,91 @@ pub enum AdmitError {
     Mismatch(LayoutField),
 }
 
+pub struct RecoveryContext<'a, L: Layout> {
+    pub layout: &'a L,
+    pub info: L::Info,
+    pub extent: usize,
+    pub dead: u8,
+    pub live: u8,
+    pub(crate) base: *const u8,
+    pub(crate) directory: &'a crate::dir::MapDirectory,
+}
+
+type RecoverFn =
+    unsafe fn(&crate::dir::MapDirectory, crate::dir::Id<()>, RecordedLayout, u8, u8) -> bool;
+
+#[derive(Clone, Copy)]
+pub struct RecoveryHandler {
+    pub(crate) schema: SchemaKey,
+    pub(crate) profile: AbiProfile,
+    pub(crate) run: RecoverFn,
+}
+
+impl RecoveryHandler {
+    pub const fn of<L: Layout>() -> Self {
+        Self {
+            schema: L::SCHEMA,
+            profile: AbiProfile::NATIVE,
+            run: recover_as::<L>,
+        }
+    }
+}
+
+unsafe fn recover_as<L: Layout>(
+    dir: &crate::dir::MapDirectory,
+    id: crate::dir::Id<()>,
+    recorded: RecordedLayout,
+    dead: u8,
+    live: u8,
+) -> bool {
+    unsafe { dir.recover_layout::<L>(id, recorded, dead, live) }
+}
+
+impl RecordedLayout {
+    pub(crate) fn mismatch<L: Layout>(self) -> Option<LayoutField> {
+        (self.magic != L::MAGIC)
+            .then_some(LayoutField::Magic)
+            .or_else(|| (self.schema.id != L::SCHEMA.id).then_some(LayoutField::Schema))
+            .or_else(|| {
+                (self.schema.revision != L::SCHEMA.revision).then_some(LayoutField::Revision)
+            })
+    }
+}
+
+pub(crate) unsafe fn recorded_at(pointer: *const u8) -> Result<RecordedLayout, AdmitError> {
+    let record = unsafe { &*pointer.cast::<Record>() };
+    if Status::from_u8(record.status.load(Ordering::Acquire)) != Status::Initialized {
+        return Err(AdmitError::Mismatch(LayoutField::State));
+    }
+    if record.format != RECORD_FORMAT {
+        return Err(AdmitError::Mismatch(LayoutField::Format));
+    }
+    let profile = record.profile();
+    if profile != AbiProfile::NATIVE {
+        return Err(AdmitError::Mismatch(LayoutField::Profile));
+    }
+    let extent = usize::try_from(u64::from_le_bytes(record.extent))
+        .map_err(|_| AdmitError::Mismatch(LayoutField::Extent))?;
+    let extent_align = usize::try_from(u64::from_le_bytes(record.extent_align))
+        .map_err(|_| AdmitError::Mismatch(LayoutField::ExtentAlign))?;
+    if extent < mem::size_of::<Record>() {
+        return Err(AdmitError::Mismatch(LayoutField::Extent));
+    }
+    if !extent_align.is_power_of_two() || !pointer.addr().is_multiple_of(extent_align) {
+        return Err(AdmitError::Mismatch(LayoutField::ExtentAlign));
+    }
+    Ok(RecordedLayout {
+        schema: SchemaKey::new(
+            SchemaId(u64::from_le_bytes(record.schema)),
+            u32::from_le_bytes(record.revision),
+        ),
+        profile,
+        magic: u16::from_le_bytes(record.magic),
+        extent,
+        extent_align,
+    })
+}
+
 const CLOSED: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -134,9 +302,10 @@ pub(crate) enum CloseError {
 
 impl<T: Layout + core::fmt::Debug> core::fmt::Debug for RcHeader<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let status = Status::from_u8(self.status.load(Ordering::Relaxed));
+        let status = Status::from_u8(self.record.status.load(Ordering::Relaxed));
+        let magic = u16::from_le_bytes(self.record.magic);
         f.debug_struct("RcHeader")
-            .field("magic", &self.magic)
+            .field("magic", &magic)
             .field("status", &status)
             .field("inner", &self.inner)
             .finish()
@@ -154,7 +323,7 @@ impl<T: Layout> const Deref for RcHeader<T> {
 impl<T: Layout> RcHeader<T> {
     #[inline]
     pub fn status(&self) -> Status {
-        Status::from_u8(self.status.load(Ordering::Acquire))
+        Status::from_u8(self.record.status.load(Ordering::Acquire))
     }
 
     #[inline]
@@ -197,9 +366,8 @@ impl<T: Layout> RcHeader<T> {
     }
 
     pub(crate) unsafe fn published_region_at(pointer: *const Self) -> Option<RegionId> {
-        let status = unsafe { &*ptr::addr_of!((*pointer).status) };
-        (Status::from_u8(status.load(Ordering::Acquire)) == Status::Initialized)
-            .then(|| unsafe { ptr::addr_of!((*pointer).region).read() })
+        unsafe { recorded_at(pointer.cast()) }.ok()?;
+        Some(unsafe { ptr::addr_of!((*pointer).region).read() })
     }
 }
 
@@ -233,13 +401,18 @@ impl<T: Layout> SharedSchema for RcHeader<T> {
 }
 
 impl<T: Layout> AdmitLayout for RcHeader<T> {
+    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout> {
+        T::storage(conf)
+    }
+
     unsafe fn admit(
         pointer: *mut Self,
         conf: Self::Config,
         ctx: LayoutContext,
         slot: Option<u8>,
     ) -> Result<(), AdmitError> {
-        let status = unsafe { &*ptr::addr_of!((*pointer).status) };
+        let layout = T::storage(&conf).ok_or(AdmitError::InvalidHeader)?;
+        let status = unsafe { &*ptr::addr_of!((*pointer).record.status) };
         loop {
             match Status::from_u8(status.load(Ordering::Acquire)) {
                 Status::Uninitialized if !ctx.allow_init => {
@@ -296,9 +469,8 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
         let info = T::info(&conf, ctx);
         let bit = slot.map_or(0, |slot| 1usize << slot);
         unsafe {
-            ptr::addr_of_mut!((*pointer).revision).write(T::SCHEMA.revision);
+            Record::initialize::<T>(ptr::addr_of_mut!((*pointer).record), layout);
             ptr::addr_of_mut!((*pointer).members).write(AtomicUsize::new(bit));
-            ptr::addr_of_mut!((*pointer).schema).write(T::SCHEMA.id);
             ptr::addr_of_mut!((*pointer).region).write(ctx.region);
             ptr::addr_of_mut!((*pointer).offset).write(ctx.offset);
             ptr::addr_of_mut!((*pointer).header_size).write(mem::size_of::<Self>() as u64);
@@ -316,8 +488,6 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
         if unsafe { T::init(ptr::addr_of_mut!((*pointer).inner), conf) } != Status::Initialized {
             return Err(AdmitError::InvalidHeader);
         }
-        let magic = unsafe { &*ptr::addr_of!((*pointer).magic) };
-        magic.store(T::MAGIC, Ordering::Release);
         status.store(Status::Initialized as u8, Ordering::Release);
         membership.disarm();
         claim.disarm();
@@ -361,13 +531,9 @@ impl<T: Layout> RcHeader<T> {
         pointer: *const Self,
         ctx: LayoutContext,
     ) -> Result<T::Info, AdmitError> {
-        let status = unsafe { &*ptr::addr_of!((*pointer).status) };
-        if Status::from_u8(status.load(Ordering::Acquire)) != Status::Initialized {
-            return Err(AdmitError::Mismatch(LayoutField::State));
-        }
-        let magic = unsafe { &*ptr::addr_of!((*pointer).magic) };
-        if magic.load(Ordering::Acquire) != T::MAGIC {
-            return Err(AdmitError::Mismatch(LayoutField::Magic));
+        let recorded = unsafe { recorded_at(pointer.cast()) }?;
+        if let Some(field) = recorded.mismatch::<T>() {
+            return Err(AdmitError::Mismatch(field));
         }
         macro_rules! check {
             ($member:ident, $expected:expr, $field:ident) => {
@@ -376,8 +542,6 @@ impl<T: Layout> RcHeader<T> {
                 }
             };
         }
-        check!(revision, T::SCHEMA.revision, Revision);
-        check!(schema, T::SCHEMA.id, Schema);
         check!(region, ctx.region, Region);
         check!(offset, ctx.offset, Offset);
         check!(header_size, mem::size_of::<Self>() as u64, HeaderSize);
@@ -401,6 +565,15 @@ impl<T: Layout> RcHeader<T> {
             Err(AdmitError::Mismatch(field)) => return Some(field),
             Err(_) => return Some(LayoutField::State),
         };
+        let Some(layout) = T::storage(conf) else {
+            return Some(LayoutField::Extent);
+        };
+        if unsafe { (*pointer).record.extent } != (layout.size() as u64).to_le_bytes() {
+            return Some(LayoutField::Extent);
+        }
+        if unsafe { (*pointer).record.extent_align } != (layout.align() as u64).to_le_bytes() {
+            return Some(LayoutField::ExtentAlign);
+        }
         if info != T::info(conf, ctx) {
             return Some(LayoutField::Info);
         }
@@ -470,6 +643,10 @@ unsafe impl Layout for () {
 }
 
 impl AdmitLayout for () {
+    fn storage(_: &Self::Config) -> Option<core::alloc::Layout> {
+        Some(core::alloc::Layout::new::<Self>())
+    }
+
     unsafe fn admit(
         _: *mut Self,
         _: Self::Config,
@@ -634,13 +811,16 @@ impl Root {
 
 #[cfg(test)]
 mod admission_tests {
-    use super::{AdmitError, AdmitLayout, Layout, LayoutField, RcHeader as Header, Root, Status};
+    use super::{
+        AdmitError, AdmitLayout, Layout, LayoutField, RECORD_FORMAT, RcHeader as Header, Root,
+        Status,
+    };
     use crate::schema::{
         LayoutContext, RegionId, SchemaKey, SharedSchema, compose_const, schema_id,
     };
+    use core::mem::MaybeUninit;
     use core::panic::AssertUnwindSafe;
     use core::sync::atomic::{AtomicUsize, Ordering};
-    use core::{mem::MaybeUninit, ptr};
 
     struct Reject;
 
@@ -926,7 +1106,7 @@ mod admission_tests {
         const SCHEMA: SchemaKey = SchemaKey::new(schema_id("test.wide-info"), 1);
     }
 
-    unsafe impl crate::LayoutInfo for WideInfo {}
+    unsafe impl crate::schema::LayoutInfo for WideInfo {}
 
     struct Narrow;
     struct Wide;
@@ -1013,6 +1193,29 @@ mod admission_tests {
     }
 
     #[test]
+    fn malformed_bootstrap_profile_is_rejected_before_typed_information() {
+        let mut storage = MaybeUninit::<Header<Root>>::zeroed();
+        let pointer = storage.as_mut_ptr();
+        let ctx = LayoutContext {
+            region: RegionId::new(41, 42),
+            offset: 0,
+            allow_init: true,
+        };
+        unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) }.unwrap();
+        unsafe { pointer.cast::<u8>().add(1).write(0) };
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) },
+            Err(AdmitError::Mismatch(LayoutField::Format))
+        );
+        unsafe { pointer.cast::<u8>().add(1).write(RECORD_FORMAT) };
+        unsafe { pointer.cast::<u8>().add(2).write(0) };
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) },
+            Err(AdmitError::Mismatch(LayoutField::Profile))
+        );
+    }
+
+    #[test]
     fn layout_membership_is_unique_until_the_owner_leaves() {
         let mut storage = MaybeUninit::<Header<Root>>::zeroed();
         let pointer = storage.as_mut_ptr();
@@ -1051,25 +1254,37 @@ mod admission_tests {
         };
         unsafe { <Header<Reject> as AdmitLayout>::admit(pointer, (&INITS, false), ctx, None) }
             .unwrap();
-        macro_rules! reject_changed {
+        macro_rules! reject_record {
             ($member:ident, $field:ident) => {{
-                let field = unsafe { ptr::addr_of_mut!((*pointer).$member) };
-                let saved = unsafe { field.read() };
-                unsafe { field.write(saved.wrapping_add(1)) };
+                unsafe { (*pointer).record.$member[0] ^= 1 };
                 assert_eq!(
                     unsafe {
                         <Header<Reject> as AdmitLayout>::admit(pointer, (&INITS, false), ctx, None)
                     },
                     Err(AdmitError::Mismatch(LayoutField::$field))
                 );
-                unsafe { field.write(saved) };
+                unsafe { (*pointer).record.$member[0] ^= 1 };
             }};
         }
-        reject_changed!(header_size, HeaderSize);
-        reject_changed!(header_align, HeaderAlign);
-        reject_changed!(info_size, InfoSize);
-        reject_changed!(info_align, InfoAlign);
-        reject_changed!(body_size, Size);
-        reject_changed!(body_align, Align);
+        reject_record!(extent, Extent);
+        reject_record!(extent_align, ExtentAlign);
+        macro_rules! reject_field {
+            ($member:ident, $field:ident) => {{
+                unsafe { (*pointer).$member += 1 };
+                assert_eq!(
+                    unsafe {
+                        <Header<Reject> as AdmitLayout>::admit(pointer, (&INITS, false), ctx, None)
+                    },
+                    Err(AdmitError::Mismatch(LayoutField::$field))
+                );
+                unsafe { (*pointer).$member -= 1 };
+            }};
+        }
+        reject_field!(header_size, HeaderSize);
+        reject_field!(header_align, HeaderAlign);
+        reject_field!(info_size, InfoSize);
+        reject_field!(info_align, InfoAlign);
+        reject_field!(body_size, Size);
+        reject_field!(body_align, Align);
     }
 }

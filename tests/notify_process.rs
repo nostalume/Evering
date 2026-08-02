@@ -2,7 +2,10 @@
 
 use std::{env, process::Command, time::Duration};
 
-use evering::{Listen, Notify, os, runtime};
+use evering::{
+    notify::{Notify, Wait as _},
+    os, runtime,
+};
 
 const CHILD: &str = "EVERING_NOTIFY_CHILD";
 const HANDLE: &str = "EVERING_NOTIFY_HANDLE";
@@ -27,8 +30,7 @@ fn wait_cross_process() {
             .unwrap()
             .block_on(async move {
                 let wait = runtime::Wait::new(event).unwrap();
-                wait.ready().await.unwrap();
-                wait.clear().unwrap();
+                wait.wait().await.unwrap();
             });
         return;
     }
@@ -101,7 +103,7 @@ fn peer_exit_cancels_wait_without_fabricating_readiness() {
 
     runtime.block_on(async {
         tokio::select! {
-            result = wait.ready() => panic!("peer exit fabricated readiness: {result:?}"),
+            result = wait.wait() => panic!("peer exit fabricated readiness: {result:?}"),
             result = status => assert!(result.unwrap().unwrap().success()),
         }
     });

@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
 
-use super::model::{
-    Contrast, ContrastKey, Policy, Status, Study, StudyError, Trial, load, validate_study,
+use super::{
+    family::Family,
+    model::{Condition, Meta, Status, Study, StudyError, Trial, load, schedule, validate_study},
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14,48 +15,38 @@ pub enum Decision {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Estimate {
-    pub contrast: Contrast,
+    pub condition: Condition,
+    pub candidate: &'static str,
     pub blocks: usize,
     pub effect: f64,
     pub low: f64,
     pub high: f64,
-    pub decision: Decision,
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub enum Authority {
+    Screening,
+    Focused(Vec<Decision>),
+}
+
 pub struct Analysis {
-    pub os: String,
-    pub target: String,
-    pub family: usize,
-    pub artifacts: Vec<String>,
+    pub(super) specification: &'static Family,
+    pub(super) meta: Meta,
     pub estimates: Vec<Estimate>,
-    pub crossovers: Vec<(Policy, u64, Decision)>,
+    pub authority: Authority,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Error {
     Study(StudyError),
-    Environment,
     Family,
     Pair,
+    Duplicate,
 }
 
-fn contrast(trial: &Trial) -> Option<Contrast> {
-    let candidate = match trial.cell.candidate.as_str() {
-        "busy" => Policy::Busy,
-        "adaptive" => Policy::Adaptive,
-        "notified" => Policy::Notified,
-        _ => return None,
-    };
-    Some(Contrast {
-        key: ContrastKey {
-            payload: trial.cell.payload,
-            capacity: trial.cell.capacity,
-            in_flight: trial.cell.in_flight,
-            memory: trial.cell.memory,
-        },
-        candidate,
-    })
+fn comparison(family: &Family, trial: &Trial) -> Option<(Condition, &'static str)> {
+    let arm = family.arm(&trial.cell.arm)?;
+    (arm.key != family.baseline.key).then_some((trial.cell.condition(), arm.key))
 }
 
 fn random(state: &mut u64) -> u64 {
@@ -81,14 +72,16 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
-fn estimate(key: Contrast, logs: &[f64], seed: u64, family: usize) -> Estimate {
+fn estimate(
+    condition: Condition,
+    candidate: &'static str,
+    logs: &[f64],
+    seed: u64,
+    tail: f64,
+) -> Estimate {
     let mut point = logs.to_vec();
     let effect = median(&mut point).exp();
-    let mut state = seed
-        ^ key.key.payload
-        ^ key.key.capacity.rotate_left(11)
-        ^ key.key.in_flight.rotate_left(23)
-        ^ (key.candidate as u64).rotate_left(37);
+    let mut state = seed;
     let mut samples = Vec::with_capacity(10_000);
     for _ in 0..10_000 {
         let mut sample = (0..logs.len())
@@ -96,174 +89,207 @@ fn estimate(key: Contrast, logs: &[f64], seed: u64, family: usize) -> Estimate {
             .collect::<Vec<_>>();
         samples.push(median(&mut sample).exp());
     }
-    let tail = 0.05 / (2.0 * family as f64);
-    let low = quantile(&mut samples, tail);
-    let high = quantile(&mut samples, 1.0 - tail);
-    let decision = if low >= 0.95 && high <= 1.05 {
-        Decision::Equivalent
-    } else if low > 1.05 {
-        Decision::Faster
-    } else if high < 0.95 {
-        Decision::Slower
-    } else {
-        Decision::Inconclusive
-    };
     Estimate {
-        contrast: key,
+        condition,
+        candidate,
         blocks: logs.len(),
         effect,
-        low,
-        high,
-        decision,
+        low: quantile(&mut samples, tail),
+        high: quantile(&mut samples, 1.0 - tail),
     }
 }
 
-pub fn analyze(studies: &[Study]) -> Result<Analysis, Error> {
-    let first = studies.first().ok_or(Error::Family)?;
-    let mut family = BTreeSet::new();
-    for study in studies {
-        validate_study(study).map_err(Error::Study)?;
-        if study.meta.os != first.meta.os
-            || study.meta.target != first.meta.target
-            || study.meta.arch != first.meta.arch
-            || study.meta.host != first.meta.host
-            || study.meta.rustc != first.meta.rustc
-            || study.meta.mode != first.meta.mode
-            || study.meta.seed != first.meta.seed
-            || study.meta.warmup != first.meta.warmup
-            || study.meta.spin != first.meta.spin
-        {
-            return Err(Error::Environment);
-        }
-        let current = study
-            .trials
-            .iter()
-            .filter(|trial| trial.block == 0 && trial.cell.implementation == "evering")
-            .filter_map(contrast)
-            .collect::<BTreeSet<_>>();
-        if family.is_empty() {
-            family = current;
-        } else if current != family {
-            return Err(Error::Family);
-        }
+fn decision(estimate: &Estimate) -> Decision {
+    if estimate.low >= 0.95 && estimate.high <= 1.05 {
+        Decision::Equivalent
+    } else if estimate.low > 1.05 {
+        Decision::Faster
+    } else if estimate.high < 0.95 {
+        Decision::Slower
+    } else {
+        Decision::Inconclusive
     }
-    if family.is_empty() {
+}
+
+fn admit(study: &Study) -> Result<(&'static Family, bool, usize), Error> {
+    validate_study(study).map_err(Error::Study)?;
+    let family = super::family::find(&study.meta.family)
+        .filter(|family| family.revision == study.meta.family_revision)
+        .ok_or(Error::Family)?;
+    let focused = match study.meta.mode.as_str() {
+        "screening" => false,
+        "focused" => true,
+        _ => return Err(Error::Family),
+    };
+    let (_, blocks) = family.mode(&study.meta.mode).ok_or(Error::Family)?;
+    let members = (family.members)(&study.meta.mode).ok_or(Error::Family)?;
+    let expected = schedule(&members, blocks, study.meta.seed);
+    let mut actual = study.trials.iter().collect::<Vec<_>>();
+    actual.sort_unstable_by_key(|trial| (trial.block, trial.order));
+    if study.meta.blocks != blocks
+        || study.meta.expected != expected.len()
+        || actual.iter().zip(expected).any(|(trial, expected)| {
+            trial.block != expected.block
+                || trial.order != expected.order
+                || trial.cell.condition() != expected.condition
+                || trial.cell.arm != expected.arm.key
+        })
+    {
         return Err(Error::Family);
     }
-    let mut estimates = Vec::with_capacity(family.len());
-    for key in family.iter().copied() {
-        let mut logs = Vec::new();
-        for study in studies {
-            for block in 0..study.meta.blocks {
-                let mut arms = study
-                    .trials
-                    .iter()
-                    .filter(|trial| trial.block == block && contrast(trial) == Some(key));
-                let candidate = arms
-                    .clone()
-                    .find(|trial| trial.cell.implementation == "evering");
-                let baseline = arms.find(|trial| trial.cell.implementation == "os-stream");
-                let (Some(candidate), Some(baseline)) = (candidate, baseline) else {
-                    return Err(Error::Pair);
-                };
-                if candidate.status != Status::Ok || baseline.status != Status::Ok {
-                    return Err(Error::Pair);
-                }
-                let rate = |trial: &Trial| {
-                    trial.validated as f64 * 1e9 / trial.elapsed_ns.expect("validated study") as f64
-                };
-                logs.push((rate(candidate) / rate(baseline)).ln());
+    let comparisons = members
+        .iter()
+        .filter(|(_, arm)| arm.key != family.baseline.key)
+        .count();
+    (comparisons > 0)
+        .then_some((family, focused, comparisons))
+        .ok_or(Error::Family)
+}
+
+pub fn analyze(study: &Study) -> Result<Analysis, Error> {
+    let (family, focused, comparisons) = admit(study)?;
+    let candidates = study
+        .trials
+        .iter()
+        .filter(|trial| trial.block == 0)
+        .filter_map(|trial| comparison(family, trial))
+        .collect::<BTreeSet<_>>();
+    if candidates.len() != comparisons {
+        return Err(Error::Family);
+    }
+    let tail = if focused {
+        0.05 / (2.0 * comparisons as f64)
+    } else {
+        0.025
+    };
+    let mut estimates = Vec::with_capacity(comparisons);
+    for (condition, candidate) in candidates {
+        let mut logs = Vec::with_capacity(study.meta.blocks as usize);
+        for block in 0..study.meta.blocks {
+            let candidate = study.trials.iter().find(|trial| {
+                trial.block == block && comparison(family, trial) == Some((condition, candidate))
+            });
+            let baseline = study.trials.iter().find(|trial| {
+                trial.block == block
+                    && trial.cell.condition() == condition
+                    && trial.cell.arm == family.baseline.key
+            });
+            let (Some(candidate), Some(baseline)) = (candidate, baseline) else {
+                return Err(Error::Pair);
+            };
+            if candidate.status != Status::Ok || baseline.status != Status::Ok {
+                return Err(Error::Pair);
             }
+            let rate = |trial: &Trial| {
+                trial.validated as f64 * 1e9 / trial.elapsed_ns.expect("validated study") as f64
+            };
+            logs.push((rate(candidate) / rate(baseline)).ln());
         }
-        estimates.push(estimate(key, &logs, first.meta.seed, family.len()));
+        estimates.push(estimate(condition, candidate, &logs, study.meta.seed, tail));
     }
-    let mut crossovers = Vec::new();
-    for policy in [Policy::Busy, Policy::Adaptive, Policy::Notified] {
-        let ordered = estimates
-            .iter()
-            .filter(|estimate| estimate.contrast.candidate == policy)
-            .collect::<Vec<_>>();
-        if let Some(pair) = ordered.windows(2).find(|pair| {
-            pair[0].decision == pair[1].decision
-                && matches!(pair[0].decision, Decision::Faster | Decision::Slower)
-                && pair[0].contrast.key.payload < pair[1].contrast.key.payload
-                && pair[0].contrast.key.capacity == pair[1].contrast.key.capacity
-                && pair[0].contrast.key.in_flight == pair[1].contrast.key.in_flight
-        }) {
-            crossovers.push((policy, pair[0].contrast.key.payload, pair[0].decision));
-        }
-    }
+    let authority = if focused {
+        Authority::Focused(estimates.iter().map(decision).collect())
+    } else {
+        Authority::Screening
+    };
     Ok(Analysis {
-        os: first.meta.os.clone(),
-        target: first.meta.target.clone(),
-        family: family.len(),
-        artifacts: studies
-            .iter()
-            .map(|study| {
-                format!(
-                    "{}:{}#0..{}",
-                    study.meta.revision, study.meta.schedule, study.meta.blocks
-                )
-            })
-            .collect(),
+        specification: family,
+        meta: study.meta.clone(),
         estimates,
-        crossovers,
+        authority,
     })
 }
 
 impl Analysis {
-    pub fn markdown(&self) -> String {
+    fn markdown(&self) -> String {
         use core::fmt::Write;
 
+        let focused = match &self.authority {
+            Authority::Screening => false,
+            Authority::Focused(_) => true,
+        };
+        let authority = if focused {
+            "Focused evidence authorizes registered familywise decisions."
+        } else {
+            "Screening is descriptive; it authorizes no performance decision."
+        };
+        let meta = &self.meta;
+        let family = self.specification;
         let mut output = format!(
-            "# IPC analysis\n\nEnvironment: `{}` on `{}`. Family: {}. Evidence: {}.\n\n\
-             | policy | payload | capacity | in-flight | memory | blocks | effect | interval | decision |\n\
-             |---|---:|---:|---:|---:|---:|---:|---:|---|\n",
-            self.os,
-            self.target,
-            self.family,
-            self.artifacts.join(", ")
+            "## {}/v{} — {}\n\n{authority}\n\nEnvironment: `{}` / `{}`; host `{}`; rustc `{}`. \
+             Evidence: `{}`. Limit: {} s. Baseline: `{}`.\n\n\
+             | arm | payload | capacity | in-flight | memory | blocks | effect | interval |{}\
+             \n|---|---:|---:|---:|---:|---:|---:|---:|{}",
+            family.key,
+            family.revision,
+            meta.mode,
+            meta.os,
+            meta.target,
+            meta.host,
+            meta.rustc,
+            format_args!("{}:{}#0..{}", meta.revision, meta.schedule, meta.blocks),
+            family.mode(&meta.mode).unwrap().0.as_secs(),
+            family.baseline.key,
+            if focused { " decision |" } else { "" },
+            if focused { "---|" } else { "" },
         );
-        for estimate in &self.estimates {
-            writeln!(
+        for (index, estimate) in self.estimates.iter().enumerate() {
+            write!(
                 output,
-                "| {:?} | {} | {} | {} | {} | {} | {:.6} | [{:.6}, {:.6}] | {:?} |",
-                estimate.contrast.candidate,
-                estimate.contrast.key.payload,
-                estimate.contrast.key.capacity,
-                estimate.contrast.key.in_flight,
-                estimate.contrast.key.memory,
+                "\n| {} | {} | {} | {} | {} | {} | {:.6} | [{:.6}, {:.6}] |",
+                estimate.candidate,
+                estimate.condition.payload,
+                estimate.condition.capacity,
+                estimate.condition.in_flight,
+                estimate.condition.memory,
                 estimate.blocks,
                 estimate.effect,
                 estimate.low,
                 estimate.high,
-                estimate.decision
             )
             .expect("String writes cannot fail");
+            if let Authority::Focused(decisions) = &self.authority {
+                write!(output, " {:?} |", decisions[index]).expect("String writes cannot fail");
+            }
         }
-        for (policy, payload, decision) in &self.crossovers {
-            writeln!(
-                output,
-                "\nCrossover: {policy:?} at {payload} bytes ({decision:?})."
-            )
-            .expect("String writes cannot fail");
-        }
+        output.push_str("\n\n");
         output
     }
+}
+
+pub(super) fn analyses(studies: &[Study]) -> Result<Vec<Analysis>, Error> {
+    let mut analyses = studies.iter().map(analyze).collect::<Result<Vec<_>, _>>()?;
+    analyses.sort_by_key(|analysis| analysis.specification.key);
+    if analyses
+        .windows(2)
+        .any(|pair| pair[0].specification.key == pair[1].specification.key)
+    {
+        return Err(Error::Duplicate);
+    }
+    Ok(analyses)
+}
+
+pub fn report(studies: &[Study]) -> Result<String, Error> {
+    let analyses = analyses(studies)?;
+    let mut output = String::from("# IPC study\n\n");
+    analyses
+        .iter()
+        .for_each(|analysis| output.push_str(&analysis.markdown()));
+    Ok(output)
+}
+
+pub(super) fn complete(path: &str) -> Result<Study, String> {
+    let loaded = load(std::path::Path::new(path))?;
+    loaded
+        .complete
+        .then_some(loaded.study)
+        .ok_or_else(|| format!("{path}: incomplete evidence"))
 }
 
 pub fn command(paths: &[String]) -> Result<String, String> {
     let studies = paths
         .iter()
-        .map(|path| {
-            let loaded = load(std::path::Path::new(path))?;
-            loaded
-                .complete
-                .then_some(loaded.study)
-                .ok_or_else(|| format!("{path}: incomplete evidence"))
-        })
+        .map(|path| complete(path))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(analyze(&studies)
-        .map_err(|error| format!("{error:?}"))?
-        .markdown())
+    report(&studies).map_err(|error| format!("{error:?}"))
 }

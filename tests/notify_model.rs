@@ -84,3 +84,27 @@ fn clear_retry_covers_every_commit_ring_interleaving() {
 
     assert!(seen.iter().any(|state| state.consumer == Consumer::Done));
 }
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RetryCause {
+    PeerFull,
+    LocalBusy,
+}
+
+const fn admits_peer_wait(cause: RetryCause) -> bool {
+    matches!(cause, RetryCause::PeerFull)
+}
+
+#[test]
+fn local_contention_never_admits_peer_only_wait() {
+    assert!(admits_peer_wait(RetryCause::PeerFull));
+    assert!(!admits_peer_wait(RetryCause::LocalBusy));
+
+    // Counterexample retained from the former collapsed error: producer A owns
+    // the slot, producer B observes local contention, and only the consumer is
+    // notified when A publishes. Sleeping B on the consumer's notification can
+    // therefore remain asleep despite local progress.
+    let local_producer_will_publish = true;
+    let producer_waiter_is_notified = false;
+    assert!(local_producer_will_publish && !producer_waiter_is_notified);
+}

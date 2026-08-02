@@ -1,15 +1,10 @@
 #[cfg(unix)]
 mod imp {
-    use core::{
-        future::Future,
-        pin::Pin,
-        task::{Context, Poll},
-    };
     use std::io;
 
     use tokio::io::unix::AsyncFd;
 
-    use crate::{Listen, os::Event};
+    use crate::{notify::Wait as WaitFor, os::Event};
 
     pub struct Wait(AsyncFd<Event>);
 
@@ -17,39 +12,16 @@ mod imp {
         pub fn new(event: Event) -> io::Result<Self> {
             AsyncFd::new(event).map(Self)
         }
-
-        pub fn into_inner(self) -> Event {
-            self.0.into_inner()
-        }
     }
 
-    pub struct Ready<'a>(&'a AsyncFd<Event>);
-
-    impl Future for Ready<'_> {
-        type Output = io::Result<()>;
-
-        fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-            match self.0.poll_read_ready(cx) {
-                Poll::Ready(Ok(mut guard)) => {
-                    guard.clear_ready();
-                    Poll::Ready(Ok(()))
-                }
-                Poll::Ready(Err(error)) => Poll::Ready(Err(error)),
-                Poll::Pending => Poll::Pending,
-            }
-        }
-    }
-
-    impl Listen for Wait {
+    impl WaitFor for Wait {
         type Error = io::Error;
-        type Ready<'a> = Ready<'a>;
 
-        fn ready(&self) -> Self::Ready<'_> {
-            Ready(&self.0)
-        }
-
-        fn clear(&self) -> Result<(), Self::Error> {
-            self.0.get_ref().clear().map_err(Into::into)
+        async fn wait(&self) -> Result<(), Self::Error> {
+            let mut ready = self.0.readable().await?;
+            self.0.get_ref().clear().map_err(io::Error::from)?;
+            ready.clear_ready();
+            Ok(())
         }
     }
 }
@@ -75,17 +47,13 @@ mod imp {
         },
     };
 
-    use crate::{Listen, os::Event};
+    use crate::{notify::Wait as WaitFor, os::Event};
 
     pub struct Wait(Event);
 
     impl Wait {
         pub fn new(event: Event) -> io::Result<Self> {
             Ok(Self(event))
-        }
-
-        pub fn into_inner(self) -> Event {
-            self.0
         }
     }
 
@@ -188,15 +156,11 @@ mod imp {
         }
     }
 
-    impl Listen for Wait {
+    impl WaitFor for Wait {
         type Error = io::Error;
-        type Ready<'a> = Ready<'a>;
 
-        fn ready(&self) -> Self::Ready<'_> {
-            Ready::new(&self.0)
-        }
-
-        fn clear(&self) -> Result<(), Self::Error> {
+        async fn wait(&self) -> Result<(), Self::Error> {
+            Ready::new(&self.0).await?;
             self.0.clear()
         }
     }
@@ -207,7 +171,10 @@ pub use imp::Wait;
 
 #[cfg(all(test, any(unix, windows)))]
 mod tests {
-    use crate::{Listen, Notify, os};
+    use crate::{
+        notify::{Notify, Wait as _},
+        os,
+    };
 
     #[tokio::test]
     async fn native_event_is_sticky_before_runtime_registration() {
@@ -216,10 +183,9 @@ mod tests {
 
         let event = super::Wait::new(event).unwrap();
         fn require_send<T: Send>(_: T) {}
-        require_send(event.ready());
+        require_send(event.wait());
 
-        event.ready().await.unwrap();
-        event.clear().unwrap();
+        event.wait().await.unwrap();
     }
 
     #[tokio::test]
@@ -229,10 +195,27 @@ mod tests {
         let event = super::Wait::new(event).unwrap();
 
         {
-            let _cancelled = event.ready();
+            let _cancelled = event.wait();
         }
         ring.notify().unwrap();
-        event.ready().await.unwrap();
-        event.clear().unwrap();
+        event.wait().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_notification_releases_all_registered_waiters() {
+        let (ring, event) = os::event().unwrap();
+        let event = super::Wait::new(event).unwrap();
+        let first = async { event.wait().await.unwrap() };
+        let second = async { event.wait().await.unwrap() };
+        let notify = async {
+            tokio::task::yield_now().await;
+            ring.notify().unwrap();
+        };
+
+        tokio::time::timeout(core::time::Duration::from_secs(1), async {
+            tokio::join!(first, second, notify);
+        })
+        .await
+        .expect("one sticky notification must release existing waiters");
     }
 }

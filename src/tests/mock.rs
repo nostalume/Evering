@@ -5,7 +5,7 @@ mod talc;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::mem::{Access, Map, MapLayout, MapView};
+use crate::mem::{Access, Build, Map};
 
 const MAX_ADDR: usize = 0x20000;
 
@@ -27,7 +27,15 @@ unsafe fn count_release(start: NonNull<u8>, len: usize) -> bool {
 }
 
 impl MockBackend<'_> {
-    fn shared(self, start: usize, size: usize) -> MapLayout {
+    fn shared(self, start: usize, size: usize) -> Build {
+        self.map(
+            start,
+            size,
+            crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(0, start as u64)),
+        )
+    }
+
+    fn map(self, start: usize, size: usize, admission: crate::schema::RegionAdmission) -> Build {
         assert!(
             start
                 .checked_add(size)
@@ -36,18 +44,13 @@ impl MockBackend<'_> {
         let pointer = NonNull::new(unsafe { self.0.as_mut_ptr().add(start) }).unwrap();
         let map =
             unsafe { Map::from_raw_parts(pointer, size, Access::READ | Access::WRITE, release) };
-        MapLayout::new(
-            map,
-            crate::RegionAdmission::Create(crate::RegionId::new(0, start as u64)),
-        )
-        .unwrap()
+        Build::new(map, admission).unwrap()
     }
 }
 
-type MockMapView = MapView;
-fn mock_view(bk: &mut [u8], start: usize, size: usize) -> MockMapView {
+fn mock_view(bk: &mut [u8], start: usize, size: usize) -> Build {
     let bk = MockBackend(bk);
-    bk.shared(start, size).try_into().unwrap()
+    bk.shared(start, size)
 }
 
 #[test]
@@ -76,7 +79,7 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
         type Config = u32;
         type Info = ();
 
-        const MAGIC: crate::LayoutMagic = 0xC17;
+        const MAGIC: crate::header::Magic = 0xC17;
 
         fn info(_: &Self::Config, _: LayoutContext) {}
 
@@ -102,7 +105,7 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
         type Config = ();
         type Info = ();
 
-        const MAGIC: crate::LayoutMagic = 0xBAD;
+        const MAGIC: crate::header::Magic = 0xBAD;
 
         fn info(_: &Self::Config, _: LayoutContext) {}
 
@@ -146,14 +149,13 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
 
     let dead = directory.peer().slot().wrapping_add(1);
     directory.abandon_released_for_test(id, dead);
-    let recovery = directory.recovery_for_test(dead);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Released)
     );
     directory.abandon_held_reservation_for_test(dead);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::RolledBack)
     );
 
@@ -161,7 +163,7 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
     let (before_close, mapped) = directory.create::<Created>(&heap, 93).unwrap();
     directory.abandon_prepared_remove_for_test(&heap, before_close, mapped, layout, dead, false);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::RolledBack)
     );
     assert_eq!(directory.open(before_close, 93).unwrap().inner.0, 93);
@@ -169,7 +171,7 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
     let (after_close, mapped) = directory.create::<Created>(&heap, 94).unwrap();
     directory.abandon_prepared_remove_for_test(&heap, after_close, mapped, layout, dead, true);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Released)
     );
     assert!(matches!(
@@ -179,6 +181,21 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
 
     let (_, replacement) = directory.create::<Created>(&heap, 92).unwrap();
     assert_eq!(replacement.inner.0, 92);
+
+    let (vacant, mapped) = directory.create::<Created>(&heap, 95).unwrap();
+    drop(mapped);
+    directory.abandon_vacant_remove_for_test(vacant, dead);
+    heap.abandon_mutation_for_test(dead);
+    assert_eq!(
+        directory.recover(&heap, dead),
+        Ok(crate::dir::Recovered::Released)
+    );
+    assert!(heap.finish_recovery(dead));
+    assert!(heap.finish_recovery(dead));
+    assert_eq!(
+        heap.allocate(core::alloc::Layout::new::<u64>()),
+        Err(crate::talc::MutationError::Poisoned)
+    );
 }
 
 #[test]
@@ -196,16 +213,23 @@ fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
 
     directory.abandon_allocated_create_for_test(dead, meta);
     heap.abandon_mutation_for_test(dead);
-    let recovery = directory.recovery_for_test(dead);
+
+    assert!(!heap.finish_recovery(dead.wrapping_add(1)));
+    assert_eq!(
+        heap.allocate(core::alloc::Layout::new::<u64>()),
+        Err(crate::talc::MutationError::Busy(dead))
+    );
 
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Quarantined)
     );
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
         Err(crate::talc::MutationError::Poisoned)
     );
+    assert!(heap.finish_recovery(dead));
+    assert!(heap.finish_recovery(dead));
 }
 
 #[test]
@@ -222,15 +246,13 @@ fn directory_recovery_rejects_authority_from_another_region() {
     let mut other_page_table = [0; MAX_ADDR];
     let mut other = MockBackend(&mut other_page_table).shared(1, MAX_ADDR - 1);
     let other_directory = other.push::<crate::dir::Header>(()).unwrap();
-    let wrong = other_directory.recovery_for_test(dead);
     assert_eq!(
-        directory.recover(&heap, &wrong),
+        other_directory.recover(&heap, dead),
         Err(crate::dir::Error::Stale)
     );
 
-    let recovery = directory.recovery_for_test(dead);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::RolledBack)
     );
 }
@@ -250,7 +272,7 @@ fn directory_grows_past_its_first_slab_and_reopens_every_layout() {
         type Config = u32;
         type Info = ();
 
-        const MAGIC: crate::LayoutMagic = 0x610;
+        const MAGIC: crate::header::Magic = 0x610;
 
         fn info(_: &Self::Config, _: LayoutContext) {}
 
@@ -312,18 +334,17 @@ fn directory_growth_recovery_rolls_back_unlinked_and_retains_linked_slabs() {
     let conf = crate::talc::Config::new(MAX_ADDR).with_bound(reserve.remaining_after());
     let heap = crate::talc::MapTalc::from_handle(reserve.commit(conf).unwrap());
     let dead = directory.peer().slot().wrapping_add(1);
-    let recovery = directory.recovery_for_test(dead);
 
     directory.abandon_growth_for_test(&heap, dead, false, true);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::RolledBack)
     );
     assert_eq!(directory.slab_count_for_test(), 1);
 
     directory.abandon_growth_for_test(&heap, dead, true, true);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Retained)
     );
     assert_eq!(directory.slab_count_for_test(), 2);
@@ -338,11 +359,10 @@ fn directory_growth_with_an_ambiguous_dead_heap_owner_is_leaked_and_poisoned() {
     let conf = crate::talc::Config::new(MAX_ADDR).with_bound(reserve.remaining_after());
     let heap = crate::talc::MapTalc::from_handle(reserve.commit(conf).unwrap());
     let dead = directory.peer().slot().wrapping_add(1);
-    let recovery = directory.recovery_for_test(dead);
 
     directory.abandon_growth_for_test(&heap, dead, false, false);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Quarantined)
     );
     assert_eq!(directory.slab_count_for_test(), 1);
@@ -361,11 +381,10 @@ fn dead_heap_owner_before_growth_evidence_poison_is_not_mistaken_for_rollback() 
     let conf = crate::talc::Config::new(MAX_ADDR).with_bound(reserve.remaining_after());
     let heap = crate::talc::MapTalc::from_handle(reserve.commit(conf).unwrap());
     let dead = directory.peer().slot().wrapping_add(1);
-    let recovery = directory.recovery_for_test(dead);
 
     directory.abandon_held_heap_for_test(&heap, dead);
     assert_eq!(
-        directory.recover(&heap, &recovery),
+        directory.recover(&heap, dead),
         Ok(crate::dir::Recovered::Quarantined)
     );
     assert_eq!(
@@ -391,11 +410,11 @@ fn failed_root_admission_releases_the_map() {
         unsafe { Map::from_raw_parts(pointer, bytes.len(), Access::READ | Access::WRITE, release) };
 
     assert!(matches!(
-        MapLayout::new(
+        Build::new(
             map,
-            crate::RegionAdmission::Create(crate::RegionId::new(1, 1))
+            crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(1, 1))
         ),
-        Err(crate::MapError::UnenoughSpace { .. })
+        Err(crate::mem::Error::UnenoughSpace { .. })
     ));
     assert_eq!(bytes, [0]);
 }
@@ -413,13 +432,13 @@ fn failed_session_composition_detaches_and_releases_once() {
     let pointer = NonNull::new(storage.0.as_mut_ptr()).unwrap();
     let map =
         unsafe { Map::from_raw_parts(pointer, len, Access::READ | Access::WRITE, count_release) };
-    let layout = MapLayout::new(
+    let layout = Build::new(
         map,
-        crate::RegionAdmission::Create(crate::RegionId::new(2, 2)),
+        crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(2, 2)),
     )
     .expect("root fits");
 
-    assert!(crate::perlude::talc::SessionBy::<()>::from(layout).is_err());
+    assert!(crate::Session::from(layout).is_err());
     assert_eq!(RELEASES.load(Ordering::Relaxed), 1);
 }
 

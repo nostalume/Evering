@@ -8,7 +8,7 @@ use nix::{
     sys::eventfd::{EfdFlags, EventFd},
 };
 
-use crate::Notify;
+use crate::notify::Notify;
 
 #[derive(Debug)]
 pub struct Ring(EventFd);
@@ -93,7 +93,7 @@ impl AsRawFd for Event {
 #[cfg(test)]
 mod tests {
     use super::event;
-    use crate::Notify;
+    use crate::notify::Notify;
 
     #[test]
     fn notification_is_sticky_and_coalesced() {

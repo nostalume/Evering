@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use crate::Notify;
+use crate::notify::Notify;
 
 #[derive(Debug)]
 pub struct Ring(UnixStream);
@@ -91,7 +91,7 @@ impl AsFd for Ring {
 #[cfg(test)]
 mod tests {
     use super::event;
-    use crate::Notify;
+    use crate::notify::Notify;
 
     #[test]
     fn notification_is_sticky_and_coalesced() {

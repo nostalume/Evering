@@ -4,7 +4,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::mem::{MapLayout, MemAlloc};
+use crate::mem::Build;
 use crate::numeric::bit::{bit_check, bit_flip};
 use crate::numeric::{
     AlignPtr, Alignable,
@@ -1354,6 +1354,11 @@ fn crash_after(point: usize) {
 }
 
 impl<H: const Deref<Target = Header>> Talc<H> {
+    #[inline]
+    pub(crate) fn base_ptr(&self) -> *const u8 {
+        self.header.talc_ref().base_ptr()
+    }
+
     pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, MutationError> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
@@ -1367,11 +1372,44 @@ impl<H: const Deref<Target = Header>> Talc<H> {
         result
     }
 
-    pub fn deallocate(&self, ptr: NonNull<u8>, layout: alloc::Layout) -> Result<(), MutationError> {
+    #[cfg(test)]
+    pub(crate) fn deallocate(
+        &self,
+        ptr: NonNull<u8>,
+        layout: alloc::Layout,
+    ) -> Result<(), MutationError> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
         crash_after(FREE_CLAIMED);
         unsafe { self.deallocate_during(&mutation, ptr, layout) };
+        #[cfg(test)]
+        crash_after(FREE_MUTATED);
+        mutation.commit();
+        #[cfg(test)]
+        crash_after(FREE_CLEAN);
+        Ok(())
+    }
+
+    pub(crate) unsafe fn release_value<T: ?Sized>(
+        &self,
+        pointer: *mut T,
+        meta: Meta,
+        layout: alloc::Layout,
+    ) -> Result<(), Meta> {
+        let mutation = match Mutation::claim(&self.header.mutation, self.owner) {
+            Ok(mutation) => mutation,
+            Err(_) => return Err(meta),
+        };
+        #[cfg(test)]
+        crash_after(FREE_CLAIMED);
+        unsafe {
+            core::ptr::drop_in_place(pointer);
+            (&mut *self.header.talc_ptr()).deallocate(
+                meta.as_nonnull(self.base_ptr()),
+                layout.size(),
+                self.geometry,
+            );
+        }
         #[cfg(test)]
         crash_after(FREE_MUTATED);
         mutation.commit();
@@ -1470,6 +1508,7 @@ pub enum MutationError {
     Busy(u8),
     Poisoned,
     Exhausted,
+    LayoutOverflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1616,109 +1655,6 @@ mod geometry_tests {
     }
 }
 
-unsafe impl<H: const Deref<Target = Header>> mem::MemAlloc for Talc<H> {
-    type Meta = Meta;
-
-    type Error = ();
-
-    #[inline]
-    fn base_ptr(&self) -> *const u8 {
-        self.header.talc_ref().base_ptr()
-    }
-
-    #[inline]
-    fn alloc(&self, layout: alloc::Layout) -> Result<Self::Meta, Self::Error> {
-        self.allocate(layout).map_err(|_| ())
-    }
-}
-
-unsafe impl<H: const Deref<Target = Header>> mem::MemDealloc for Talc<H> {
-    #[inline]
-    fn dealloc(&self, meta: Self::Meta, layout: alloc::Layout) -> Result<(), Self::Meta> {
-        match self.deallocate(unsafe { meta.as_nonnull(self.base_ptr()) }, layout) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(meta),
-        }
-    }
-
-    unsafe fn release<T: ?Sized>(
-        &self,
-        pointer: *mut T,
-        meta: Self::Meta,
-        layout: alloc::Layout,
-    ) -> Result<(), Self::Meta> {
-        let mutation = match Mutation::claim(&self.header.mutation, self.owner) {
-            Ok(mutation) => mutation,
-            Err(_) => return Err(meta),
-        };
-        #[cfg(test)]
-        crash_after(FREE_CLAIMED);
-        unsafe {
-            core::ptr::drop_in_place(pointer);
-            (&mut *self.header.talc_ptr()).deallocate(
-                meta.as_nonnull(self.base_ptr()),
-                layout.size(),
-                self.geometry,
-            );
-        }
-        #[cfg(test)]
-        crash_after(FREE_MUTATED);
-        mutation.commit();
-        #[cfg(test)]
-        crash_after(FREE_CLEAN);
-        Ok(())
-    }
-}
-
-impl<H: const Deref<Target = Header>> mem::MemAllocator for Talc<H> {}
-
-unsafe impl<H: const Deref<Target = Header>> mem::TransferAllocator for Talc<H> {
-    fn layout_id(&self) -> crate::LayoutId {
-        self.header().layout_id()
-    }
-
-    fn admit(
-        &self,
-        owner: crate::LayoutId,
-        meta: &Meta,
-        expected: alloc::Layout,
-    ) -> Result<NonNull<u8>, mem::TransferError> {
-        if owner != self.layout_id() {
-            return Err(mem::TransferError::WrongAllocator);
-        }
-        if expected.size() == 0 {
-            return meta
-                .is_null()
-                .then(|| NonNull::new(expected.align() as *mut u8).unwrap())
-                .ok_or(mem::TransferError::OutOfBounds);
-        }
-        if meta.is_null() {
-            return Err(mem::TransferError::Null);
-        }
-        let info = self.header().layout_info();
-        let bound = core::mem::size_of::<TalcMeta>()
-            .checked_add(info.usable_offset as usize)
-            .and_then(|value| value.checked_add(info.usable_length as usize))
-            .ok_or(mem::TransferError::OutOfBounds)?;
-        let end = meta
-            .view
-            .start_offset
-            .checked_add(meta.view.size)
-            .ok_or(mem::TransferError::OutOfBounds)?;
-        if end > bound {
-            return Err(mem::TransferError::OutOfBounds);
-        }
-        if meta.view.size != expected.size() {
-            return Err(mem::TransferError::WrongExtent);
-        }
-        let pointer = unsafe { self.base_ptr().add(meta.view.start_offset) } as *mut u8;
-        if !pointer.addr().is_multiple_of(expected.align()) {
-            return Err(mem::TransferError::Misaligned);
-        }
-        NonNull::new(pointer).ok_or(mem::TransferError::Null)
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 pub struct Config {
     forward: Offset,
@@ -1768,11 +1704,6 @@ impl Config {
             ..self
         }
     }
-
-    #[inline]
-    pub const fn with_offset(self, forward: Offset) -> Self {
-        Self { forward, ..self }
-    }
 }
 
 unsafe impl header::Layout for TalckMeta {
@@ -1816,11 +1747,6 @@ impl<H: const Deref<Target = Header>> Talc<H> {
     pub const fn header(&self) -> &Header {
         &self.header
     }
-
-    #[inline]
-    pub const fn geometry(&self) -> Geometry {
-        self.geometry
-    }
 }
 
 impl Clone for RefTalc<'_> {
@@ -1845,12 +1771,12 @@ impl MapTalc {
         }
     }
 
-    pub(crate) fn region_id(&self) -> crate::RegionId {
+    pub(crate) fn region_id(&self) -> crate::schema::RegionId {
         self.header.region_id()
     }
 
     #[inline]
-    pub fn from_layout(area: MapLayout, conf: Config) -> Result<Self, mem::Error> {
+    pub(crate) fn from_layout(area: Build, conf: Config) -> Result<Self, mem::Error> {
         let mut area = area;
         let reserve = area.reserve::<Header>()?;
         let conf = conf.with_bound(reserve.remaining_after());
@@ -1868,10 +1794,6 @@ impl MapTalc {
             owner: self.owner,
             geometry: self.geometry,
         }
-    }
-
-    pub fn recover(&self, recovery: &mem::Recovery<'_>) -> bool {
-        poison_mutation(&self.header.mutation, recovery.slot())
     }
 
     pub(crate) fn mutation_state(&self) -> MutationState {
@@ -1899,8 +1821,14 @@ impl MapTalc {
     }
 
     pub(crate) fn finish_recovery(&self, dead: u8) -> bool {
-        if self.mutation_state() != MutationState::Clean {
-            return false;
+        match self.mutation_state() {
+            MutationState::Clean | MutationState::Poisoned => {}
+            MutationState::Owned(owner) if owner == dead => {
+                if !self.poison_owner(dead) && self.mutation_state() != MutationState::Poisoned {
+                    return false;
+                }
+            }
+            MutationState::Owned(_) => return false,
         }
         self.header.recover_member(dead);
         !self.header.has_member(dead)
@@ -1920,10 +1848,10 @@ impl MapTalc {
     }
 }
 
-impl TryFrom<MapLayout> for MapTalc {
+impl TryFrom<Build> for MapTalc {
     type Error = mem::Error;
 
-    fn try_from(area: MapLayout) -> Result<Self, Self::Error> {
+    fn try_from(area: Build) -> Result<Self, Self::Error> {
         use crate::mem::MemOps;
         let size = area.size();
         Self::from_layout(area, Config::new(size))
@@ -1945,37 +1873,19 @@ unsafe impl crate::msg::Repr for Meta {
     const SCHEMA: SchemaKey = <Self as SharedSchema>::SCHEMA;
 }
 
-impl mem::Meta for Meta {
-    #[inline]
-    fn null() -> Self {
+impl Meta {
+    pub(crate) const fn null() -> Self {
         Self {
             view: AddrSpan::null(),
         }
     }
 
-    #[inline]
-    fn is_null(&self) -> bool {
-        self.view.is_null()
-    }
-
-    unsafe fn recall(&self, base_ptr: *const u8) -> NonNull<u8> {
-        unsafe { self.as_nonnull(base_ptr) }
-    }
-
-    fn layout_bytes(&self) -> alloc::Layout {
-        unsafe {
-            alloc::Layout::from_size_align_unchecked(self.view.size, core::mem::align_of::<u8>())
-        }
-    }
-}
-
-impl Meta {
     pub(crate) fn layout(&self) -> alloc::Layout {
         unsafe { alloc::Layout::from_size_align_unchecked(self.view.size, 1) }
     }
 
     #[inline]
-    const fn is_null(&self) -> bool {
+    pub(crate) const fn is_null(&self) -> bool {
         self.view.is_null()
     }
 

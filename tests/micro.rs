@@ -7,8 +7,10 @@ mod micro;
 use std::time::Instant;
 
 use ::evering::{
-    Listen, Notify, RegionId, Repr, SchemaId, SchemaKey,
-    perlude::talc::{Access, Session, SessionBy},
+    Session,
+    layout::{RegionId, Repr, SchemaId, SchemaKey},
+    mapping::{Access, Request},
+    notify::{Notify, Wait as _},
 };
 use micro::{Mechanism, Sample, measure};
 
@@ -23,47 +25,72 @@ unsafe impl Repr for Record {
 }
 
 #[cfg(unix)]
-fn session() -> Session<Record> {
+fn session() -> Session {
     let source = ::evering::os::unix::UnixFd::memfd("evering-micro", 1 << 20, false).unwrap();
-    SessionBy::create(
+    Session::create(
         source.borrow(),
-        ::evering::Request::new(1 << 20, Access::READ | Access::WRITE),
+        Request::new(1 << 20, Access::READ | Access::WRITE),
+        REGION,
+    )
+    .unwrap()
+}
+
+#[cfg(unix)]
+fn session_pair() -> (Session, Session) {
+    let source = ::evering::os::unix::UnixFd::memfd("evering-micro-pair", 1 << 20, false).unwrap();
+    let request = Request::new(1 << 20, Access::READ | Access::WRITE);
+    (
+        Session::create(source.borrow(), request, REGION).unwrap(),
+        Session::open(source.borrow(), request, REGION).unwrap(),
+    )
+}
+
+#[cfg(windows)]
+fn session() -> Session {
+    let source =
+        ::evering::os::windows::Section::anonymous(1 << 20, Access::READ | Access::WRITE).unwrap();
+    Session::create(
+        source.borrow(),
+        Request::new(1 << 20, Access::READ | Access::WRITE),
         REGION,
     )
     .unwrap()
 }
 
 #[cfg(windows)]
-fn session() -> Session<Record> {
+fn session_pair() -> (Session, Session) {
     let source =
         ::evering::os::windows::Section::anonymous(1 << 20, Access::READ | Access::WRITE).unwrap();
-    SessionBy::create(
-        source.borrow(),
-        ::evering::Request::new(1 << 20, Access::READ | Access::WRITE),
-        REGION,
+    let request = Request::new(1 << 20, Access::READ | Access::WRITE);
+    (
+        Session::create(source.borrow(), request, REGION).unwrap(),
+        Session::open(source.borrow(), request, REGION).unwrap(),
     )
-    .unwrap()
 }
 
 fn queue_rows(iterations: u64) -> Vec<micro::Row> {
-    let session = session();
-    let id = session.prepare(8).unwrap();
-    let view = session.acquire(id).unwrap();
-    let (tx, _) = view.clone().lsplit();
-    let (_, rx) = view.rsplit();
-    let heap = session.heap();
+    let (session, peer) = session_pair();
+    let (left, port) = session.create_channel::<Record>(8).unwrap();
+    let right = peer.adopt(port).unwrap();
+    let (tx, _) = left.split();
+    let (_, rx) = right.split();
+    let pool = session.create_pool(64 * 1024, None).unwrap();
+    let peer_pool = peer.open_pool(pool.id()).unwrap();
+    let pool = pool.as_ref();
+    let peer_pool = peer_pool.as_ref();
     let reserve = measure(
         Mechanism::ReservePublish,
         iterations,
         "capacity=8",
         |operation| {
-            let record = heap.copy::<u8>(&[]).unwrap().pack(Record(operation));
+            let record = pool.copy(&[0_u8]).unwrap().transfer(Record(operation));
             let started = Instant::now();
             tx.try_send(record).map_err(|_| "send".to_owned())?;
             let elapsed = started.elapsed();
-            let record = rx.try_recv().map_err(|_| "reset receive".to_owned())?;
-            heap.discard(record)
-                .map_err(|_| "reset discard".to_owned())?;
+            rx.claim()
+                .map_err(|_| "reset receive".to_owned())?
+                .discard(peer_pool)
+                .map_err(|error| format!("reset discard: {error:?}"))?;
             Ok(Sample {
                 elapsed,
                 operations: 1,
@@ -77,13 +104,15 @@ fn queue_rows(iterations: u64) -> Vec<micro::Row> {
         iterations,
         "capacity=8",
         |operation| {
-            tx.try_send(heap.copy::<u8>(&[]).unwrap().pack(Record(operation)))
+            tx.try_send(pool.copy(&[0_u8]).unwrap().transfer(Record(operation)))
                 .map_err(|_| "setup send".to_owned())?;
             let started = Instant::now();
-            let record = rx.try_recv().map_err(|_| "receive".to_owned())?;
+            let claim = rx.claim().map_err(|_| "receive".to_owned())?;
+            let (_, block) = claim
+                .adopt::<[u8]>(peer_pool)
+                .map_err(|error| format!("adopt: {error:?}"))?;
             let elapsed = started.elapsed();
-            heap.discard(record)
-                .map_err(|_| "reset discard".to_owned())?;
+            drop(block);
             Ok(Sample {
                 elapsed,
                 operations: 1,
@@ -97,16 +126,38 @@ fn queue_rows(iterations: u64) -> Vec<micro::Row> {
 
 #[test]
 fn registered_local_mechanisms_reset_every_iteration() {
+    let iterations = std::env::var("EVERING_MICRO_ITERATIONS")
+        .map_or(Ok(8), |value| value.parse::<u64>())
+        .unwrap();
     let session = session();
     let heap = session.heap();
-    let allocation = measure(
+    let talc = measure(
         Mechanism::AllocateRelease,
-        8,
+        iterations,
         "surface=typed;bytes=64;allocator=adaptive",
         |_| {
             let started = Instant::now();
-            let record = heap.copy(&[0_u8; 64]).unwrap().pack(Record(0));
-            heap.discard(record).map_err(|_| "release".to_owned())?;
+            drop(heap.copy(&[0_u8; 64]).unwrap());
+            Ok(Sample {
+                elapsed: started.elapsed(),
+                operations: 1,
+                reset: true,
+            })
+        },
+    )
+    .unwrap();
+    let pool = session.create_pool(64 * 1024, None).unwrap();
+    let pool = pool.as_ref();
+    let pool = measure(
+        Mechanism::AllocateRelease,
+        iterations,
+        "surface=typed;bytes=64;allocator=pool",
+        |iteration| {
+            let started = Instant::now();
+            let block = pool
+                .copy(&[0_u8; 64])
+                .map_err(|error| format!("reserve {iteration}: {error:?}"))?;
+            drop(block);
             Ok(Sample {
                 elapsed: started.elapsed(),
                 operations: 1,
@@ -120,26 +171,77 @@ fn registered_local_mechanisms_reset_every_iteration() {
         .enable_all()
         .build()
         .unwrap();
-    let _entered = runtime.enter();
     let (ring, event) = ::evering::os::event().unwrap();
-    let wait = ::evering::runtime::Wait::new(event).unwrap();
-    let notification = measure(Mechanism::SignalConsume, 8, "sticky=native", |_| {
+    let wait = {
+        let _entered = runtime.enter();
+        ::evering::runtime::Wait::new(event).unwrap()
+    };
+    let notification = measure(Mechanism::Notify, iterations, "sticky=native", |_| {
         let started = Instant::now();
         ring.notify().map_err(|error| error.to_string())?;
-        wait.clear().map_err(|error| error.to_string())?;
+        let elapsed = started.elapsed();
+        runtime
+            .block_on(wait.wait())
+            .map_err(|error| error.to_string())?;
         Ok(Sample {
-            elapsed: started.elapsed(),
+            elapsed,
             operations: 1,
             reset: true,
         })
     })
     .unwrap();
+    let signal_consume = measure(
+        Mechanism::SignalConsume,
+        iterations,
+        "sticky=native",
+        |_| {
+            let started = Instant::now();
+            ring.notify().map_err(|error| error.to_string())?;
+            runtime
+                .block_on(wait.wait())
+                .map_err(|error| error.to_string())?;
+            Ok(Sample {
+                elapsed: started.elapsed(),
+                operations: 1,
+                reset: true,
+            })
+        },
+    )
+    .unwrap();
 
-    for row in queue_rows(8).into_iter().chain([allocation, notification]) {
-        assert_eq!(row.iterations, 8);
+    for row in queue_rows(iterations)
+        .into_iter()
+        .chain([talc, pool, notification, signal_consume])
+    {
+        assert_eq!(row.iterations, iterations);
         assert!(row.gross_ns > 0);
         print!("{}", row.encode());
     }
+}
+
+#[test]
+fn pool_contention_candidate() {
+    let iterations = std::env::var("EVERING_MICRO_ITERATIONS")
+        .map_or(Ok(1000), |value| value.parse::<u64>())
+        .unwrap();
+    let session = session();
+    let pool = session.create_pool(64 * 1024, None).unwrap();
+    let pool = pool.as_ref();
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for thread in 0..4 {
+            scope.spawn(move || {
+                for value in 0..iterations {
+                    std::hint::black_box(pool.put(value ^ thread).unwrap());
+                }
+            });
+        }
+    });
+    println!(
+        "POOL-CONTENTION\tthreads=4\toperations={}\telapsed_ns={}",
+        iterations * 4,
+        started.elapsed().as_nanos()
+    );
 }
 
 #[test]

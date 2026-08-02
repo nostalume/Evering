@@ -8,9 +8,11 @@ use std::{
 };
 
 use evering::{
-    Listen, Notify, Peer, RegionId, Request, TryRecvError,
+    Channel, ChannelId as Id, Pool, PoolId, Port, RemoveError, Session,
+    layout::{self, RegionId},
+    mapping::{Access, Peer, Request},
+    notify::{Notify, Wait as _},
     os::{Event, Ring, event},
-    perlude::talc::{Access, Id, Session, SessionBy},
     process::{Bootstrap, Supervisor},
 };
 
@@ -22,7 +24,7 @@ const REGION: RegionId = RegionId::new(0x7265_636f_7665_7279, 1);
 const VALUE: u64 = 0x0051_a7e5;
 const TIMEOUT: Duration = Duration::from_secs(5);
 
-type TestSession = Session<()>;
+type TestSession = Session;
 
 #[derive(Clone, Copy, Debug)]
 enum Cut {
@@ -61,27 +63,42 @@ impl Cut {
     }
 }
 
-fn bootstrap(id: Id<()>) -> Bootstrap {
+fn bootstrap(port: &Port<()>, pool: PoolId) -> Bootstrap {
+    let id = port.id();
+    let (_, pool_slab, pool_entry, pool_generation) = pool.parts();
     Bootstrap::new(format!(
-        "{},{},{},{}",
+        "{},{},{},{},{},{},{},{},{}",
         id.slab(),
         id.entry(),
         id.generation(),
-        id.capacity()
+        id.capacity(),
+        port.role(),
+        port.generation(),
+        pool_slab,
+        pool_entry,
+        pool_generation,
     ))
     .unwrap()
 }
 
-fn parse_id(bytes: &[u8]) -> Id<()> {
+fn parse_ids(bytes: &[u8]) -> (Port<()>, PoolId) {
     let text = std::str::from_utf8(bytes).unwrap();
     let mut parts = text.split(',').map(|part| part.parse::<usize>().unwrap());
-    Id::new(
+    let id = Id::new(
         REGION,
         parts.next().unwrap() as u32,
         parts.next().unwrap() as u32,
         parts.next().unwrap(),
         parts.next().unwrap(),
-    )
+    );
+    let port = Port::from_parts(id, parts.next().unwrap() as u8, parts.next().unwrap()).unwrap();
+    let pool = PoolId::new(
+        REGION,
+        parts.next().unwrap() as u32,
+        parts.next().unwrap() as u32,
+        parts.next().unwrap(),
+    );
+    (port, pool)
 }
 
 fn announce(peer: Peer, ring: &Ring, code: i32) -> ! {
@@ -94,9 +111,10 @@ fn announce(peer: Peer, ring: &Ring, code: i32) -> ! {
     std::process::exit(code)
 }
 
-fn crash(session: TestSession, id: Id<()>, ring: Ring, cut: Cut) -> ! {
-    let view = session.acquire(id).expect("crash subject");
-    let (send, recv) = view.rsplit();
+fn crash(session: TestSession, port: Port<()>, pool: PoolId, ring: Ring, cut: Cut) -> ! {
+    let channel = session.adopt(port).expect("crash subject");
+    let pool = session.open_pool(pool).expect("transfer pool");
+    let (send, recv) = channel.split();
     let peer = session.peer();
     match cut {
         Cut::Reserved => {
@@ -104,12 +122,12 @@ fn crash(session: TestSession, id: Id<()>, ring: Ring, cut: Cut) -> ! {
             announce(peer, &ring, cut.code());
         }
         Cut::Staged => {
-            let record = session.heap().put(VALUE).unwrap().pack(());
+            let record = pool.as_ref().put(VALUE).unwrap().transfer(());
             let _staged = send.reserve().unwrap().stage(record);
             announce(peer, &ring, cut.code());
         }
         Cut::Published => {
-            let record = session.heap().put(VALUE).unwrap().pack(());
+            let record = pool.as_ref().put(VALUE).unwrap().transfer(());
             send.reserve().unwrap().stage(record).publish();
             announce(peer, &ring, cut.code());
         }
@@ -128,7 +146,9 @@ type Source = evering::os::windows::Section<std::os::windows::io::OwnedHandle>;
 struct Setup {
     source: Source,
     session: TestSession,
-    id: Id<()>,
+    channel: Channel<()>,
+    pool: Pool,
+    pool_id: PoolId,
     child: Supervisor,
     event: Event,
     ready: PathBuf,
@@ -154,13 +174,14 @@ fn child() -> Option<()> {
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).unwrap();
     let ring = unsafe { Ring::from_owned_fd(resources.remove(0)) };
-    let session = SessionBy::open(
+    let session = Session::open(
         source,
         Request::new(SIZE, Access::READ | Access::WRITE),
         REGION,
     )
     .unwrap();
-    crash(session, parse_id(bytes.as_ref()), ring, cut)
+    let (port, pool) = parse_ids(bytes.as_ref());
+    crash(session, port, pool, ring, cut)
 }
 
 #[cfg(windows)]
@@ -175,13 +196,14 @@ fn child() -> Option<()> {
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
     let ring = unsafe { Ring::from_owned_handle(resources.remove(0).into_raw_handle()) };
-    let session = SessionBy::open(
+    let session = Session::open(
         source,
         Request::new(SIZE, Access::READ | Access::WRITE),
         REGION,
     )
     .unwrap();
-    crash(session, parse_id(bytes.as_ref()), ring, cut)
+    let (port, pool) = parse_ids(bytes.as_ref());
+    crash(session, port, pool, ring, cut)
 }
 
 #[cfg(unix)]
@@ -191,14 +213,16 @@ fn setup(cut: Cut, ready: PathBuf) -> Setup {
     use evering::os::unix::{UnixFd, process::Socket};
 
     let source = UnixFd::memfd("evering-recovery", SIZE, false).unwrap();
-    let session = SessionBy::create(
+    let session = Session::create(
         source.borrow(),
         Request::new(SIZE, Access::READ | Access::WRITE),
         REGION,
     )
     .unwrap();
-    let id = session.prepare(4).unwrap();
-    seed_claimed(&session, id, cut);
+    let (channel, port) = session.create_channel::<()>(4).unwrap();
+    let pool = session.create_pool(512 * 1024, None).unwrap();
+    let pool_id = pool.id();
+    seed_claimed(&channel, &pool, cut);
     let path = env::temp_dir().join(format!(
         "evering-recovery-{}-{}.sock",
         std::process::id(),
@@ -219,13 +243,15 @@ fn setup(cut: Cut, ready: PathBuf) -> Setup {
     };
     let (ring, event) = event().unwrap();
     socket
-        .send(&bootstrap(id), &[source.as_fd(), ring.as_fd()])
+        .send(&bootstrap(&port, pool_id), &[source.as_fd(), ring.as_fd()])
         .unwrap();
     fs::remove_file(path).unwrap();
     Setup {
         source,
         session,
-        id,
+        channel,
+        pool,
+        pool_id,
         child,
         event,
         ready,
@@ -240,38 +266,42 @@ fn setup(cut: Cut, ready: PathBuf) -> Setup {
 
     let listener = Listener::bind().unwrap();
     let child = Supervisor::spawn(&mut command(cut, &ready, listener.name())).expect("spawn child");
-    let socket = listener.accept(&child).unwrap();
+    let socket = listener.accept(&child, Instant::now() + TIMEOUT).unwrap();
     let source = Section::anonymous(SIZE, Access::READ | Access::WRITE).unwrap();
-    let session = SessionBy::create(
+    let session = Session::create(
         source.borrow(),
         Request::new(SIZE, Access::READ | Access::WRITE),
         REGION,
     )
     .unwrap();
-    let id = session.prepare(4).unwrap();
-    seed_claimed(&session, id, cut);
+    let (channel, port) = session.create_channel::<()>(4).unwrap();
+    let pool = session.create_pool(512 * 1024, None).unwrap();
+    let pool_id = pool.id();
+    seed_claimed(&channel, &pool, cut);
     let (ring, event) = event().unwrap();
     socket
         .send(
             &child,
-            &bootstrap(id),
+            &bootstrap(&port, pool_id),
             &[source.as_handle(), ring.as_handle()],
         )
         .unwrap();
     Setup {
         source,
         session,
-        id,
+        channel,
+        pool,
+        pool_id,
         child,
         event,
         ready,
     }
 }
 
-fn seed_claimed(session: &TestSession, id: Id<()>, cut: Cut) {
+fn seed_claimed(channel: &Channel<()>, pool: &Pool, cut: Cut) {
     if matches!(cut, Cut::Claimed) {
-        let (send, _) = session.acquire(id).unwrap().lsplit();
-        send.try_send(session.heap().put(VALUE).unwrap().pack(()))
+        let (send, _) = channel.split();
+        send.try_send(pool.as_ref().put(VALUE).unwrap().transfer(()))
             .unwrap();
     }
 }
@@ -285,23 +315,42 @@ fn peer(path: &PathBuf) -> Peer {
     )
 }
 
-fn drain(session: &TestSession, id: Id<()>) -> Vec<u64> {
-    let (_, recv) = session.acquire(id).unwrap().lsplit();
+fn drain(channel: &Channel<()>, pool: &Pool) -> Vec<u64> {
+    let (_, recv) = channel.split();
     let mut values = Vec::new();
     loop {
-        match recv.try_recv() {
-            Ok(record) => {
-                let heap = session.heap();
-                let (_, value) = heap.open::<(), u64>(record).unwrap();
+        match recv.claim() {
+            Ok(claim) => {
+                let (_, value) = claim.adopt::<u64>(pool.as_ref()).unwrap();
                 values.push(*value);
             }
-            Err(TryRecvError::Empty | TryRecvError::Disconnected) => return values,
+            Err(evering::ReceiveError::Busy) => std::thread::yield_now(),
+            Err(evering::ReceiveError::Empty | evering::ReceiveError::Closed) => return values,
         }
     }
 }
 
-fn clean_attach(source: &Source, session: &TestSession, dead: Peer) {
-    let attached = SessionBy::<()>::open(
+fn remove_bounded(session: &TestSession, mut channel: Channel<()>) {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        match session.remove(channel) {
+            Ok(()) => return,
+            Err(RemoveError::Busy(returned)) => channel = returned,
+            Err(RemoveError::Evidence(_)) => panic!("remove could not resolve queued storage"),
+        }
+        assert!(Instant::now() < deadline, "channel removal stayed busy");
+        std::thread::yield_now();
+    }
+}
+
+fn clean_attach(
+    source: &Source,
+    session: &TestSession,
+    pool_id: PoolId,
+    parent_pool: &Pool,
+    dead: Peer,
+) {
+    let attached = Session::open(
         source.borrow(),
         Request::new(SIZE, Access::READ | Access::WRITE),
         REGION,
@@ -313,17 +362,17 @@ fn clean_attach(source: &Source, session: &TestSession, dead: Peer) {
         "dead slot was not reaped"
     );
     assert_ne!(attached.peer().generation(), dead.generation());
-    let id = session.prepare(1).unwrap();
-    let (send, _) = attached.acquire(id).unwrap().rsplit();
-    send.try_send(attached.heap().put(VALUE + 1).unwrap().pack(()))
+    let (channel, port) = session.create_channel::<()>(1).unwrap();
+    let pool = attached.open_pool(pool_id).unwrap();
+    let peer_channel = attached.adopt(port).unwrap();
+    let (send, _) = peer_channel.split();
+    send.try_send(pool.as_ref().put(VALUE + 1).unwrap().transfer(()))
         .unwrap();
-    assert_eq!(drain(session, id), [VALUE + 1]);
+    assert_eq!(drain(&channel, parent_pool), [VALUE + 1]);
     drop(send);
+    drop(peer_channel);
     drop(attached);
-    assert!(
-        session.remove(id, session.acquire(id).unwrap()).is_ok(),
-        "clean channel removal"
-    );
+    remove_bounded(session, channel);
 }
 
 #[test]
@@ -346,23 +395,27 @@ fn recovery_conserves_every_accepted_record() {
             evering::runtime::Wait::new(setup.event).unwrap()
         };
         runtime
-            .block_on(async { tokio::time::timeout(TIMEOUT, wait.ready()).await })
+            .block_on(async { tokio::time::timeout(TIMEOUT, wait.wait()).await })
             .expect("advisory wait timed out")
             .unwrap();
-        wait.clear().unwrap();
 
         let dead = peer(&setup.ready);
         fs::remove_file(&setup.ready).unwrap();
         let started = Instant::now();
         let exit = setup.child.wait().unwrap();
         assert_eq!(exit.status().code(), Some(cut.code()));
-        let recovery = unsafe { setup.session.assume_exited(dead, &exit) }
-            .expect("exact participant generation");
-        assert!(setup.session.reap(recovery).is_ok(), "complete repair");
+        let recovery =
+            unsafe { setup.session.assume_dead(dead) }.expect("exact participant generation");
+        assert!(
+            recovery
+                .reap_with(&[layout::recovery_handler::<()>()])
+                .is_ok(),
+            "complete repair"
+        );
         let recovery_ns = started.elapsed().as_nanos();
 
-        let values = drain(&setup.session, setup.id);
-        let accepted = usize::from(!matches!(cut, Cut::Reserved));
+        let values = drain(&setup.channel, &setup.pool);
+        let accepted = usize::from(matches!(cut, Cut::Published | Cut::Claimed));
         let validated = values.iter().filter(|&&value| value == VALUE).count();
         let fabricated = values.iter().filter(|&&value| value != VALUE).count();
         let duplicates = validated.saturating_sub(1);
@@ -381,13 +434,13 @@ fn recovery_conserves_every_accepted_record() {
             recovery_ns
         );
 
-        clean_attach(&setup.source, &setup.session, dead);
-        assert!(
-            setup
-                .session
-                .remove(setup.id, setup.session.acquire(setup.id).unwrap())
-                .is_ok(),
-            "crash subject removal"
+        clean_attach(
+            &setup.source,
+            &setup.session,
+            setup.pool_id,
+            &setup.pool,
+            dead,
         );
+        remove_bounded(&setup.session, setup.channel);
     }
 }

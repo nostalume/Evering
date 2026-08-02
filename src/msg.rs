@@ -1,15 +1,11 @@
-use crate::{
-    SchemaKey,
-    numeric::Id,
-    schema::{compose_schema, schema_id},
-};
+use crate::schema::{SchemaKey, compose_schema, schema_id};
 
 pub type TypeId = u64;
 
 /// A value whose initialized representation may cross a process boundary.
 ///
 /// ```compile_fail
-/// use evering::{Repr, SchemaId, SchemaKey};
+/// use evering::layout::{Repr, SchemaId, SchemaKey};
 /// use std::rc::Rc;
 ///
 /// struct Local(Rc<()>);
@@ -117,29 +113,10 @@ pub const fn type_id<P: Repr + ?Sized, T: Repr + ?Sized>() -> TypeId {
     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
-pub trait Tag<T>: Repr {
-    fn with_tag(self, value: T) -> Self
-    where
-        Self: Sized;
-    fn tag(&self) -> T;
-}
-
-pub trait TagRef<T>: Repr {
-    fn set_tag(&mut self, value: T);
-    fn tag_ref(&self) -> &T;
-}
-
-pub trait TagId: Repr {
-    fn with_id(self, value: Id) -> Self
-    where
-        Self: Sized;
-    fn id(&self) -> Id;
-}
-
 #[cfg(test)]
 mod tests {
     use super::{Repr, type_id};
-    use crate::{SchemaId, SchemaKey};
+    use crate::schema::{SchemaId, SchemaKey};
 
     struct First;
     struct Second;

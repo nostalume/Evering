@@ -3,13 +3,14 @@ use std::{
     io,
     os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
     sync::atomic::{AtomicU64, Ordering},
+    time::Instant,
 };
 
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-        ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE,
-        INVALID_HANDLE_VALUE,
+        ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, GetLastError,
+        HANDLE, INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -17,8 +18,9 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_READMODE_MESSAGE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+            ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_NOWAIT,
+            PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+            SetNamedPipeHandleState,
         },
         Threading::GetCurrentProcess,
     },
@@ -66,7 +68,10 @@ impl Listener {
             CreateNamedPipeW(
                 wide(&name).as_ptr(),
                 PIPE_ACCESS_DUPLEX | FILE_FLAG_FIRST_PIPE_INSTANCE,
-                PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS,
+                PIPE_TYPE_MESSAGE
+                    | PIPE_READMODE_MESSAGE
+                    | PIPE_NOWAIT
+                    | PIPE_REJECT_REMOTE_CLIENTS,
                 1,
                 MAX_MESSAGE as u32,
                 MAX_MESSAGE as u32,
@@ -87,10 +92,23 @@ impl Listener {
         &self.name
     }
 
-    pub fn accept(self, child: &Supervisor) -> io::Result<Socket> {
+    pub fn accept(self, child: &Supervisor, deadline: Instant) -> io::Result<Socket> {
         let handle = raw(&self.handle);
-        if unsafe { ConnectNamedPipe(handle, core::ptr::null_mut()) } == 0
-            && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED
+        loop {
+            if unsafe { ConnectNamedPipe(handle, core::ptr::null_mut()) } != 0 {
+                break;
+            }
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => break,
+                ERROR_PIPE_LISTENING if Instant::now() < deadline => std::thread::yield_now(),
+                ERROR_PIPE_LISTENING => return Err(io::ErrorKind::TimedOut.into()),
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
+        let mode = PIPE_READMODE_MESSAGE | PIPE_WAIT;
+        if unsafe {
+            SetNamedPipeHandleState(handle, &mode, core::ptr::null_mut(), core::ptr::null_mut())
+        } == 0
         {
             return Err(io::Error::last_os_error());
         }

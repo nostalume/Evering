@@ -1,32 +1,29 @@
-use core::alloc::Layout;
+use alloc::sync::Arc;
 use core::ptr::NonNull;
+use core::{marker::PhantomData, ops::Deref};
+
+use crate::{
+    header::{AdmitError, AdmitLayout, Layout, Member, RootHeader},
+    schema::{LayoutContext, RegionAdmission, RegionId},
+};
 
 pub use crate::header::LayoutField;
-use crate::schema::LayoutId;
-
-mod area;
-
 #[cfg(test)]
-pub use self::area::MapView;
-pub(crate) use self::area::ProjectionError;
-pub use self::area::{
-    CloseError as RegionCloseError, Map, MapLayout, Mapped, Peer, Recovery, Ref, Region,
-};
 pub use alloc::alloc::AllocError;
 
 bitflags::bitflags! {
     #[repr(transparent)]
-    #[derive(Debug,Clone,Copy,PartialEq,Eq)]
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Access: u8 {
-        const READ  = 0x1;
+        const READ = 0x1;
         const WRITE = 0x1 << 1;
-        const EXEC  = 0x1 << 2;
+        const EXEC = 0x1 << 2;
     }
 }
 
 impl core::fmt::Display for Access {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(&self, f)
+        core::fmt::Debug::fmt(self, f)
     }
 }
 
@@ -48,39 +45,15 @@ impl Request {
 ///
 /// An implementation must return a valid, suitably aligned mapping with the
 /// requested access and extent. Its release function must remain callable and
-/// release that mapping exactly once from any thread that may own an admitted
-/// `Mapped<T>`.
+/// release that mapping exactly once from any thread that may own it.
 pub unsafe trait Source: Sized {
     type Error: core::fmt::Debug;
 
     fn map(self, request: Request) -> Result<Map, Self::Error>;
 }
 
-pub enum OpenError<E> {
-    Source(E),
-    Admission(Error),
-}
-
-impl<E: core::fmt::Debug> core::fmt::Debug for OpenError<E> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Source(error) => write!(f, "Mapping failed: {error:?}"),
-            Self::Admission(error) => core::fmt::Debug::fmt(error, f),
-        }
-    }
-}
-
-impl<E: core::fmt::Debug> core::fmt::Display for OpenError<E> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        core::fmt::Debug::fmt(self, f)
-    }
-}
-
-impl<E: core::fmt::Debug> core::error::Error for OpenError<E> {}
-
 pub enum Error {
     PermissionDenied { requested: Access },
-    OutofSize { requested: usize, bound: usize },
     UnenoughSpace { requested: usize, allocated: usize },
     Contention,
     LayoutClosed,
@@ -98,31 +71,25 @@ impl core::fmt::Debug for Error {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::PermissionDenied { requested } => {
-                write!(f, "Permission denied, requested {:?}", requested)
+                write!(f, "Permission denied, requested {requested:?}")
             }
             Self::UnenoughSpace {
                 requested,
                 allocated,
             } => write!(
                 f,
-                "Not enough space available, requested {}, allocated {}",
-                requested, allocated
+                "Not enough space available, requested {requested}, allocated {allocated}"
             ),
-            Self::OutofSize { requested, bound } => write!(
-                f,
-                "Out of upper bounded size, requested {}, upper bound {}",
-                requested, bound
-            ),
-            Self::Contention => write!(f, "Contention"),
-            Self::LayoutClosed => write!(f, "Shared layout is closed"),
+            Self::Contention => f.write_str("Contention"),
+            Self::LayoutClosed => f.write_str("Shared layout is closed"),
             Self::DuplicateAttachment => {
-                write!(f, "This participant already attached the shared layout")
+                f.write_str("This participant already attached the shared layout")
             }
-            Self::InvalidHeader => write!(f, "Header initialization failed"),
-            Self::LayoutMismatch(field) => write!(f, "Layout mismatch: {:?}", field),
-            Self::PoisonedComposition => write!(f, "Layout composition is poisoned"),
-            Self::ArithmeticOverflow => write!(f, "Layout cursor arithmetic overflow"),
-            Self::ParticipantExhausted => write!(f, "No shared-memory participant slot is free"),
+            Self::InvalidHeader => f.write_str("Header initialization failed"),
+            Self::LayoutMismatch(field) => write!(f, "Layout mismatch: {field:?}"),
+            Self::PoisonedComposition => f.write_str("Layout composition is poisoned"),
+            Self::ArithmeticOverflow => f.write_str("Layout cursor arithmetic overflow"),
+            Self::ParticipantExhausted => f.write_str("No shared-memory participant slot is free"),
         }
     }
 }
@@ -133,175 +100,22 @@ impl core::fmt::Display for Error {
     }
 }
 
-pub trait Meta: crate::msg::Repr {
-    // type SpanMeta: Span;
-    fn null() -> Self;
-    fn is_null(&self) -> bool;
-    unsafe fn recall(&self, base_ptr: *const u8) -> NonNull<u8>;
-    fn recall_by<A: MemAlloc>(&self, alloc: &A) -> NonNull<u8> {
-        unsafe { self.recall(alloc.base_ptr()) }
-    }
-    fn layout_bytes(&self) -> Layout;
-}
-
-// Internal allocator kernel. Safe callers allocate only through `Heap`.
-pub trait MemAllocator: MemAlloc + MemDealloc {}
-impl<A: MemAllocator> MemAllocator for &A {}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum TransferError {
-    Busy,
-    WrongAllocator,
-    WrongExtent,
-    Null,
-    OutOfBounds,
-    Misaligned,
-}
-
-/// An allocator instance that validates shared token metadata before recall.
+/// Exposes one live contiguous memory extent.
 ///
 /// # Safety
 ///
-/// A successful admission must return storage owned by `layout_id()` that
-/// satisfies `expected`.
-pub unsafe trait TransferAllocator: MemAllocator {
-    fn layout_id(&self) -> LayoutId;
-    fn admit(
-        &self,
-        owner: LayoutId,
-        meta: &Self::Meta,
-        expected: Layout,
-    ) -> Result<NonNull<u8>, TransferError>;
-}
-
-unsafe impl<A: TransferAllocator> TransferAllocator for &A {
-    fn layout_id(&self) -> LayoutId {
-        (*self).layout_id()
-    }
-
-    fn admit(
-        &self,
-        owner: LayoutId,
-        meta: &Self::Meta,
-        expected: Layout,
-    ) -> Result<NonNull<u8>, TransferError> {
-        (*self).admit(owner, meta, expected)
-    }
-}
-// pub trait MemAllocator2: MemAlloc + MemDeallocBy {}
-// impl<A: MemAllocator2> MemAllocator2 for &A {}
-
-/// Allocates region-relative blocks whose metadata may cross a process boundary.
-///
-/// # Safety
-///
-/// Implementors must return metadata that denotes storage within `base_ptr`'s
-/// region, remains valid at another mapping base, and satisfies the requested
-/// layout until it is successfully deallocated.
-pub unsafe trait MemAlloc {
-    type Meta: Meta;
-    type Error;
-    fn base_ptr(&self) -> *const u8;
-    fn alloc(&self, layout: Layout) -> Result<Self::Meta, Self::Error>;
-    fn alloc_of<H>(&self) -> Result<Self::Meta, Self::Error> {
-        let layout = Layout::new::<H>();
-        self.alloc(layout)
-    }
-    fn alloc_bytes(&self, size: usize) -> Result<Self::Meta, Self::Error> {
-        let layout = Layout::array::<u8>(size).unwrap();
-        self.alloc(layout)
-    }
-}
-
-/// Releases blocks allocated by the same region-relative allocator.
-///
-/// # Safety
-///
-/// Implementors must reject foreign, stale, or layout-mismatched metadata
-/// without releasing storage and must make each successful release observable
-/// exactly once to all participating processes.
-pub unsafe trait MemDealloc: MemAlloc {
-    fn dealloc(&self, meta: Self::Meta, layout: Layout) -> Result<(), Self::Meta>;
-
-    /// Drops `pointer` and releases its allocation only after deallocation
-    /// authority has been acquired.
-    ///
-    /// # Safety
-    ///
-    /// `pointer`, `meta`, and `layout` must describe the same live allocation.
-    /// On failure the implementation must not touch `pointer` and must return
-    /// the exact `meta`.
-    unsafe fn release<T: ?Sized>(
-        &self,
-        pointer: *mut T,
-        meta: Self::Meta,
-        layout: Layout,
-    ) -> Result<(), Self::Meta>;
-
-    #[inline]
-    fn dealloc_bytes(&self, meta: Self::Meta) -> Result<(), Self::Meta> {
-        let layout = meta.layout_bytes();
-        self.dealloc(meta, layout)
-    }
-}
-
-unsafe impl<A: MemAlloc> MemAlloc for &A {
-    type Meta = A::Meta;
-    type Error = A::Error;
-
-    fn base_ptr(&self) -> *const u8 {
-        (*self).base_ptr()
-    }
-    fn alloc(&self, layout: Layout) -> Result<Self::Meta, Self::Error> {
-        (*self).alloc(layout)
-    }
-}
-
-unsafe impl<A: MemDealloc> MemDealloc for &A {
-    fn dealloc(&self, meta: Self::Meta, layout: Layout) -> Result<(), Self::Meta> {
-        (*self).dealloc(meta, layout)
-    }
-
-    unsafe fn release<T: ?Sized>(
-        &self,
-        pointer: *mut T,
-        meta: Self::Meta,
-        layout: Layout,
-    ) -> Result<(), Self::Meta> {
-        unsafe { (*self).release(pointer, meta, layout) }
-    }
-}
-
-/// Exposes the bounds of one contiguous memory region.
-///
-/// # Safety
-///
-/// `start_ptr` and `size` must describe one live contiguous allocation for the
-/// duration of the implementation value. Mutable access must remain subject to
-/// the owner's aliasing and synchronization rules.
+/// `start_ptr` and `size` must remain valid for the implementation's lifetime.
 pub unsafe trait MemOps {
-    /// Returns the start pointer of the memory block.
     fn start_ptr(&self) -> *const u8;
-
-    /// Returns the byte size of the memory block.
     fn size(&self) -> usize;
 
-    /// Returns the start pointer of the memory block.
-    ///
-    /// ## Safety
-    /// The `ptr` should be correctly modified.
     #[inline]
     unsafe fn start_mut_ptr(&self) -> *mut u8 {
         self.start_ptr().cast_mut()
     }
 
-    /// Returns the offset to the start of the memory block.
-    ///
-    /// ## Safety
-    /// - `ptr` must be allocated in the memory.
     #[inline]
     unsafe fn offset<T: ?Sized>(&self, ptr: *const T) -> usize {
-        // Safety: `ptr` must has address greater than `self.start_ptr()`.
         unsafe { ptr.byte_offset_from_unsigned(self.start_ptr()) }
     }
 }
@@ -323,12 +137,8 @@ pub struct AddrSpan<T> {
 }
 
 impl<T> AddrSpan<T> {
-    #[inline]
-    pub const fn new(offset: T, size: T) -> Self {
-        Self {
-            start_offset: offset,
-            size,
-        }
+    pub const fn new(start_offset: T, size: T) -> Self {
+        Self { start_offset, size }
     }
 }
 
@@ -343,5 +153,589 @@ impl AddrSpan<usize> {
 
     pub const unsafe fn as_nonnull(&self, base: *const u8) -> NonNull<u8> {
         unsafe { NonNull::new_unchecked(base.add(self.start_offset).cast_mut()) }
+    }
+}
+
+/// Linear owner of one process-local mapping.
+pub struct Map {
+    start: NonNull<u8>,
+    len: usize,
+    access: Access,
+    release: Option<unsafe fn(NonNull<u8>, usize) -> bool>,
+}
+
+impl core::fmt::Debug for Map {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Map")
+            .field("start", &self.start)
+            .field("len", &self.len)
+            .field("access", &self.access)
+            .finish()
+    }
+}
+
+unsafe impl MemOps for Map {
+    #[inline]
+    fn start_ptr(&self) -> *const u8 {
+        self.start.as_ptr()
+    }
+
+    #[inline]
+    fn size(&self) -> usize {
+        self.len
+    }
+}
+
+impl Drop for Map {
+    fn drop(&mut self) {
+        if let Some(release) = self.release.take() {
+            let _ = unsafe { release(self.start, self.len) };
+        }
+    }
+}
+
+impl Map {
+    /// Creates an owner for an externally established mapping.
+    ///
+    /// # Safety
+    ///
+    /// `start..start + len` must remain exclusively owned and valid for the
+    /// declared access until `release` is invoked. `release` must release that
+    /// exact mapping and must be safe to call exactly once from any thread.
+    pub const unsafe fn from_raw_parts(
+        start: NonNull<u8>,
+        len: usize,
+        access: Access,
+        release: unsafe fn(NonNull<u8>, usize) -> bool,
+    ) -> Self {
+        Self {
+            start,
+            len,
+            access,
+            release: Some(release),
+        }
+    }
+
+    #[inline]
+    pub fn permits(&self, access: Access) -> Result<(), Error> {
+        if !self.access.contains(access) {
+            return Err(Error::PermissionDenied { requested: access });
+        }
+        Ok(())
+    }
+
+    fn close(mut self) -> bool {
+        let release = self.release.take().expect("live map has release authority");
+        unsafe { release(self.start, self.len) }
+    }
+
+    #[inline]
+    unsafe fn reserve<T: Layout>(&self, offset: usize) -> Result<(*mut T, usize), Error> {
+        self.permits(Access::WRITE)?;
+        let align = core::mem::align_of::<T>();
+        let start = self.start_ptr().addr();
+        let candidate = start.checked_add(offset).ok_or(Error::ArithmeticOverflow)?;
+        let aligned_address = candidate
+            .checked_add(align - 1)
+            .map(|value| value & !(align - 1))
+            .ok_or(Error::ArithmeticOverflow)?;
+        let end = aligned_address
+            .checked_add(core::mem::size_of::<T>())
+            .ok_or(Error::ArithmeticOverflow)?;
+        let aligned = aligned_address
+            .checked_sub(start)
+            .ok_or(Error::ArithmeticOverflow)?;
+        let next = end.checked_sub(start).ok_or(Error::ArithmeticOverflow)?;
+        if next > self.size() {
+            return Err(Error::UnenoughSpace {
+                requested: next,
+                allocated: self.size(),
+            });
+        }
+        let ptr = unsafe { self.start_mut_ptr().add(aligned).cast::<T>() };
+        #[cfg(feature = "tracing")]
+        tracing::debug!("[Area]: reserve offset, old {}, new {}", offset, next);
+        Ok((ptr, next))
+    }
+
+    #[inline]
+    unsafe fn commit<T: AdmitLayout>(
+        &self,
+        header: *mut T,
+        conf: T::Config,
+        ctx: LayoutContext,
+    ) -> Result<NonNull<T>, Error> {
+        self.permits(Access::WRITE)?;
+        match unsafe { T::admit(header, conf, ctx, None) } {
+            Ok(()) => Ok(unsafe { NonNull::new_unchecked(header) }),
+            Err(AdmitError::Contention) => Err(Error::Contention),
+            Err(AdmitError::Closed) => Err(Error::LayoutClosed),
+            Err(AdmitError::DuplicateMember) => Err(Error::DuplicateAttachment),
+            Err(AdmitError::InvalidHeader) => Err(Error::InvalidHeader),
+            Err(AdmitError::Mismatch(field)) => Err(Error::LayoutMismatch(field)),
+        }
+    }
+}
+
+/// Immutable process-local authority for one mapped shared-memory region.
+///
+/// The mapping backend is erased after successful root admission. The only
+/// retained backend operation is final unmap.
+pub(crate) struct Region {
+    map: Option<Map>,
+    header: NonNull<RootHeader>,
+    member: Member,
+    region: RegionId,
+    allow_init: bool,
+    detached: bool,
+}
+
+// Region exposes only atomic root operations; typed projections independently
+// require `T: Sync`. Drop has unique ownership, and Map admission requires its
+// release function to be callable from any owning thread.
+unsafe impl Send for Region {}
+unsafe impl Sync for Region {}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CloseError {
+    InUse,
+    UnmapFailed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ProjectionError {
+    ReadOnly,
+    ArithmeticOverflow,
+    OutOfBounds,
+    Misaligned,
+    Admission(AdmitError),
+}
+
+unsafe impl MemOps for Region {
+    #[inline]
+    fn start_ptr(&self) -> *const u8 {
+        self.map().start_ptr()
+    }
+
+    #[inline]
+    fn size(&self) -> usize {
+        self.map().size()
+    }
+}
+
+impl core::fmt::Debug for Region {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Region")
+            .field("map", &self.map)
+            .field("region", &self.region)
+            .finish()
+    }
+}
+
+impl Drop for Region {
+    fn drop(&mut self) {
+        self.detach();
+        let _ = self.unmap();
+    }
+}
+
+impl Region {
+    fn new(map: Map, admission: RegionAdmission) -> Result<(Arc<Self>, usize), Error> {
+        let (ptr, offset) = unsafe { map.reserve::<RootHeader>(0) }?;
+        let region = match admission {
+            RegionAdmission::Create(id) | RegionAdmission::Expect(id) => id,
+            RegionAdmission::Discover => match unsafe { RootHeader::published_region_at(ptr) } {
+                Some(region) => region,
+                None => return Err(Error::InvalidHeader),
+            },
+        };
+        let allow_init = matches!(admission, RegionAdmission::Create(_));
+        let ctx = LayoutContext {
+            region,
+            offset: 0,
+            allow_init,
+        };
+        let header = unsafe { map.commit(ptr, (), ctx) }?;
+        let member = match unsafe { header.as_ref() }.inner.join() {
+            Some(member) => member,
+            None => return Err(Error::ParticipantExhausted),
+        };
+        Ok((
+            Arc::new(Self {
+                map: Some(map),
+                header,
+                member,
+                region,
+                allow_init,
+                detached: false,
+            }),
+            offset,
+        ))
+    }
+
+    fn header(&self) -> &RootHeader {
+        unsafe { self.header.as_ref() }
+    }
+
+    fn map(&self) -> &Map {
+        self.map.as_ref().expect("live region owns its map")
+    }
+
+    fn permits(&self, access: Access) -> Result<(), Error> {
+        self.map().permits(access)
+    }
+
+    unsafe fn reserve<T: Layout>(&self, offset: usize) -> Result<(*mut T, usize), Error> {
+        unsafe { self.map().reserve::<T>(offset) }
+    }
+
+    unsafe fn commit<T: AdmitLayout>(
+        &self,
+        pointer: *mut T,
+        conf: T::Config,
+        ctx: LayoutContext,
+    ) -> Result<NonNull<T>, Error> {
+        self.permits(Access::WRITE)?;
+        match unsafe { T::admit(pointer, conf, ctx, Some(self.member.slot)) } {
+            Ok(()) => Ok(unsafe { NonNull::new_unchecked(pointer) }),
+            Err(AdmitError::Contention) => Err(Error::Contention),
+            Err(AdmitError::Closed) => Err(Error::LayoutClosed),
+            Err(AdmitError::DuplicateMember) => Err(Error::DuplicateAttachment),
+            Err(AdmitError::InvalidHeader) => Err(Error::InvalidHeader),
+            Err(AdmitError::Mismatch(field)) => Err(Error::LayoutMismatch(field)),
+        }
+    }
+
+    fn unmap(&mut self) -> bool {
+        let Some(map) = self.map.take() else {
+            return true;
+        };
+        map.close()
+    }
+
+    fn detach(&mut self) {
+        if self.detached {
+            return;
+        }
+        let _ = self.header().inner.leave(self.member);
+        self.detached = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close(region: Arc<Self>) -> Result<(), CloseError> {
+        let mut region = Arc::try_unwrap(region).map_err(|_| CloseError::InUse)?;
+        region.detach();
+        if region.unmap() {
+            Ok(())
+        } else {
+            Err(CloseError::UnmapFailed)
+        }
+    }
+
+    pub fn peer(&self) -> Peer {
+        Peer(self.member)
+    }
+
+    /// Marks an exact participant generation as permanently unable to access
+    /// this region.
+    ///
+    /// # Safety
+    ///
+    /// The caller must know that the process represented by `peer` can never
+    /// again access this mapping. A timeout, task cancellation, or thread exit
+    /// is not sufficient evidence.
+    pub(crate) unsafe fn mark_dead(&self, peer: Peer) -> Option<Member> {
+        let root = &self.header().inner;
+        (root.mark_dead(peer.0) || root.is_dead(peer.0)).then_some(peer.0)
+    }
+
+    pub(crate) fn release_dead(&self, member: Member) -> bool {
+        self.header().inner.release_dead(member)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Peer(Member);
+
+impl Peer {
+    pub const fn from_parts(slot: u8, generation: usize) -> Self {
+        Self(Member { slot, generation })
+    }
+
+    pub const fn slot(self) -> u8 {
+        self.0.slot
+    }
+
+    pub const fn generation(self) -> usize {
+        self.0.generation
+    }
+}
+
+pub(crate) struct Reservation<'a, T: AdmitLayout> {
+    layout: &'a mut Build,
+    offset: usize,
+    next: usize,
+    _marker: PhantomData<fn() -> T>,
+}
+
+impl<T: AdmitLayout> Reservation<'_, T> {
+    #[inline]
+    pub fn remaining_after(&self) -> usize {
+        self.layout.size().saturating_sub(self.next)
+    }
+
+    pub fn commit(self, conf: T::Config) -> Result<Mapped<T>, Error> {
+        self.layout.commit_reserved(self.offset, self.next, conf)
+    }
+}
+
+pub(crate) struct Build {
+    area: Arc<Region>,
+    offset: usize,
+    poisoned: bool,
+}
+
+unsafe impl MemOps for Build {
+    #[inline]
+    fn start_ptr(&self) -> *const u8 {
+        self.area.start_ptr()
+    }
+
+    #[inline]
+    fn size(&self) -> usize {
+        self.area.size()
+    }
+}
+
+impl Build {
+    /// Creates a new layout manager from a raw map, initializing the header and offset.
+    #[inline]
+    pub(crate) fn new(map: Map, admission: RegionAdmission) -> Result<Self, Error> {
+        let (area, offset) = Region::new(map, admission)?;
+        Ok(Self {
+            area,
+            offset,
+            poisoned: false,
+        })
+    }
+
+    pub fn region_id(&self) -> RegionId {
+        self.area.region
+    }
+
+    /// Reserves space for `T`, exclusively borrowing this composition until commit.
+    #[inline]
+    pub(crate) fn reserve<T: AdmitLayout>(&mut self) -> Result<Reservation<'_, T>, Error> {
+        if self.poisoned {
+            return Err(Error::PoisonedComposition);
+        }
+        let (ptr, next) = unsafe { self.area.reserve::<T>(self.offset) }?;
+        let offset = unsafe { self.area.offset(ptr) };
+        Ok(Reservation {
+            layout: self,
+            offset,
+            next,
+            _marker: PhantomData,
+        })
+    }
+
+    fn commit_reserved<T: AdmitLayout>(
+        &mut self,
+        offset: usize,
+        expected_next: usize,
+        conf: T::Config,
+    ) -> Result<Mapped<T>, Error> {
+        if self.poisoned {
+            return Err(Error::PoisonedComposition);
+        }
+        let (ptr, next) = match unsafe { self.area.reserve::<T>(self.offset) } {
+            Ok(value) => value,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        if unsafe { self.area.offset(ptr) } != offset || next != expected_next {
+            self.poisoned = true;
+            return Err(Error::InvalidHeader);
+        }
+        let ctx = LayoutContext {
+            region: self.region_id(),
+            offset: offset as u64,
+            allow_init: self.area.allow_init,
+        };
+        let ptr = match unsafe { self.area.commit::<T>(ptr, conf, ctx) } {
+            Ok(ptr) => ptr,
+            Err(error) => {
+                self.poisoned = true;
+                return Err(error);
+            }
+        };
+        self.offset = next;
+        let handle = unsafe { Mapped::from_raw(Arc::clone(&self.area), ptr) };
+        Ok(handle)
+    }
+
+    /// Reserves and commits space for a type `T` in one step, advancing the offset.
+    #[inline]
+    pub(crate) fn push<T: AdmitLayout>(&mut self, conf: T::Config) -> Result<Mapped<T>, Error> {
+        self.reserve::<T>()?.commit(conf)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn header(&self) -> &RootHeader {
+        self.area.header()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn close(self) -> Result<(), CloseError> {
+        Region::close(self.area)
+    }
+}
+
+pub(crate) struct Mapped<T: AdmitLayout> {
+    handle: Arc<Region>,
+    ptr: NonNull<T>,
+    attached: bool,
+}
+// Safety: Region erasure admits only cache-coherent process-shared mappings;
+// the projected layout controls whether immutable cross-thread access is safe.
+unsafe impl<T: AdmitLayout + Sync> Send for Mapped<T> {}
+unsafe impl<T: AdmitLayout + Sync> Sync for Mapped<T> {}
+
+impl<T: AdmitLayout + core::fmt::Debug> core::fmt::Debug for Mapped<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Mapped")
+            .field("handle", &self.handle)
+            .field("ptr", &self.ptr)
+            .finish()
+    }
+}
+
+impl<T: AdmitLayout> Drop for Mapped<T> {
+    fn drop(&mut self) {
+        if self.attached {
+            unsafe { T::leave(self.ptr.as_ptr(), self.handle.member.slot) };
+        }
+    }
+}
+
+impl<T: AdmitLayout> const Deref for Mapped<T> {
+    type Target = T;
+
+    fn deref(&self) -> &Self::Target {
+        unsafe { self.ptr.as_ref() }
+    }
+}
+
+impl<T: AdmitLayout> Mapped<T> {
+    pub(crate) fn pointer(&self) -> NonNull<T> {
+        self.ptr
+    }
+
+    pub(crate) fn disarm_detach(&mut self) {
+        self.attached = false;
+    }
+
+    pub fn region_id(&self) -> RegionId {
+        self.handle.region
+    }
+
+    pub fn peer(&self) -> Peer {
+        self.handle.peer()
+    }
+
+    pub(crate) unsafe fn mark_dead(&self, peer: Peer) -> Option<Member> {
+        unsafe { self.handle.mark_dead(peer) }
+    }
+
+    pub(crate) fn release_dead(&self, member: Member) -> bool {
+        self.handle.release_dead(member)
+    }
+
+    pub(crate) fn offset_of(
+        &self,
+        pointer: NonNull<u8>,
+        size: usize,
+    ) -> Result<usize, ProjectionError> {
+        let offset = pointer
+            .as_ptr()
+            .addr()
+            .checked_sub(self.handle.start_ptr().addr())
+            .ok_or(ProjectionError::OutOfBounds)?;
+        let end = offset
+            .checked_add(size)
+            .ok_or(ProjectionError::ArithmeticOverflow)?;
+        (end <= self.handle.size())
+            .then_some(offset)
+            .ok_or(ProjectionError::OutOfBounds)
+    }
+
+    pub(crate) unsafe fn ref_at<U>(&self, offset: usize) -> Result<&U, ProjectionError> {
+        let end = offset
+            .checked_add(core::mem::size_of::<U>())
+            .ok_or(ProjectionError::ArithmeticOverflow)?;
+        if end > self.handle.size() {
+            return Err(ProjectionError::OutOfBounds);
+        }
+        let pointer = unsafe { self.handle.start_ptr().add(offset) }.cast::<U>();
+        if !pointer.is_aligned() {
+            return Err(ProjectionError::Misaligned);
+        }
+        Ok(unsafe { &*pointer })
+    }
+}
+
+impl<T: crate::header::Layout> Mapped<crate::header::RcHeader<T>> {
+    pub(crate) fn recover_member(&self, slot: u8) -> bool {
+        unsafe { self.ptr.as_ref() }.recover_member(slot)
+    }
+
+    pub(crate) fn has_member(&self, slot: u8) -> bool {
+        unsafe { self.ptr.as_ref() }.has_member(slot)
+    }
+}
+
+impl<T: AdmitLayout> Mapped<T> {
+    unsafe fn from_raw(handle: Arc<Region>, ptr: NonNull<T>) -> Self {
+        Self {
+            handle,
+            ptr,
+            attached: true,
+        }
+    }
+
+    pub(crate) fn admit_at<U: AdmitLayout>(
+        &self,
+        offset: usize,
+        conf: U::Config,
+        allow_init: bool,
+    ) -> Result<Mapped<U>, ProjectionError> {
+        if self.handle.permits(Access::WRITE).is_err() {
+            return Err(ProjectionError::ReadOnly);
+        }
+        let layout = <U as AdmitLayout>::storage(&conf).ok_or(ProjectionError::Admission(
+            crate::header::AdmitError::InvalidHeader,
+        ))?;
+        let end = offset
+            .checked_add(layout.size())
+            .ok_or(ProjectionError::ArithmeticOverflow)?;
+        if end > self.handle.size() {
+            return Err(ProjectionError::OutOfBounds);
+        }
+        let pointer = unsafe { self.handle.map().start_mut_ptr().add(offset) }.cast::<U>();
+        if pointer.addr() % layout.align() != 0 {
+            return Err(ProjectionError::Misaligned);
+        }
+        let offset = u64::try_from(offset).map_err(|_| ProjectionError::ArithmeticOverflow)?;
+        let ctx = LayoutContext {
+            region: self.handle.region,
+            offset,
+            allow_init,
+        };
+        unsafe { U::admit(pointer, conf, ctx, Some(self.handle.member.slot)) }
+            .map_err(ProjectionError::Admission)?;
+        Ok(unsafe { Mapped::from_raw(self.handle.clone(), NonNull::new_unchecked(pointer)) })
     }
 }

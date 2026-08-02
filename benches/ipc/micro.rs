@@ -5,6 +5,7 @@ pub enum Mechanism {
     ReservePublish,
     ClaimRecycle,
     AllocateRelease,
+    Notify,
     SignalConsume,
     ProcessExchange,
 }
@@ -15,6 +16,7 @@ impl Mechanism {
             Self::ReservePublish => "reserve-publish",
             Self::ClaimRecycle => "claim-recycle",
             Self::AllocateRelease => "allocate-release",
+            Self::Notify => "notify",
             Self::SignalConsume => "signal-consume",
             Self::ProcessExchange => "process-exchange",
         }

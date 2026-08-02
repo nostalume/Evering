@@ -9,7 +9,7 @@ use windows_sys::Win32::{
     System::Threading::{CreateEventW, ResetEvent, SetEvent},
 };
 
-use crate::Notify;
+use crate::notify::Notify;
 
 #[derive(Debug)]
 struct Handle(HANDLE);
