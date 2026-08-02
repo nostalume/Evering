@@ -3,6 +3,19 @@ use super::plot;
 use super::{analysis, drive, environment, evering, family, geometry, micro, model, pilot, stream};
 
 #[test]
+fn path_presence_cannot_preserve_event_frequency() {
+    let once = drive::Path {
+        send_stalled: true,
+        ..drive::Path::default()
+    };
+    let mut repeated = drive::Path::default();
+    repeated.send_stalled = true;
+    repeated.send_stalled = true;
+
+    assert_eq!(repeated, once);
+}
+
+#[test]
 fn geometry_replay_keeps_causal_metrics_separate() {
     use geometry::{Event::*, Geometry, Rejection, Trace};
 
