@@ -134,7 +134,7 @@ struct TraceEndpoint {
 #[test]
 fn family_identity_is_explicit_unique_and_closed() {
     let core = family::find("core-ipc").unwrap();
-    assert_eq!((core.key, core.revision), ("core-ipc", 1));
+    assert_eq!((core.key, core.revision), ("core-ipc", 2));
     assert_eq!(
         core.mode("screening"),
         Some((std::time::Duration::from_secs(180), 3))
@@ -147,7 +147,7 @@ fn family_identity_is_explicit_unique_and_closed() {
 #[test]
 fn local_family_owns_its_exact_two_arm_matrix() {
     let local = family::find("local-ipc-unix").unwrap();
-    assert_eq!((local.key, local.revision), ("local-ipc-unix", 1));
+    assert_eq!((local.key, local.revision), ("local-ipc-unix", 2));
     assert_eq!(local.baseline.key, "uds/readiness");
     assert_eq!(
         local.mode("pilot"),
@@ -174,6 +174,7 @@ fn local_family_owns_its_exact_two_arm_matrix() {
                 pair.iter()
                     .all(|(cell, _)| (cell.capacity, cell.in_flight) == (8, 8))
             );
+            assert!(pair.iter().all(|(cell, _)| cell.memory == model::MEMORY));
         }
     }
 }
@@ -208,7 +209,7 @@ fn pilot_identity() -> pilot::Identity {
     pilot::Identity {
         algorithm: 3,
         family: "core-ipc".into(),
-        family_revision: 1,
+        family_revision: family::CORE.revision,
         revision: "revision".into(),
         diff: "diff".into(),
         target: "target".into(),
@@ -768,7 +769,7 @@ fn successful_trial() -> model::Trial {
             payload: 64,
             capacity: 8,
             in_flight: 3,
-            memory: 4096,
+            memory: model::MEMORY,
         },
         requested: 7,
         accepted: 7,
@@ -783,7 +784,7 @@ fn successful_trial() -> model::Trial {
             window: 3,
             topology: "1c1w".into(),
             transport: "shared-memory".into(),
-            extent: Some(4096),
+            extent: Some(model::MEMORY),
             allocator: Some("adaptive".into()),
             socket_send: None,
             socket_recv: None,
@@ -800,7 +801,7 @@ fn study(trials: Vec<model::Trial>) -> model::Study {
         meta: model::Meta {
             format: 5,
             family: "core-ipc".into(),
-            family_revision: 1,
+            family_revision: family::CORE.revision,
             revision: "abc123".into(),
             dirty: false,
             diff: "clean".into(),
@@ -831,7 +832,7 @@ fn condition() -> model::Condition {
         payload: 64,
         capacity: 8,
         in_flight: 3,
-        memory: 4096,
+        memory: model::MEMORY,
     }
 }
 
@@ -892,6 +893,12 @@ fn registered_families_have_exact_bounded_membership() {
     assert_eq!((screening.len(), focused.len()), (36, 10));
     assert_eq!(model::schedule(&screening, 3, 7).len(), 108);
     assert_eq!(model::schedule(&focused, 15, 7).len(), 150);
+    assert!(
+        screening
+            .iter()
+            .chain(&focused)
+            .all(|(cell, _)| cell.memory == model::MEMORY)
+    );
     assert!(
         focused
             .iter()
@@ -1110,7 +1117,7 @@ fn screening_has_estimates_but_no_decision_authority() {
     let markdown = analysis::report(core::slice::from_ref(&evidence)).unwrap();
     assert_eq!(markdown, analysis::report(&[evidence]).unwrap());
     assert!(
-        ["core-ipc/v1", "2.000000", "tcp/readiness", "Limit: 180 s"]
+        ["core-ipc/v2", "2.000000", "tcp/readiness", "Limit: 180 s"]
             .iter()
             .all(|value| markdown.contains(value))
     );

@@ -148,7 +148,7 @@ static CORE_MODES: [(&str, u64, u32); 4] = [
 ];
 pub static CORE: Family = Family {
     key: "core-ipc",
-    revision: 1,
+    revision: 2,
     baseline: &STREAM,
     arms: &CORE_ARMS,
     modes: &CORE_MODES,
@@ -177,7 +177,7 @@ static LOCAL_MODES: [(&str, u64, u32); 4] = [
 #[cfg(all(unix, feature = "local-socket"))]
 pub static LOCAL: Family = Family {
     key: "local-ipc-unix",
-    revision: 1,
+    revision: 2,
     baseline: &LOCAL_STREAM,
     arms: &LOCAL_ARMS,
     modes: &LOCAL_MODES,

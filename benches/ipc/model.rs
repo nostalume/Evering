@@ -2,6 +2,8 @@ use std::collections::HashSet;
 
 use super::drive::Path;
 
+pub const MEMORY: u64 = 32 * 1024 * 1024;
+
 pub fn payload(seed: u64, operation: u64, len: usize) -> Vec<u8> {
     (0..len)
         .map(|index| payload_byte(seed, operation, index))
@@ -75,12 +77,11 @@ impl Condition {
 }
 
 pub fn condition(payload: u64, capacity: u64, in_flight: u64) -> Condition {
-    let working = payload.max(64) * capacity * 2;
     Condition {
         payload,
         capacity,
         in_flight,
-        memory: (working + 4 * 1024 * 1024).next_multiple_of(4096),
+        memory: MEMORY,
     }
 }
 
