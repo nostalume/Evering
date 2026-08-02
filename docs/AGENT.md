@@ -4,8 +4,8 @@
 
 Evering develops a general, operating-system-independent model for bounded
 inter-process communication over shared memory. The intended fast path uses
-relocatable allocation metadata, fixed-capacity shared queues, typed ownership
-transfer, and generational correlation without placing process-local
+recoverable Pool capabilities, fixed-capacity shared queues, typed ownership
+transfer, and runtime schema admission without placing process-local
 capabilities in shared storage.
 
 Optimize only after preserving the cross-process model. Monomorphism, const
@@ -26,15 +26,16 @@ conceptually separable.
   their native-platform sugar; Tokio and tracing remain orthogonal features.
 - Const generics and nightly const-trait features for statically specialized
   layouts and policies.
-- Atomic bounded queues and generational registries for shared coordination.
-- A synchronized variable-size talc allocator with region-relative metadata and
-  a session-scoped heap view for typed payload operations.
-- Allocator-layout-identified tokens with checked extent and alignment admission
-  for typed move semantics.
+- Atomic bounded queues and a generational Directory for shared coordination.
+- A synchronized Talc GeneralHeap isolated to Directory layouts and explicit
+  PBox values; it is not recoverable transfer storage.
+- Recoverable Pools with immutable geometry, lifecycle-authoritative slots, and
+  private Pool-identified Tokens with checked type, extent, and alignment.
 - Unix file-descriptor and memory-mapping support through `nix`.
 - Optional Linux event-counter and Windows manual-event notification adapters,
   with Tokio registration kept process-local.
-- Criterion-style benchmark infrastructure with external IPC comparisons.
+- A bounded experiment harness with JSONL/Markdown/SVG artifacts and local-socket
+  comparison; new baselines are added only with matched semantics.
 
 ## Working principles
 
@@ -42,7 +43,7 @@ conceptually separable.
   before proposing a replacement API.
 - Treat shared bytes as a protocol. Identify which values are persistent,
   transferable, process-local, and reconstructable.
-- Treat `Message` and `Envelope` implementations as unsafe portability proofs;
+- Treat `Repr` and `Layout` implementations as unsafe portability proofs;
   reject process-local representation and ownership at that boundary.
 - Keep the mapping root responsible only for region identity and mapping
   lifetime. Let each persistent layout own and validate its schema and immutable
@@ -64,6 +65,10 @@ conceptually separable.
   behavior. Erase construction-only policy once its owned runtime effect has
   been admitted.
 - Performance claims require current benchmarks and a correctness oracle.
+- Keep Session protocol-neutral. Select protocol at typed Channel creation or
+  Port admission, and keep custom recovery handlers explicit.
+- Resolve queued Pool identity internally during Channel removal. Release Pool
+  storage before recycling its Queue slot; never accept a caller-selected Pool.
 
 ## Verification expectations
 
@@ -74,7 +79,7 @@ At minimum, select evidence from:
 
 - mock-backend tests for layout and allocator logic;
 - Unix mapping tests for platform behavior;
-- registry and queue concurrency tests;
+- Directory, Pool, and queue concurrency tests;
 - type-mismatch and stale-generation negative tests;
 - real two-process tests with different mapping bases;
 - queue-full, disconnect, cancellation, and abrupt-peer-death tests;
@@ -86,18 +91,9 @@ verified.
 
 ## Immediate goal
 
-The immediate goal is semantic truth at the actual process boundary:
-
-- prove that independently mapped peers can attach to the same session;
-- prove that registry identifiers and allocator metadata remain valid at
-  different mapping bases;
-- extend fixed-size and dynamically allocated token round trips with explicit
-  wrong-layout rejection;
-- define bounded behavior for disconnect and peer death;
-- model close/send and cancellation/completion interleavings beyond thread
-  stress, and continue the workspace-wide unsafe `Send`/`Sync` audit.
-
-The next boundary is public bootstrap exchange: transfer mapping and
-notification resources atomically, retain exact child identity for supervision,
-and keep recovery behind explicit proof that the peer can no longer access the
-mapping. Broader backends and performance comparison follow that evidence.
+Preserve the verified substrate while building one practical, bounded
+multi-process job example. It must use only the public Session, Pool,
+Channel/Port, process-resource exchange, Signals, close, and remove workflow;
+it must not hide reconstruction, allocation fallback, or an example-local IPC
+facade. Continue performance comparisons only through registered workloads and
+complete correctness evidence.
