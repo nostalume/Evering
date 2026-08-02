@@ -1,0 +1,197 @@
+<svg width="1500" height="760" viewBox="0 0 1500 760" xmlns="http://www.w3.org/2000/svg">
+<rect x="0" y="0" width="1500" height="760" opacity="1" fill="#FFFFFF" stroke="none"/>
+<text x="40" y="35" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="20.161290322580644" opacity="1" fill="#334155">
+Throughput ratios — core-ipc/v1
+</text>
+<text x="40" y="68" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="12.903225806451614" opacity="1" fill="#334155">
+Baseline: TCP readiness · 3 paired blocks · screening descriptive only
+</text>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="564" y1="649" x2="564" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="679" y1="649" x2="679" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="746" y1="649" x2="746" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="794" y1="649" x2="794" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="831" y1="649" x2="831" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="861" y1="649" x2="861" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="886" y1="649" x2="886" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="909" y1="649" x2="909" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="928" y1="649" x2="928" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="946" y1="649" x2="946" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="946" y1="649" x2="946" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1060" y1="649" x2="1060" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1128" y1="649" x2="1128" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1175" y1="649" x2="1175" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1212" y1="649" x2="1212" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1243" y1="649" x2="1243" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1268" y1="649" x2="1268" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1290" y1="649" x2="1290" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1310" y1="649" x2="1310" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1327" y1="649" x2="1327" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1327" y1="649" x2="1327" y2="95"/>
+<line opacity="0.45" stroke="#CBD5E1" stroke-width="1" x1="1442" y1="649" x2="1442" y2="95"/>
+<text x="977" y="695" dy="-0.5ex" text-anchor="middle" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+throughput ratio (candidate / baseline, log scale)
+</text>
+<line opacity="0.2" stroke="#000000" stroke-width="1" x1="564" y1="649" x2="564" y2="95"/>
+<line opacity="0.2" stroke="#000000" stroke-width="1" x1="946" y1="649" x2="946" y2="95"/>
+<line opacity="0.2" stroke="#000000" stroke-width="1" x1="1327" y1="649" x2="1327" y2="95"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="509,95 509,649 "/>
+<text x="500" y="649" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 64 KiB payload · queue 8 · 8 in flight · shared memory 5.000 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,649 509,649 "/>
+<text x="500" y="625" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering busy · 64 KiB payload · queue 8 · 8 in flight · shared memory 5.000 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,625 509,625 "/>
+<text x="500" y="601" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering adaptive · 64 KiB payload · queue 8 · 8 in flight · shared memory 5.000 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,601 509,601 "/>
+<text x="500" y="577" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 16 KiB payload · queue 8 · 8 in flight · shared memory 4.250 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,577 509,577 "/>
+<text x="500" y="553" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering busy · 16 KiB payload · queue 8 · 8 in flight · shared memory 4.250 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,553 509,553 "/>
+<text x="500" y="529" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering adaptive · 16 KiB payload · queue 8 · 8 in flight · shared memory 4.250 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,529 509,529 "/>
+<text x="500" y="505" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 256 · 64 in flight · shared memory 4.500 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,505 509,505 "/>
+<text x="500" y="481" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 256 · 8 in flight · shared memory 4.500 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,481 509,481 "/>
+<text x="500" y="457" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 256 · 1 in flight · shared memory 4.500 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,457 509,457 "/>
+<text x="500" y="433" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 8 · 64 in flight · shared memory 4.016 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,433 509,433 "/>
+<text x="500" y="409" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 8 · 8 in flight · shared memory 4.016 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,409 509,409 "/>
+<text x="500" y="385" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering busy · 1 KiB payload · queue 8 · 8 in flight · shared memory 4.016 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,385 509,385 "/>
+<text x="500" y="360" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering adaptive · 1 KiB payload · queue 8 · 8 in flight · shared memory 4.016 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,360 509,360 "/>
+<text x="500" y="336" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 8 · 1 in flight · shared memory 4.016 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,336 509,336 "/>
+<text x="500" y="312" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 1 · 64 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,312 509,312 "/>
+<text x="500" y="288" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 1 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,288 509,288 "/>
+<text x="500" y="264" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 1 KiB payload · queue 1 · 1 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,264 509,264 "/>
+<text x="500" y="240" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · 64 B payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,240 509,240 "/>
+<text x="500" y="216" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering busy · 64 B payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,216 509,216 "/>
+<text x="500" y="192" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering adaptive · 64 B payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,192 509,192 "/>
+<text x="500" y="168" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering notified · empty payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,168 509,168 "/>
+<text x="500" y="144" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering busy · empty payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,144 509,144 "/>
+<text x="500" y="120" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+Evering adaptive · empty payload · queue 8 · 8 in flight · shared memory 4.004 MiB
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,120 509,120 "/>
+<text x="500" y="95" dy="0.5ex" text-anchor="end" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="504,95 509,95 "/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="510,650 1444,650 "/>
+<text x="564" y="660" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+1.00×
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="564,650 564,655 "/>
+<text x="946" y="660" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+10.00×
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="946,650 946,655 "/>
+<text x="1327" y="660" dy="0.76em" text-anchor="middle" font-family="sans-serif" font-size="11.290322580645162" opacity="1" fill="#334155">
+100.00×
+</text>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="1" points="1327,650 1327,655 "/>
+<polyline fill="none" opacity="1" stroke="#CBD5E1" stroke-width="2" points="564,649 564,120 "/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1185,120 1212,120 "/>
+<circle cx="1201" cy="120" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1416,144 1428,144 "/>
+<circle cx="1426" cy="144" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1140,168 1164,168 "/>
+<circle cx="1141" cy="168" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1155,192 1178,192 "/>
+<circle cx="1168" cy="192" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1275,216 1278,216 "/>
+<circle cx="1277" cy="216" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1150,240 1169,240 "/>
+<circle cx="1156" cy="240" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="842,264 848,264 "/>
+<circle cx="845" cy="264" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="800,288 841,288 "/>
+<circle cx="841" cy="288" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="821,312 852,312 "/>
+<circle cx="830" cy="312" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="812,336 833,336 "/>
+<circle cx="819" cy="336" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1016,360 1050,360 "/>
+<circle cx="1044" cy="360" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1077,385 1105,385 "/>
+<circle cx="1089" cy="385" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1009,409 1042,409 "/>
+<circle cx="1037" cy="409" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="1002,433 1022,433 "/>
+<circle cx="1003" cy="433" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="836,457 860,457 "/>
+<circle cx="849" cy="457" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="946,481 994,481 "/>
+<circle cx="955" cy="481" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="747,505 756,505 "/>
+<circle cx="749" cy="505" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="644,529 652,529 "/>
+<circle cx="648" cy="529" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="716,553 725,553 "/>
+<circle cx="723" cy="553" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="648,577 672,577 "/>
+<circle cx="651" cy="577" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="567,601 599,601 "/>
+<circle cx="594" cy="601" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="593,625 617,625 "/>
+<circle cx="609" cy="625" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<polyline fill="none" opacity="1" stroke="#334155" stroke-width="2" points="568,649 603,649 "/>
+<circle cx="587" cy="649" r="5" opacity="1" fill="#2563EB" stroke="none" stroke-width="1"/>
+<text x="40" y="735" dy="0.76em" text-anchor="start" font-family="sans-serif" font-size="10.483870967741936" opacity="1" fill="#334155">
+Evidence 3eb8e047083615a41a84a089ec71bd15fad86364:12798164110868729919 · intervals are conditioned estimates; families are not pooled or ranked
+</text>
+</svg>
