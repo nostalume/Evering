@@ -6,7 +6,7 @@ use std::{
 };
 
 use evering::{
-    Channel, ChannelId as Id, HeapGeometry, Pool, PoolId, Port, Rx, Session, TrySendError, Tx,
+    BlockRange, Channel, ChannelId as Id, Pool, PoolId, Port, Rx, Session, TrySendError, Tx,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
     mapping::{Access, Request, Source},
     notify::{Signals, Wait as _},
@@ -21,6 +21,7 @@ use super::{
 };
 
 pub(super) const REGION: RegionId = RegionId::new(0x4556_4552_494e_4742, 1);
+pub(super) const POOL_EXTENT: usize = 16_515_072;
 const MAGIC: u64 = 0x4556_4552_4245_4e31;
 const DATA: u64 = 0;
 const READY: u64 = 1;
@@ -28,6 +29,18 @@ const BOOTSTRAP_LEN: usize = 88;
 pub(super) const ADAPTIVE_SPINS: usize = 64;
 #[cfg(unix)]
 static NEXT_SOCKET: AtomicU64 = AtomicU64::new(0);
+
+pub(super) fn pool_range() -> BlockRange {
+    BlockRange::new(64, 64 * 1024).unwrap()
+}
+
+fn pool_geometry(pool: &Pool) -> String {
+    let classes: Vec<_> = (0..).map_while(|index| pool.class(index)).collect();
+    format!(
+        "extent={POOL_EXTENT};range={:?};classes={classes:?}",
+        pool.range()
+    )
+}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -635,7 +648,7 @@ fn setup(
         .create_channel::<Envelope>(capacity)
         .map_err(|error| format!("could not create channel: {error:?}"))?;
     let pool = session
-        .create_pool(extent / 2, None)
+        .create_pool(POOL_EXTENT, Some(pool_range()))
         .map_err(|error| format!("could not create Pool: {error:?}"))?;
     let pool_id = pool.id();
     let path = std::env::temp_dir().join(format!(
@@ -722,7 +735,7 @@ fn setup(
         .create_channel::<Envelope>(capacity)
         .map_err(|error| format!("could not create channel: {error:?}"))?;
     let pool = session
-        .create_pool(extent / 2, None)
+        .create_pool(POOL_EXTENT, Some(pool_range()))
         .map_err(|error| format!("could not create Pool: {error:?}"))?;
     let pool_id = pool.id();
     let (parent_ring, parent_event) = evering::os::event().map_err(text)?;
@@ -778,7 +791,7 @@ fn run_with<const SPINS: usize, const WAIT: bool>(
         wait: &setup.wait,
         runtime: &setup.runtime,
     };
-    let geometry = HeapGeometry::auto(extent).ok();
+    let geometry = pool_geometry(&setup.pool);
     let mut counts = Counts {
         observed: Some(Observed {
             payload: cell.payload,
@@ -788,7 +801,7 @@ fn run_with<const SPINS: usize, const WAIT: bool>(
             topology: "1c1w".into(),
             transport: "shared-memory".into(),
             extent: Some(cell.memory),
-            allocator: geometry.map(|value| format!("{value:?}")),
+            allocator: Some(geometry),
             socket_send: None,
             socket_recv: None,
         }),

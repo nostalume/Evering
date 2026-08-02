@@ -179,6 +179,44 @@ fn local_family_owns_its_exact_two_arm_matrix() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn registered_evering_cells_fit_the_frozen_pool() {
+    use ::evering::{
+        Session,
+        mapping::{Access, Request},
+        os::unix::UnixFd,
+    };
+
+    let source = UnixFd::memfd("evering-study-pool", model::MEMORY as usize, false).unwrap();
+    let session = Session::create(
+        source.borrow(),
+        Request::new(model::MEMORY as usize, Access::READ | Access::WRITE),
+        evering::REGION,
+    )
+    .unwrap();
+    let pool = session
+        .create_pool(evering::POOL_EXTENT, Some(evering::pool_range()))
+        .unwrap();
+    assert_eq!(pool.range(), evering::pool_range());
+
+    for (condition, _) in (family::CORE.members)("screening")
+        .unwrap()
+        .into_iter()
+        .chain((family::LOCAL.members)("screening").unwrap())
+        .filter(|(_, arm)| arm.key.starts_with("evering/"))
+    {
+        let bytes = vec![0_u8; condition.payload as usize];
+        let live: Vec<_> = (0..condition.capacity.min(condition.in_flight))
+            .map(|_| pool.as_ref().copy(&bytes).unwrap())
+            .collect();
+        assert_eq!(
+            live.len() as u64,
+            condition.capacity.min(condition.in_flight)
+        );
+    }
+}
+
 #[test]
 fn environment_snapshot_is_stable_complete_and_self_identifying() {
     let first = environment::capture().unwrap();
