@@ -12,20 +12,16 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  tumbleweed:
+  linux:
     runs-on: ubuntu-latest
-    container: opensuse/tumbleweed:latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
-      - name: Install host tools
-        run: zypper --non-interactive install curl gcc gcc-32bit glibc-devel-32bit
-      - name: Install pinned Rust
-        run: |
-          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain none
-          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Install components and target
-        run: rustup toolchain install nightly-2026-05-19 --profile minimal --component rustfmt,clippy,rust-docs --target i686-unknown-linux-gnu
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-19
+          components: rustfmt, clippy, rust-docs
+          targets: i686-unknown-linux-gnu
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
@@ -38,7 +34,7 @@ jobs:
     runs-on: windows-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-05-19
