@@ -101,7 +101,7 @@ verified.
   atomic-ordering, or recovery proofs; delete syntax narration and copied
   architecture prose.
 - Ordinary CI owns format, warning-denied Clippy, docs, feature checks, package
-  inspection, and real process behavior on Windows and Tumbleweed. Timed studies
+  inspection, and real process behavior on hosted Linux and Windows. Timed studies
   remain isolated and emit inspectable artifacts.
 - The package is an unpublished `0.1.0` candidate with publication disabled.
   Do not tag, upload, or weaken that guard without a separate explicit release

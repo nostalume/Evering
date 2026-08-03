@@ -6,29 +6,30 @@
 
 </div>
 
-Evering is an experimental Rust substrate for bounded inter-process
-communication through shared memory. Its operating-system-independent core
-combines relocatable typed layouts, recoverable transfer storage, bounded duplex
-queues, and explicit ownership transitions. Native mapping, process handoff,
-notification, and asynchronous waiting are additive adapters.
+Evering is an experimental Rust substrate for bounded inter-process communication
+through shared memory. Its operating-system-independent core combines relocatable
+typed layouts, recoverable transfer storage, bounded duplex queues, and explicit
+ownership transitions. Native resources and asynchronous waiting are adapters.
 
 ## Model
 
-- Each persistent layout records and validates its own schema and immutable
-  information; there is no session-wide manifest.
-- A generational Directory owns reusable Channels and Pools.
-- Pools use authoritative lifecycle words for transferable Blocks. Talc remains
-  isolated to Directory construction and explicit `PBox` values; it is never a
-  silent transfer fallback.
-- A Channel is a protocol-typed duplex pair whose admitted role derives the only
-  valid transmit and receive directions.
-- Queue state is authoritative. Signals only advise a peer after commit and
-  optionally wait before retrying shared truth.
-- Pointers, native handles, wakers, callbacks, and process-local reference counts
-  never represent shared ownership.
+| Concept | What you use it for |
+| --- | --- |
+| `Session` | Create or open one typed view of a shared-memory region. |
+| `Pool` | Store transferable payloads in bounded, recoverable blocks. |
+| `Channel<H>` | Exchange fixed-representation headers through a bounded duplex queue. |
+| `Port<H>` | Hand one channel role to another process as stable bytes. |
+| `Signals` | Wait for progress and notify a peer after shared state commits. |
 
-The fast path keeps protocol, queue, and layout behavior concrete for
-monomorphization and inlining. Construction policy disappears after admission.
+A creator creates a `Session`, `Pool`, and channel, then hands the mapping,
+`PoolId`, and `Port` to a peer. The peer opens the session and adopts the port.
+Each side splits its channel into `Tx` and `Rx`; sending publishes a Pool-backed
+transfer, and receiving admits its schema into a typed block. Close transmitters,
+drain peers, then remove the channels.
+
+Native resources and Tokio waiting are optional adapters. `Session::heap` and
+`PBox` are an explicit general heap, never an automatic channel fallback. The
+[architecture](docs/architecture.md) defines recovery and safety invariants.
 
 ## Use from Git
 
@@ -45,9 +46,8 @@ also checks with default features disabled.
 
 ## Practical example
 
-The indexer creates shared storage and typed Channels, hands native resources to
-two worker processes, admits runtime-classified results, and closes and removes
-its resources:
+The indexer hands shared storage and typed Channels to two workers, admits their
+runtime-classified results, then closes and removes its resources:
 
 ```console
 cargo run --example index --features os,tokio -- README.md Cargo.toml
@@ -75,14 +75,11 @@ their work:
 | 1,024 | 3.064 | [2.953, 3.197] |
 | 65,536 | 2.934 | [2.879, 3.136] |
 
-These are condition-specific throughput decisions, not universal IPC claims or
-causal attribution. A later Windows diagnostic found that matched 64-KiB Pool
-allocation/copy metadata was not the observed end-to-end bottleneck; short-lived
-setup dominated wall time, while sustained residual costs remain unattributed
-between payload work and cross-process scheduling. The study document records
-the conditions, claim levels, conservation checks, historical evidence,
-analysis commands, and extension rules. Plots are generated on demand rather
-than committed as evidence.
+These are condition-specific throughput results, not universal IPC claims or
+causal attribution. A later Windows diagnostic excluded matched 64-KiB Pool
+allocation/copy metadata as the observed bottleneck but did not attribute the
+remaining sustained costs. The study records conditions, conservation checks,
+analysis, and extension rules; plots are generated on demand.
 
 ## Limits
 
