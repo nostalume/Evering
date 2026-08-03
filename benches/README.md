@@ -1,953 +1,265 @@
-# Evering IPC: registered methods and validity report
+# Evering IPC performance study
 
 ## Abstract
 
-This study asks when an Evering shared-memory request/response channel changes
-end-to-end throughput relative to a framed stream between two processes. The
-core family uses IPv4-loopback TCP; the first Unix extension uses a
-Unix-domain stream (UDS). The primary quantity is the paired ratio of fully validated
-operations per second under an exact platform, payload, capacity, in-flight
-window, waiting policy, memory extent, and allocator geometry. It is not a
-measurement of an isolated ring instruction.
+This study measures a complete two-process request/response operation, not an
+isolated queue instruction. It compares Evering shared-memory channels with a
+framed stream while matching logical work, application-visible capacity,
+in-flight concurrency, process topology, validation, and trial lifecycle.
 
-The candidate may avoid kernel transport and payload copies that the stream
-necessarily performs. Those differences are part of the whole-system estimand,
-not proof that any single queue, allocator, or notification mechanism caused the
-result. Mechanism attribution requires separate symmetric measurements.
+The newest complete focused experiment ran on openSUSE Tumbleweed under WSL2.
+For empty, 1-KiB, and 64-KiB requests, Evering delivered respectively 3.097,
+3.064, and 2.934 times the validated throughput of a Unix-domain stream (UDS).
+All familywise intervals lie above the registered 1.05 practical threshold.
+The result applies to the measured persistent one-coordinator/one-worker digest
+workload; it neither proves that shared memory is universally faster nor
+attributes the effect to one queue, allocator, or notification operation.
 
-The newest complete focused Tumbleweed delivery study contains 90/90 conserved
-trials over empty, 1-KiB, and 64-KiB payloads. Its paired Evering/UDS effects are
-3.097 `[2.767,3.341]`, 3.064 `[2.953,3.197]`, and 2.934
-`[2.879,3.136]`; all satisfy the registered Faster decision. These conclusions
-apply only to the persistent one-coordinator/one-worker digest workload.
+## Result
 
-The later Windows B6 run is diagnostic rather than confirmatory. One-block
-system smoke exposed short-session setup dominance. A matched 64-KiB Pool
-mechanism run measured a -58.377 ns/op paired difference against local-copy
-control, showing that Pool allocation metadata is not the observed end-to-end
-bottleneck. Different source identities prevent a causal join, and the remaining
-payload and scheduling shares are not attributed.
+The focused experiment used 15 paired blocks per payload and completed all 90
+trials. Capacity and maximum in-flight work were both eight, the shared extent
+was 32 MiB, and the Evering arm used adaptive waiting. The worker read every
+request byte and returned an eight-byte digest.
 
-## Research question and estimand
+| Payload | Evering op/s | UDS op/s | Evering / UDS | Familywise interval | Decision |
+|---:|---:|---:|---:|---:|---|
+| 0 B | 1,319,071 | 420,043 | 3.097 | [2.767, 3.341] | Faster |
+| 1 KiB | 1,119,129 | 365,510 | 3.064 | [2.953, 3.197] | Faster |
+| 64 KiB | 170,705 | 57,774 | 2.934 | [2.879, 3.136] | Faster |
 
-The primary question is:
+Every trial conserved
+`requested = accepted = completed = validated`. Accounted phases totalled
+7.275 s of setup and warmup, 20.365 s of timed work, and 0.185 s of drain.
+Individual timed phases lasted 156.1--320.3 ms. The evidence identity is
+`6103c79dfe62c5fb3a790f8b961e0f12338e2fa4fcb540210a2165c0fd8a1992`.
 
-> For a declared two-process, one-coordinator/one-worker request/response
-> workload, how does Evering change the rate of fully validated operations
-> relative to a framed IPv4-loopback TCP stream when logical work,
-> application-visible capacity, in-flight bound, trial lifecycle, and analysis
-> are matched?
+The practical conclusion is narrow: Evering was about three times faster than
+UDS for these three persistent-connection conditions on this host. The
+experiment does not estimate latency tails, CPU or energy efficiency, equal
+memory efficiency, multi-producer scaling, or crash-recovery cost.
 
-The Local IPC extension asks the same conditioned question for Evering adaptive
-relative to UDS readiness on one observed Unix host. The families are never
-pooled.
+## Question and metric
 
-For candidate arm `E`, baseline arm `S`, and condition `c`, the estimand is
+For condition `c`, the primary estimand is
 
-`R(c) = throughput(E, c) / throughput(S, c)`
+`R(c) = throughput(Evering, c) / throughput(stream, c)`
 
-where throughput is `validated_operations / timed_seconds`. `R(c)` is defined
-only from complete, successful, paired blocks. There is no aggregate ratio
-across platforms, payloads, policies, or resource geometries.
+where throughput is the number of fully validated operations divided by timed
+seconds. A ratio exists only for a complete pair of successful trials. Results
+are not pooled across payloads, platforms, transports, waiting policies, or
+memory geometries.
 
-The study answers a deployment-level question: the elapsed cost of accepting,
-transporting, transforming, returning, and validating a bounded set of
-requests. It does not directly answer:
+One operation consists of a numbered deterministic request, a complete worker
+read and digest transform, and an exactly matching response. A submitted or
+accepted request is never counted as completed. Wrong, missing, duplicated, or
+fabricated responses invalidate the trial.
 
-- how many nanoseconds one ring transition takes;
-- whether shared memory is universally faster than sockets;
-- whether one allocator, wait primitive, or runtime caused the observed ratio;
-- how either system behaves with multiple producers, multiple workers, remote
-  peers, unidirectional traffic, or a long-lived process pool;
-- tail latency, CPU efficiency, energy efficiency, or equal-memory efficiency.
-
-Those are separate estimands and require separately registered experiments.
-
-## Claim ladder
-
-Claims are admitted in increasing order of strength:
-
-1. **Correctness:** every accepted request is returned once with the exact
-   operation number and transformed payload.
-2. **Conditioned association:** complete paired evidence establishes a
-   throughput ratio under the recorded condition.
-3. **Practical decision:** the familywise interval places that ratio above,
-   below, or inside the registered equivalence band.
-4. **Bounded explanation:** separate mechanism evidence is consistent with a
-   named contributor to the whole-system result.
-5. **Causal attribution:** not provided by this study.
-
-A lower claim never implies a higher one. In particular, a large throughput
-ratio does not identify its cause.
+This is a deployment-level metric: it includes allocation and copying required
+by each arm, transport or publication, synchronization, worker processing,
+response transfer, and validation. Setup, process creation, mapping, handle
+exchange, warmup, drain, child reaping, and evidence persistence are measured
+separately and excluded from throughput.
 
 ## Compared systems
 
-### Evering candidate
-
-The coordinator creates a platform shared-memory object, one explicit
-recoverable Pool, and one bounded bidirectional channel. Each timed request
-allocates and copies the deterministic payload into that Pool, publishes a
-typed envelope, and notifies according to the selected retry policy. The worker
-admits the same Block, transforms its bytes in place, and publishes it back. The
-coordinator admits and validates the returned Block. Setup, resource exchange,
-channel/Pool creation, and final removal are outside timed work.
-
-### Stream baseline
-
-The coordinator creates one IPv4 loopback TCP connection to one fresh worker.
-Both endpoints enable `TCP_NODELAY`. Each request and response contains a
-12-byte operation/length header and the full payload. The sender constructs a
-frame, the receiver allocates a payload buffer, and the worker transforms that
-buffer before writing a framed response. The registered coordinator is a
-single-thread duplex endpoint that uses the existing current-thread Tokio
-runtime for readable/writable readiness; the worker uses blocking reads and
-writes. Connection setup and child creation are outside timed work.
-
-### Unix-domain stream baseline
-
-The Unix-only Local family uses the same framing, client state machine,
-workload, validation, scheduling, and analysis as TCP. A parent-owned temporary
-directory supplies one exclusive endpoint; the listener binds before worker
-spawn, and the owner guard removes only that endpoint. The measured client is
-statically specialized for Tokio UDS readiness with no trait object in the
-trial loop.
-
-This is intentionally a real portable stream baseline rather than a synthetic
-shared-memory imitation. Consequently the arms match logical service and bounds,
-not internal byte movement. The result includes the kernel path, framing,
-copying, allocation, synchronization, and validation each implementation needs
-to provide that service.
-
-## Fairness model
-
-Fairness means **semantic equivalence with transparent physical differences**.
-It does not mean forcing both implementations to use the same internal
-algorithm.
-
-Matched properties are request bytes, transform, response validation,
-application-visible capacity, in-flight bound, process topology, phase
-boundaries, registered duration class, and block scheduling. Total operation
-count may differ by arm but is separately piloted, frozen before block 0, and
-fully conserved. Deliberately different properties are transport, framing,
-memory ownership, allocation path, copy count, and retry/wait implementation.
-These differences must be reported because they explain what the whole-system
-ratio contains.
-
-The comparison is invalid if an arm silently weakens validation, drops work,
-uses a different logical window, falls back to another transport, or moves
-required timed work into setup. A physical optimization is not unfair merely
-because the other arm cannot use it; exposing that optimization is the purpose
-of a whole-system comparison.
-
-## Present evidence status
-
-| Evidence | Status | Permitted conclusion |
-|---|---|---|
-| Windows and Tumbleweed smoke | complete | Both arms can exchange and validate the registered smoke cases |
-| Windows 10-block exploratory run | valid partial, not complete | The matrix exposed a stream batching defect |
-| Tumbleweed core revision-1 screening | historical: 3 blocks, 108/108 trials | Descriptive conditioned ratios only |
-| Tumbleweed Local revision-1 screening | historical: 3 blocks, 30/30 trials | Descriptive conditioned ratios only |
-| Tumbleweed Local revision-2 screening | historical: 3 blocks, 30/30 trials | Descriptive conditioned ratios only; no cross-revision decision |
-| Tumbleweed focused delivery | complete: 15 blocks, 90/90 trials | Faster for the three registered persistent-connection conditions |
-| Windows B6 system/mechanism | complete diagnostic smoke and matched mechanism | Setup diagnosis and allocator bottleneck rejection; no system decision or causal attribution |
-| Windows excluded pilot/count manifest | complete locally, not retained evidence | Confirms the calibration and admission path works; no throughput claim |
-| Windows one-block manifest-authorized run | complete locally, diagnostic only | Confirms per-arm count conservation; too few blocks for an estimate |
-
-The retained historical [core evidence](evidence/core-ipc-tumbleweed-screening-20260731.jsonl)
-and [Local evidence](evidence/local-ipc-unix-tumbleweed-screening-20260731.jsonl)
-have SHA-256 digests
-`00c6fc9f052bf0b805e7e418ae49fff9b309fef8394394963b16e5e0d6b9c693`,
-and `cfd9af2e35459f644537e545a720cba51501f8308f09825ec1b2a5b28e5b0b71`.
-Local and core record dirty digests `14b86ac1df9347d1` and
-`6e0718d77b9964a5` because this paper and retained artifacts changed between
-family runs. Benchmark production code did not change; the families remain
-independent and are not pooled.
-
-The historical [Local revision-2 evidence](evidence/local-ipc-unix-tumbleweed-screening-20260802.jsonl)
-has SHA-256 digest
-`2b5eaa9ef08cb3c18d55cc68ac619efa4d08328ce50a75e52573fd26593a30fb`.
-It is clean (`dirty=false`), uses family revision 2, seed `20260802`, a fixed
-32-MiB condition extent, and records the actual 16,515,072-byte Pool geometry.
-
-### Current focused delivery result
-
-The persistent-connection family fixes capacity and in-flight window at eight,
-uses a 32-MiB extent, generates payloads and expected digests outside timed
-work, reads every request byte inside the worker, and returns one fixed-size
-digest. Screening completed before the 15-block focused run. Focused execution
-finished 90/90 trials in 33.6 seconds; setup, timed work, and drain were recorded
-separately, and every accepted operation was completed and validated.
-
-| Payload | Evering / UDS paired effect | 95% interval | Decision |
-|---:|---:|---:|---|
-| 0 | 3.097 | [2.767, 3.341] | Faster |
-| 1 KiB | 3.064 | [2.953, 3.197] | Faster |
-| 64 KiB | 2.934 | [2.879, 3.136] | Faster |
-
-Evidence identity is `6103c79d…8a1992`. The result is a conditioned deployment
-comparison, not a latency, CPU-efficiency, allocator, or universal transport
-claim.
-
-### Latest Windows bottleneck diagnostic
-
-The bounded B6 smoke sealed five observations in 4.838 seconds. Its single-block
-adaptive/TCP, busy/TCP, and notified/TCP ratios were 40.813, 52.720, and 3.191;
-they are smoke diagnostics, not intervals or decisions. Per-case setup took
-450--783 ms while measured transfer took 0.10--45.10 ms, so setup dominates this
-short-lived topology.
-
-The matched 64-KiB Pool mechanism run used three 19,828-operation AB/BA pairs.
-Gross shared-Pool batches took 30.52--31.26 ms and local-copy control took
-31.68--32.48 ms. The paired median was -58.377 ns/op with interval
-[-61.474, -55.679] ns/op. Pool allocation metadata is therefore rejected as the
-observed 140-us/message system bottleneck. Payload generation, worker mutation,
-bytewise validation, and cross-process scheduling remain residual candidates;
-their shares are not isolated. The Windows system and mechanism artifacts have
-different source identities, so no causal join is asserted.
-
-### Earlier revision-2 Local snapshot
-
-The bounded pilot completed ten cells in 6.2 seconds; screening completed all
-30 rows in 17.2 seconds. Every row conserves requested, accepted, completed,
-and validated operations. The resulting descriptive ratios are:
-
-| Payload | Evering adaptive / UDS readiness | Descriptive 95% interval |
-|---:|---:|---:|
-| 0 | 2.938 | [2.814, 3.295] |
-| 64 | 2.644 | [2.397, 2.750] |
-| 1024 | 1.677 | [1.622, 1.842] |
-| 16384 | 1.132 | [1.100, 1.149] |
-| 65536 | 1.277 | [1.204, 1.308] |
-
-All Evering rows report the same explicit Pool range and class table. Unlike
-the historical snapshot, the current adaptive arm records receive stalls,
-wait entry/return, and stale wakes. That path-regime change and the revised
-memory/geometry contract forbid a revision-1/revision-2 `Q` comparison.
-
-### Historical snapshot and later comparisons
-
-The two 2026-07-31 screening artifacts are immutable historical snapshots, not
-the current implementation baseline. Core contains 108/108 rows with source
-revision `3eb8e047083615a41a84a089ec71bd15fad86364`, dirty digest
-`6e0718d77b9964a5`, and evidence SHA-256
-`00c6fc9f052bf0b805e7e418ae49fff9b309fef8394394963b16e5e0d6b9c693`.
-Local contains 30/30 rows at the same revision, dirty digest
-`14b86ac1df9347d1`, and evidence SHA-256
-`cfd9af2e35459f644537e545a720cba51501f8308f09825ec1b2a5b28e5b0b71`.
-Both used format 5, family revision 1, seed 7, three screening blocks,
-x86_64 Tumbleweed under WSL, and rustc 1.97 nightly.
-
-A later run gets a new artifact name and retains the old bytes. It must match
-family revision, condition matrix, mode, target, host class, and observation
-contract before a longitudinal comparison is attempted. For snapshot `s`, let
-`R_s(c) = throughput(Evering, c) / throughput(baseline, c)`. The descriptive
-relative change is `Q(c) = R_new(c) / R_old(c)`. Blocks from different snapshots
-are resampled independently and are never pooled or treated as paired in time.
-Absolute Evering and baseline throughput changes are reported beside `Q`; a
-baseline drift or path-presence change is a regime warning, not something the
-ratio silently normalizes. Screening supports only descriptive change. A
-faster/slower/equivalent or regression decision requires a separately
-registered focused longitudinal design and its complete evidence.
-
-The 63.9-second core command contains 59.439 seconds of recorded trial phases:
-5.336 setup/warmup, 53.951 timed work, and 0.152 drain. Its 23 conditioned
-comparisons have block-ratio CV from 0.80% to 15.65%. At the reference capacity
-and in-flight bound:
-
-| Payload | Adaptive/TCP | Busy/TCP | Notified/TCP |
-|---:|---:|---:|---:|
-| 0 | 46.834 | 181.598 | 32.543 |
-| 64 | 38.319 | 73.863 | 35.648 |
-| 1024 | 18.167 | 23.715 | 17.406 |
-| 16384 | 1.665 | 2.619 | 1.688 |
-| 65536 | 1.198 | 1.315 | 1.152 |
-
-The eight notified boundary comparisons at payload 1024 range from 3.058 to
-14.143. The analyzer can regenerate the complete condition table and
-descriptive intervals from the retained JSONL. Core timed trials range from
-335.916 to 637.739 ms.
-
-The 22-second Local command contains 18.612 seconds of recorded trial phases:
-1.360 setup/warmup, 17.195 timed work, and 0.056 drain.
-
-| Payload | Block ratios | Mean | CV | Median and descriptive 95% interval |
-|---:|---|---:|---:|---:|
-| 0 | 2.957, 3.063, 3.228 | 3.083 | 4.43% | 3.063 [2.957, 3.228] |
-| 64 | 3.081, 3.028, 3.165 | 3.091 | 2.23% | 3.081 [3.028, 3.165] |
-| 1024 | 1.542, 2.025, 1.792 | 1.786 | 13.51% | 1.792 [1.542, 2.025] |
-| 16384 | 1.090, 1.097, 1.085 | 1.091 | 0.53% | 1.090 [1.085, 1.097] |
-| 65536 | 1.093, 1.210, 1.194 | 1.166 | 5.43% | 1.194 [1.093, 1.210] |
-
-All rows conserve `requested = accepted = completed = validated`; timed
-durations range from 478.895 to 656.809 ms. Three blocks provide weak
-descriptive intervals, the WSL host lacks several nuisance observations, and
-the absence of recorded waits limits interpretation. These ratios neither
-identify a mechanism nor authorize a deployment decision.
-
-The partial exploratory file is diagnostic evidence only. Successful rows from
-the same incomplete schedule may not be selected for performance analysis.
-All three failures used payload 65,536, capacity 8, and in-flight 8:
-
-| Block | Candidate policy paired with the stream row | Accepted | Completed | Validated | Status |
-|---:|---|---:|---:|---:|---|
-| 0 | notified | 6 | 0 | 0 | timed error |
-| 4 | notified | 6 | 0 | 0 | timed error |
-| 8 | busy | 6 | 0 | 0 | timed error |
-
-The candidate policy column identifies the paired contrast; it does not change
-the stream implementation. Repetition under two candidate labels is consistent
-with a stream-side progress defect rather than a waiting-policy result.
-
-## Implementation conformance audit
-
-The registered method is normative. The original defects and their implemented
-gates are:
-
-| Requirement | Current implementation | Consequence | Required gate |
-|---|---|---|---|
-| Transport-buffer-independent progress | Fixed-burst historical runner could deadlock | 64-KiB work depended on socket buffering | Current sliding-window duplex pump and constrained-buffer regression are green |
-| Per-arm duration calibration | Historical runner accepted one global count | Trial duration varied qualitatively by arm | Digest-bound `(condition, arm)→count` pilot is enforced before evidence creation |
-| Symmetric timed boundary | Historical stream used an unacknowledged sentinel | Residual control work could enter timing | Both arms share the same driver and validated work contract |
-| Waiting-path observability | A requested label did not prove the executed path | Waiting claims could be false | Format 5 records six timed path-presence booleans |
-| Host controls | Historical evidence omitted material observations | Environmental drift could not be admitted | Parent and worker independently match one read-only canonical environment digest |
-| Comparator semantics | Historical stream was called `blocking` | The label misdescribed execution | Current client uses Tokio readiness and records exact path presence |
-
-These gates permit execution; they do not themselves create a statistical
-result. Local revision-2 screening is complete; focused confirmation and
-core-family revision-2 screening remain outstanding.
-
-The benchmark verification suite is an explicit Cargo target at
-`benches/ipc/test_main.rs`, gated by the `benchmark` feature. Ordinary `cargo test`
-does not compile or run it. Run it independently with
-`cargo test --features benchmark --test ipc-study`; its separate LOC ledger is
-therefore a build boundary rather than a reporting convention. The executable
-and test roots use ordinary sibling-module discovery; no path override or
-formatter suppression is part of the benchmark.
-
-## Logical operation
-
-One accepted operation is exactly one request with:
-
-- a monotonically assigned operation number;
-- the declared payload length;
-- deterministic payload bytes derived from the study seed and operation
-  number.
-
-One completed operation is exactly one response carrying the same operation
-number and the declared deterministic transform of the complete request.
-Validation checks every response byte.
-
-A successful trial satisfies:
-
-`requested = accepted = completed = validated`
-
-A mismatch is a phase-specific failure with no performance value. Submitted
-work is never treated as completed work.
-
-## Contrast, arm, and block
-
-A `ContrastKey` identifies semantic workload only:
-
-- platform and target;
-- payload;
-- application-visible capacity;
-- maximum in-flight operations;
-- topology;
-- shared extent and allocator geometry where applicable.
-
-A `Contrast` combines that key with exactly two named arms:
-
-- candidate: Evering with one of `busy`, `adaptive`, or `notified`;
-- baseline: framed IPv4 loopback with policy `readiness`.
-
-Implementation and arm policy are not fields of `ContrastKey`. The readiness
-baseline is never duplicated under fake Evering policy labels.
-
-One arm observation is one trial with fresh arm resources and a fresh worker
-process. The benchmark coordinator process remains alive across trials.
-Each block has exactly one trial for both arms of every registered contrast.
-The seed deterministically randomizes contrast order, then arm order inside
-each contrast. It never changes membership, work, or identity. Worker processes,
-connections, mappings, heaps, and channels are not reused across units;
-coordinator allocator, cache, and host-process history can persist and are
-controlled only by randomized paired blocks.
-
-## Process and phase boundary
-
-The core topology is one coordinator process, one worker process, and one
-connection or typed request/response channel pair. Producer-count and
-multi-worker claims require a separately registered experiment.
-
-Every trial has:
-
-1. setup: resource creation, mapping/admission, child spawn, handle exchange,
-   runtime registration, and fixed-buffer allocation;
-2. warmup: identical logical request/response work;
-3. readiness: one reserved request/response on the measured transport,
-   validated by the coordinator, followed by no release message;
-4. timed work: exact admitted requests, backpressure, allocation/copy required
-   by the arm, response completion, and full validation;
-5. drain: close, remaining notification consumption, child wait or exact
-   kill-and-wait, reclamation, and unmapping;
-6. evidence persistence outside the timed interval.
-
-After the ready response, the coordinator requires zero staged and outstanding
-work, resets timed observations, and starts the clock immediately before
-operation zero. Normal operation identities and warmup cannot reach the
-reserved ready identity. The clock stops after validation of the last requested
-response. Setup, timed, and drain each have one absolute deadline. An I/O retry
-cannot restart a phase timeout. Every spawned child reaches one observed
-terminal state.
-
-## Work and resource equivalence
-
-- Each arm reuses the same deterministic payload, prepared before timed work.
-- Paired counts may differ; operation semantics, duration class, window,
-  topology, phase meaning, and validation remain matched.
-- Capacity is the maximum application-visible outstanding record count.
-- Stream batching is `min(capacity, in_flight, remaining)`.
-- The stream uses one connection, enables `TCP_NODELAY` on both endpoints, and
-  records actual socket-buffer sizes.
-- Evering records actual shared extent and admitted allocator geometry.
-- No equal-memory claim is made unless all relevant buffers and bounds were
-  observed. Otherwise memory comparability is explicitly unavailable.
-- Unsupported arm/condition pairs remain explicit without timing.
-- Setup, warmup, drain, error, and validation rules are identical in meaning,
-  even when their transport mechanics differ.
-
-## Condition ledger
-
-Every condition belongs to one of five classes. A report must preserve the
-class; merely recording a value does not make it controlled.
-
-| Condition | Role | Registered values or rule | Current observability |
-|---|---|---|---|
-| Payload | experimental factor | Local: 0, 1,024, 65,536 bytes | requested and observed |
-| Evering retry | experimental factor | busy, adaptive, notified | format 5 records path presence; exact fallback/coalescing counts remain separate diagnostics |
-| Capacity | experimental factor | reference 8; boundary 1 and 256 | requested and observed |
-| In-flight | experimental factor | reference 8; boundary 1 and 64 | requested and observed |
-| Platform | separate family | native Windows; openSUSE Tumbleweed under WSL | OS, target, architecture, host string |
-| Topology | fixed | one coordinator, one worker, one channel/connection | recorded as `1c1w` |
-| Logical work | fixed | worker reads the full payload and returns an 8-byte digest | operation and digest validated |
-| Connection count | fixed | one | implied by runner; not an evidence field |
-| Stream framing | fixed | 8-byte operation, 4-byte length, request payload or digest response | fixed by implementation |
-| Stream transport | fixed | IPv4 loopback TCP with `TCP_NODELAY` and coordinator readiness | transport and observed socket buffer sizes |
-| Shared extent | fixed | 32 MiB | requested and observed |
-| Allocator geometry | derived factor | registered Pool range in that extent | observed debug representation |
-| Warmup | fixed per artifact | registered before execution | metadata |
-| Operation count | fixed per arm after pilot | predetermined and conserved; paired arms may differ to enter one duration class | pilot manifest and each evidence row |
-| Block and arm order | randomized control | deterministic from seed | schedule identity and row order |
-| Trial process lifetime | fixed | persistent coordinator; fresh worker and arm resources | enforced by runner |
-| Lifecycle deadline | fixed | one absolute trial deadline capped by one family command deadline | remaining time is passed through setup, timed work, drain, and reap |
-| CPU model | nuisance condition | no target value | observed |
-| CPU affinity | nuisance condition | externally prepared, never mutated | inherited process mask observed and worker-matched |
-| Frequency/power policy | nuisance condition | externally prepared or declared unavailable | observed when the platform exposes it |
-| Page size | nuisance condition | observe, do not assume | observed |
-| Socket buffer geometry | nuisance/effect modifier | OS-selected; must not determine progress | observed; constrained-buffer progress is tested |
-| Background load/thermal state | nuisance condition | stabilize and describe session | explicitly unavailable unless externally documented |
-| Compiler and source | blocking identity | exact Rust compiler, revision, dirty digest | recorded |
-
-An unavailable value remains a limitation. It must not be converted into an
-assumption during analysis. Windows and WSL Tumbleweed differ in kernel,
-virtualization, scheduler, timer, and host interaction; they are independent
-families even when executed on the same physical computer.
-
-The benchmark does not set affinity or power policy. The operator may prepare
-them externally. Format 5 observes CPU identity/architecture/logical count, process
-affinity, OS/kernel and native/WSL identity, page size, available power/governor
-state, compiler/target, and source identity. Each worker independently admits
-the parent-supplied expected digest before connecting; the later empty `ready`
-response proves that admission and transport readiness both completed.
-The pilot manifest binds the snapshot and evidence admission rejects observable
-drift.
-
-Power, thermal, background-load, and physical-core/SMT information that cannot
-be observed remains nuisance context, not a new experimental factor. It may
-widen intervals or qualify magnitude. Qualitative decisions remain conditional
-on the recorded platform/session; Windows and Tumbleweed are reported
-separately if they disagree.
-
-### Factor semantics and aliasing
-
-The registered workload is closed-loop with a sliding window. The coordinator
-admits whenever
-`accepted - completed + staged < min(capacity, in_flight)`, where `staged` is
-zero or one partially committed request. Each complete response immediately
-releases one slot; there is no send-window/receive-window batch barrier. This is
-not an open-loop arrival process and does not model overload, queueing delay
-under an external arrival rate, or independent clients.
-
-The current runner executes this sliding window and records `window`. Older
-formats are not admitted or pooled with the current study.
-
-`capacity` and `in_flight` are therefore aliased through their minimum for
-logical concurrency. They are not interchangeable internally: changing
-capacity also changes Evering's ring allocation and derived shared extent,
-whereas the stream has no corresponding application queue allocation.
-Consequently:
-
-- an in-flight effect may be interpreted as a window effect while capacity and
-  geometry remain fixed;
-- a capacity effect can combine window, ring-layout, and shared-memory effects;
-- two cells with the same minimum window are not necessarily physically equal;
-- the study cannot estimate independent capacity and in-flight coefficients
-  from these cells.
-
-A zero-byte operation still carries an envelope or 12-byte stream header and
-exercises synchronization, framing, and validation. It means zero application
-payload, not zero transported metadata or zero work.
-
-## Timed work and cost accounting
-
-The clock begins immediately after the arm-specific warmup/ready exchange and
-ends after the final response is fully validated. The primary ratio therefore
-includes:
-
-| Cost | Evering | Stream |
-|---|---|---|
-| Deterministic request generation | excluded; one payload is prebuilt | excluded; one payload is prebuilt |
-| Request allocation | recoverable Pool reservation | frame and payload `Vec` allocation |
-| Request payload copy | into shared allocation | into user frame, then through socket path |
-| Request publication/transport | ring publication and possible notification | framed socket writes |
-| Worker receive | shared allocation admission | frame read and payload allocation |
-| Worker consumption | full payload read and digest | full payload read and digest |
-| Response transport | digest in envelope; allocation ownership returned | framed 8-byte digest response |
-| Coordinator receive/validation | allocation open, O(1) digest validation, release | frame read and O(1) digest validation |
-| Setup, mapping, spawn, handle exchange | excluded | excluded |
-| Drain, child wait, channel removal | excluded | excluded |
-| Evidence persistence | excluded | excluded |
-
-The table is an ownership-level accounting model, not an asserted count of
-hardware copies, cache misses, syscalls, or context switches. Those counts
-depend on platform behavior and need symmetric instrumentation. Logical GiB/s,
-when reported, is based on application payload and must not be described as
-memory bandwidth or wire bandwidth.
-
-Zero-byte trials measure control-path throughput. They cannot support a
-payload-bandwidth claim. Large-payload trials combine control and byte movement.
-Comparing them may show a conditioned change in association, but subtracting one
-from the other is not an admitted decomposition.
-
-## Progress equivalence
-
-Capacity and in-flight are application bounds, not permission to rely on
-transport buffer capacity. For every supported condition, either arm must make
-progress with only its declared application window and bounded internal state.
-
-The stream coordinator preserves the logical window while interleaving bounded
-send and receive progress. A regression with deliberately constrained socket
-buffers at payload 64 KiB, capacity 8, and in-flight 8 prevents progress from
-depending on OS socket-buffer size.
-
-## Registered matrices
-
-Reference values are payload 1024 bytes, capacity 8, in-flight 8, a fixed
-32-MiB shared extent, and the registered `64 B..64 KiB` Pool geometry. Every
-Evering row records the actual class sizes and slot counts.
-
-### Smoke
-
-Smoke runs 101 operations per selected arm as a correctness check only. It produces no
-performance claim.
-
-### Screening
-
-The core family has 36 arm rows per block:
-
-- all 15 combinations of payload `[0, 64, 1024, 16384, 65536]` and Evering
-  policy `[busy, adaptive, notified]` at capacity 8 and in-flight 8;
-- capacity `[1, 256]` at payload 1024, in-flight 8, notified;
-- in-flight `[1, 64]` at payload 1024, capacity 8, notified;
-- boundary pairs `(capacity, in-flight)` of `(1,1)`, `(1,64)`, `(256,1)`, and
-  `(256,64)` at payload 1024, notified.
-
-The Local family has six arm rows per block: three payloads times Evering
-adaptive and UDS readiness at capacity 8 and in-flight 8. Screening uses three
-complete paired blocks. Its intervals and capacity/in-flight observations are
-descriptive.
-
-### Focused confirmation
-
-The focused family is fixed before screening: three payload contrasts between
-Evering adaptive and the readiness baseline at capacity 8 and in-flight 8. It
-uses 15 complete paired blocks per platform. Capacity, in-flight,
-memory-geometry, or topology confirmation
-requires a later preregistered family.
-
-Windows and openSUSE Tumbleweed are separate artifacts and separate reports.
-
-## Pilot and stopping
-
-Before screening, an excluded pilot selects one exact operation count per
-`(contrast, arm)` so each arm enters the registered duration class without
-approaching the timed deadline. Paired counts may differ, but each is frozen
-before block 0 and exactly conserved during evidence execution.
-
-For `W = min(capacity, in_flight)`, algorithm 4 begins at
-`max(64, 32 × W)` rounded to a multiple of `W`. Fresh trials scale toward a
-measurable 50 ms observation for at most eight attempts, then freeze a checked
-250 ms target count. The manifest records every ramp, the selected count,
-source/environment/condition identity, and digest. Calibration failure appends
-one sanitized `ABORT` row; an incomplete manifest is neither admissible nor
-resumable. Pilot rows are excluded from performance evidence.
-
-One absolute command deadline governs whether new work may start and caps each
-trial through setup, warmup, measurement, drain, and child reap. Each trial
-receives the lesser of the family command remainder and its recorded per-trial
-limit. Local pilot, screening, and focused limits are respectively 45, 60, and
-90 seconds. A supervising process may add at most 20 seconds only to clean up
-a failed command. Budget expiry is an error and can never be encoded as low
-throughput.
-
-Pilot progress prints one flushed stderr line at cell start and completion.
-Screening prints one flushed stderr line per completed trial and one compact
-block summary. Stdout is reserved for terminal machine-readable output;
-progress never authorizes, repairs, or excludes an artifact.
-
-## Waiting policies
-
-- `busy` retries the same nonblocking shared operation without an OS wait.
-- `adaptive` performs a recorded bounded spin, then follows the notified path.
-- `notified` performs check-arm-recheck through the shipped sticky
-  notification and immediately retries authoritative shared state after wake.
-- `readiness` names the framed stream comparator. Its single coordinator thread
-  waits through Tokio for readable/writable readiness when immediate
-  nonblocking I/O cannot progress; its worker uses blocking I/O. Readiness is
-  advisory and must be followed by authoritative I/O.
-
-The three Evering policies share layouts, payload representation, operation
-path, counts, validation, close, and cleanup. They differ only at retry.
-Notification is advisory: it never publishes, consumes, closes, rolls back a
-committed record, or proves peer death.
-
-Format-5 trials record only whether each timed path occurred:
-
-- `send_stalled`: a logical send could not commit immediately;
-- `recv_stalled`: no complete response was immediately available;
-- `wait_entered`: runtime/OS waiting was entered;
-- `wait_returned`: waiting returned before the deadline;
-- `stale_wake`: the immediate authoritative retry made no progress;
-- `partial_io`: transport bytes progressed without a complete logical commit.
-
-These are process-local booleans, reset after `ready` and retained on success or
-failure. They prove path presence, not frequency or cost. Exact retry, spin,
-wait, wake, stale-wake, and notification-coalescing counts require a separately
-instrumented diagnostic run and cannot be mixed into primary throughput.
-
-## Evidence format and persistence
-
-Format 5 is newline-delimited JSON with one tagged `header`, ordered `trial`
-rows, and one terminal `end`. There is no production compatibility parser for
-older study formats. The header binds family/revision, source and dirty digest,
-compiler/target, environment, command, mode, seed, schedule, blocks, warmup,
-per-trial limit, expected rows, and adaptive-spin bound. Each trial records its
-scheduled identity, requested and conserved counts, timed duration, three phase
-durations, exact observed resources, path-presence bits, and terminal status.
-The end record binds row count, schedule, and the digest of all preceding
-JSONL bytes.
-
-The recorder uses `create_new`, synchronously appends and `sync_data`s every
-validated row, validates the whole study, then appends and `sync_all`s the end
-record. An interrupted or failed file remains a readable but incomplete prefix
-at its requested name. It has no analysis authority. The first mandatory
-failure stops lazy evaluation before any later trial starts, and no rerun
-overwrites an existing path. The design provides inspectable fail-fast
-evidence, not atomic final-name publication or parent-directory durability.
-
-When driven from Windows through WSL, use
-`C:\Windows\System32\wsl.exe --distribution tumbleweed --cd
-/mnt/e/Proj/dev/evering sh -lc ...` from the Windows user context. The managed
-sandbox token sees an empty distro registry, and Tumbleweed clears its `/tmp`
-mount when the instance stops; retained staging therefore uses ignored
-`target/study/`. Direct invocation of the already-built absolute benchmark
-binary avoids unnecessary Cargo freshness rebuilds on the mounted NTFS tree.
-
-## Analysis
-
-For each complete paired block:
-
-`log_ratio = ln(evering_operations_per_second / baseline_operations_per_second)`
-
-The point estimate is `exp(median(log_ratio))`.
-
-The deterministic percentile bootstrap resamples complete paired blocks 10,000
-times. Its seed is derived from the study seed and stable contrast encoding.
-Screening reports descriptive 95% intervals without faster, slower, equivalent,
-or crossover decisions.
-
-For a focused family of `m` contrasts, each contrast uses the two-sided
-Bonferroni bootstrap tails `0.05 / (2m)`, providing at least 95% familywise
-coverage.
-
-The practical-equivalence band is `[0.95, 1.05]`:
-
-- interval wholly inside the band: practically equivalent;
-- interval wholly above 1.05: candidate directionally faster;
-- interval wholly below 0.95: candidate directionally slower;
-- otherwise: inconclusive.
-
-Analysis resamples blocks, never individual rows; rejects incomplete pairs,
-unregistered matrices, or duplicate family artifacts; never pools artifacts or
-mutates raw evidence; and produces deterministic family-ordered Markdown with
-traceable artifact, contrast, and block identities.
-
-`cargo bench --bench ipc --features benchmark -- analyze <evidence>...` performs
-that registered analysis without a statistics or dataframe dependency. Every
-input must be one complete format-5 artifact matching its registered family,
-revision, mode, seed, blocks, and exact matrix. A report admits at most one
-artifact per family and renders independent sections in stable family order.
-
-The optional `plot` feature adds only Plotters' SVG backend. Run
-`cargo bench --bench ipc --features benchmark,plot -- plot <new-output-dir> <evidence>...`.
-The renderer refuses an existing output directory and consumes the same admitted,
-sorted `Analysis` values as Markdown; it does not recompute estimates, pool
-families, rank arms, or promote screening intervals to decisions. It emits one
-byte-stable logarithmic ratio plot per family.
-
-Each row spells out the policy, payload, queue capacity, messages in flight,
-shared extent, candidate/baseline op/s and useful MiB/s, ratio, and interval.
-
-Plots are generated on demand from admitted evidence and are not retained as
-authoritative artifacts.
-
-The timed execution/transport core retains its 2,000 nonblank, noncomment line
-ceiling. Offline native analysis and its command admission have a separate
-280-line natural-format ceiling because they do not participate in the timed
-path; tests are
-accounted separately from both. The optional renderer has its own 220-line
-ceiling.
-
-Latency ratios, combined coordinator-plus-worker CPU ns/op, logical GiB/s, and
-kernel counters are secondary only when collected symmetrically. Instrumented
-throughput, latency, and counter runs are separate when instrumentation changes
-the primary path.
-
-## Mechanism measurements
-
-Mechanism evidence is separate from IPC trials. Registered operations are:
-
-- reserve/publish;
-- claim/recycle;
-- shared allocate/release;
-- notification signal/consume;
-- one complete process exchange.
-
-Each row names whether it is same-process, cross-thread, or cross-process,
-records exact iterations and state reset, and includes a non-elided control
-loop using `std::hint::black_box`. Net and gross costs are reported; negative
-subtracted time is not manufactured into zero or a positive result.
-
-Mechanism rows cannot be decoded or reported as whole-system throughput. An
-association between mechanism and process evidence supports only a bounded
-explanation.
-
-Run the registered external harness with
-`cargo test --release --all-features --test micro -- --nocapture`. It emits
-`MICRO` rows for all five boundaries. Platform/session/process setup and state
-reset live in the external test harness and remain outside each measured
-transition; this avoids duplicating the IPC runner and preserves the shared
-micro/recovery production ceiling. The harness is diagnostic evidence, not a
-throughput claim or a retained report artifact.
-
-The allocation row measures the explicit GeneralHeap/PBox 64-byte
-allocate/initialize/release surface. It does not claim to isolate raw Talc
-mutation from mandatory typed initialization or admission; any narrower
-allocator claim requires a separately registered internal instrumentation
-surface.
-
-## Recovery experiment
-
-Recovery is correctness evidence, not a throughput sample. One fresh worker is
-terminated at each distinct shared-memory cut:
-
-- after reserve, before a value is staged;
-- before publish;
-- after publish;
-- after claim;
-
-“After claim” and “before recycle” name the same durable claimed state because
-the safe `Claim::take` transition couples moving the value with recycling the
-slot. They are one registered cut. The study does not add an otherwise
-unobservable lifecycle state merely to split those procedural labels.
-
-After terminal `Exit` from the exact retained `Supervisor`, the coordinator
-admits death, rechecks and drains authoritative shared state once, repairs,
-reaps, and classifies each accepted operation.
-
-Run `cargo test --release --all-features --test recovery_process --
---nocapture`. Each `RECOVERY` row records the cut, exact exit code, accepted,
-validated, recovered-loss, duplicate, and fabricated counts, followed by
-recovery nanoseconds. The notification only releases the advisory wait; the
-retained `Exit` remains the sole death evidence.
-
-Valid recovery satisfies:
+### Evering
+
+The coordinator and worker share one bounded bidirectional channel and one
+recoverable Pool. A request is copied into a Pool allocation and published as a
+typed envelope. The worker admits the allocation, reads the bytes, writes the
+digest, and returns ownership through the channel. The coordinator admits the
+returned allocation, verifies the digest, and releases it.
+
+The `busy`, `adaptive`, and `notified` policies change retry behaviour only.
+Notification is advisory: authoritative shared state decides whether a send,
+receive, close, or recovery transition occurred.
+
+### Stream baselines
+
+The portable baseline is framed IPv4-loopback TCP with `TCP_NODELAY`. The Unix
+comparison reported above uses UDS with the same framing and logical state
+machine. A request frame carries an operation number, payload length, and full
+payload; the response carries the operation number and digest. The coordinator
+uses Tokio readiness when nonblocking I/O stalls, while the worker uses
+blocking I/O.
+
+The arms match service semantics and resource bounds, not physical byte
+movement. Kernel transport, framing, copying, allocation, and readiness are
+real costs of the stream implementation and therefore belong in the
+whole-system comparison.
+
+## Experimental design
+
+The topology is one persistent coordinator, one fresh worker per trial, and one
+channel or connection. Each paired block observes both arms. A fixed seed
+randomizes condition order and arm order without changing membership or work.
+Fresh mappings, channels, connections, and worker processes limit cross-trial
+state; the coordinator and host can retain cache, allocator, scheduler, and
+thermal history.
+
+Each trial has six phases:
+
+1. Setup creates resources, exchanges handles, and starts the worker.
+2. Warmup performs the same logical operation used during measurement.
+3. A reserved readiness exchange proves both endpoints admitted the condition.
+4. Timed work executes the frozen operation count under bounded backpressure.
+5. Drain closes resources and observes one exact child terminal state.
+6. Evidence is persisted after timing.
+
+One absolute deadline covers setup, warmup, measurement, drain, and child reap.
+A retry cannot restart the deadline. Before evidence collection, an excluded
+pilot chooses a fixed count for each condition and arm so measurement is long
+enough to reduce timer and startup sensitivity without allowing one command to
+run unboundedly. The chosen count is frozen before the first paired block.
+
+Capacity is the maximum application-visible outstanding record count.
+In-flight is the maximum admitted but incomplete operation count. Their minimum
+is the logical sliding window, but they are not physically interchangeable:
+changing Evering capacity also changes ring geometry, whereas changing
+in-flight alone does not.
+
+## Statistical analysis
+
+For every complete paired block, analysis computes
+
+`log_ratio = ln(Evering operations/s / baseline operations/s)`.
+
+The point estimate is the exponentiated median log ratio. A deterministic
+percentile bootstrap resamples complete blocks 10,000 times; it never resamples
+individual operations. For `m` focused contrasts, two-sided bootstrap tails use
+`0.05 / (2m)`, giving at least 95% familywise coverage.
+
+The registered practical-equivalence band is `[0.95, 1.05]`:
+
+- an interval wholly above 1.05 is Faster;
+- an interval wholly below 0.95 is Slower;
+- an interval wholly inside the band is Practically equivalent;
+- every overlapping interval is Inconclusive.
+
+Screening intervals are descriptive and never receive those decisions.
+Incomplete schedules, mismatched conditions, duplicate families, and
+unsupported evidence formats are rejected before analysis.
+
+## Bottleneck evidence
+
+A later Windows diagnostic separates short-session overhead from the timed
+transport path. Five smoke observations completed in 4.838 s. Setup took
+450--783 ms per case, while measured transfer took 0.10--45.10 ms. This shows
+that repeatedly creating a worker and connection dominates short benchmark
+commands, but setup is outside the persistent-connection throughput estimand.
+
+A matched 64-KiB allocation experiment used three AB/BA pairs of 19,828
+operations. Shared-Pool batches took 30.52--31.26 ms; a local-copy control took
+31.68--32.48 ms. The paired median difference was -58.377 ns/op with interval
+[-61.474, -55.679] ns/op. Under that diagnostic, Pool allocation metadata
+cannot explain the observed roughly 140-us/message system cost.
+
+This is a rejection, not a causal decomposition. Payload generation, worker
+mutation, validation, cache traffic, notification, and cross-process scheduling
+were not isolated symmetrically. The system and mechanism observations also
+have different source identities, so they cannot be joined into a causal
+estimate.
+
+## Robustness and validity
+
+The comparison admits a performance value only when:
+
+- phase boundaries and logical work are identical in meaning;
+- requested, accepted, completed, and validated counts are equal;
+- every response number and digest is correct;
+- both arms respect the same capacity and in-flight bounds;
+- no timeout, fallback, or unsupported path is encoded as success;
+- the worker reaches exactly one observed terminal state;
+- the compiler, source, schedule, environment, and resource geometry are
+  recorded and internally consistent.
+
+Paired randomized blocks reduce temporal drift but cannot remove scheduler,
+frequency, thermal, page-fault, virtualization, or background-load effects.
+Threads are not assumed pinned and unavailable host controls remain explicit
+limitations. Very short observations can still look precise; the per-arm pilot
+and minimum duration are therefore admission requirements.
+
+The shared-memory and stream arms intentionally differ in ownership and copy
+paths. Internal memory use is not matched: socket buffers, private buffers,
+mappings, Pool metadata, and runtime state have not been measured under one
+common memory budget. Logical MiB/s is application payload throughput, not wire
+or memory bandwidth.
+
+The focused result is specific to x86_64 Tumbleweed under WSL2, the recorded
+compiler and source, one coordinator and one worker, one persistent connection,
+capacity and in-flight eight, a 32-MiB extent, adaptive waiting, and the digest
+workload. Windows, bare-metal Linux, another architecture, concurrent clients,
+open-loop arrivals, crash-heavy operation, and other transports require
+separate evidence.
+
+## Recovery evidence
+
+Recovery is tested as correctness, not throughput. A worker is terminated after
+reserve, before publish, after publish, or after claim. Only an observed
+terminal process exit authorizes repair; a timeout, notification error, closed
+pipe, PID, or heartbeat does not prove death.
+
+Valid recovery satisfies
 
 `accepted = validated + recovered_loss`
 
-Duplicate and fabricated records are zero. Timeout, notification error, pipe
-closure, PID, or heartbeat never authorizes death admission. The current
-public reap result proves complete repair or returns its still-live authority;
-it does not expose layout or quarantine counters. The harness therefore does
-not manufacture those values. It instead verifies channel removal, dead-slot
-reuse at a newer generation, and a subsequent clean attach/exchange/removal.
+with zero duplicate and fabricated records. The test also verifies channel
+removal, reuse of a dead participant slot at a newer generation, and a clean
+subsequent attach, exchange, and removal.
 
-## Interpretation of large ratios
+## Reproduction
 
-A large observed ratio is plausible but is not self-authenticating. Evering can
-avoid kernel stream framing and can return the same shared allocation after an
-in-place transform. For zero-byte busy trials, its hot path may be mostly
-shared atomics and cache coherence while the stream still performs framed
-kernel I/O and scheduling. This can produce an order-of-magnitude difference
-without measurement fraud.
+Benchmark tests are isolated from the ordinary project test suite:
 
-The same structural asymmetry also makes the ratio sensitive to omitted
-conditions:
+```console
+cargo test --features benchmark --test ipc-study
+```
 
-- delayed acknowledgement dominated the stream until `TCP_NODELAY` was enabled;
-- socket buffer capacity currently determines whether the 64-KiB batched
-  baseline makes progress;
-- a global count of 1,000 leaves some candidate trials far below the registered
-  250-ms duration, increasing timer, scheduler, startup-residue, and frequency
-  sensitivity;
-- continuous availability can make a nominally notified policy complete
-  without sleeping, so the policy name alone does not establish wake cost;
-- setup and teardown dominate command wall time but are outside the throughput
-  estimand;
-- payload copying, allocation, kernel work, and cache behavior are deliberately
-  included but not separately observed.
+Run a study and analyze complete evidence with:
 
-Therefore the correct reading of an unexpectedly large ratio is:
+```console
+cargo bench --bench ipc --features benchmark -- <study-command>
+cargo bench --bench ipc --features benchmark -- analyze <evidence.jsonl>...
+```
 
-1. verify conservation and artifact completeness;
-2. verify both arms ran long enough under the same frozen count;
-3. audit transport progress and fallback observations;
-4. inspect paired block dispersion and the familywise interval;
-5. reproduce in a separate platform family;
-6. use symmetric mechanism or counter evidence before proposing a cause.
+The optional `plot` feature creates SVG from the admitted analysis without
+changing estimates:
 
-The study reports the ratio if it survives these gates. It does not shrink or
-discard a valid large effect merely because it looks surprising, and it does
-not promote a surprising exploratory value into a result.
+```console
+cargo bench --bench ipc --features benchmark,plot -- \
+  plot <new-output-directory> <evidence.jsonl>...
+```
 
-## Threats to validity
+Plots are derived presentation artifacts and are not committed as authority.
+The analyzer consumes newline-delimited JSON containing one header, ordered
+trial rows, and one terminal record that binds the row count, schedule, and
+digest of preceding bytes. Interrupted evidence remains an inspectable but
+inadmissible prefix; reruns never overwrite an existing artifact.
 
-### Construct validity
+Retained historical screening evidence is available for audit:
 
-Validated operations per second represents a bounded request/response service,
-not general IPC performance. The baseline is portable IPv4-loopback TCP, not
-the fastest platform-specific IPC facility. Busy, adaptive, notified, and the
-stream comparator follow different progress strategies; comparing them answers
-policy-qualified questions only.
+- [Tumbleweed TCP screening, 2026-07-31](evidence/core-ipc-tumbleweed-screening-20260731.jsonl)
+- [Tumbleweed UDS screening, 2026-07-31](evidence/local-ipc-unix-tumbleweed-screening-20260731.jsonl)
+- [Tumbleweed UDS screening, 2026-08-02](evidence/local-ipc-unix-tumbleweed-screening-20260802.jsonl)
 
-The application-visible capacity and in-flight window are matched, but internal
-memory use is not. An equal-memory claim is unavailable until process-private
-buffers, socket buffers, mappings, allocator overhead, and runtime state are
-measured consistently.
+Those artifacts describe earlier implementations and must not be pooled with
+the focused result or treated as the current performance baseline.
 
-### Internal validity
+## Next evidence
 
-Paired randomized blocks reduce temporal drift but do not remove it. Unpinned
-threads, unavailable power controls, background load, thermal changes, page
-faults, allocator state, and virtualization can affect the ratio. Fresh workers
-and arm resources limit cross-trial state, but the persistent coordinator and
-host retain allocator, cache, scheduler, and system history. Setup can also
-leave arm-specific residue immediately before the timed ready boundary.
+The present paper supports one conditioned throughput decision and one bounded
+allocator rejection. The most useful extensions are:
 
-The deterministic payload generator and byte validation execute in both arms,
-but their memory ownership differs. Compiler optimization is constrained by
-observable inter-process exchange and validation; it is not assumed absent.
+1. repeat the focused UDS experiment on native Linux and another physical host;
+2. repeat it on native Windows with a named-pipe baseline;
+3. collect symmetric CPU time, context switches, page faults, and cache counters
+   in a separate instrumented run;
+4. register latency and multi-client studies rather than deriving them from
+   throughput;
+5. admit additional IPC systems only after matching topology, work, bounds,
+   allocation, batching, fallback, and validation semantics.
 
-### Statistical conclusion validity
-
-Very short trials can produce precise-looking but unstable ratios. The
-per-contrast pilot and 250-ms minimum are therefore blocking requirements.
-Blocks, not individual operations, are the resampling units. Serial dependence
-between blocks remains a limitation rather than being assumed away.
-Bonferroni intervals protect the registered focused family, not arbitrary
-post-hoc subsets. Ten screening blocks are descriptive; thirty focused blocks
-do not guarantee useful power when environmental variance is high.
-
-The equivalence interval expresses the registered practical threshold, not
-proof that implementations are identical. Failure to establish faster, slower,
-or equivalent is reported as inconclusive.
-
-### External validity
-
-Results apply only to the recorded compiler, revision, host conditions,
-platform family, two-process topology, message transform, connection count,
-payloads, bounds, and policies. Native Windows results do not predict WSL
-Tumbleweed, and neither predicts bare metal, another CPU architecture, a
-container host, multi-producer load, crash-heavy service, or network transport.
-
-### Instrumentation validity
-
-Wall-clock throughput alone cannot distinguish CPU execution, blocked time,
-context switches, cache misses, page faults, or copying. Optional counters must
-be collected symmetrically in a separate instrumented run if their collection
-changes either hot path. Missing counters remain missing; elapsed time is not a
-proxy for CPU consumption.
-
-## Invalidity rules
-
-A trial has no performance value when:
-
-- phase boundaries differ from the declared arm;
-- requested/accepted/completed/validated conservation fails;
-- a response number or payload is wrong, duplicate, or fabricated;
-- the child is not exactly waited or killed-and-waited;
-- a phase exceeds its absolute deadline;
-- resource, queue, or task growth exceeds its declared bound;
-- fallback, timeout, comparator error, or unsupported behavior is encoded as
-  elapsed success;
-- metadata, schedule, arm pair, environment, or revision is absent or
-  inconsistent;
-- the operation count/order cannot be reproduced;
-- instrumentation changes one arm only.
-
-Invalid and unsupported rows remain in partial evidence with a reason and no
-elapsed performance value. No post-hoc exclusion is permitted.
-
-## Comparator admission
-
-The mandatory baseline is the real two-process framed IPv4-loopback stream.
-Platform-native Unix-domain sockets and Windows named pipes are separate
-transport factors, not aliases of the portable baseline.
-
-Optional whole-system admission order is current `shmipc` on Linux, then
-iceoryx2 only for a named cross-platform middleware question. Every admitted
-row records exact version, runtime, geometry, capacity, batching, allocation,
-and fallback behavior. Fallback is invalid or a separately named arm.
-
-Monoio is a runtime-driver candidate, not an IPC comparator. It may enter a
-separate Linux/macOS study only over the same transport, topology, connection
-count, work, validation, and bounds. No optional dependency is added before a
-written equivalence/admission review.
-
-## Evidence retention and reporting
-
-Pilot and unreferenced exploratory artifacts remain ignored. Every artifact
-cited by a retained report is copied unchanged into
-`benches/evidence/`, revalidated there, and committed with the report. If a
-cited artifact exceeds 5 MiB, publication stops until a content-addressed
-external archive is approved.
-
-Each report claim names artifact, revision, platform, target, topology,
-payload, capacity, in-flight, candidate/baseline policies, extent/geometry,
-block count, estimator, familywise interval, and decision. Negative, null,
-unsupported, invalid, and inconclusive results remain visible. No claim
-generalizes beyond its recorded conditions.
-
-## Core completion
-
-Core completion requires:
-
-- evidence format 5, deterministic paired scheduling, absolute lifecycle deadlines,
-  process-crash persistence, and complete validation;
-- matched Evering busy/adaptive/notified and readiness-stream arms;
-- native registered analysis;
-- mechanism and recovery evidence;
-- 3-block screening and 15-block focused families on Windows and Tumbleweed;
-- a checked-in condition-qualified report and every cited evidence artifact.
-
-Optional comparators, runtime drivers, latency distributions, process counters,
-plots, and hosted regression tracking are not core-completion requirements.
+Monoio is a runtime-driver candidate, not an IPC comparator. `shmipc` or another
+shared-memory system may become a comparator only through an explicit
+equivalence review; otherwise its result would answer a different question.
