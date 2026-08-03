@@ -7,13 +7,14 @@ use std::{
 };
 
 use evering::{
-    ReceiveError, Session,
+    Encoded, ReceiveError, Session,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
     mapping::{Access, Request},
     notify::{Committed, Notify, ProgressError, Signals, Wait},
 };
 
 const REGION: RegionId = RegionId::new(0x6539_7375_7266_6163, 1);
+const RUNTIME: SchemaKey = SchemaKey::new(SchemaId(0x6539_7275_6e74_696d), 1);
 
 #[repr(C)]
 #[derive(Debug)]
@@ -88,6 +89,32 @@ fn sessions() -> (Session, Session) {
     )
 }
 
+#[test]
+fn signal_capabilities_are_static_and_commits_are_consumed_explicitly() {
+    let (left_session, right_session) = sessions();
+    let (left, port) = left_session.create_channel::<Encoded>(1).unwrap();
+    let right = right_session.adopt(port).unwrap();
+    let pool = left_session.create_pool(64 * 1024, None).unwrap();
+    let right_pool = right_session.open_pool(pool.id()).unwrap();
+    let (tx, _) = left.split();
+    let (_, rx) = right.split();
+    let signals = Signals::none();
+
+    signals
+        .try_send(&tx, pool.as_ref().put(29_u64).unwrap().encode(RUNTIME))
+        .unwrap()
+        .into_value();
+    let value = signals
+        .admit::<u64>(rx.claim().unwrap(), right_pool.as_ref(), RUNTIME)
+        .unwrap()
+        .into_value();
+    assert_eq!(*value, 29);
+
+    let bell = FaultBell(Cell::new(0));
+    let ((), notified) = Signals::notify(&bell).close_tx(&tx).into_parts();
+    assert_eq!(notified, Err(7));
+}
+
 #[cfg(windows)]
 fn sessions() -> (Session, Session) {
     let source =
@@ -118,13 +145,14 @@ async fn borrowed_signals_commit_then_notify_concrete_endpoints() {
             pool.as_ref().put(7_u64).unwrap().transfer(Envelope(11)),
         )
         .unwrap();
-    assert_eq!(sent.notified, Ok(()));
+    assert_eq!(sent.into_parts().1, Ok(()));
     assert_eq!(bell.0.get(), 1);
 
     let received = signals.claim(&rx).await.unwrap();
     assert_eq!(bell.0.get(), 1, "claim alone does not recycle capacity");
     let discarded = signals.discard(received, right_pool.as_ref()).unwrap();
-    assert_eq!(discarded.value.0, 11);
+    let (discarded, _) = discarded.into_parts();
+    assert_eq!(discarded.0, 11);
     assert_eq!(bell.0.get(), 2);
     assert_eq!(wait.1.get(), 0);
 
@@ -148,7 +176,7 @@ async fn permit_rollback_precedes_its_notification() {
     assert!(matches!(rx.claim(), Err(ReceiveError::Busy)));
 
     let cancelled = signals.reserve(&tx).await.unwrap().cancel();
-    assert_eq!(cancelled.notified, Ok(()));
+    assert_eq!(cancelled.into_parts().1, Ok(()));
     assert_eq!(bell.0.get(), 2);
 }
 
@@ -198,11 +226,12 @@ async fn notification_failure_never_turns_commit_into_retry() {
             pool.as_ref().put(13_u64).unwrap().transfer(Envelope(17)),
         )
         .unwrap();
-    assert_eq!(committed.notified, Err(7));
+    assert_eq!(committed.into_parts().1, Err(7));
     let received = rx.claim().unwrap();
     let recycled = signals.discard(received, right_pool.as_ref()).unwrap();
-    assert_eq!(recycled.value.0, 17);
-    assert_eq!(recycled.notified, Err(7));
+    let (recycled, notified) = recycled.into_parts();
+    assert_eq!(recycled.0, 17);
+    assert_eq!(notified, Err(7));
     assert_eq!(bell.0.get(), 2);
 }
 
@@ -238,7 +267,7 @@ async fn wait_and_admission_failures_preserve_precommit_authority() {
     signals.discard(received, right_pool.as_ref()).unwrap();
     assert_eq!(bell.0.get(), 2);
 
-    assert_eq!(signals.close_tx(&tx).notified, Ok(()));
+    assert_eq!(signals.close_tx(&tx).into_parts().1, Ok(()));
     assert_eq!(bell.0.get(), 3);
     assert!(matches!(rx.claim(), Err(ReceiveError::Closed)));
 }

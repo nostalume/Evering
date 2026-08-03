@@ -188,7 +188,11 @@ fn zero_generation_cannot_authorize_nonempty_pool_bytes() {
         .into_parts();
     allocation.detach().unwrap();
     token.token.generation = 0;
-    assert!(pool.as_ref().adopt::<(), [u8]>(&token).is_err());
+    assert!(
+        pool.as_ref()
+            .adopt_id::<(), [u8]>(&token, crate::msg::type_id::<(), [u8]>())
+            .is_err()
+    );
 }
 
 #[test]
@@ -503,6 +507,35 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
         send.try_send(pool.as_ref().put(23_u64).unwrap().transfer(())),
         Err(crate::TrySendError::Full(_) | crate::TrySendError::Busy(_))
     ));
+}
+
+#[test]
+fn encoded_admission_classifies_and_moves_authority_once() {
+    const JOB: crate::schema::SchemaKey =
+        crate::schema::SchemaKey::new(crate::schema::SchemaId(0x004a_4f42), 1);
+    const OTHER: crate::schema::SchemaKey =
+        crate::schema::SchemaKey::new(crate::schema::SchemaId(0x004f_5448_4552), 1);
+
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    let pool = session.create_pool(32 * 1024, None).unwrap();
+    let (left, port) = session.create_channel::<crate::Encoded>(1).unwrap();
+    let peer = peer_session(&mut pt);
+    let peer_pool = peer.open_pool(pool.id()).unwrap();
+    let right = peer.adopt(port).unwrap();
+    let (send, _) = left.split();
+    let (_, recv) = right.split();
+
+    send.try_send(pool.as_ref().put(17_u64).unwrap().encode(JOB))
+        .unwrap();
+    let received = recv.claim().unwrap();
+    assert_eq!(received.type_id(), crate::Encoded::id::<u64>(JOB));
+    let received = match received.admit::<u64>(peer_pool.as_ref(), OTHER) {
+        Err(error) => error.into_received(),
+        Ok(_) => panic!("wrong runtime schema admitted the transfer"),
+    };
+    let value = received.admit::<u64>(peer_pool.as_ref(), JOB).unwrap();
+    assert_eq!(*value, 17);
 }
 
 #[test]

@@ -78,8 +78,6 @@ impl<T: ?Sized> Rel<T> {
         }
     }
 
-    /// Construct Rel from raw pointer relative to `base_ptr`.
-    ///
     /// # Safety
     ///
     /// - `ptr` must be within the same allocation as `base_ptr`.
@@ -112,7 +110,6 @@ impl<T> Rel<[T]> {
 }
 
 impl<T> Rel<T> {
-    /// Return a raw pointer using `base_ptr` by wrapping arithmetic.
     /// # Safety
     ///
     /// - `ptr` must be within the same allocation as `base_ptr`.
@@ -121,7 +118,6 @@ impl<T> Rel<T> {
         base_ptr.wrapping_add(self.offset).cast_mut().cast()
     }
 
-    /// Return a `NonNull<T>` pointer using `base_ptr` by wrapping arithmetic.
     /// # Safety
     /// - `ptr` must be within the same allocation as `base_ptr`.
     #[inline]
@@ -189,16 +185,11 @@ impl Tag {
         unsafe {
             let post = ptr.add(size).align_up_of::<Word>();
             let post_rel = Rel::from_raw(post, heap_base);
-            // Suppose it's a ptr to `Tag` or directly a `Tag`.
             let tag_or_tag_rel = post.cast::<RelPtr>().read();
-
-            // The low bits of flags of tag doesn't affect the inequality.
             if tag_or_tag_rel > post_rel {
-                // If it's a ptr to the real `Tag`
                 let tag_ptr = tag_or_tag_rel.as_raw(heap_base);
                 tag_ptr.cast()
             } else {
-                // Else it's directly a `Tag`
                 post.cast()
             }
         }
@@ -211,9 +202,7 @@ impl Tag {
         unsafe { Chunk::from_endpoint(base, acme) }
     }
 
-    /// Encode and write a Tag value to `tag_ptr`.
     unsafe fn init(tag: *mut Self, chunk_base: *mut u8, is_above_free: bool, heap_base: *mut u8) {
-        // let base_value = chunk_base.addr();
         let rel_base = unsafe { Rel::from_raw(chunk_base, heap_base) };
         debug_assert!(
             rel_base.offset & Self::ALL_FLAG == 0,
@@ -232,7 +221,6 @@ impl Tag {
         unsafe { *tag = Self(rel_base.offset | flags) };
     }
 
-    /// If the tag pointer differs from the chunk's acme, store a relative pointer to the tag in the acme for later resolution.
     #[inline]
     unsafe fn acme_tag(tag: *mut Tag, chunk_acme: *mut u8, heap_base: *mut u8) {
         if tag.cast() != chunk_acme {
@@ -291,16 +279,11 @@ impl Tag {
     }
 }
 
-/// Intrusive doubly-linked list node for free chunks.
-///
-/// # Layout:
-///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
+/// Intrusive free-list node stored at a free chunk's base.
 #[derive(Debug)]
 #[repr(C)]
 pub struct FreeNode {
-    /// The ptr to the next free node.
     pub next: Option<Rel<FreeNode>>,
-    /// The ptr to the prev free node's `next` field.
     pub prev_next: Rel<Option<Rel<FreeNode>>>,
 }
 
@@ -310,7 +293,6 @@ impl FreeNode {
     const SIZE: Size = core::mem::size_of::<Self>();
     const ALIGN: Offset = core::mem::align_of::<Self>();
 
-    /// Return pointer to the `next` field within the node.
     #[inline]
     const unsafe fn next(node: *mut Self) -> *mut FreeNodeLink {
         unsafe { &raw mut (*node).next }
@@ -324,7 +306,6 @@ impl FreeNode {
         }
     }
 
-    /// Return pointer to the `next_prev` field within the node.
     #[inline]
     const unsafe fn as_rel(node: *mut Self, heap_base: *mut u8) -> FreeNodeLink {
         unsafe { Some(Rel::from_raw(node, heap_base)) }
@@ -355,7 +336,6 @@ impl FreeNode {
         }
     }
 
-    /// Assume `prev_next` point to `next`, resolve the `next` node and insert `this node`.
     #[inline]
     const unsafe fn insert_by(node: *mut Self, prev_next: *mut FreeNodeLink, heap_base: *mut u8) {
         unsafe {
@@ -401,12 +381,7 @@ impl Iterator for FreeNodeIter {
     }
 }
 
-/// Header structure at the base of a free chunk.
-///
-/// # Layout:
-///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
-///
-///  Where `[FreeListNode] [size: usize] = [FreeHead]`
+/// Free-chunk head paired with a size-bearing [`FreeTail`].
 #[derive(Debug)]
 #[repr(C)]
 struct FreeHead {
@@ -415,7 +390,6 @@ struct FreeHead {
 }
 
 impl FreeHead {
-    /// Creates a pointer to the FreeHead struct from the raw chunk base pointer.
     #[inline]
     const unsafe fn from_base(base: *mut u8) -> *mut Self {
         base.cast()
@@ -448,14 +422,11 @@ impl FreeHead {
         }
     }
 
-    /// Gets the raw base pointer of the chunk from a pointer to the FreeHead.
     #[inline]
     const fn to_base(head: *mut Self) -> *mut u8 {
         head.cast()
     }
 
-    /// Calculates the acme pointer (the address at the exclusive *end* of the chunk)
-    /// by reading the `size_low` field.
     #[inline]
     const unsafe fn to_acme(head: *mut Self) -> *mut u8 {
         unsafe {
@@ -473,14 +444,10 @@ impl FreeHead {
     }
 }
 
-/// Tail structure at the base of a free chunk.
-///
-/// # Layout:
-///  `[FreeListNode] [size: usize] ... [FreeTail(size)]`
+/// Boundary tag holding the free chunk's size.
 #[derive(Debug)]
 #[repr(transparent)]
 struct FreeTail {
-    // Stores the size of the entire chunk
     size_high: usize,
 }
 
@@ -488,7 +455,6 @@ impl FreeTail {
     const SIZE: usize = core::mem::size_of::<Self>();
     const ALIGN: usize = core::mem::align_of::<Self>();
 
-    /// Creates a pointer to the `FreeTail` from the chunk acme ptr.
     #[inline]
     const unsafe fn from_acme(acme: *mut u8) -> *mut Self {
         unsafe { acme.sub(FreeTail::SIZE).cast() }
@@ -499,8 +465,6 @@ impl FreeTail {
         unsafe { (*tail).size_high = size_high }
     }
 
-    /// Calculates the chunk base pointer from the chunk acme pointer
-    /// by reading the `size_high` field.
     #[inline]
     const unsafe fn to_head(tail: *mut Self) -> *mut FreeHead {
         unsafe {
@@ -518,9 +482,7 @@ struct Chunk {
 }
 
 impl Chunk {
-    /// The minimal offset of a tag from the base ptr, which is the node size.
     const MIN_TAG_OFFSET: usize = FreeNode::SIZE;
-    /// The minimal size of a chunk from the base ptr, which is the node size plus a tag size.
     const MIN_CHUNK_SIZE: usize = Self::MIN_TAG_OFFSET + Tag::SIZE;
 
     #[inline]
@@ -557,13 +519,11 @@ impl Chunk {
     }
 
     #[inline]
-    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
     fn is_valid(self) -> bool {
         Self::is_chunk(self.base, self.acme)
     }
 
     #[inline]
-    /// Returns whether the range is greater than `MIN_CHUNK_SIZE`.
     fn is_chunk<T, U>(base: *mut T, acme: *mut U) -> bool {
         if acme < base.cast() {
             return false;
@@ -586,7 +546,6 @@ impl Chunk {
         }
     }
 
-    /// Split to a prefix chunk if possible and modify the base to the new prefix acme.
     #[inline]
     fn split_prefix(&mut self, alloc_base: *mut u8) -> Option<Self> {
         // Prefix Chunk should be prefix_acme <= alloc_base && [base, prefix_acme(new_base)] >= MIN_CHUNK_SIZE
@@ -603,7 +562,6 @@ impl Chunk {
         }
     }
 
-    /// Split to a prefix chunk if possible and modify the acme to the new suffix base.
     #[inline]
     fn split_suffix(&mut self, alloc_acme: *mut u8) -> (Option<Self>, *mut Tag) {
         // Suffix Chunk should be suffix_base >= alloc_acme && [suffix_base(new_acme), acme] >= MIN_CHUNK_SIZE && [free_base, suffix_base(new_acme)] >= MIN_CHUNK_SIZE
@@ -818,17 +776,10 @@ impl Geometry {
     }
 }
 
-// abbr: LU/LS/LinS/LD
-/// # Talc Allocator
 #[repr(C)]
 pub struct TalcMeta {
-    /// The bits array of available node.
-    ///
-    /// Each bits of a word suggests existence or not.
-    ///
     summary: Word,
     avails: Rel<[Word]>,
-    /// The pointer to the array of nodes in bits array.
     bins: Rel<[FreeNodeLink]>,
 }
 
@@ -997,7 +948,6 @@ impl TalcMeta {
         unsafe { self.toggle_avail(idx, false, geometry) };
     }
 
-    // Context resolution
     #[inline]
     const fn bin_by_idx(&self, idx: usize, geometry: Geometry) -> *mut FreeNodeLink {
         debug_assert!(idx < geometry.bin_count());
@@ -1041,9 +991,6 @@ impl TalcMeta {
 
     #[cfg(debug_assertions)]
     fn scan_errors(&self, geometry: Geometry) {
-        // #[cfg(any(test, feature = "tracing"))]
-        // let mut vec = std::vec::Vec::new();
-
         for idx in 0..geometry.bin_count() {
             unsafe {
                 let iter = FreeNodeIter::new(*self.bin_by_idx(idx, geometry), self.base_ptr());
@@ -1068,8 +1015,6 @@ impl TalcMeta {
 
                     let prev_tag = Tag::from_acme(head.as_ptr().cast());
                     assert!((*prev_tag).is_above_free());
-                    // a free chunk should already merged below free chunk.
-                    // so any below chunk should be allocated.
                     assert!((*prev_tag).is_allocated());
                 }
             }
@@ -1157,13 +1102,11 @@ impl TalcMeta {
                     let chunk_size = head.as_ref().size_low;
                     let base = FreeHead::to_base(head.as_ptr());
                     let acme = FreeHead::to_acme(head.as_ptr());
-                    // no need align
                     if chunk_size >= req_size && !need_align {
                         let alloc_acme = base.add(size).align_up_of::<Word>();
                         self.remove_free(head.as_ptr(), bin_idx, geometry);
                         return Some((Chunk::from_endpoint(base, acme), base, alloc_acme));
                     }
-                    // need align
                     let alloc_base = base.align_up(align);
                     if alloc_base.add(req_size) <= acme {
                         let alloc_acme = alloc_base.add(size).align_up_of::<Word>();
@@ -1226,9 +1169,6 @@ impl TalcMeta {
             return;
         }
 
-        // #[cfg(feature = "counters")]
-        // self.counters.account_dealloc(layout.size());
-
         self.scan_errors(geometry);
         unsafe {
             let tag = Tag::from_alloc_base(ptr.as_ptr(), size, self.base_ptr());
@@ -1247,7 +1187,6 @@ impl TalcMeta {
                 prev_tag,
                 prev_tag.cast::<Word>().read()
             );
-            // try recombine below if below is free.
             if !(*prev_tag).is_allocated() {
                 let prev_tail = chunk.prev_tail();
                 let prev_head = self.remove_free_by_tail(prev_tail, geometry);
@@ -1257,7 +1196,6 @@ impl TalcMeta {
                 Tag::set_above_free(prev_tag);
             }
 
-            // try recombine above.
             if (*tag).is_above_free() {
                 let next_head = chunk.next_head();
                 let next_size = (*next_head).size_low;
@@ -1266,7 +1204,6 @@ impl TalcMeta {
                 chunk.acme = chunk.acme.byte_add(next_size);
             }
 
-            // free the recombined chunk back.
             self.insert_free(chunk.head(), chunk.size_by_range(), geometry);
         }
     }

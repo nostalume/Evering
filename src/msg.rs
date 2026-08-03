@@ -5,9 +5,8 @@ pub type TypeId = u64;
 /// A value whose initialized representation may cross a process boundary.
 ///
 /// ```compile_fail
-/// use evering::layout::{Repr, SchemaId, SchemaKey};
-/// use std::rc::Rc;
-///
+/// # use evering::{Repr, SchemaId, SchemaKey};
+/// # use std::rc::Rc;
 /// struct Local(Rc<()>);
 /// unsafe impl Repr for Local {
 ///     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(1), 1);
@@ -15,12 +14,9 @@ pub type TypeId = u64;
 /// ```
 ///
 /// ```compile_fail
-/// use evering::{Repr, SchemaId, SchemaKey};
-///
+/// # use evering::{Repr, SchemaId, SchemaKey};
 /// struct Dropping;
-/// impl Drop for Dropping {
-///     fn drop(&mut self) {}
-/// }
+/// impl Drop for Dropping { fn drop(&mut self) {} }
 /// unsafe impl Repr for Dropping {
 ///     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(1), 1);
 /// }
@@ -73,37 +69,32 @@ unsafe impl<T: Repr> Repr for [T] {
     const VALID: () = T::VALID;
 }
 
-/// A library-owned protocol header for safely encoded byte payloads.
+/// The protocol domain for runtime-classified payloads.
+///
+/// Only [`crate::Block::encode`] constructs this marker for publication.
+///
+/// ```compile_fail
+/// use evering::Encoded;
+/// let _ = Encoded(());
+/// ```
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Encoded {
-    schema: SchemaKey,
-}
+pub struct Encoded(pub(crate) ());
 
 impl Encoded {
+    /// Derives the stable classifier for `T` under `schema`.
     #[inline(always)]
-    pub const fn new(schema: SchemaKey) -> Self {
-        Self { schema }
-    }
-
-    #[inline(always)]
-    pub const fn schema(&self) -> SchemaKey {
-        self.schema
+    pub const fn id<T: Repr + ?Sized>(schema: SchemaKey) -> TypeId {
+        type_id_for(compose_schema(Self::SCHEMA, schema), T::SCHEMA)
     }
 }
 
 unsafe impl Repr for Encoded {
-    const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.encoded"), 1);
+    const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.encoded"), 2);
 }
 
-/// Derives a runtime discriminator from a protocol schema and a body schema.
-///
-/// Namespace and body remain API positions; neither needs a separate marker or
-/// a user-selected numeric tag.
 #[inline(always)]
-pub const fn type_id<P: Repr + ?Sized, T: Repr + ?Sized>() -> TypeId {
-    let protocol = P::SCHEMA;
-    let body = T::SCHEMA;
+const fn type_id_for(protocol: SchemaKey, body: SchemaKey) -> TypeId {
     let domain = schema_id("evering.type");
     (domain.0
         ^ protocol.id.0.rotate_left(7)
@@ -113,9 +104,15 @@ pub const fn type_id<P: Repr + ?Sized, T: Repr + ?Sized>() -> TypeId {
     .wrapping_mul(0x9E37_79B9_7F4A_7C15)
 }
 
+/// Derives a runtime discriminator from protocol and body schemas.
+#[inline(always)]
+pub const fn type_id<P: Repr + ?Sized, T: Repr + ?Sized>() -> TypeId {
+    type_id_for(P::SCHEMA, T::SCHEMA)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Repr, type_id};
+    use super::{Encoded, Repr, type_id};
     use crate::schema::{SchemaId, SchemaKey};
 
     struct First;
@@ -145,5 +142,15 @@ mod tests {
     #[test]
     fn slice_schema_is_not_element_schema() {
         assert_ne!(type_id::<(), [u32]>(), type_id::<(), u32>());
+    }
+
+    #[test]
+    fn encoded_id_is_the_zero_sized_runtime_authority() {
+        let first = SchemaKey::new(SchemaId(0x401), 1);
+        let second = SchemaKey::new(SchemaId(0x402), 1);
+        assert_eq!(core::mem::size_of::<Encoded>(), 0);
+        assert_ne!(Encoded::id::<Member>(first), Encoded::id::<Member>(second));
+        assert_ne!(Encoded::id::<Member>(first), Encoded::id::<u32>(first));
+        assert_ne!(Encoded::id::<Member>(first), type_id::<Encoded, Member>());
     }
 }

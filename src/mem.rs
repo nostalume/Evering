@@ -509,7 +509,6 @@ unsafe impl MemOps for Build {
 }
 
 impl Build {
-    /// Creates a new layout manager from a raw map, initializing the header and offset.
     #[inline]
     pub(crate) fn new(map: Map, admission: RegionAdmission) -> Result<Self, Error> {
         let (area, offset) = Region::new(map, admission)?;
@@ -524,7 +523,6 @@ impl Build {
         self.area.region
     }
 
-    /// Reserves space for `T`, exclusively borrowing this composition until commit.
     #[inline]
     pub(crate) fn reserve<T: AdmitLayout>(&mut self) -> Result<Reservation<'_, T>, Error> {
         if self.poisoned {
@@ -577,7 +575,6 @@ impl Build {
         Ok(handle)
     }
 
-    /// Reserves and commits space for a type `T` in one step, advancing the offset.
     #[inline]
     pub(crate) fn push<T: AdmitLayout>(&mut self, conf: T::Config) -> Result<Mapped<T>, Error> {
         self.reserve::<T>()?.commit(conf)

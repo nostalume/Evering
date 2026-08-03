@@ -1,4 +1,4 @@
-use core::future::Future;
+use core::{convert::Infallible, future::Future};
 
 use crate::{
     AdoptError, Block, PoolRef, ReceiveError, Received, Rx, Transfer, TrySendError, Tx,
@@ -14,6 +14,15 @@ pub trait Notify {
     fn notify(&self) -> Result<(), Self::Error>;
 }
 
+impl Notify for () {
+    type Error = Infallible;
+
+    #[inline(always)]
+    fn notify(&self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+}
+
 /// Observes and consumes sticky advisory readiness in one operation.
 pub trait Wait {
     type Error;
@@ -24,8 +33,23 @@ pub trait Wait {
 /// A committed shared operation and the health of its advisory notification.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Committed<T, E> {
-    pub value: T,
-    pub notified: Result<(), E>,
+    value: T,
+    notified: Result<(), E>,
+}
+
+impl<T, E> Committed<T, E> {
+    pub fn into_parts(self) -> (T, Result<(), E>) {
+        (self.value, self.notified)
+    }
+}
+
+impl<T> Committed<T, Infallible> {
+    pub fn into_value(self) -> T {
+        match self.notified {
+            Ok(()) => self.value,
+            Err(never) => match never {},
+        }
+    }
 }
 
 /// An asynchronous operation that did not commit.
@@ -55,13 +79,33 @@ impl<'a, N: ?Sized, W: ?Sized> Signals<'a, N, W> {
     }
 }
 
+impl Signals<'static, (), ()> {
+    /// Uses no notification or wait adapter for nonblocking operations.
+    ///
+    /// ```compile_fail
+    /// # use evering::{Rx, notify::Signals};
+    /// # fn cannot_wait(rx: &Rx<()>) {
+    /// Signals::none().claim(rx);
+    /// # }
+    /// ```
+    pub const fn none() -> Self {
+        Self::new(&(), &())
+    }
+}
+
+impl<'a, N: Notify + ?Sized> Signals<'a, N, ()> {
+    pub const fn notify(notify: &'a N) -> Self {
+        Self { notify, wait: &() }
+    }
+}
+
 #[must_use = "dropping an unused permit cancels its Queue reservation"]
 pub struct Permit<'n, 'q, H: Repr, N: Notify + ?Sized> {
     reserved: Option<TransferReserved<'q, H>>,
     notify: &'n N,
 }
 
-impl<N: Notify + ?Sized, W: Wait + ?Sized> Signals<'_, N, W> {
+impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
     #[expect(
         clippy::result_large_err,
         reason = "pre-commit failure returns the exact linear Transfer"
@@ -77,7 +121,10 @@ impl<N: Notify + ?Sized, W: Wait + ?Sized> Signals<'_, N, W> {
     pub async fn reserve<'q, H: Repr>(
         &self,
         tx: &'q Tx<H>,
-    ) -> Result<Permit<'_, 'q, H, N>, ProgressError<W::Error>> {
+    ) -> Result<Permit<'_, 'q, H, N>, ProgressError<W::Error>>
+    where
+        W: Wait,
+    {
         let mut retries = 0;
         loop {
             match tx.reserve() {
@@ -106,7 +153,10 @@ impl<N: Notify + ?Sized, W: Wait + ?Sized> Signals<'_, N, W> {
     pub async fn claim<'q, H: Repr>(
         &self,
         rx: &'q Rx<H>,
-    ) -> Result<Received<'q, H>, ProgressError<W::Error>> {
+    ) -> Result<Received<'q, H>, ProgressError<W::Error>>
+    where
+        W: Wait,
+    {
         let mut retries = 0;
         loop {
             match rx.claim() {
@@ -142,6 +192,20 @@ impl<N: Notify + ?Sized, W: Wait + ?Sized> Signals<'_, N, W> {
     {
         received
             .adopt(pool)
+            .map(|value| committed(self.notify, value))
+    }
+
+    pub fn admit<'q, 'p, T>(
+        &self,
+        received: Received<'q, crate::Encoded>,
+        pool: PoolRef<'p>,
+        expected: crate::layout::SchemaKey,
+    ) -> Result<Committed<Block<'p, T>, N::Error>, AdoptError<'q, crate::Encoded>>
+    where
+        T: Repr + crate::token::Shape + ?Sized,
+    {
+        received
+            .admit(pool, expected)
             .map(|value| committed(self.notify, value))
     }
 

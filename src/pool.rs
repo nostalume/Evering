@@ -354,6 +354,8 @@ unsafe impl header::Layout for Storage {
 pub struct PoolId(dir::Id<Storage>);
 
 impl PoolId {
+    pub const BYTE_LEN: usize = dir::ID_BYTES;
+
     pub const fn new(
         region: crate::schema::RegionId,
         slab: u32,
@@ -365,6 +367,14 @@ impl PoolId {
 
     pub const fn parts(self) -> (crate::schema::RegionId, u32, u32, usize) {
         self.0.parts()
+    }
+
+    pub fn to_bytes(self) -> [u8; Self::BYTE_LEN] {
+        self.0.to_bytes()
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        dir::Id::from_bytes(bytes).map(Self)
     }
 }
 
@@ -564,12 +574,13 @@ impl<'p> PoolRef<'p> {
         debug_assert_eq!(released, Ok(local.0));
     }
 
-    pub(crate) fn adopt<H: Repr, T: Repr + Shape + ?Sized>(
+    pub(crate) fn adopt_id<H: Repr, T: Repr + Shape + ?Sized>(
         self,
         transfer: &Token<H>,
+        expected: crate::msg::TypeId,
     ) -> Result<Block<'p, T>, AdoptError> {
         let token = &transfer.token;
-        if token.id != crate::msg::type_id::<H, T>() {
+        if token.id != expected {
             return Err(AdoptError::Type);
         }
         let metadata = token.metadata().ok_or(AdoptError::Type)?;
@@ -805,7 +816,7 @@ impl<T: ?Sized> core::ops::DerefMut for Block<'_, T> {
 }
 
 impl<'p, T: Repr + Shape + ?Sized> Block<'p, T> {
-    pub fn transfer<H: Repr>(self, header: H) -> Transfer<'p, H> {
+    fn transfer_with<H: Repr>(self, header: H, id: crate::msg::TypeId) -> Transfer<'p, H> {
         let this = ManuallyDrop::new(self);
         let metadata = T::metadata(this.pointer.as_ptr());
         let allocation = unsafe { ptr::read(&this._allocation) };
@@ -819,11 +830,19 @@ impl<'p, T: Repr + Shape + ?Sized> Block<'p, T> {
                 },
                 generation,
                 metadata,
-                crate::msg::type_id::<H, T>(),
+                id,
             ),
             header,
         };
         Transfer { allocation, token }
+    }
+
+    pub fn transfer<H: Repr>(self, header: H) -> Transfer<'p, H> {
+        self.transfer_with(header, crate::msg::type_id::<H, T>())
+    }
+
+    pub fn encode(self, schema: SchemaKey) -> Transfer<'p, crate::Encoded> {
+        self.transfer_with(crate::Encoded(()), crate::Encoded::id::<T>(schema))
     }
 }
 

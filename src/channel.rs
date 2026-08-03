@@ -176,7 +176,11 @@ pub struct Port<H: Repr> {
     pub(crate) generation: usize,
 }
 
+const PORT_BYTES: usize = 49;
+
 impl<H: Repr> Port<H> {
+    pub const BYTE_LEN: usize = PORT_BYTES;
+
     pub(crate) const fn new(id: Id<H>, role: usize, generation: usize) -> Self {
         Self {
             id,
@@ -210,6 +214,31 @@ impl<H: Repr> Port<H> {
             role: role as usize,
             generation,
         })
+    }
+
+    pub fn to_bytes(&self) -> [u8; PORT_BYTES] {
+        let mut bytes = [0; PORT_BYTES];
+        bytes[..crate::dir::ID_BYTES].copy_from_slice(&self.id.inner.to_bytes());
+        for (offset, value) in [
+            (32, self.id.capacity() as u64),
+            (41, self.generation as u64),
+        ] {
+            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+        }
+        bytes[40] = self.role();
+        bytes
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() != Self::BYTE_LEN {
+            return None;
+        }
+        let u64_at = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let id = Id {
+            inner: crate::dir::Id::from_bytes(&bytes[..crate::dir::ID_BYTES])?,
+            capacity: usize::try_from(u64_at(32)).ok()?,
+        };
+        Self::from_parts(id, bytes[40], usize::try_from(u64_at(41)).ok()?)
     }
 }
 
@@ -1011,7 +1040,7 @@ impl<'a, H: Repr> Received<'a, H> {
         self,
         pool: crate::PoolRef<'p>,
     ) -> Result<(H, crate::Block<'p, T>), AdoptError<'a, H>> {
-        let block = match pool.adopt::<H, T>(self.claim().item()) {
+        let block = match pool.adopt_id(self.claim().item(), crate::msg::type_id::<H, T>()) {
             Ok(block) => block,
             Err(error) => return Err(AdoptError::from_pool(error, self)),
         };
@@ -1027,6 +1056,25 @@ impl<'a, H: Repr> Received<'a, H> {
         let transfer = self.take_claim().take();
         drop(allocation);
         Ok(transfer.header)
+    }
+}
+
+impl<'a> Received<'a, crate::Encoded> {
+    pub fn type_id(&self) -> crate::msg::TypeId {
+        self.claim().item().token.id
+    }
+
+    pub fn admit<'p, T: Repr + crate::token::Shape + ?Sized>(
+        self,
+        pool: crate::PoolRef<'p>,
+        expected: SchemaKey,
+    ) -> Result<crate::Block<'p, T>, AdoptError<'a, crate::Encoded>> {
+        let block = match pool.adopt_id(self.claim().item(), crate::Encoded::id::<T>(expected)) {
+            Ok(block) => block,
+            Err(error) => return Err(AdoptError::from_pool(error, self)),
+        };
+        self.take_claim().take();
+        Ok(block)
     }
 }
 
