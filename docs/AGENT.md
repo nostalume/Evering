@@ -103,9 +103,8 @@ verified.
 - Ordinary CI owns format, warning-denied Clippy, docs, feature checks, package
   inspection, and real process behavior on hosted Linux and Windows. Timed studies
   remain isolated and emit inspectable artifacts.
-- The package is an unpublished `0.1.0` candidate with publication disabled.
-  Do not tag, upload, or weaken that guard without a separate explicit release
-  authorization.
+- Version `0.1.0` is published on crates.io. Do not tag or upload another version
+  without separate explicit release authorization.
 
 ## Current goal
 

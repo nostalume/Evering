@@ -31,13 +31,12 @@ Native resources and Tokio waiting are optional adapters. `Session::heap` and
 `PBox` are an explicit general heap, never an automatic channel fallback. The
 [architecture](docs/architecture.md) defines recovery and safety invariants.
 
-## Use from Git
+## Install
 
-Evering is not published yet. Pin the repository while its public ABI remains
-experimental:
+Evering 0.1.0 is available from crates.io. Its public ABI remains experimental:
 
 ```toml
-evering = { git = "https://github.com/nostalume/evering", features = ["os", "tokio"] }
+evering = { version = "0.1.0", features = ["os", "tokio"] }
 ```
 
 The default feature is `std`. `map`, `notify`, and `process` are composable;
