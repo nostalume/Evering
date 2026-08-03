@@ -2,335 +2,231 @@
 
 ## Purpose
 
-Evering is a low-level, operating-system-independent model for bounded
-communication through a shared memory region. It combines region layout,
-relocatable allocation, typed ownership transfer, reusable duplex queues, and
-optional advisory progress notification.
+Evering is a low-level substrate for bounded communication through a shared
+memory region. Its core model does not depend on an operating system: shared
+layouts, allocation authority, queues, ownership transfer, and recovery are
+expressed entirely in mapped bytes and atomics. Optional adapters establish a
+mapping, exchange native resources, notify a peer, or connect the progress
+model to an asynchronous runtime.
 
-The performance model favors static composition for persistent layouts and hot
-operations: message protocol, queue geometry, endpoint role, and typed layout
-remain concrete so the compiler can monomorphize and inline the active path.
-Platform mapping policy ends at construction and does not propagate through
-admitted layout or session types.
+The design favors concrete types, constant geometry, monomorphization, and
+inlining where they change shared interpretation or the hot path. Construction
+policy is erased once admitted. This keeps address preferences, native handles,
+and runtime choices out of persistent types and avoids the long generic chains
+that previously coupled allocator, registry, queue, and driver policy.
 
-Evering is a communication framework, not a complete asynchronous runtime.
-Scheduling, peer discovery, process creation, and liveness detection remain
-outside the core. Optional native latches and runtime waiting adapt shared
-progress without becoming shared protocol state.
+Evering is not a scheduler, process manager, discovery service, or request
+dispatcher. Application protocols own correlation, retry, idempotency, and
+deadlines. Evering supplies the shared transport and the evidence needed to
+move or recover its storage authority.
 
 ## System model
 
-The central object is a protocol-neutral session over one mapped region. A
-session owns three cooperating facilities:
+A session is one admitted view of a mapped region. The region contains a
+Directory, an isolated general heap, recoverable Pools, and Directory-owned
+resources such as duplex Channels. Each persistent layout records and validates
+its own schema and immutable information. There is no region-wide manifest that
+must enumerate every possible layout or message type.
 
-- a Directory that identifies independently typed shared layouts and governs
-  their creation, admission, recovery, and removal;
-- one general heap for explicit variable-size values and Directory storage;
-- recoverable Pools whose lifecycle words, rather than allocator metadata,
-  authorize transferable Blocks.
+The Directory gives a current lifetime to independently typed layouts. The
+general heap supplies variable-sized storage for Directory construction and
+explicit shared boxes. A Pool supplies recoverable transfer storage. A Channel
+contains two bounded queues and derives direction from an admitted role. The
+session itself remains protocol-neutral; a protocol type appears when a Channel
+is created or a typed Port is admitted.
 
-A Channel is a Directory-owned duplex pair of bounded queues. Channel protocol
-type enters when that Channel is created or its typed Port is admitted; it does
-not parameterize the Session. Each process derives opposite sender and receiver
-directions from its admitted role without a runtime side choice.
+Shared bytes are authoritative for layout state, participant generations,
+allocation lifecycle, queue progress, and endpoint gates. Process-local owners
+are authoritative for mapping lifetime, native resources, task registration,
+and typed borrows. A pointer is always derived from an admitted mapping and
+validated metadata; it never serves as transferable ownership evidence.
 
-The shared region is the source of truth for Directory entries, GeneralHeap and
-Pool metadata, queue state, and transferable storage. Process-local values own
-mapping lifetime, typed admission, polling state, task wakers, and endpoint
-role.
-
-## Conceptual boundaries
-
-### Mapping
-
-The mapping boundary turns a platform or application-owned source into one
-linear local mapping with explicit extent, access, and exactly-once release
-authority. A successful root admission transfers that mapping to the region;
-every failure releases it before returning. Region layout then places typed
-headers in order and either initializes them or attaches to an existing
-compatible header.
-
-Platform address preferences, mapping flags, handles, and source errors exist
-only at this boundary. Admitted layouts, sessions, allocators, registries, and
-queues retain no backend type, allocation, trait object, or platform policy.
-Custom bare-metal and RTOS sources may supply mapped reserved memory through an
-explicit unsafe ownership contract.
-
-### Region layout and initialization
-
-The mapping root carries a caller-supplied region identity. Creation may
-initialize an empty root; expected-identity and discovery modes are attach-only.
-This keeps identity authority outside the operating-system-independent core and
-prevents an attaching process from silently constructing absent shared state.
-
-Every persistent layout independently records a fixed admission prefix and
-layout-owned typed information. The prefix identifies its state, magic,
-recursive schema key, region, position, and the size and alignment of the
-complete typed header, information value, and body. The typed information
-records facts owned by that layout, such as queue capacity and resource schema,
-Pool classes, or usable geometry. Composite schema keys consume
-both the identifier and revision of each nested layout, so changing a nested
-revision changes every enclosing protocol identity.
-
-Initialization claims empty storage through an atomic state transition,
-initializes through a raw destination, and publishes completion with release
-ordering. Attachment first validates the fixed prefix and only then interprets
-typed information or the body. Rejection never falls back to initialization,
-and a failed claimed initialization publishes a corrupted state.
-
-Layout remains positional and compile-time typed, while composition remains
-open-ended. A reservation exclusively borrows its composition cursor and is
-committed only through that cursor; successful admission advances it. A failed
-commit poisons the local cursor so callers cannot continue from an ambiguous
-position. Participants must agree on the ordered prefix they access, but a
-prefix-only participant does not need to know or validate independent suffix
-layouts.
-
-Admission currently requires a writable mapping. Even an attaching root
-updates shared participation state, so read-only mapping is rejected before
-typed admission. Read-only observation would require a different lifetime
-model.
-
-### Storage
-
-Evering separates general allocation from recoverable transfer storage. The
-GeneralHeap is a synchronized variable-size Talc domain used for explicit PBox
-values and for allocating Directory-owned layouts. Talc remains isolated: its
-poison state may reject new layouts or PBox values, but it cannot revoke an
-already admitted Channel or Pool and is never an implicit Pool fallback.
-
-A Pool divides one immutable extent into recorded geometry and gives each slot
-one authoritative lifecycle word. Reservation grants local Block authority;
-publication changes that authority to detached transfer ownership; claim-bound
-admission moves it to the receiver. Pointer reconstruction is derived only
-after Pool identity, generation, span, runtime type, extent, and alignment agree.
-
-Pool geometry may use several fixed size classes and upward spill, but geometry
-is an implementation policy rather than the ownership contract. A Pool never
-silently allocates from GeneralHeap. Large logical objects may use multiple
-Blocks without changing the bounded size of one capability.
-
-### Directory
-
-The Directory owns reusable shared layouts. A generational identifier selects
-an entry and distinguishes its current lifetime from older occupants of the
-same slot. Every layout records and validates its own schema and information;
-there is no session-wide manifest or runtime protocol classification.
-
-Creation claims a free entry, allocates its layout from GeneralHeap, initializes
-it, and returns the admitted owner directly. Opening by identifier admits the
-recorded layout without reconstructing creation options. Owned Pool and Channel
-values keep their mappings alive independently of a Session borrow. Exhausted
-generations are retired rather than wrapped.
-
-Whole-Channel removal is owned by Session. It terminalizes both directions,
-resolves each queued Token's private Pool identity through the Directory,
-releases storage, and only then recycles the Queue slot. A caller cannot supply
-a Pool and therefore cannot select the wrong storage authority. Unknown
-evidence returns the same Channel for inspection or retry.
-
-### Messages and tokens
-
-A message declares a deterministic type tag and transfer semantics. Move
-semantics allocate the value in shared memory and replace ownership with a
-token. Declaring a message or envelope is an unsafe portability contract:
-implementations promise a stable initialized representation without
-process-local pointers, callbacks, runtime handles, or local allocator
-ownership.
-
-A private token contains:
-
-- the identity of the Pool that issued it;
-- its class, slot, and allocation generation;
-- sized or slice pointer metadata;
-- a deterministic message type identifier.
-
-The token is not a pointer or public reconstruction capability. A receiver must
-provide an admitted view of the identified Pool. Type and lifecycle rejection
-return the same claim-bound Received authority; dropping it deliberately does
-not recycle a slot that still governs detached storage.
-
-An envelope is orthogonal metadata carried beside the token. The implemented
-request envelope adds a generational operation identifier for response
-correlation.
-
-### Channels
-
-A shared queue stores fixed transfer records, not application objects or
-process-local capabilities. Their storage locators are private and cannot admit
-a pointer. Queue slots use atomic sequence stamps, and queue headers track
-bounded producer/consumer progress and disconnection.
-
-A duplex resource contains two queues. Role-specific splitting makes one queue
-outbound and the other inbound for each participant. Closing an endpoint changes
-shared connection state. Close serializes with sender admission, and a receiver
-reports terminal disconnection only after admitted senders have left and a
-final empty observation. A rejected send returns the exact input. Finalization
-reopens an empty resource for reuse and quarantines a nonempty one.
-
-Concrete transmit and receive endpoints own only their admitted direction and
-process-local mapping lifetime. The queue kernel remains independent of message
-storage and notification policy. Receiving yields a claim-bound value that can
-only adopt storage through the matching Pool or explicitly discard it. Either
-operation moves Pool authority before recycling the queue slot; there is no
-public locator-only receive path.
-
-### Request correlation
-
-The substrate does not own request identifiers, pending calls, response
-dispatch, or task wakers. Those policies belong to a higher protocol because
-they require application-specific cancellation, duplicate, late-response, and
-shutdown semantics. Shared channels transport the protocol's fixed
-representation without interpreting correlation fields.
-
-### Progress notification
-
-Notification is advisory; queue and gate state remain authoritative. A
-signaled operation borrows an unchanged nonblocking endpoint, one local ring
-owner, and one local wait owner. Waiting fuses registration, readiness
-observation, and latch consumption before immediately retrying shared truth.
-No endpoint, claim, shared borrow, callback, or task waker crosses that wait.
-
-Successful publication or capacity release rings the peer after shared state
-has committed. A ring failure therefore cannot roll back the operation or
-return already-moved input. The result reports the committed value separately
-from notification health. Close follows the same order: publish the shared gate
-transition, then advise the peer to recheck it.
-
-An asynchronous send waits for a Queue reservation before taking its payload.
-The resulting permit moves, stages, publishes, and notifies without another
-suspension. Cancelling the wait leaves the payload in caller scope; cancelling
-the permit publishes its rollback before advising the peer. Receive notification
-is delayed until adoption or discard recycles the claimed slot. Deadlines and
-bounded spinning remain runtime policy around this adapter.
-
-Linux uses an event counter, other Unix targets use a nonblocking socket latch,
-and Windows uses a manual-reset event. Runtime registration and cancellation
-are process-local. Multiple waits may coexist; readiness may coalesce or be
-spurious, and concurrent consumption is idempotent. The mandatory retry observes
-shared truth immediately afterward, while a later ring remains latched. No
-notification word, handle, or extra atomic operation is added to a duplex layout.
-
-## End-to-end flow
-
-1. A creator maps a backing region with a supplied identity; peers map it with
-   an expected identity or explicitly discover the published identity.
-2. One participant creates a typed Channel and communicates its typed Port out
-   of band.
-3. The peer admits the Port, and each Channel derives its opposite directions.
-4. The sender reserves a Block from an explicit Pool and turns it into a
-   transfer capability.
-5. An application protocol may attach a portable operation identifier without
-   placing its local completion state in shared memory.
-6. The outbound queue moves the token into shared storage and, when configured,
-   rings the peer only after publication commits.
-7. The receiver claims the transfer, verifies its runtime type and Pool
-   lifecycle evidence, and admits its extent and alignment before pointer
-   reconstruction.
-8. The receiver consumes or transforms the message and may return a response
-   through the opposite queue according to its application protocol.
-9. A waiting endpoint rechecks shared state after each advisory wake. Any
-   request correlation and task wakeup remains process-local application state.
-10. Endpoint guards and mapping handles release process-local participation;
-    Session removal drains Pool storage before Directory reuse.
-
-## Ownership and authority
-
-| Concern | Owner | Authority |
+| Concern | Authority | Permitted effect |
 | --- | --- | --- |
-| Local mapping | Linear mapping owner and source | Establish one local view, transfer it at root admission, and release it exactly once |
-| Region identity | Mapping root and caller admission policy | Initialize or validate one immutable shared-memory domain identifier |
-| Persistent layout admission | Each typed header | Record and validate its own schema, position, representation, and immutable information |
-| Layout order | Composition cursor | Place and attach independent typed layouts without a session-wide manifest |
-| Shared allocation | Pool | Reserve fixed storage, move participant ownership, admit provenance and extent, reconstruct a borrow, and release it |
-| General allocation | General heap | Manage explicit PBox values outside the recoverable transfer path |
-| Resource lifetime | Directory entry | Construct, admit, close, remove proven-empty resources, and retain uncertain ownership |
-| Payload ownership | Pool lifecycle plus a claim-bound transfer record | Move one allocation between participants without exposing a pointer capability |
-| Queue direction | Endpoint role | Select the legal outbound and inbound queue |
-| Request correlation | Application protocol | Define identifiers, duplicate/late-response policy, cancellation, and local task state |
-| Progress notification | Borrowed local ring and fused wait owners | Advise a peer after commit; observe and consume sticky readiness before retry |
-| Scheduling and polling | Application/runtime | Drive retries, completion pumping, timeout, and cancellation |
+| Local mapped extent | Linear mapping owner | Transfer the view at root admission and release it exactly once |
+| Persistent layout | Its recorded header | Initialize or admit one schema, information value, extent, and body |
+| Layout lifetime | Generational Directory entry | Create, open, close, recover, quarantine, or remove the current occupant |
+| General allocation | Synchronized heap mutation | Allocate explicit boxes and construction storage within its failure domain |
+| Transfer allocation | Pool lifecycle word | Reserve, detach, adopt, release, or reclaim one generation of one slot |
+| Transport position | Queue sequence and cursors | Publish, claim, cancel, recycle, and establish terminal drain |
+| Channel direction | Admitted role generation | Derive the only legal transmit and receive sides |
+| Progress advice | Borrowed local Signals | Notify after commit or wait before retrying authoritative shared state |
+| Process death | Exact supervisor or platform evidence | Authorize recovery only for the named participant generation |
 
-## Required invariants
+The principal data flow is mapping admission, layout admission, Pool
+reservation, payload initialization, Token publication, queue claim, Pool
+admission, application consumption, and storage release. Optional process
+handoff precedes mapping admission; optional notification follows publication
+or recycling. Each arrow is a move or checked admission. No step copies local
+authority into the shared representation.
 
-- Shared state contains no raw pointer whose meaning depends on one process's
-  mapping base.
-- Relative Block metadata is interpreted only by the Pool that created it.
-- Typed reconstruction occurs only after allocator identity, extent, layout,
-  and alignment admission.
-- A token's type identifier, pointer metadata, allocation metadata, and actual
-  allocation layout agree.
-- Every moved allocation has exactly one active reclamation authority, including
-  queue-full, disconnect, cancellation, and peer-death paths.
-- Terminal queue disconnection implies that no sender admitted in that open
-  epoch can publish later.
-- Failed send returns its exact input. Failed transfer admission returns the
-  same claim-bound authority for retry or explicit discard; implicit drop never
-  recycles detached Pool storage.
-- A Directory identifier is accepted only while both its index and generation
-  identify the current entry lifetime.
-- Queue capacity is nonzero and all participants agree on queue representation
-  and dynamic geometry.
-- A persistent header is used only after successful initialization or compatible
-  attachment.
-- Persistent header, information, and body extents match before typed
-  information or body projection.
-- An attaching mapping cannot initialize an absent root or child layout.
-- Fixed admission fields are validated before layout-owned information or body
-  bytes are interpreted as the expected type.
-- Every layout belongs to the admitted region identity and its recorded
-  region-relative position.
-- A layout schema composes every generic or const parameter that changes its
-  shared interpretation.
-- Mapping sources must provide exclusively owned valid bytes, accurate extent
-  and access, and an exactly-once release operation; platform handles, flags,
-  and errors do not survive admission.
-- Process-local wakers, reference counts, mapping handles, and allocator views
-  never enter shared queue entries.
-- Notification failure after commit never fabricates pre-commit failure or
-  returns moved ownership.
-- Cancellation removes only process-local wait registration; shared queue,
-  gate, and payload state remain unchanged.
+## Representation and admission
 
-## Current evidence and limits
+The mapping boundary accepts one linear local mapping with an extent, access
+mode, and exactly-once release operation. Successful root admission transfers
+that owner to the region. Every failure releases it. Platform sources may use
+files, anonymous sections, reserved memory, or another mechanism, but their
+types and errors do not survive admission.
 
-The repository has unit tests for mapping, state-driven layout admission,
-Pool provenance rejection, mixed-Pool Channel removal, Directory reuse and retained uncertain ownership,
-invalid identifiers, local queues, claim-bound transfer rejection, static
-transfer bounds, initialization failure publication,
-representation-extent rejection, cursor poisoning, and concurrent thread
-access. Unix integration evidence covers process-isolated root identity
-rejection, process-isolated attach-only behavior, prefix-only attachment,
-Directory schema mismatch, recursive child-revision mismatch, process-isolated
-talc geometry rejection, write-required admission, and a different-base
-independent-process message round trip. The benchmark exercises the complete
-message/Pool/channel flow over a shared mapping.
+The root has a caller-chosen region identity. Creation may initialize an empty
+root. Expected-identity and discovery modes only attach, so a peer cannot turn
+missing shared state into a new region by accident. Admission currently needs
+writable access because attachment updates participant state; read-only
+observation would require a separate lifetime model.
 
-This evidence supports relocation, compositional same-build layout admission,
-Pool provenance admission, direct queue transport across two Unix
-processes, exhaustive notification ordering at the abstract latch boundary,
-and real-process asynchronous notification on Linux and Windows. It does not
-prove compatibility across Rust builds or target architectures, read-only
-participation, or public mapping-and-notification bootstrap exchange.
+Every layout begins with a fixed record followed by layout-owned information
+and body bytes. The record binds state, magic, recursive schema, region,
+position, complete extent, and alignment. Admission validates that fixed record
+before interpreting typed information or projecting the body. Initialization
+claims empty storage atomically, initializes through an uninitialized
+destination, then publishes with release ordering. A failed claimed
+initialization becomes corrupted instead of appearing absent.
 
-Unix and Windows mapping, process-resource exchange, and notification adapters
-are implemented behind optional capabilities.
+Schema composition includes every type, constant, and nested revision that
+changes shared interpretation. A nested incompatible change therefore changes
+the enclosing identity. Compatibility is behavioral across native word widths:
+each architecture may use its natural representation, but both obey the same
+state transitions and reject values that cannot be represented locally. The
+project does not promise a byte-identical Rust ABI across builds or targets.
 
-The crate defaults to standard-library support without selecting a platform
-adapter. Its `no_std + alloc` configuration compiles on the pinned nightly when
-default features are disabled. Unix mapping and process evidence additionally
-selects the mapping capability.
+## Storage and ownership
 
-Type tags are deterministic within the declared scheme, but the complete shared
-ABI is still Rust-layout dependent. Compatibility is therefore limited to peers
-that agree on build, architecture, protocol types, allocator, capacities, and
-session composition.
+General allocation and transferable allocation have different failure domains.
+The general heap is a synchronized Talc domain. It remains useful for compact,
+variable-size allocation, but its multi-field mutation cannot be treated as the
+sole crash-recoverable ownership ledger. It is therefore isolated to Directory
+layouts and explicit shared boxes. Poisoning may reject later general-heap
+operations but cannot revoke an admitted Pool or Channel.
 
-Transfer ownership remains explicit and fallible. A rejected or implicitly
-dropped receive retains queue authority instead of silently recycling detached
-Pool storage. Queue recovery resolves storage through the private locator and
-uses the queue's preserved source owner, including when a later participant
-replaces a dead reaper. Reserved, staged, published, and claimed process-death
-cuts are covered. A native nested process cut also kills the first reaper after
-its persisted claim and proves a second reaper can finish the original storage
-owner before either participant slot is reused.
+A Pool has immutable creation-time geometry and one authoritative lifecycle
+word per slot. Geometry may use several size classes and upward spill; that is
+an implementation policy, not part of the public capability type. A request
+that no class can represent fails explicitly. It never falls back silently to
+the general heap. Large logical objects may be streamed through several Blocks
+without changing the bound of one Block.
+
+Reservation gives a process-local Block exclusive payload authority. Encoding
+or typed transfer creates a private Token and retains local allocation authority
+until queue publication commits. Publication detaches the allocation from the
+sender. Admission checks Pool identity, slot, generation, metadata, runtime
+type, extent, and alignment before reconstructing a pointer and moving
+authority to the receiver. Release returns the slot only from that receiver
+authority.
+
+Runtime-classified messages use a zero-sized Encoded protocol marker. Their
+Token type identifier is derived from the supplied protocol schema and body
+schema. The receiver can inspect that identifier and admit the expected body in
+one operation. A mismatch preserves the same claim; success returns the body,
+not a redundant marker or second validation record.
+
+## Transport and channels
+
+A queue transports a fixed shared representation. It does not allocate,
+interpret application objects, reconstruct pointers, or own notification.
+Sequence stamps authorize slot reuse, while header cursors and gates describe
+producer and consumer progress. A failed send returns the exact input.
+
+A duplex Channel owns two queues. Admitting a Port assigns one unique role, and
+splitting derives the legal outbound and inbound directions from that role.
+There is no user-selected left/right choice that can invert behavior. Concrete
+Tx and Rx values hold only their admitted direction and local mapping lifetime.
+
+Receiving produces a claim-bound Received authority. Dropping it intentionally
+does not recycle the queue slot because detached Pool storage may still depend
+on that claim. The receiver must admit the storage or explicitly discard it.
+Both operations resolve Pool authority before recycling the slot. Whole-Channel
+removal applies the same order to queued Tokens and resolves each private Pool
+identity through the Directory; callers cannot provide the wrong allocator.
+
+Closing serializes with sender admission. A receiver observes terminal closure
+only after senders admitted in the open epoch have left and the queue is empty.
+Removal terminalizes both directions, drains governed storage, and then returns
+the Directory entry to reuse. Uncertain evidence retains or quarantines the
+resource rather than guessing that it is empty.
+
+## Progress and process adapters
+
+Notification is advisory. Queue and gate state remain authoritative. Signals
+borrows a notification capability and, when asynchronous progress is required,
+a wait capability. The null Signals form supports nonblocking and post-commit
+operations but cannot wait; the type system prevents an async claim without a
+real wait source.
+
+Publication, recycling, and close update shared truth before notifying the
+peer. Notification failure therefore cannot revoke committed work or return
+moved input. A committed result exposes its value separately from notification
+health. Waiting registers process-local interest, observes and consumes sticky
+readiness, then immediately retries shared truth. Wakers, callbacks, reference
+counts, and native handles never enter the shared protocol.
+
+Native latches may coalesce signals or wake spuriously. Concurrent waiters are
+allowed, cancellation unregisters only local interest, and a later notification
+remains observable. An async sender waits for a reservation before accepting
+its payload; after that typestate transition, staging and publication contain
+no suspension point.
+
+Process adapters exchange an opaque bounded bootstrap value followed by an
+ordered mapping, wait event, and notification ring. The framing magic owns its
+version. Receipt is all-or-nothing: count or framing failure closes every
+received resource. Supervision retains one exact child identity and terminal
+status; a timeout or task cancellation is not proof that a process can no
+longer access shared memory.
+
+## Recovery model
+
+Recovery begins only with authoritative participant-death evidence. Participant
+slots carry generations so an observation about an earlier process cannot be
+applied to a replacement. Directory operations persist their transaction owner
+and phase. Recovery can finish or roll back from those states without inferring
+intent from payload bytes.
+
+Pool recovery scans lifecycle words for the exact dead owner and reclaims only
+matching generations. Queue recovery preserves the source owner of a reserved,
+published, or claimed transition. If a recovery participant dies, a replacement
+continues from that persisted source rather than substituting its own identity.
+Storage evidence is resolved before the queue advances, preventing a reused
+slot from overwriting the Token needed for reclamation.
+
+The general heap has a stricter boundary. A dead owner at a mutation point that
+has durable Directory evidence can be resolved by that enclosing transaction.
+An ambiguous heap mutation is poisoned and its dependent layout retained or
+quarantined. This fail-stop outcome trades availability for avoiding fabricated
+ownership. Large data that needs crash-tolerant transfer must use Pool-backed
+Blocks or an application protocol over them, not an implicit heap allocation.
+
+## Invariants and limits
+
+The essential invariants are:
+
+- shared state contains no process-relative pointer, callback, native handle,
+  task waker, or local reference count;
+- each layout validates its own schema, immutable information, position,
+  extent, and region identity before typed projection;
+- each moved Pool allocation has exactly one reclamation authority through
+  reserve, publish, claim, admit or discard, release, cancellation, closure,
+  and proven peer death;
+- failed transfer admission preserves the same Received authority, and
+  notification failure after commit never becomes a pre-commit error;
+- Directory and Pool identifiers are accepted only for their current
+  generations, which retire instead of wrapping;
+- terminal queue closure excludes later publication from the closed epoch;
+- process-local mapping and resource owners release exactly once.
+
+Current evidence covers model-level interleavings, typed admission failures,
+Directory and Pool generation reuse, queue contention and closure, malformed
+resource exchange, different-base process mappings, asynchronous notification,
+and bounded worker recovery on supported native platforms. The practical
+indexer demonstrates public construction, process handoff, runtime waiting,
+typed payload admission, close, and removal.
+
+The crate defaults to standard-library support; its core also compiles with
+default features disabled. Native mapping, notification, process exchange,
+Tokio waiting, tracing, evidence capture, comparison transports, and plotting
+are additive capabilities. Bare-metal or restricted systems may supply their
+own mapping and polling environment without a fake signal implementation.
+
+Evering remains experimental. It does not promise cross-build ABI stability,
+read-only participation, automatic replay of application work, universal
+allocator recovery, or performance superiority outside a registered and
+matched study condition. These limits are protocol boundaries, not hidden
+fallback behavior.

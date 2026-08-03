@@ -89,11 +89,28 @@ At minimum, select evidence from:
 Do not describe an unexecuted platform path, benchmark, or process boundary as
 verified.
 
-## Immediate goal
+## Reduction and delivery discipline
 
-Preserve the verified substrate while building one practical, bounded
-multi-process job example. It must use only the public Session, Pool,
-Channel/Port, process-resource exchange, Signals, close, and remove workflow;
-it must not hide reconstruction, allocation fallback, or an example-local IPC
-facade. Continue performance comparisons only through registered workloads and
-complete correctness evidence.
+- Production, inline tests, source tests, integration tests, benchmarks,
+  benchmark tests, examples, shipped docs, and ignored plans have separate LOC
+  ledgers. Never move code between them to manufacture a reduction.
+- A private helper must own validation, authority, or cleanup and delete more
+  repetition than it adds. Do not introduce macros or traits for one-use
+  mechanical sharing.
+- Rustdoc states public contracts. Inline comments preserve nonlocal safety,
+  atomic-ordering, or recovery proofs; delete syntax narration and copied
+  architecture prose.
+- Ordinary CI owns format, warning-denied Clippy, docs, feature checks, package
+  inspection, and real process behavior on Windows and Tumbleweed. Timed studies
+  remain isolated and emit inspectable artifacts.
+- The package is an unpublished `0.1.0` candidate with publication disabled.
+  Do not tag, upload, or weaken that guard without a separate explicit release
+  authorization.
+
+## Current goal
+
+Keep the public Session, Pool, Channel/Port, process-resource exchange, Signals,
+close, remove, and practical indexer flow coherent while freezing wire owners,
+schema revisions, failure authority, documentation, and CI evidence. Minor API
+changes are accepted only when they remove duplicated validation or make a
+linear transition harder to misuse without adding hot-path work.
