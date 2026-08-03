@@ -20,6 +20,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: nightly-2026-05-19
+          components: rustfmt, clippy, rust-docs
       - name: Match candidate metadata
         shell: bash
         run: |
