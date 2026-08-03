@@ -16,7 +16,6 @@ use nix::{
 use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
 
 const HEADER: usize = 8;
-const MAGIC: [u8; 4] = *b"EVR1";
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -61,7 +60,7 @@ impl Socket {
             ));
         }
         let mut bytes = Vec::with_capacity(HEADER + bootstrap.as_ref().len());
-        bytes.extend_from_slice(&MAGIC);
+        bytes.extend_from_slice(&crate::process::HANDOFF_MAGIC);
         bytes.extend_from_slice(&(bootstrap.as_ref().len() as u16).to_le_bytes());
         bytes.extend_from_slice(&(resources.len() as u16).to_le_bytes());
         bytes.extend_from_slice(bootstrap.as_ref());
@@ -120,7 +119,7 @@ impl Socket {
         if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
             return Err(invalid("truncated control datagram"));
         }
-        if count < HEADER || bytes[..4] != MAGIC {
+        if count < HEADER || bytes[..4] != crate::process::HANDOFF_MAGIC {
             return Err(invalid("malformed control header"));
         }
         let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;

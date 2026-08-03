@@ -29,7 +29,6 @@ use windows_sys::Win32::{
 use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES, Supervisor};
 
 const HEADER: usize = 8;
-const MAGIC: [u8; 4] = *b"EVR1";
 const MAX_MESSAGE: usize = HEADER + MAX_BOOTSTRAP + MAX_RESOURCES * size_of::<usize>();
 static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
 
@@ -184,7 +183,7 @@ impl Socket {
         let mut message = Vec::with_capacity(
             HEADER + bootstrap.as_ref().len() + remote.len() * size_of::<usize>(),
         );
-        message.extend_from_slice(&MAGIC);
+        message.extend_from_slice(&crate::process::HANDOFF_MAGIC);
         message.extend_from_slice(&(bootstrap.as_ref().len() as u16).to_le_bytes());
         message.extend_from_slice(&(remote.len() as u16).to_le_bytes());
         message.extend_from_slice(bootstrap.as_ref());
@@ -231,7 +230,7 @@ impl Socket {
             return Err(io::Error::last_os_error());
         }
         let read = read as usize;
-        if read < HEADER || message[..4] != MAGIC {
+        if read < HEADER || message[..4] != crate::process::HANDOFF_MAGIC {
             return Err(invalid("malformed control header"));
         }
         let len = u16::from_le_bytes([message[4], message[5]]) as usize;

@@ -1,6 +1,8 @@
 use std::{
     io,
-    os::windows::io::{AsHandle, AsRawHandle, BorrowedHandle, RawHandle},
+    os::windows::io::{
+        AsHandle, AsRawHandle, BorrowedHandle, IntoRawHandle, OwnedHandle, RawHandle,
+    },
     sync::Arc,
 };
 
@@ -56,24 +58,16 @@ impl Notify for Ring {
 }
 
 impl Ring {
-    /// Reconstructs a notification owner received from another process.
-    ///
-    /// # Safety
-    ///
-    /// `handle` must be an owned handle to a manual-reset event.
-    pub unsafe fn from_owned_handle(handle: RawHandle) -> Self {
-        Self(Arc::new(Handle(handle.cast())))
+    /// Takes ownership of a received notification handle.
+    pub fn from_owned_handle(handle: OwnedHandle) -> Self {
+        Self(Arc::new(Handle(handle.into_raw_handle().cast())))
     }
 }
 
 impl Event {
-    /// Reconstructs an event owner received from another process.
-    ///
-    /// # Safety
-    ///
-    /// `handle` must be an owned handle to a manual-reset event.
-    pub unsafe fn from_owned_handle(handle: RawHandle) -> Self {
-        Self(Arc::new(Handle(handle.cast())))
+    /// Takes ownership of a received wait handle.
+    pub fn from_owned_handle(handle: OwnedHandle) -> Self {
+        Self(Arc::new(Handle(handle.into_raw_handle().cast())))
     }
 
     pub(crate) fn clear(&self) -> io::Result<()> {

@@ -14,9 +14,21 @@ use std::{
 };
 
 use evering::{
-    os::unix::process::Socket,
+    os::{Handoff, unix::process::Socket},
     process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES},
 };
+
+#[test]
+fn typed_handoff_is_available() {
+    let handoff = Handoff::bind().unwrap();
+    assert!(!handoff.address().is_empty());
+}
+
+#[cfg(feature = "notify")]
+#[test]
+fn received_event_constructor_is_safe() {
+    let _: fn(std::os::fd::OwnedFd) -> evering::os::Event = evering::os::Event::from_owned_fd;
+}
 use nix::{
     fcntl::{FcntlArg, FdFlag, fcntl},
     sys::socket::{ControlMessage, MsgFlags, sendmsg},

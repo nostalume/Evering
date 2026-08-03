@@ -35,25 +35,13 @@ impl Notify for Ring {
 }
 
 impl Ring {
-    /// Reconstructs a notification owner received from another process.
-    ///
-    /// # Safety
-    ///
-    /// `fd` must be one owned end of a nonblocking Unix stream whose peer is
-    /// an `Event`.
-    pub unsafe fn from_owned_fd(fd: OwnedFd) -> Self {
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
         Self(UnixStream::from(fd))
     }
 }
 
 impl Event {
-    /// Reconstructs a wait owner received from another process.
-    ///
-    /// # Safety
-    ///
-    /// `fd` must be one owned end of a nonblocking Unix stream whose peer is a
-    /// `Ring`.
-    pub unsafe fn from_owned_fd(fd: OwnedFd) -> Self {
+    pub fn from_owned_fd(fd: OwnedFd) -> Self {
         Self(UnixStream::from(fd))
     }
 

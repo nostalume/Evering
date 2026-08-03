@@ -173,7 +173,7 @@ fn child() -> Option<()> {
     let (bytes, resources) = socket.recv(2).unwrap().into_parts();
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).unwrap();
-    let ring = unsafe { Ring::from_owned_fd(resources.remove(0)) };
+    let ring = Ring::from_owned_fd(resources.remove(0));
     let session = Session::open(
         source,
         Request::new(SIZE, Access::READ | Access::WRITE),
@@ -186,8 +186,6 @@ fn child() -> Option<()> {
 
 #[cfg(windows)]
 fn child() -> Option<()> {
-    use std::os::windows::io::IntoRawHandle;
-
     use evering::os::windows::{Section, process::Socket};
 
     let cut = Cut::parse(&env::var(ROLE).ok()?);
@@ -195,7 +193,7 @@ fn child() -> Option<()> {
     let (bytes, resources) = socket.recv(2).unwrap().into_parts();
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
-    let ring = unsafe { Ring::from_owned_handle(resources.remove(0).into_raw_handle()) };
+    let ring = Ring::from_owned_handle(resources.remove(0));
     let session = Session::open(
         source,
         Request::new(SIZE, Access::READ | Access::WRITE),

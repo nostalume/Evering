@@ -6,6 +6,7 @@ use std::{
 
 pub const MAX_BOOTSTRAP: usize = 4096;
 pub const MAX_RESOURCES: usize = 8;
+pub(crate) const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bootstrap(Box<[u8]>);
@@ -37,6 +38,12 @@ impl AsRef<[u8]> for Bootstrap {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
+}
+
+#[cfg(test)]
+#[test]
+fn handoff_version_is_frozen() {
+    assert_eq!(HANDOFF_MAGIC, *b"EVR1");
 }
 
 /// Linear ownership of one exact child instance.

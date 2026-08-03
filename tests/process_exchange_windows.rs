@@ -14,7 +14,7 @@ use evering::{
     mapping::{Access, Peer, Request},
     notify::Notify,
     os::{
-        event,
+        Handoff, event,
         windows::{
             Section,
             process::{Listener, Socket},
@@ -22,6 +22,19 @@ use evering::{
     },
     process::{Bootstrap, Supervisor},
 };
+
+#[test]
+fn typed_handoff_is_available() {
+    let handoff = Handoff::bind().unwrap();
+    assert!(!handoff.address().is_empty());
+}
+
+#[cfg(feature = "notify")]
+#[test]
+fn received_event_constructor_is_safe() {
+    let _: fn(std::os::windows::io::OwnedHandle) -> evering::os::Event =
+        evering::os::Event::from_owned_handle;
+}
 use windows_sys::Win32::{
     Foundation::WAIT_OBJECT_0,
     System::Threading::{

@@ -19,10 +19,13 @@ fn wait_cross_process() {
         #[cfg(unix)]
         let event = {
             use std::os::fd::{FromRawFd, OwnedFd};
-            unsafe { os::Event::from_owned_fd(OwnedFd::from_raw_fd(raw as i32)) }
+            os::Event::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw as i32) })
         };
         #[cfg(windows)]
-        let event = unsafe { os::Event::from_owned_handle(raw as *mut _) };
+        let event = {
+            use std::os::windows::io::{FromRawHandle, OwnedHandle};
+            os::Event::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw as *mut _) })
+        };
 
         tokio::runtime::Builder::new_current_thread()
             .enable_all()
