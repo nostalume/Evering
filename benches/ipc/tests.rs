@@ -1,18 +1,450 @@
-#[cfg(feature = "plot")]
-use super::plot;
-use super::{analysis, drive, environment, evering, family, geometry, micro, model, pilot, stream};
+use super::{
+    analysis, drive, environment, evering, family, fixture, geometry, mechanism, model, pilot,
+    stream, study, system,
+};
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct ExampleSpec;
+
+impl study::Identity for ExampleSpec {
+    fn identity(&self, _: &mut blake3::Hasher) {}
+}
+
+struct ExampleSchema;
+
+impl study::Schema for ExampleSchema {
+    const NAME: &'static str = "example";
+    const REVISION: u32 = 1;
+    type Specification = ExampleSpec;
+    type Case = u64;
+    type Measure = u64;
+
+    fn validate(
+        header: &study::Header<Self::Specification, Self::Case>,
+        observation: &study::Observation<Self::Measure>,
+    ) -> Result<(), String> {
+        (header.cases.get(observation.case as usize) == Some(&observation.measure))
+            .then_some(())
+            .ok_or_else(|| "measure does not match case".into())
+    }
+}
+
+struct ForeignSchema;
+
+impl study::Schema for ForeignSchema {
+    const NAME: &'static str = "foreign";
+    const REVISION: u32 = 1;
+    type Specification = ExampleSpec;
+    type Case = u64;
+    type Measure = u64;
+
+    fn validate(
+        _: &study::Header<Self::Specification, Self::Case>,
+        _: &study::Observation<Self::Measure>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+struct ExampleFixture(u64);
+
+impl mechanism::Fixture for ExampleFixture {
+    type Parameters = u64;
+    type Case = u64;
+
+    fn prepare(_: &u64, _: &u64) -> Result<Self, String> {
+        Ok(Self(0))
+    }
+
+    fn state(&self) -> Result<String, String> {
+        Ok(self.0.to_string())
+    }
+
+    fn limit(&self) -> std::num::NonZeroU64 {
+        std::num::NonZeroU64::new(1).unwrap()
+    }
+
+    fn setup(&mut self, _: u64, _: mechanism::Body) -> Result<(), String> {
+        Ok(())
+    }
+
+    fn gross(&mut self, operations: u64) -> Result<(), String> {
+        self.0 = operations;
+        Ok(())
+    }
+
+    fn control(&mut self, operations: u64) -> Result<(), String> {
+        self.0 = operations;
+        Ok(())
+    }
+
+    fn reset(&mut self) -> Result<(), String> {
+        self.0 = 0;
+        Ok(())
+    }
+}
+
+struct ExampleMechanism;
+
+impl mechanism::FixtureSchema for ExampleMechanism {
+    const KEY: &'static str = "mechanism.example";
+    type Parameters = u64;
+    type Case = u64;
+    type Fixture = ExampleFixture;
+
+    fn matches(_: &u64, _: &u64, _: &system::Case) -> bool {
+        true
+    }
+}
+
+fn mechanism_header(seed: u64) -> study::Header<mechanism::Specification<u64>, u64> {
+    let (schedule, orders) = mechanism::schedule(seed, 2, 3);
+    study::Header::new::<mechanism::Mechanism<ExampleMechanism>>(
+        study::Context::default(),
+        mechanism::Specification {
+            targets: vec!["a".repeat(64), "b".repeat(64)],
+            parameters: 8,
+            policy: mechanism::Policy {
+                min_ns: 1,
+                max_ns: u64::MAX,
+                pairs: 3,
+                calibration_attempts: 1,
+            },
+            alpha: 0.05,
+            delta_ns: 1.0,
+            system_delta: 0.05,
+            orders,
+        },
+        vec![1, 2],
+        study::Run {
+            seed,
+            budget_ms: 1_000,
+            schedule,
+            ..study::Run::default()
+        },
+    )
+}
 
 #[test]
-fn path_presence_cannot_preserve_event_frequency() {
-    let once = drive::Path {
-        send_stalled: true,
-        ..drive::Path::default()
-    };
-    let mut repeated = drive::Path::default();
-    repeated.send_stalled = true;
-    repeated.send_stalled = true;
+fn mechanism_schema_batches_pairs_and_returns_to_initial_state() {
+    let root = std::env::temp_dir().join(format!("evering-mechanism-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("evidence.jsonl");
+    mechanism::record::<ExampleMechanism>(&path, mechanism_header(7)).unwrap();
+    let evidence = study::load::<mechanism::Mechanism<ExampleMechanism>>(&path).unwrap();
 
-    assert_eq!(repeated, once);
+    assert_eq!(evidence.observations.len(), 6);
+    assert!(evidence.observations.iter().all(|row| {
+        row.measure.operations == 1
+            && row.measure.before == "0"
+            && row.measure.after == row.measure.before
+    }));
+    let repeated = mechanism_header(7);
+    assert_eq!(evidence.header.run.schedule, repeated.run.schedule);
+    assert_eq!(
+        evidence.header.specification.orders,
+        repeated.specification.orders
+    );
+    assert!(
+        evidence
+            .header
+            .specification
+            .orders
+            .contains(&mechanism::Order::GrossControl)
+    );
+    assert!(
+        evidence
+            .header
+            .specification
+            .orders
+            .contains(&mechanism::Order::ControlGross)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn mechanism_registration_is_exact_closed_and_typed() {
+    assert_eq!(
+        fixture::KEYS,
+        [
+            "mechanism.queue.reserve-publish",
+            "mechanism.queue.claim-recycle",
+            "mechanism.pool.allocate-release",
+            "mechanism.talc.allocate-release",
+            "mechanism.notify",
+            "mechanism.signal-wait",
+        ]
+    );
+}
+
+#[test]
+fn registered_mechanisms_admit_typed_specs_and_seal_real_fixtures() {
+    let root = std::env::temp_dir().join(format!("evering-fixtures-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let common = serde_json::json!({
+        "targets": ["a".repeat(64)],
+        "policy": { "min_ns": 1, "max_ns": u64::MAX, "pairs": 1, "calibration_attempts": 1 },
+        "seed": 7,
+        "budget_ms": 5_000,
+        "alpha": 0.05,
+        "delta_ns": 1.0,
+        "system_delta": 0.05,
+    });
+    for (index, (key, parameters, cases)) in [
+        (
+            fixture::KEYS[0],
+            serde_json::json!({ "extent": 1 << 20, "storage": 1 << 16, "capacity": 8 }),
+            serde_json::json!([{ "payload": 0 }]),
+        ),
+        (
+            fixture::KEYS[1],
+            serde_json::json!({ "extent": 1 << 20, "storage": 1 << 16, "capacity": 8 }),
+            serde_json::json!([{ "payload": 0 }]),
+        ),
+        (
+            fixture::KEYS[2],
+            serde_json::json!({ "extent": 1 << 20, "storage": 1 << 16, "placement": "shared-mapping" }),
+            serde_json::json!([{ "bytes": 64, "alignment": 1, "occupancy": 0, "touch": true }]),
+        ),
+        (
+            fixture::KEYS[3],
+            serde_json::json!({ "extent": 1 << 20, "storage": 1 << 16, "placement": "shared-mapping" }),
+            serde_json::json!([{ "bytes": 64, "alignment": 1, "occupancy": 0, "touch": true }]),
+        ),
+        (
+            fixture::KEYS[4],
+            serde_json::json!({ "limit": 1 }),
+            serde_json::json!([{ "sticky": true }]),
+        ),
+        (
+            fixture::KEYS[5],
+            serde_json::json!({ "limit": 1 }),
+            serde_json::json!([{ "sticky": true }]),
+        ),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut specification = common.clone();
+        specification["fixture"] = key.into();
+        specification["parameters"] = parameters;
+        specification["cases"] = cases;
+        let input = root.join(format!("{index}.json"));
+        let output = root.join(format!("{index}.jsonl"));
+        std::fs::write(&input, serde_json::to_vec(&specification).unwrap()).unwrap();
+        fixture::record(&input, &output).unwrap();
+        assert!(
+            std::fs::read_to_string(output)
+                .unwrap()
+                .contains("\"complete\"")
+        );
+        let encoded = std::fs::read_to_string(root.join(format!("{index}.jsonl"))).unwrap();
+        let schema = study::schema_str(&encoded).unwrap();
+        let analysis = fixture::analyze_str(&schema, &encoded, &[]).unwrap();
+        assert_eq!(analysis.estimates.len(), 1);
+    }
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+fn example_header() -> study::Header<ExampleSpec, u64> {
+    let schedule = [0, 1]
+        .map(|order| study::Scheduled {
+            unit: study::Unit { block: 0, order },
+            case: order,
+        })
+        .into();
+    study::Header::new::<ExampleSchema>(
+        study::Context::default(),
+        ExampleSpec,
+        vec![11, 22],
+        study::Run {
+            schedule,
+            ..study::Run::default()
+        },
+    )
+}
+
+fn example_artifact(path: &std::path::Path) -> String {
+    let mut recorder = study::Recorder::<ExampleSchema>::create(path, example_header()).unwrap();
+    for (order, measure) in [11, 22].into_iter().enumerate() {
+        recorder
+            .observe(study::Observation {
+                unit: study::Unit {
+                    block: 0,
+                    order: order as u32,
+                },
+                case: order as u32,
+                measure,
+            })
+            .unwrap();
+    }
+    recorder.complete().unwrap()
+}
+
+#[test]
+fn typed_study_round_trips_and_schema_selects_the_decoder() {
+    let root = std::env::temp_dir().join(format!("evering-typed-study-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("evidence.jsonl");
+    let digest = example_artifact(&path);
+    let loaded = study::load::<ExampleSchema>(&path).unwrap();
+
+    assert_eq!(loaded.header, example_header());
+    assert_eq!(loaded.observations.len(), 2);
+    assert_eq!(loaded.complete.content, digest);
+    assert_eq!(
+        study::load::<ForeignSchema>(&path).err(),
+        Some(study::Error::Schema)
+    );
+    let mut another_run = example_header();
+    another_run.run.seed = 99;
+    assert_eq!(
+        study::study_id::<ExampleSchema>(&loaded.header),
+        study::study_id::<ExampleSchema>(&another_run)
+    );
+    another_run.context.source.revision = "different source".into();
+    assert_ne!(
+        study::study_id::<ExampleSchema>(&loaded.header),
+        study::study_id::<ExampleSchema>(&another_run)
+    );
+    assert_ne!(
+        study::case_id::<ExampleSchema>(&11),
+        study::case_id::<ExampleSchema>(&22)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_study_rejects_every_unsealed_prefix_and_abort() {
+    let root = std::env::temp_dir().join(format!("evering-typed-cuts-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let complete = root.join("complete.jsonl");
+    example_artifact(&complete);
+    let bytes = std::fs::read(&complete).unwrap();
+    for cut in 0..bytes.len() {
+        let path = root.join(format!("cut-{cut}"));
+        std::fs::write(&path, &bytes[..cut]).unwrap();
+        assert!(
+            study::load::<ExampleSchema>(&path).is_err(),
+            "accepted cut {cut}"
+        );
+    }
+    let aborted = root.join("aborted.jsonl");
+    let recorder = study::Recorder::<ExampleSchema>::create(&aborted, example_header()).unwrap();
+    recorder.abort(None, "stopped\nnow").unwrap();
+    assert_eq!(
+        study::load::<ExampleSchema>(&aborted).err(),
+        Some(study::Error::Aborted)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_study_rejects_corruption_duplicate_rows_and_post_terminal_data() {
+    let root = std::env::temp_dir().join(format!("evering-typed-corrupt-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let complete = root.join("complete.jsonl");
+    example_artifact(&complete);
+    let text = std::fs::read_to_string(&complete).unwrap();
+    let lines: Vec<_> = text.lines().collect();
+
+    let corrupt = root.join("corrupt.jsonl");
+    std::fs::write(
+        &corrupt,
+        text.replacen("\"measure\":11", "\"measure\":12", 1),
+    )
+    .unwrap();
+    assert!(study::load::<ExampleSchema>(&corrupt).is_err());
+
+    let revision = root.join("revision.jsonl");
+    std::fs::write(
+        &revision,
+        text.replacen("\"revision\":1", "\"revision\":2", 1),
+    )
+    .unwrap();
+    assert_eq!(
+        study::load::<ExampleSchema>(&revision).err(),
+        Some(study::Error::Schema)
+    );
+
+    let duplicate = root.join("duplicate.jsonl");
+    std::fs::write(
+        &duplicate,
+        format!("{}\n{}\n{}\n{}\n", lines[0], lines[1], lines[1], lines[3]),
+    )
+    .unwrap();
+    assert!(study::load::<ExampleSchema>(&duplicate).is_err());
+
+    let trailing = root.join("trailing.jsonl");
+    std::fs::write(&trailing, format!("{text}{}\n", lines[1])).unwrap();
+    assert_eq!(
+        study::load::<ExampleSchema>(&trailing).err(),
+        Some(study::Error::Syntax)
+    );
+
+    let aborted = root.join("aborted.jsonl");
+    study::Recorder::<ExampleSchema>::create(&aborted, example_header())
+        .unwrap()
+        .abort(None, "stopped")
+        .unwrap();
+    let forged = root.join("forged-complete.jsonl");
+    std::fs::write(
+        &forged,
+        std::fs::read_to_string(aborted)
+            .unwrap()
+            .replace("\"kind\":\"abort\"", "\"kind\":\"complete\""),
+    )
+    .unwrap();
+    assert!(study::load::<ExampleSchema>(&forged).is_err());
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn typed_study_rejects_reorder_invalid_measure_and_overwrite() {
+    let root = std::env::temp_dir().join(format!("evering-typed-order-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let path = root.join("evidence.jsonl");
+    let mut recorder = study::Recorder::<ExampleSchema>::create(&path, example_header()).unwrap();
+    assert_eq!(
+        recorder.observe(study::Observation {
+            unit: study::Unit { block: 0, order: 1 },
+            case: 1,
+            measure: 22,
+        }),
+        Err(study::Error::Schedule)
+    );
+    assert_eq!(
+        recorder.observe(study::Observation {
+            unit: study::Unit { block: 0, order: 0 },
+            case: 0,
+            measure: 99,
+        }),
+        Err(study::Error::Invalid)
+    );
+    assert!(study::Recorder::<ExampleSchema>::create(&path, example_header()).is_err());
+    recorder.abort(None, "test complete").unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn path_counts_preserve_frequency_cause_and_overflow() {
+    let mut paths = drive::PathCounts::default();
+    paths.send_full().unwrap();
+    paths.send_full().unwrap();
+    paths.send_busy().unwrap();
+    paths.recv_empty().unwrap();
+
+    assert_eq!(
+        (
+            paths.send_full,
+            paths.send_busy,
+            paths.recv_empty,
+            paths.send_attempts
+        ),
+        (2, 1, 1, 0)
+    );
+    paths.send_full = u64::MAX;
+    assert_eq!(paths.send_full(), Err(drive::CountOverflow));
 }
 
 #[test]
@@ -119,21 +551,22 @@ fn balanced_geometry_is_integer_deterministic_and_extent_bounded() {
 
 #[test]
 fn projected_benchmark_conditions_never_authorize_buddy() {
-    let mut trial = successful_trial();
-    trial.observed.as_mut().unwrap().extent = Some(8192);
-    let report = geometry::evidence_report(&[study(vec![trial.clone()])]).unwrap();
+    let evidence = system_evidence("focused", 1.0);
+    let report = geometry::evidence_report(core::slice::from_ref(&evidence)).unwrap();
     assert!(report.starts_with("geometry-v1\nsource\t"));
     assert!(report.lines().nth(2).unwrap().ends_with("\tfalse"));
     assert_eq!(
         report,
-        geometry::evidence_report(&[study(vec![trial])]).unwrap()
+        geometry::evidence_report(core::slice::from_ref(&evidence)).unwrap()
     );
 }
 
 #[derive(Default)]
 struct TraceEndpoint {
     staged: Option<u64>,
-    replies: std::collections::VecDeque<u64>,
+    staged_digest: u64,
+    payloads: Vec<Vec<u8>>,
+    replies: std::collections::VecDeque<(u64, u64, usize)>,
     trace: Vec<(char, u64)>,
     corrupt: bool,
     fail_before_send: bool,
@@ -142,12 +575,13 @@ struct TraceEndpoint {
     delay_ready: bool,
     fail_abort: bool,
     aborted: bool,
+    quiet: bool,
 }
 
 #[test]
 fn family_identity_is_explicit_unique_and_closed() {
     let core = family::find("core-ipc").unwrap();
-    assert_eq!((core.key, core.revision), ("core-ipc", 2));
+    assert_eq!((core.key, core.revision), ("core-ipc", 3));
     assert_eq!(
         core.mode("screening"),
         Some((std::time::Duration::from_secs(180), 3))
@@ -160,7 +594,7 @@ fn family_identity_is_explicit_unique_and_closed() {
 #[test]
 fn local_family_owns_its_exact_two_arm_matrix() {
     let local = family::find("local-ipc-unix").unwrap();
-    assert_eq!((local.key, local.revision), ("local-ipc-unix", 2));
+    assert_eq!((local.key, local.revision), ("local-ipc-unix", 3));
     assert_eq!(local.baseline.key, "uds/readiness");
     assert_eq!(
         local.mode("pilot"),
@@ -168,16 +602,16 @@ fn local_family_owns_its_exact_two_arm_matrix() {
     );
     assert_eq!(
         local.mode("screening"),
-        Some((std::time::Duration::from_secs(90), 3))
+        Some((std::time::Duration::from_secs(60), 3))
     );
     assert_eq!(
         local.mode("focused"),
-        Some((std::time::Duration::from_secs(240), 15))
+        Some((std::time::Duration::from_secs(90), 15))
     );
     for mode in ["screening", "focused"] {
         let members = (local.members)(mode).unwrap();
-        assert_eq!(members.len(), 10);
-        for payload in [0, 64, 1024, 16 * 1024, 64 * 1024] {
+        assert_eq!(members.len(), 6);
+        for payload in [0, 1024, 64 * 1024] {
             let pair: Vec<_> = members
                 .iter()
                 .filter(|(cell, _)| cell.payload == payload)
@@ -258,14 +692,20 @@ fn environment_snapshot_is_stable_complete_and_self_identifying() {
 
 fn pilot_identity() -> pilot::Identity {
     pilot::Identity {
-        algorithm: 3,
+        algorithm: 4,
         family: "core-ipc".into(),
         family_revision: family::CORE.revision,
         revision: "revision".into(),
+        dirty: false,
         diff: "diff".into(),
         target: "target".into(),
+        os: "os".into(),
+        arch: "arch".into(),
         rustc: "rustc".into(),
+        host: "host".into(),
         environment: "environment".into(),
+        command: "command".into(),
+        started: "started".into(),
         seed: 7,
         warmup: 8,
         timeout_ms: 5_000,
@@ -281,7 +721,7 @@ fn pilot_calibration_freezes_from_one_measurable_ramp_without_a_probe() {
         Ok(if calls == 1 { 49_000_000 } else { 110_000_000 })
     })
     .unwrap();
-    assert_eq!((row.count, row.observations.len(), calls), (450, 2, 2));
+    assert_eq!((row.count, row.observations.len(), calls), (225, 2, 2));
 }
 
 #[test]
@@ -313,6 +753,15 @@ fn pilot_calibration_bounds_attempts_overflow_timeout_and_identity() {
     assert!(pilot::calibrate(cell(&family::BUSY), u64::MAX, |_| Ok(50_000_000)).is_err());
 }
 
+fn calibration_evidence(identity: pilot::Identity, rows: Vec<pilot::Row>) -> pilot::Evidence {
+    let path = std::env::temp_dir().join(format!("evering-calibration-{}", fastrand::u64(..)));
+    let cases = rows.iter().map(|row| row.cell.clone()).collect();
+    pilot::record(&path, identity, cases, rows.into_iter().map(Ok)).unwrap();
+    let evidence = pilot::load(&path).unwrap().0;
+    std::fs::remove_file(path).unwrap();
+    evidence
+}
+
 #[test]
 fn pilot_admission_rejects_foreign_missing_duplicate_and_unverified_counts() {
     let scheduled = model::schedule(
@@ -322,41 +771,80 @@ fn pilot_admission_rejects_foreign_missing_duplicate_and_unverified_counts() {
     );
     let cells: Vec<_> = scheduled[..2].iter().map(|entry| entry.cell()).collect();
     let verified = |cell| pilot::calibrate(cell, 8, |_| Ok(500_000_000)).unwrap();
-    let manifest = pilot::Manifest {
-        identity: pilot_identity(),
-        rows: cells.into_iter().map(verified).collect(),
-    };
+    let evidence =
+        calibration_evidence(pilot_identity(), cells.into_iter().map(verified).collect());
     assert_eq!(
-        pilot::admit(&manifest, &pilot_identity(), &scheduled).unwrap(),
+        pilot::admit(&evidence, &pilot_identity(), &scheduled).unwrap(),
         vec![96; 4]
     );
-    let mut invalid = manifest.clone();
-    invalid.identity.target = "foreign".into();
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
-    let mut invalid = manifest.clone();
-    invalid.identity.family_revision += 1;
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
-    let mut invalid = manifest.clone();
-    invalid.identity.algorithm = 2;
-    assert!(pilot::admit(&invalid, &invalid.identity.clone(), &scheduled).is_err());
-    let mut invalid = manifest.clone();
-    invalid.rows.pop();
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
-    let mut invalid = manifest.clone();
-    invalid.rows.push(invalid.rows[0].clone());
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
-    let mut invalid = manifest;
-    invalid.rows[0].observations.pop();
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
-    let mut invalid = pilot::Manifest {
-        identity: pilot_identity(),
-        rows: scheduled[..2]
+    let mut reuse = pilot_identity();
+    reuse.command = "screening invocation".into();
+    reuse.started = "later".into();
+    assert_eq!(
+        pilot::admit(&evidence, &reuse, &scheduled).unwrap(),
+        vec![96; 4]
+    );
+    let mut foreign = pilot_identity();
+    foreign.target = "foreign".into();
+    assert!(pilot::admit(&evidence, &foreign, &scheduled).is_err());
+    foreign = pilot_identity();
+    foreign.family_revision += 1;
+    assert!(pilot::admit(&evidence, &foreign, &scheduled).is_err());
+    let mut unsupported = pilot_identity();
+    unsupported.algorithm = 2;
+    let unsupported_evidence = calibration_evidence(
+        unsupported.clone(),
+        scheduled[..2]
             .iter()
             .map(|entry| verified(entry.cell()))
             .collect(),
-    };
-    invalid.rows[0].count = 99;
-    assert!(pilot::admit(&invalid, &pilot_identity(), &scheduled).is_err());
+    );
+    assert!(pilot::admit(&unsupported_evidence, &unsupported, &scheduled).is_err());
+    assert!(pilot::admit(&evidence, &pilot_identity(), &scheduled[..1]).is_err());
+
+    let duplicate = scheduled[0].cell();
+    let path = std::env::temp_dir().join(format!("evering-duplicate-{}", fastrand::u64(..)));
+    assert!(
+        pilot::record(
+            &path,
+            pilot_identity(),
+            vec![duplicate.clone(), duplicate.clone()],
+            [Ok(verified(duplicate.clone())), Ok(verified(duplicate))],
+        )
+        .is_err()
+    );
+    assert!(!path.exists());
+
+    let path = std::env::temp_dir().join(format!("evering-mismatch-{}", fastrand::u64(..)));
+    assert!(
+        pilot::record(
+            &path,
+            pilot_identity(),
+            vec![scheduled[0].cell()],
+            [Ok(verified(scheduled[1].cell()))],
+        )
+        .is_err()
+    );
+    assert!(
+        std::fs::read_to_string(&path)
+            .unwrap()
+            .contains("row does not match case")
+    );
+    std::fs::remove_file(path).unwrap();
+
+    let mut invalid = verified(scheduled[0].cell());
+    invalid.count = 99;
+    let path = std::env::temp_dir().join(format!("evering-invalid-{}", fastrand::u64(..)));
+    assert!(
+        pilot::record(
+            &path,
+            pilot_identity(),
+            vec![invalid.cell.clone()],
+            [Ok(invalid)],
+        )
+        .is_err()
+    );
+    std::fs::remove_file(path).unwrap();
 }
 
 #[test]
@@ -366,35 +854,36 @@ fn pilot_manifest_round_trip_is_digest_bound_and_non_overwriting() {
         1,
         7,
     );
-    let manifest = pilot::Manifest {
-        identity: pilot_identity(),
-        rows: scheduled
-            .iter()
-            .map(|entry| {
-                let cell = entry.cell();
-                pilot::calibrate(cell, 8, |count| Ok(count * 10_000_000)).unwrap()
-            })
-            .collect(),
-    };
+    let identity = pilot_identity();
+    let rows: Vec<_> = scheduled
+        .iter()
+        .map(|entry| {
+            let cell = entry.cell();
+            pilot::calibrate(cell, 8, |count| Ok(count * 10_000_000)).unwrap()
+        })
+        .collect();
     let path = std::env::temp_dir().join(format!("evering-pilot-{}", std::process::id()));
     let digest = pilot::record(
         &path,
-        manifest.identity.clone(),
-        manifest.rows.len(),
-        manifest
-            .rows
-            .iter()
-            .cloned()
-            .map(|row| (row.cell.clone(), Ok(row))),
+        identity.clone(),
+        rows.iter().map(|row| row.cell.clone()).collect(),
+        rows.iter().cloned().map(Ok),
     )
     .unwrap();
-    assert_eq!(pilot::load(&path).unwrap(), (manifest.clone(), digest));
+    let (evidence, loaded_digest) = pilot::load(&path).unwrap();
+    assert_eq!(
+        (pilot::identity(&evidence), loaded_digest),
+        (identity.clone(), digest)
+    );
+    assert_eq!(evidence.observations.len(), rows.len());
+    let report = analysis::command(&[path.to_string_lossy().into_owned()]).unwrap();
+    assert!(report.contains("Calibration evidence"));
     assert!(
         pilot::record(
             &path,
-            manifest.identity.clone(),
-            manifest.rows.len(),
-            std::iter::empty::<(model::Cell, Result<pilot::Row, String>)>(),
+            identity,
+            rows.iter().map(|row| row.cell.clone()).collect(),
+            std::iter::empty::<Result<pilot::Row, String>>(),
         )
         .is_err()
     );
@@ -419,11 +908,8 @@ fn pilot_partial_is_durable_non_admissible_and_sanitizes_abort() {
         pilot::record(
             &path,
             pilot_identity(),
-            2,
-            [
-                (cell.clone(), Ok(row)),
-                (cell, Err("bad\tline\nreason".into())),
-            ],
+            vec![cell.clone(), scheduled[1].cell()],
+            [Ok(row), Err("bad\tline\nreason".into())],
         )
         .is_err()
     );
@@ -459,59 +945,67 @@ fn nested_deadlines_never_reset_or_exceed_the_command() {
 impl drive::Endpoint for TraceEndpoint {
     type Error = &'static str;
 
-    fn stage(&mut self, operation: u64, _: Vec<u8>) -> Result<(), Self::Error> {
+    fn stage(&mut self, operation: u64, payload: &[u8]) -> Result<(), Self::Error> {
         if self.staged.replace(operation).is_some() {
             return Err("double stage");
         }
+        self.staged_digest = model::digest(payload);
+        self.payloads.push(payload.to_vec());
         Ok(())
     }
 
     fn try_send(
         &mut self,
-        _: &mut drive::Path,
+        _: &mut drive::PathCounts,
     ) -> Result<drive::Step<(), Self::Error>, Self::Error> {
         if self.fail_before_send {
             return Err("pre-commit send failure");
         }
         let operation = self.staged.take().ok_or("send without stage")?;
-        self.trace.push(('s', operation));
-        self.replies.push_back(operation);
+        if !self.quiet {
+            self.trace.push(('s', operation));
+        }
+        self.replies.push_back((
+            operation,
+            self.staged_digest,
+            self.payloads.last().map_or(0, Vec::len),
+        ));
         let _advisory_signal_failed = self.fail_after_send;
         Ok(drive::Step::Committed(Ok(())))
     }
 
     fn try_recv(
         &mut self,
-        _: &mut drive::Path,
+        _: &mut drive::PathCounts,
         expected: drive::Expected,
     ) -> Result<drive::Step<bool, Self::Error>, Self::Error> {
-        let Some(operation) = self.replies.pop_front() else {
+        let Some((operation, digest, payload_len)) = self.replies.pop_front() else {
             return Ok(drive::Step::Pending);
         };
         if self.delay_ready && operation == u64::MAX {
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        self.trace.push(('r', operation));
+        if !self.quiet {
+            self.trace.push(('r', operation));
+        }
         if self.fail_after_recv {
             return Ok(drive::Step::Committed(Err(
                 "post-commit reconstruction failure",
             )));
         }
-        let mut bytes = model::payload(7, operation, usize::from(operation != u64::MAX));
-        if let Some(byte) = bytes.first_mut() {
-            *byte ^= 0xa5;
-            *byte ^= u8::from(self.corrupt);
-        }
-        Ok(drive::Step::Committed(Ok(
-            expected.matches(operation, &bytes)
-        )))
+        let digest = digest ^ u64::from(self.corrupt);
+        Ok(drive::Step::Committed(Ok(expected.matches_digest(
+            operation,
+            digest,
+            payload_len,
+        ))))
     }
 
     fn wait(
         &mut self,
         _: drive::Interest,
         _: drive::Deadline,
-        _: &mut drive::Path,
+        _: &mut drive::PathCounts,
     ) -> Result<(), Self::Error> {
         Err("unexpected wait")
     }
@@ -532,6 +1026,15 @@ fn trace_transfer(
     count: u64,
     window: u64,
 ) -> Result<drive::Counts, drive::Error<&'static str>> {
+    trace_transfer_with_paths(endpoint, count, window).map(|(counts, _)| counts)
+}
+
+fn trace_transfer_with_paths(
+    endpoint: &mut TraceEndpoint,
+    count: u64,
+    window: u64,
+) -> Result<(drive::Counts, drive::PathCounts), drive::Error<&'static str>> {
+    let mut paths = drive::PathCounts::default();
     drive::transfer(
         endpoint,
         drive::Work {
@@ -543,18 +1046,20 @@ fn trace_transfer(
         },
         drive::Deadline::after(std::time::Instant::now(), std::time::Duration::from_secs(1))
             .unwrap(),
-        &mut drive::Path::default(),
+        &mut paths,
     )
+    .map(|counts| (counts, paths))
 }
 
 #[test]
 fn shared_driver_uses_a_sliding_window_and_shared_validation() {
     let mut endpoint = TraceEndpoint::default();
-    let counts = trace_transfer(&mut endpoint, 4, 2).unwrap();
+    let (counts, paths) = trace_transfer_with_paths(&mut endpoint, 4, 2).unwrap();
     assert_eq!(
         (counts.accepted, counts.completed, counts.validated),
         (4, 4, 4)
     );
+    assert_eq!((paths.send_attempts, paths.recv_attempts), (4, 4));
     assert_eq!(
         endpoint.trace,
         [
@@ -568,6 +1073,7 @@ fn shared_driver_uses_a_sliding_window_and_shared_validation() {
             ('r', 3),
         ]
     );
+    assert!(endpoint.payloads.windows(2).all(|pair| pair[0] == pair[1]));
 }
 
 #[test]
@@ -671,19 +1177,16 @@ fn evering_bootstrap_binds_region_channel_and_extent() {
 }
 
 #[test]
-fn deterministic_validation_checks_every_response_byte() {
-    let mut response = model::payload(7, 11, 4096);
-    response.iter_mut().for_each(|byte| *byte ^= 0xa5);
-    assert!(model::valid_response(7, 11, 4096, &response));
-    response[2047] ^= 1;
-    assert!(!model::valid_response(7, 11, 4096, &response));
-    let mut truncated = model::payload(7, 11, 2048);
-    truncated.iter_mut().for_each(|byte| *byte ^= 0xa5);
-    assert!(!model::valid_response(7, 11, 4096, &truncated));
+fn delivery_digest_reads_the_complete_payload() {
+    let payload = model::payload(7, 11, 4096);
+    let digest = model::digest(&payload);
+    let mut changed = payload.clone();
+    changed[2047] ^= 1;
+    assert_ne!(digest, model::digest(&changed));
 }
 
 #[test]
-fn framed_stream_round_trip_validates_complete_payload() {
+fn framed_stream_returns_only_the_delivery_digest() {
     use std::io::{Read, Write};
     use std::net::{Shutdown, TcpListener, TcpStream};
 
@@ -702,7 +1205,7 @@ fn framed_stream_round_trip_validates_complete_payload() {
     let mut response = vec![0; u32::from_le_bytes(header[8..].try_into().unwrap()) as usize];
     client.read_exact(&mut response).unwrap();
     assert_eq!(u64::from_le_bytes(header[..8].try_into().unwrap()), 11);
-    assert!(model::valid_response(7, 11, 4096, &response));
+    assert_eq!(response, model::digest(&payload).to_le_bytes());
     client.shutdown(Shutdown::Write).unwrap();
     worker.join().unwrap();
 }
@@ -721,10 +1224,10 @@ fn framing_is_transport_independent() {
     client.write_all(&7_u64.to_le_bytes()).unwrap();
     client.write_all(&3_u32.to_le_bytes()).unwrap();
     client.write_all(&[1, 2, 3]).unwrap();
-    let mut response = [0; 15];
+    let mut response = [0; 20];
     client.read_exact(&mut response).unwrap();
-    assert_eq!(&response[..12], &[7, 0, 0, 0, 0, 0, 0, 0, 3, 0, 0, 0]);
-    assert_eq!(&response[12..], &[0xa4, 0xa7, 0xa6]);
+    assert_eq!(&response[..12], &[7, 0, 0, 0, 0, 0, 0, 0, 8, 0, 0, 0]);
+    assert_eq!(&response[12..], &model::digest(&[1, 2, 3]).to_le_bytes());
     client.shutdown(Shutdown::Write).unwrap();
     worker.join().unwrap();
 }
@@ -786,10 +1289,10 @@ fn readiness_stream_progresses_with_constrained_duplex_buffers() {
             seed: 7,
         },
         deadline,
-        &mut drive::Path::default(),
+        &mut drive::PathCounts::default(),
     )
     .unwrap();
-    let mut path = drive::Path::default();
+    let mut path = drive::PathCounts::default();
     let counts = drive::transfer(
         &mut client,
         drive::Work {
@@ -811,73 +1314,6 @@ fn readiness_stream_progresses_with_constrained_duplex_buffers() {
     worker.join().unwrap();
 }
 
-fn successful_trial() -> model::Trial {
-    model::Trial {
-        block: 0,
-        order: 0,
-        cell: model::Cell {
-            arm: family::BUSY.key.into(),
-            payload: 64,
-            capacity: 8,
-            in_flight: 3,
-            memory: model::MEMORY,
-        },
-        requested: 7,
-        accepted: 7,
-        completed: 7,
-        validated: 7,
-        elapsed_ns: Some(1),
-        phase_ns: [1; 3],
-        observed: Some(model::Observed {
-            payload: 64,
-            capacity: 8,
-            in_flight: 3,
-            window: 3,
-            topology: "1c1w".into(),
-            transport: "shared-memory".into(),
-            extent: Some(model::MEMORY),
-            allocator: Some("adaptive".into()),
-            socket_send: None,
-            socket_recv: None,
-        }),
-        path: drive::Path::default(),
-        status: model::Status::Ok,
-        error: None,
-    }
-}
-
-fn study(trials: Vec<model::Trial>) -> model::Study {
-    let expected = trials.len();
-    let mut study = model::Study {
-        meta: model::Meta {
-            format: 5,
-            family: "core-ipc".into(),
-            family_revision: family::CORE.revision,
-            revision: "abc123".into(),
-            dirty: false,
-            diff: "clean".into(),
-            target: "x86_64-test".into(),
-            os: "test".into(),
-            arch: "x86_64".into(),
-            rustc: "rustc-test".into(),
-            command: "study --seed 7".into(),
-            started: "0".into(),
-            mode: "test".into(),
-            seed: 7,
-            warmup: 1,
-            blocks: 1,
-            timeout_ms: 1000,
-            schedule: 0,
-            expected,
-            host: "test-host".into(),
-            spin: 0,
-        },
-        trials,
-    };
-    study.meta.schedule = model::trial_schedule_id(&study.trials);
-    study
-}
-
 fn condition() -> model::Condition {
     model::Condition {
         payload: 64,
@@ -887,28 +1323,12 @@ fn condition() -> model::Condition {
     }
 }
 
-fn contrast(arm: &'static family::Arm) -> (model::Condition, &'static family::Arm) {
-    (condition(), arm)
-}
-
 fn cell(arm: &'static family::Arm) -> model::Cell {
     condition().cell(arm)
 }
 
-#[test]
-fn study_identity_must_resolve_its_exact_family_revision() {
-    let mut evidence = study(vec![successful_trial()]);
-    evidence.meta.family = "unknown".into();
-    assert_eq!(
-        model::validate_study(&evidence).unwrap_err(),
-        model::StudyError::Family
-    );
-    evidence.meta.family = "core-ipc".into();
-    evidence.meta.family_revision += 1;
-    assert_eq!(
-        model::validate_study(&evidence).unwrap_err(),
-        model::StudyError::Family
-    );
+fn contrast(arm: &'static family::Arm) -> (model::Condition, &'static family::Arm) {
+    (condition(), arm)
 }
 
 #[test]
@@ -950,11 +1370,6 @@ fn registered_families_have_exact_bounded_membership() {
             .chain(&focused)
             .all(|(cell, _)| cell.memory == model::MEMORY)
     );
-    assert!(
-        focused
-            .iter()
-            .all(|(_, arm)| [family::ADAPTIVE.key, family::STREAM.key].contains(&arm.key))
-    );
 }
 
 #[test]
@@ -976,628 +1391,535 @@ fn stream_window_obeys_capacity_and_in_flight() {
     assert_eq!(model::window(3, 8, 64), 3);
 }
 
-#[test]
-fn duplicate_baseline_rows_are_rejected() {
-    let mut busy = successful_trial();
-    busy.cell.arm = family::STREAM.key.into();
-    busy.observed = Some(stream_observed());
-    let mut duplicate = busy.clone();
-    duplicate.order = 1;
-    assert_eq!(
-        model::validate_study(&study(vec![busy, duplicate])).unwrap_err(),
-        model::StudyError::DuplicateCell
-    );
-}
-
-#[test]
-fn analysis_reuses_one_baseline_for_every_policy_in_a_condition() {
-    let evidence = registered_study("screening", &[2.0]);
-    let analysis = analysis::analyze(&evidence).unwrap();
-    assert_eq!(
-        analysis
-            .estimates
+fn system_header(mode: &str) -> study::Header<system::Specification, system::Case> {
+    let family = &family::CORE;
+    let blocks = family.mode(mode).unwrap().1;
+    let selected = model::schedule(&(family.members)(mode).unwrap(), blocks, 7);
+    let mut cases = Vec::new();
+    let mut schedule = Vec::new();
+    for entry in selected {
+        let case = system::Case {
+            workload: entry.cell(),
+            resources: entry.arm.resources(),
+        };
+        let index = cases
             .iter()
-            .filter(|estimate| {
-                estimate.condition.payload == 64
-                    && estimate.condition.capacity == 8
-                    && estimate.condition.in_flight == 8
+            .position(|known| known == &case)
+            .unwrap_or_else(|| {
+                cases.push(case);
+                cases.len() - 1
+            });
+        schedule.push(study::Scheduled {
+            unit: study::Unit {
+                block: entry.block,
+                order: entry.order,
+            },
+            case: index as u32,
+        });
+    }
+    let contrasts = cases
+        .iter()
+        .filter(|case| case.workload.arm != family.baseline.key)
+        .filter_map(|candidate| {
+            let baseline = cases.iter().find(|case| {
+                case.workload.condition() == candidate.workload.condition()
+                    && case.workload.arm == family.baseline.key
+            })?;
+            Some(system::Contrast {
+                candidate: study::case_id::<system::System>(candidate),
+                baseline: study::case_id::<system::System>(baseline),
+                delta: 0.05,
+                role: system::Role::Primary,
             })
-            .map(|estimate| (estimate.candidate, estimate.effect))
-            .collect::<Vec<_>>(),
-        vec![
-            (family::ADAPTIVE.key, 2.0),
-            (family::BUSY.key, 2.0),
-            (family::NOTIFIED.key, 2.0),
-        ]
-    );
+        })
+        .collect();
+    study::Header::new::<system::System>(
+        study::Context {
+            source: study::Source {
+                revision: "revision".into(),
+                dirty: false,
+                diff: "diff".into(),
+            },
+            compiler: study::Compiler {
+                target: "target".into(),
+                rustc: "rustc".into(),
+            },
+            host: study::Host {
+                os: "os".into(),
+                arch: "arch".into(),
+                description: "host".into(),
+                environment: "environment".into(),
+            },
+        },
+        system::Specification {
+            family: family.key.into(),
+            family_revision: family.revision,
+            mode: mode.into(),
+            blocks,
+            spin: 0,
+            timeout_ms: 5_000,
+            alpha: 0.05,
+            calibration: Some("calibration".into()),
+            contrasts,
+        },
+        cases,
+        study::Run {
+            seed: 7,
+            started: "started".into(),
+            command: "command".into(),
+            warmup: 8,
+            budget_ms: family.mode(mode).unwrap().0.as_millis() as u64,
+            schedule,
+        },
+    )
 }
 
-fn stream_observed() -> model::Observed {
-    model::Observed {
-        payload: 64,
-        capacity: 8,
-        in_flight: 3,
-        window: 3,
-        topology: "1c1w".into(),
-        transport: "ipv4-loopback".into(),
-        extent: None,
-        allocator: None,
-        socket_send: Some(4096),
-        socket_recv: Some(4096),
+fn system_measure(case: &system::Case, elapsed_ns: u64) -> system::Measure {
+    let requested = 100;
+    system::Measure {
+        requested,
+        accepted: requested,
+        completed: requested,
+        validated: requested,
+        elapsed_ns,
+        phase_ns: [1, elapsed_ns, 1],
+        observed: model::Observed {
+            payload: case.workload.payload,
+            capacity: case.workload.capacity,
+            in_flight: case.workload.in_flight,
+            window: model::window(requested, case.workload.capacity, case.workload.in_flight),
+            topology: case.resources.topology.clone(),
+            transport: case.resources.transport.clone(),
+            extent: case.resources.extent.then_some(case.workload.memory),
+            allocator: case.resources.allocator.then(|| "pool".into()),
+            socket_send: case.resources.socket_send.then_some(4096),
+            socket_recv: case.resources.socket_recv.then_some(4096),
+        },
+        path: drive::PathCounts {
+            send_attempts: requested,
+            recv_attempts: requested,
+            ..drive::PathCounts::default()
+        },
     }
 }
 
-fn registered_study(mode: &str, ratios: &[f64]) -> model::Study {
-    let blocks = family::CORE.mode(mode).unwrap().1;
-    let scheduled = model::schedule(&(family::CORE.members)(mode).unwrap(), blocks, 7);
-    let trials = scheduled
-        .into_iter()
-        .map(|entry| {
-            let mut trial = successful_trial();
-            trial.block = entry.block;
-            trial.order = entry.order;
-            trial.cell = entry.cell();
-            let observed = if entry.arm.key == family::STREAM.key {
-                stream_observed()
-            } else {
-                trial.observed.take().unwrap()
-            };
-            trial.observed = Some(model::Observed {
-                payload: trial.cell.payload,
-                capacity: trial.cell.capacity,
-                in_flight: trial.cell.in_flight,
-                window: model::window(trial.requested, trial.cell.capacity, trial.cell.in_flight),
-                extent: (entry.arm.key != family::STREAM.key).then_some(trial.cell.memory),
-                ..observed
-            });
-            let ratio = ratios[entry.block as usize % ratios.len()];
-            trial.elapsed_ns = Some(
-                if entry.arm.key == family::STREAM.key {
-                    ratio
-                } else {
-                    1.0
-                }
-                .mul_add(1_000_000.0, 0.0) as u64,
-            );
-            trial
-        })
-        .collect();
-    let mut evidence = study(trials);
-    evidence.meta.mode = mode.into();
-    evidence.meta.blocks = blocks;
-    evidence.meta.expected = evidence.trials.len();
-    evidence.meta.schedule = model::trial_schedule_id(&evidence.trials);
+fn record_system_evidence(
+    path: &std::path::Path,
+    mode: &str,
+    candidate_ratio: f64,
+    revision: &str,
+) {
+    let mut header = system_header(mode);
+    header.context.source.revision = revision.into();
+    let execution = header.run.schedule.clone();
+    let cases = header.cases.clone();
+    let baseline = family::CORE.baseline.key;
+    let mut recorder = study::Recorder::<system::System>::create(path, header).unwrap();
+    for expected in execution {
+        let case = &cases[expected.case as usize];
+        let elapsed = if case.workload.arm == baseline {
+            1_000_000
+        } else {
+            (1_000_000.0 / candidate_ratio) as u64
+        };
+        recorder
+            .observe(study::Observation {
+                unit: expected.unit,
+                case: expected.case,
+                measure: system_measure(case, elapsed),
+            })
+            .unwrap();
+    }
+    recorder.complete().unwrap();
+}
+
+fn system_evidence_at(mode: &str, candidate_ratio: f64, revision: &str) -> system::Evidence {
+    let path = std::env::temp_dir().join(format!("evering-system-{}", fastrand::u64(..)));
+    record_system_evidence(&path, mode, candidate_ratio, revision);
+    let evidence = system::load(&path).unwrap();
+    std::fs::remove_file(path).unwrap();
     evidence
 }
 
-#[test]
-fn paired_analysis_is_order_independent_and_hand_checked() {
-    let evidence = registered_study("focused", &[2.0]);
-    let analysis = analysis::analyze(&evidence).unwrap();
-    assert_eq!(analysis.estimates.len(), 5);
-    let estimate = &analysis.estimates[0];
-    assert_eq!(estimate.blocks, 15);
-    assert_eq!(
-        analysis.authority,
-        analysis::Authority::Focused(vec![analysis::Decision::Faster; 5])
-    );
-    assert!((estimate.effect - 2.0).abs() < 1e-12);
-    assert!((estimate.low - 2.0).abs() < 1e-12);
-    assert!((estimate.high - 2.0).abs() < 1e-12);
+fn system_evidence(mode: &str, candidate_ratio: f64) -> system::Evidence {
+    system_evidence_at(mode, candidate_ratio, "revision")
+}
 
-    let mut reversed = evidence.clone();
-    reversed.trials.reverse();
-    reversed.meta.schedule = model::trial_schedule_id(&reversed.trials);
+fn mechanism_analysis(system: &system::Evidence) -> analysis::MechanismAnalysis {
+    let target = system.header.specification.contrasts[0].candidate.clone();
+    analysis::MechanismAnalysis {
+        schema: "mechanism.queue.reserve-publish".into(),
+        evidence: "mechanism-evidence".into(),
+        context: system.header.context.clone(),
+        delta_ns: 1.0,
+        system_delta: 0.05,
+        estimates: vec![analysis::MechanismEstimate {
+            target,
+            target_admitted: Some(true),
+            case: r#"{"payload":0}"#.into(),
+            paired_ns: vec![10.0; 9],
+            gross_ns: vec![12.0; 9],
+            control_ns: vec![2.0; 9],
+            iqr: [10.0, 10.0],
+            interval: analysis::Interval {
+                point: 10.0,
+                low: 10.0,
+                high: 10.0,
+            },
+            decision: analysis::Decision::Slower,
+        }],
+    }
+}
+
+#[test]
+fn attribution_requires_exact_path_direction_intervention_and_provenance() {
+    let before = system_evidence_at("focused", 0.8, "before");
+    let after = system_evidence_at("focused", 0.95, "after");
+    let mechanism = mechanism_analysis(&before);
+
     assert_eq!(
-        analysis::analyze(&reversed).unwrap().estimates,
-        analysis.estimates
+        analysis::attribute(&before, None, None).unwrap().authority,
+        analysis::Authority::SystemEffect
+    );
+    assert_eq!(
+        analysis::attribute(&before, Some(&mechanism), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Attributed
+    );
+    let mut conflict = mechanism_analysis(&before);
+    conflict.estimates[0].target_admitted = Some(false);
+    assert_eq!(
+        analysis::attribute(&before, Some(&conflict), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
+    );
+    let mut conflict = mechanism_analysis(&before);
+    conflict.estimates[0].target = "f".repeat(64);
+    assert_eq!(
+        analysis::attribute(&before, Some(&conflict), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
+    );
+    let mut conflict = mechanism_analysis(&before);
+    conflict.estimates[0].decision = analysis::Decision::Faster;
+    assert_eq!(
+        analysis::attribute(&before, Some(&conflict), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
+    );
+    let mut conflict = mechanism_analysis(&before);
+    conflict.schema = "mechanism.talc.allocate-release".into();
+    assert_eq!(
+        analysis::attribute(&before, Some(&conflict), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
+    );
+    let mut conflict = mechanism_analysis(&before);
+    conflict.context.source.revision = "foreign".into();
+    assert_eq!(
+        analysis::attribute(&before, Some(&conflict), Some(&after))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
+    );
+    let insufficient = system_evidence_at("focused", 0.82, "insufficient");
+    assert_eq!(
+        analysis::attribute(&before, Some(&mechanism), Some(&insufficient))
+            .unwrap()
+            .authority,
+        analysis::Authority::Inconclusive
     );
 }
 
 #[test]
-fn analysis_classifies_registered_band_and_rejects_bad_admission() {
-    let classify = |ratios: &[f64]| match analysis::analyze(&registered_study("focused", ratios))
-        .unwrap()
-        .authority
-    {
-        analysis::Authority::Focused(decisions) => decisions[0],
-        analysis::Authority::Screening => unreachable!(),
-    };
-    assert_eq!(classify(&[0.97, 1.0, 1.03]), analysis::Decision::Equivalent);
-    assert_eq!(
-        classify(&[0.90, 1.0, 1.10]),
-        analysis::Decision::Inconclusive
+fn system_schema_registers_resources_contrasts_and_exact_schedule() {
+    let evidence = system_evidence("focused", 1.2);
+    let analysis = analysis::analyze(&evidence).unwrap();
+    assert_eq!(analysis.estimates.len(), 5);
+    assert!(
+        analysis
+            .estimates
+            .iter()
+            .all(|estimate| estimate.effect > 1.19)
     );
-    assert_eq!(classify(&[0.8]), analysis::Decision::Slower);
-
-    let mut failed = registered_study("focused", &[1.0]);
-    failed.trials[0].status = model::Status::TimedError;
-    failed.trials[0].elapsed_ns = None;
-    failed.trials[0].error = Some("timeout".into());
-    failed.meta.schedule = model::trial_schedule_id(&failed.trials);
-    assert!(matches!(
-        analysis::analyze(&failed),
-        Err(analysis::Error::Pair)
-    ));
-
-    let first = registered_study("focused", &[1.0]);
-    let mut other_platform = first.clone();
-    other_platform.meta.os = "other".into();
-    assert_eq!(
-        analysis::report(&[first.clone(), other_platform]).unwrap_err(),
-        analysis::Error::Duplicate
+    assert_eq!(analysis.authority, analysis::Authority::SystemEffect);
+    let markdown = analysis.markdown();
+    assert!(markdown.contains("candidate op/s | baseline op/s"));
+    assert!(markdown.contains("candidate MiB/s | baseline MiB/s"));
+    assert!(
+        analysis
+            .decisions
+            .iter()
+            .all(|decision| *decision == analysis::Decision::Faster)
     );
+    assert_eq!(
+        evidence.header.run.schedule.len(),
+        evidence.observations.len()
+    );
+    assert!(
+        evidence
+            .header
+            .specification
+            .contrasts
+            .iter()
+            .all(|contrast| contrast.delta == 0.05)
+    );
+}
 
-    let mut subset = first.clone();
-    subset.trials.retain(|trial| trial.cell.payload == 0);
-    for block in 0..subset.meta.blocks {
-        subset
-            .trials
-            .iter_mut()
-            .filter(|trial| trial.block == block)
-            .enumerate()
-            .for_each(|(order, trial)| trial.order = order as u32);
-    }
-    subset.meta.expected = subset.trials.len();
-    subset.meta.schedule = model::trial_schedule_id(&subset.trials);
-    assert!(model::validate_study(&subset).is_ok());
-    assert!(matches!(
-        analysis::analyze(&subset),
-        Err(analysis::Error::Family)
-    ));
+#[test]
+fn system_schema_rejects_wrong_resources_counts_and_duplicate_cases() {
+    let path = std::env::temp_dir().join(format!("evering-system-invalid-{}", fastrand::u64(..)));
+    let header = system_header("focused");
+    let execution = header.run.schedule[0];
+    let case = header.cases[execution.case as usize].clone();
+    let mut invalid = system_measure(&case, 1);
+    invalid.accepted -= 1;
+    let mut recorder = study::Recorder::<system::System>::create(&path, header).unwrap();
+    assert_eq!(
+        recorder.observe(study::Observation {
+            unit: execution.unit,
+            case: execution.case,
+            measure: invalid,
+        }),
+        Err(study::Error::Invalid)
+    );
+    let mut invalid = system_measure(&case, 1);
+    invalid.observed.transport = "wrong".into();
+    assert_eq!(
+        recorder.observe(study::Observation {
+            unit: execution.unit,
+            case: execution.case,
+            measure: invalid,
+        }),
+        Err(study::Error::Invalid)
+    );
+    recorder.abort(Some(execution.unit), "invalid").unwrap();
+    assert!(system::load(&path).is_err());
+    std::fs::remove_file(&path).unwrap();
 
-    let mut missing = first.clone();
-    missing.trials.pop();
-    assert!(matches!(
-        analysis::analyze(&missing),
-        Err(analysis::Error::Study(model::StudyError::Incomplete))
-    ));
-    let mut duplicate = first;
-    duplicate.trials.push(duplicate.trials[0].clone());
-    duplicate.meta.expected += 1;
-    duplicate.meta.schedule = model::trial_schedule_id(&duplicate.trials);
-    assert!(matches!(
-        analysis::analyze(&duplicate),
-        Err(analysis::Error::Study(model::StudyError::DuplicateCell))
-    ));
+    let mut duplicate = system_header("focused");
+    duplicate.cases.push(duplicate.cases[0].clone());
+    assert_eq!(
+        study::Recorder::<system::System>::create(&path, duplicate).err(),
+        Some(study::Error::Invalid)
+    );
+    let mut duplicate = system_header("focused");
+    let contrast = duplicate.specification.contrasts[0].clone();
+    duplicate.specification.contrasts.push(contrast);
+    assert_eq!(
+        study::Recorder::<system::System>::create(&path, duplicate).err(),
+        Some(study::Error::Invalid)
+    );
 }
 
 #[test]
 fn screening_has_estimates_but_no_decision_authority() {
-    let evidence = registered_study("screening", &[2.0]);
-    let markdown = analysis::report(core::slice::from_ref(&evidence)).unwrap();
-    assert_eq!(markdown, analysis::report(&[evidence]).unwrap());
-    assert!(
-        ["core-ipc/v2", "2.000000", "tcp/readiness", "Limit: 180 s"]
-            .iter()
-            .all(|value| markdown.contains(value))
-    );
-    assert!(markdown.contains("Screening is descriptive"));
-    assert!(!markdown.contains("| decision |"));
-    assert!(!markdown.contains("Faster"));
+    let evidence = system_evidence("screening", 1.1);
+    let analysis = analysis::analyze(&evidence).unwrap();
+    assert!(!analysis.estimates.is_empty());
+    assert_eq!(analysis.authority, analysis::Authority::Descriptive);
 }
 
-#[cfg(feature = "plot")]
 #[test]
-fn plot_is_separate_stable_descriptive_and_non_overwriting() {
-    let study = registered_study("screening", &[1.5, 2.0, 2.5]);
-    let markdown = analysis::report(core::slice::from_ref(&study)).unwrap();
-    let root = std::env::temp_dir().join(format!(
-        "evering-plot-{}-{}",
-        std::process::id(),
-        fastrand::u64(..)
-    ));
+fn smoke_is_admitted_only_as_descriptive_evidence() {
+    let evidence = system_evidence("smoke", 1.2);
+    let analysis = analysis::analyze(&evidence).unwrap();
+    assert!(!analysis.estimates.is_empty());
+    assert_eq!(analysis.authority, analysis::Authority::Descriptive);
+}
+
+#[test]
+fn report_is_input_order_invariant_and_binds_exact_source_bytes() {
+    let root = std::env::temp_dir().join(format!("evering-report-{}", fastrand::u64(..)));
     std::fs::create_dir(&root).unwrap();
-    let first = root.join("first");
-    let second = root.join("second");
-    let paths = plot::render(&first, core::slice::from_ref(&study)).unwrap();
-    assert_eq!(paths, [first.join("core-ipc.svg")]);
-    let svg = std::fs::read(&paths[0]).unwrap();
-    let repeated = plot::render(&second, core::slice::from_ref(&study)).unwrap();
-    assert_eq!(svg, std::fs::read(&repeated[0]).unwrap());
-    let text = std::str::from_utf8(&svg).unwrap();
-    assert!(
-        [
-            "<svg",
-            "core-ipc/v1",
-            "screening descriptive only",
-            "TCP readiness",
-            "Evering adaptive",
-            "empty payload",
-            "queue 8",
-            "8 in flight",
-            "shared memory"
-        ]
-        .iter()
-        .all(|value| text.contains(value))
-    );
-    assert!(
-        !["c8", "f8", "m4198400"]
-            .iter()
-            .any(|value| text.contains(value))
-    );
-    assert!(
-        !["Faster", "Slower", "Equivalent"]
-            .iter()
-            .any(|value| text.contains(value))
-    );
-    assert_eq!(
-        markdown,
-        analysis::report(core::slice::from_ref(&study)).unwrap()
-    );
-    assert!(plot::render(&first, core::slice::from_ref(&study)).is_err());
-    assert!(plot::render(&root.join("duplicate"), &[study.clone(), study]).is_err());
+    let first = root.join("first.jsonl");
+    let second = root.join("second.jsonl");
+    record_system_evidence(&first, "focused", 1.2, "first");
+    record_system_evidence(&second, "focused", 1.1, "second");
+    let paths = [first, second].map(|path| path.to_string_lossy().into_owned());
+
+    let forward = analysis::command(&paths).unwrap();
+    let reverse = analysis::command(&[paths[1].clone(), paths[0].clone()]).unwrap();
+    assert_eq!(forward, reverse);
+    for path in &paths {
+        let digest = blake3::hash(&std::fs::read(path).unwrap()).to_hex();
+        assert!(forward.contains(digest.as_str()));
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn micro_evidence_requires_one_reset_transition_per_iteration() {
-    use std::time::Duration;
-
-    let row = micro::measure(micro::Mechanism::ReservePublish, 3, "capacity=8", |_| {
-        Ok(micro::Sample {
-            elapsed: Duration::from_nanos(7),
-            operations: 1,
-            reset: true,
-        })
-    })
-    .unwrap();
-    assert_eq!(row.iterations, 3);
-    assert_eq!(row.gross_ns, 21);
-    assert_eq!(row.net_ns, 21_i128 - row.control_ns as i128);
-    assert!(
-        row.encode()
-            .starts_with("MICRO\treserve-publish\tsame-process\t")
-    );
-    assert!(model::decode(&row.encode()).is_err());
-
-    for sample in [
-        micro::Sample {
-            elapsed: Duration::ZERO,
-            operations: 0,
-            reset: true,
-        },
-        micro::Sample {
-            elapsed: Duration::from_nanos(1),
-            operations: 1,
-            reset: false,
-        },
-    ] {
-        assert!(
-            micro::measure(micro::Mechanism::ClaimRecycle, 1, "capacity=8", |_| {
-                Ok(sample)
-            })
-            .is_err()
-        );
-    }
-    let negative = micro::measure(micro::Mechanism::SignalConsume, 1, "sticky=native", |_| {
-        Ok(micro::Sample {
-            elapsed: Duration::ZERO,
-            operations: 1,
-            reset: true,
-        })
-    })
-    .unwrap();
-    assert_eq!(negative.net_ns, -(negative.control_ns as i128));
-    let notify = micro::measure(micro::Mechanism::Notify, 1, "sticky=native", |_| {
-        Ok(micro::Sample {
-            elapsed: Duration::from_nanos(1),
-            operations: 1,
-            reset: true,
-        })
-    })
-    .unwrap();
-    assert!(notify.encode().starts_with("MICRO\tnotify\tsame-process\t"));
-    assert!(
-        micro::measure(micro::Mechanism::AllocateRelease, 1, "bytes=64", |_| {
-            Err("failed operation".into())
-        })
-        .is_err()
-    );
-}
-
-#[test]
-fn seeded_blocks_are_reproducible_but_not_fixed_order() {
-    let contrasts = [
-        contrast(&family::BUSY),
-        contrast(&family::ADAPTIVE),
-        contrast(&family::NOTIFIED),
-    ];
-    let first = model::schedule(&contrasts, 2, 7);
-    assert_eq!(
-        model::schedule_id(&first),
-        model::schedule_id(&model::schedule(&contrasts, 2, 7))
-    );
-    assert_ne!(
-        model::schedule_id(&first),
-        model::schedule_id(&model::schedule(&contrasts, 2, 8))
-    );
-}
-
-#[test]
-fn study_rejects_duplicate_block_cell_rows() {
-    let trial = successful_trial();
-    assert_eq!(
-        model::validate_study(&study(vec![trial.clone(), trial])).unwrap_err(),
-        model::StudyError::DuplicateCell
-    );
-}
-
-#[test]
-fn recorder_persists_rows_and_seals_the_final_path() {
-    use std::fs;
-
-    let root = std::env::temp_dir().join(format!(
-        "evering-study-{}-{}",
-        std::process::id(),
-        fastrand::u64(..)
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let final_path = root.join("evidence.jsonl");
-    let mut trial = successful_trial();
-    trial.path = drive::Path {
-        send_stalled: true,
-        recv_stalled: true,
-        wait_entered: true,
-        wait_returned: true,
-        stale_wake: true,
-        partial_io: true,
-    };
-    let evidence = study(vec![trial]);
-
-    model::record(
-        &final_path,
-        evidence.meta.clone(),
-        evidence.trials.iter().cloned().map(Ok),
+#[cfg(feature = "plot")]
+fn publication_is_complete_digest_bound_and_non_overwriting() {
+    let root = std::env::temp_dir().join(format!("evering-publish-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let system = root.join("system.jsonl");
+    record_system_evidence(&system, "focused", 1.2, "publish");
+    let specification = root.join("mechanism.json");
+    let mechanism = root.join("mechanism.jsonl");
+    std::fs::write(
+        &specification,
+        serde_json::to_vec(&serde_json::json!({
+            "fixture": fixture::KEYS[0],
+            "targets": ["a".repeat(64)],
+            "parameters": { "extent": 1 << 20, "storage": 1 << 16, "capacity": 8 },
+            "cases": [{ "payload": 0 }],
+            "policy": { "min_ns": 1, "max_ns": u64::MAX, "pairs": 1, "calibration_attempts": 1 },
+            "seed": 7,
+            "budget_ms": 5_000,
+            "alpha": 0.05,
+            "delta_ns": 1.0,
+            "system_delta": 0.05,
+        }))
+        .unwrap(),
     )
     .unwrap();
-    let complete = fs::read_to_string(&final_path).unwrap();
-    assert_eq!(model::decode(&complete).unwrap(), evidence);
-    let mismatched = complete.replacen("\"rows\":1", "\"rows\":2", 1);
-    assert_eq!(
-        model::decode(&mismatched).unwrap_err(),
-        model::CodecError::Study(model::StudyError::Incomplete)
-    );
-    assert!(
-        model::record(
-            &final_path,
-            evidence.meta,
-            std::iter::empty::<Result<model::Trial, String>>(),
-        )
-        .is_err()
-    );
+    fixture::record(&specification, &mechanism).unwrap();
+    let sources = [&system, &mechanism].map(|path| path.to_string_lossy().into_owned());
+    let output = root.join("published");
 
-    fs::remove_file(final_path).unwrap();
-    fs::remove_dir(root).unwrap();
-}
-
-#[test]
-fn recorder_stops_before_evaluating_work_after_a_mandatory_failure() {
-    use std::{cell::Cell, fs, rc::Rc};
-
-    let root = std::env::temp_dir().join(format!(
-        "evering-fail-fast-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let final_path = root.join("evidence.jsonl");
-    let mut failed = successful_trial();
-    failed.status = model::Status::TimedError;
-    failed.error = Some("deadline".into());
-    failed.elapsed_ns = None;
-    let evidence = study(vec![failed.clone()]);
-    let evaluated = Rc::new(Cell::new(0));
-    let later = Rc::clone(&evaluated);
-    let trials = std::iter::once(Ok(failed)).chain(std::iter::once_with(move || {
-        later.set(later.get() + 1);
-        Ok(successful_trial())
+    let files = super::plot::command(&output, &sources).unwrap();
+    assert_eq!(files.len(), 4);
+    assert!(files.iter().any(|path| path.ends_with("report.md")));
+    assert!(files.iter().any(|path| path.ends_with("DIGESTS.blake3")));
+    let svgs = files
+        .iter()
+        .filter(|path| path.extension().is_some_and(|extension| extension == "svg"))
+        .map(|path| std::fs::read_to_string(path).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(svgs.len(), 2);
+    assert!(svgs.iter().any(|svg| svg.contains("practical band")));
+    assert!(svgs.iter().any(|svg| svg.contains("paired difference")));
+    let manifest = std::fs::read_to_string(output.join("DIGESTS.blake3")).unwrap();
+    for path in files
+        .iter()
+        .filter(|path| !path.ends_with("DIGESTS.blake3"))
+    {
+        let digest = blake3::hash(&std::fs::read(path).unwrap()).to_hex();
+        assert!(manifest.contains(&format!(
+            "{}  {}",
+            digest,
+            path.file_name().unwrap().to_string_lossy()
+        )));
+    }
+    let repeated = super::plot::command(&root.join("repeated"), &sources).unwrap();
+    assert!(files.iter().zip(&repeated).all(|(left, right)| {
+        left.file_name() == right.file_name()
+            && std::fs::read(left).unwrap() == std::fs::read(right).unwrap()
     }));
-
-    assert!(model::record(&final_path, evidence.meta, trials).is_err());
-    assert_eq!(evaluated.get(), 0);
-    let partial = fs::read_to_string(&final_path).unwrap();
-    assert!(!partial.contains("\"kind\":\"end\""));
-    assert_eq!(
-        model::decode_prefix(&partial).unwrap().trials,
-        evidence.trials
-    );
-
-    fs::remove_file(final_path).unwrap();
-    fs::remove_dir(root).unwrap();
-
-    let root = std::env::temp_dir().join(format!(
-        "evering-invalid-fast-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_nanos()
-    ));
-    fs::create_dir_all(&root).unwrap();
-    let final_path = root.join("evidence.jsonl");
-    let mut invalid = successful_trial();
-    invalid.completed = invalid.accepted + 1;
-    let meta = study(vec![invalid.clone()]).meta;
-    let evaluated = Rc::new(Cell::new(0));
-    let later = Rc::clone(&evaluated);
-    let trials = std::iter::once(Ok(invalid)).chain(std::iter::once_with(move || {
-        later.set(later.get() + 1);
-        Ok(successful_trial())
-    }));
-    assert!(model::record(&final_path, meta, trials).is_err());
-    assert_eq!(evaluated.get(), 0);
-    fs::remove_file(final_path).unwrap();
-    fs::remove_dir(root).unwrap();
-}
-
-#[test]
-fn dropped_recorder_leaves_an_unsealed_final_path() {
-    use std::{fs, io::Write};
-
-    let root = std::env::temp_dir().join(format!("evering-study-drop-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    let final_path = root.join("evidence.jsonl");
-    let evidence = study(vec![successful_trial()]);
+    let before = files
+        .iter()
+        .map(|path| (path.clone(), std::fs::read(path).unwrap()))
+        .collect::<Vec<_>>();
+    assert!(super::plot::command(&output, &sources).is_err());
     assert!(
-        model::record(
-            &final_path,
-            evidence.meta.clone(),
-            [Ok(evidence.trials[0].clone()), Err("process cut".into()),],
-        )
-        .is_err()
-    );
-    let loaded = model::load(&final_path).unwrap();
-    assert!(!loaded.complete);
-    assert_eq!(loaded.study, evidence);
-
-    fs::OpenOptions::new()
-        .append(true)
-        .open(&final_path)
-        .unwrap()
-        .write_all(b"{\"kind\"")
-        .unwrap();
-    assert!(model::load(&final_path).is_err());
-    assert!(
-        model::record(
-            &final_path,
-            study(Vec::new()).meta,
-            std::iter::empty::<Result<model::Trial, String>>(),
-        )
-        .is_err()
-    );
-
-    fs::remove_file(final_path).unwrap();
-    fs::remove_dir(root).unwrap();
-}
-
-#[test]
-fn unsealed_path_never_authorizes_evidence_at_any_persistence_cut() {
-    use std::{fs, io::Write};
-
-    let root = std::env::temp_dir().join(format!("evering-study-cuts-{}", std::process::id()));
-    fs::create_dir_all(&root).unwrap();
-    let mut second = successful_trial();
-    second.order = 1;
-    second.cell.arm = family::ADAPTIVE.key.into();
-    let evidence = study(vec![successful_trial(), second]);
-    for cut in 0..=evidence.trials.len() {
-        let path = root.join(format!("cut-{cut}.jsonl"));
-        let trials = evidence
-            .trials
+        before
             .iter()
-            .take(cut)
-            .cloned()
-            .map(Ok)
-            .chain(std::iter::once(Err("cut".into())));
-        assert!(model::record(&path, evidence.meta.clone(), trials).is_err());
-        let loaded = model::load(&path).unwrap();
-        assert!(!loaded.complete);
-        assert_eq!(loaded.study.trials.len(), cut);
-        writeln!(
-            fs::OpenOptions::new().append(true).open(&path).unwrap(),
-            "{{}}"
-        )
+            .all(|(path, bytes)| std::fs::read(path).unwrap() == *bytes)
+    );
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg(feature = "plot")]
+fn publication_rejects_source_over_the_retention_limit_before_decode() {
+    let root = std::env::temp_dir().join(format!("evering-retention-{}", fastrand::u64(..)));
+    std::fs::create_dir(&root).unwrap();
+    let oversized = root.join("oversized.jsonl");
+    std::fs::File::create(&oversized)
+        .unwrap()
+        .set_len(5 * 1024 * 1024 + 1)
         .unwrap();
-        assert!(model::load(&path).is_err());
-        fs::remove_file(path).unwrap();
-    }
-    fs::remove_dir(root).unwrap();
-}
-
-#[test]
-fn actual_configuration_is_required_after_setup() {
-    let mut trial = successful_trial();
-    trial.observed = None;
-    assert_eq!(
-        model::validate_trial(&trial).unwrap_err(),
-        model::TrialError::MissingObserved
-    );
-    trial.status = model::Status::TimedError;
-    trial.elapsed_ns = None;
-    trial.error = Some("timed out".into());
-    assert_eq!(
-        model::validate_trial(&trial).unwrap_err(),
-        model::TrialError::MissingObserved
-    );
-}
-
-#[test]
-fn observed_configuration_must_exactly_match_the_scheduled_trial() {
-    let mut payload = successful_trial();
-    payload.observed.as_mut().unwrap().payload += 1;
-    assert_eq!(
-        model::validate_study(&study(vec![payload])).unwrap_err(),
-        model::StudyError::Trial(model::TrialError::InvalidCell)
-    );
-
-    let mut window = successful_trial();
-    window.observed.as_mut().unwrap().window -= 1;
-    assert_eq!(
-        model::validate_study(&study(vec![window])).unwrap_err(),
-        model::StudyError::Trial(model::TrialError::InvalidCell)
-    );
-}
-
-#[test]
-fn family_rejects_unknown_arms_and_undeclared_resources() {
-    let mut unknown = successful_trial();
-    unknown.cell.arm = "foreign/arm".into();
-    assert_eq!(
-        model::validate_study(&study(vec![unknown])).unwrap_err(),
-        model::StudyError::Family
-    );
-
-    let mut extra = successful_trial();
-    extra.observed.as_mut().unwrap().socket_send = Some(4096);
-    assert_eq!(
-        model::validate_study(&study(vec![extra])).unwrap_err(),
-        model::StudyError::Trial(model::TrialError::InvalidCell)
-    );
-}
-
-#[test]
-fn schema5_rejects_corrupt_metadata_seal_and_elapsed_value() {
-    assert_eq!(
-        model::decode_prefix("{}").unwrap_err(),
-        model::CodecError::Syntax
-    );
-    let mut zero = successful_trial();
-    zero.elapsed_ns = Some(0);
-    assert_eq!(
-        model::validate_trial(&zero).unwrap_err(),
-        model::TrialError::ZeroElapsed
-    );
-
-    let first = successful_trial();
-    let mut second = first.clone();
-    second.order = 1;
-    second.cell.arm = family::ADAPTIVE.key.into();
-    let mut missing = study(vec![first, second]);
-    missing.trials.pop();
-    assert_eq!(
-        model::validate_study(&missing).unwrap_err(),
-        model::StudyError::Incomplete
-    );
-
-    let root = std::env::temp_dir().join(format!("evering-study-footer-{}", std::process::id()));
-    std::fs::create_dir_all(&root).unwrap();
-    let final_path = root.join("evidence.jsonl");
-    let evidence = study(vec![successful_trial()]);
-    model::record(
-        &final_path,
-        evidence.meta,
-        evidence.trials.into_iter().map(Ok),
+    let error = super::plot::command(
+        &root.join("published"),
+        &[oversized.to_string_lossy().into_owned()],
     )
-    .unwrap();
-    let mut complete = std::fs::read_to_string(&final_path).unwrap();
-    complete.truncate(complete.len() - 2);
-    assert!(model::decode(&complete).is_err());
-    std::fs::remove_file(final_path).unwrap();
-    std::fs::remove_dir(root).unwrap();
+    .unwrap_err();
+    assert!(error.contains("retention limit"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+#[cfg_attr(debug_assertions, ignore = "optimized evidence gate")]
+fn path_counter_overhead_stays_inside_one_percent() {
+    use std::time::{Duration, Instant};
+
+    fn timed(instrumented: bool) -> f64 {
+        let mut endpoint = TraceEndpoint {
+            replies: std::collections::VecDeque::with_capacity(8),
+            quiet: true,
+            ..TraceEndpoint::default()
+        };
+        let work = drive::Work {
+            start: 0,
+            count: 100_000,
+            window: 8,
+            payload: 0,
+            seed: 7,
+        };
+        let began = Instant::now();
+        let deadline = drive::Deadline::after(began, Duration::from_secs(10)).unwrap();
+        let counts = if instrumented {
+            drive::transfer(
+                &mut endpoint,
+                work,
+                deadline,
+                &mut drive::PathCounts::default(),
+            )
+        } else {
+            drive::transfer_control(&mut endpoint, work, deadline)
+        }
+        .unwrap();
+        assert_eq!(counts.validated, work.count);
+        began.elapsed().as_secs_f64()
+    }
+
+    for _ in 0..3 {
+        std::hint::black_box((timed(false), timed(true)));
+    }
+    let ratios = (0..101)
+        .map(|pair| {
+            let (control, instrumented) = if pair % 2 == 0 {
+                let first = timed(false);
+                let inner = timed(true) * timed(true);
+                (first * timed(false), inner)
+            } else {
+                let first = timed(true);
+                let inner = timed(false) * timed(false);
+                (inner, first * timed(true))
+            };
+            (instrumented / control).sqrt()
+        })
+        .collect::<Vec<_>>();
+    let mut state = 7_u64;
+    let mut interval = (0..10_000)
+        .map(|_| {
+            let mut sample = (0..ratios.len())
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6_364_136_223_846_793_005)
+                        .wrapping_add(1);
+                    ratios[state as usize % ratios.len()]
+                })
+                .collect::<Vec<_>>();
+            sample.sort_unstable_by(f64::total_cmp);
+            sample[sample.len() / 2]
+        })
+        .collect::<Vec<_>>();
+    interval.sort_unstable_by(f64::total_cmp);
+    let low = interval[250];
+    let high = interval[9_749];
+    assert!(
+        low >= 0.99 && high <= 1.01,
+        "instrumentation interval [{:.4}, {:.4}]",
+        low,
+        high
+    );
 }
 
 #[test]
@@ -1623,92 +1945,4 @@ fn warmup_consumption_cannot_reset_the_measured_deadline() {
     .unwrap();
     assert!(error.timed);
     assert_eq!(error.error.kind, drive::Kind::Deadline);
-}
-
-#[test]
-fn study_requires_complete_blocks_and_environment_identity() {
-    let mut first = successful_trial();
-    let mut second = successful_trial();
-    second.block = 1;
-    let mut study = study(vec![first.clone(), second]);
-    study.meta.blocks = 2;
-    assert!(model::validate_study(&study).is_ok());
-
-    first.cell.capacity = 16;
-    first.observed.as_mut().unwrap().capacity = 16;
-    first.order = 1;
-    study.trials.push(first);
-    study.meta.expected = 3;
-    study.meta.schedule = model::trial_schedule_id(&study.trials);
-    assert_eq!(
-        model::validate_study(&study).unwrap_err(),
-        model::StudyError::IncompleteBlock
-    );
-
-    study.trials.pop();
-    study.meta.revision.clear();
-    assert_eq!(
-        model::validate_study(&study).unwrap_err(),
-        model::StudyError::Metadata
-    );
-}
-
-#[test]
-fn successful_trial_requires_exact_conserved_work() {
-    let mut trial = successful_trial();
-    trial.accepted -= 1;
-    trial.completed -= 1;
-    trial.validated -= 1;
-    assert_eq!(
-        model::validate_trial(&trial).unwrap_err(),
-        model::TrialError::CountMismatch
-    );
-}
-
-#[test]
-fn trial_status_cannot_disguise_failure_as_timing() {
-    let mut trial = successful_trial();
-    trial.status = model::Status::TimedError;
-    trial.error = Some("worker exited".into());
-    assert_eq!(
-        model::validate_trial(&trial).unwrap_err(),
-        model::TrialError::UnexpectedElapsed
-    );
-
-    trial.elapsed_ns = None;
-    assert!(model::validate_trial(&trial).is_ok());
-}
-
-#[test]
-fn unsupported_cell_has_reason_and_no_work_or_timing() {
-    let mut trial = successful_trial();
-    trial.status = model::Status::Unsupported;
-    trial.accepted = 0;
-    trial.completed = 0;
-    trial.validated = 0;
-    trial.elapsed_ns = None;
-    trial.error = Some("policy unavailable".into());
-    assert!(model::validate_trial(&trial).is_ok());
-
-    trial.error = None;
-    assert_eq!(
-        model::validate_trial(&trial).unwrap_err(),
-        model::TrialError::MissingError
-    );
-}
-
-#[test]
-fn every_failure_phase_has_no_performance_value() {
-    for status in [
-        model::Status::Invalid,
-        model::Status::SetupError,
-        model::Status::TimedError,
-        model::Status::DrainError,
-    ] {
-        let mut trial = successful_trial();
-        trial.status = status;
-        trial.elapsed_ns = None;
-        trial.error = Some("phase failed".into());
-        assert!(model::validate_trial(&trial).is_ok());
-    }
 }

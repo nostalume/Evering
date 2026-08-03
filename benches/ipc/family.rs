@@ -5,8 +5,9 @@ use super::local;
 use super::{
     drive::Deadline,
     evering,
-    model::{self, Cell, Condition, Observed},
+    model::{self, Cell, Condition},
     stream,
+    system::Resources,
 };
 
 type Runner = fn(&Cell, u64, u64, u64, Deadline, &str) -> Result<stream::Counts, stream::RunError>;
@@ -21,20 +22,15 @@ pub struct Arm {
 }
 
 impl Arm {
-    pub fn admits(&self, value: &Observed) -> bool {
-        let present = u8::from(value.extent.is_some())
-            | u8::from(value.allocator.is_some()) << 1
-            | u8::from(value.socket_send.is_some()) << 2
-            | u8::from(value.socket_recv.is_some()) << 3;
-        value.transport == self.transport
-            && present == self.resources
-            && value.extent.is_none_or(|value| value > 0)
-            && value
-                .allocator
-                .as_deref()
-                .is_none_or(|value| !value.is_empty())
-            && value.socket_send.is_none_or(|value| value > 0)
-            && value.socket_recv.is_none_or(|value| value > 0)
+    pub fn resources(&self) -> Resources {
+        Resources {
+            topology: "1c1w".into(),
+            transport: self.transport.into(),
+            extent: self.resources & 1 != 0,
+            allocator: self.resources & 2 != 0,
+            socket_send: self.resources & 4 != 0,
+            socket_recv: self.resources & 8 != 0,
+        }
     }
 }
 
@@ -71,16 +67,11 @@ pub struct Family {
     pub key: &'static str,
     pub revision: u32,
     pub baseline: &'static Arm,
-    arms: &'static [&'static Arm],
     modes: &'static [(&'static str, u64, u32)],
     pub members: Matrix,
 }
 
 impl Family {
-    pub fn arm(&self, key: &str) -> Option<&'static Arm> {
-        self.arms.iter().copied().find(|arm| arm.key == key)
-    }
-
     pub fn mode(&self, mode: &str) -> Option<(Duration, u32)> {
         let &(_, seconds, blocks) = self.modes.iter().find(|entry| entry.0 == mode)?;
         Some((Duration::from_secs(seconds), blocks))
@@ -139,7 +130,6 @@ fn core(mode: &str) -> Option<Vec<(Condition, &'static Arm)>> {
     Some(members)
 }
 
-static CORE_ARMS: [&Arm; 4] = [&BUSY, &ADAPTIVE, &NOTIFIED, &STREAM];
 static CORE_MODES: [(&str, u64, u32); 4] = [
     ("smoke", 90, 1),
     ("pilot", 90, 1),
@@ -148,9 +138,8 @@ static CORE_MODES: [(&str, u64, u32); 4] = [
 ];
 pub static CORE: Family = Family {
     key: "core-ipc",
-    revision: 2,
+    revision: 3,
     baseline: &STREAM,
-    arms: &CORE_ARMS,
     modes: &CORE_MODES,
     members: core,
 };
@@ -159,27 +148,24 @@ fn local(mode: &str) -> Option<Vec<(Condition, &'static Arm)>> {
     let payloads: &[_] = if mode == "smoke" {
         &[1024]
     } else if matches!(mode, "screening" | "focused") {
-        &[0, 64, 1024, 16 * 1024, 64 * 1024]
+        &[0, 1024, 64 * 1024]
     } else {
         return None;
     };
     Some(pairs(payloads, &LOCAL_STREAM))
 }
 #[cfg(all(unix, feature = "local-socket"))]
-static LOCAL_ARMS: [&Arm; 2] = [&ADAPTIVE, &LOCAL_STREAM];
-#[cfg(all(unix, feature = "local-socket"))]
 static LOCAL_MODES: [(&str, u64, u32); 4] = [
     ("smoke", 45, 1),
     ("pilot", 45, 1),
-    ("screening", 90, 3),
-    ("focused", 240, 15),
+    ("screening", 60, 3),
+    ("focused", 90, 15),
 ];
 #[cfg(all(unix, feature = "local-socket"))]
 pub static LOCAL: Family = Family {
     key: "local-ipc-unix",
-    revision: 2,
+    revision: 3,
     baseline: &LOCAL_STREAM,
-    arms: &LOCAL_ARMS,
     modes: &LOCAL_MODES,
     members: local,
 };

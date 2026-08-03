@@ -418,14 +418,13 @@ fn outcomes(trace: &Trace, report: &Report) -> Vec<(usize, Outcome)> {
         .collect()
 }
 
-pub fn evidence_report(studies: &[super::model::Study]) -> Result<String, &'static str> {
+pub fn evidence_report(studies: &[super::system::Evidence]) -> Result<String, &'static str> {
     let mut cases = BTreeSet::new();
     for study in studies {
-        for trial in &study.trials {
-            let Some(observed) = trial
-                .observed
-                .as_ref()
-                .filter(|value| value.allocator.is_some())
+        super::analysis::analyze(study).map_err(|_| "system evidence not admitted")?;
+        for row in &study.observations {
+            let Some(observed) =
+                Some(&row.measure.observed).filter(|value| value.allocator.is_some())
             else {
                 continue;
             };

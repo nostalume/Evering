@@ -14,9 +14,9 @@ use evering::{
 };
 
 use super::{
-    drive::{self, Deadline, Expected, Interest, Path, Step},
+    drive::{self, Deadline, Expected, Interest, PathCounts, Step},
     environment,
-    model::{Cell, Observed, Status, window},
+    model::{self, Cell, Observed, Status, window},
     stream::{Counts, RunError, fail, measured, wait_child},
 };
 
@@ -47,10 +47,11 @@ fn pool_geometry(pool: &Pool) -> String {
 pub(super) struct Envelope {
     kind: u64,
     operation: u64,
+    digest: u64,
 }
 
 unsafe impl Repr for Envelope {
-    const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x6970_632e_656e_7631), 1);
+    const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x6970_632e_656e_7631), 2);
 }
 
 fn text(error: impl ToString) -> String {
@@ -180,7 +181,7 @@ impl Local<'_> {
         if WAIT {
             Signals::new(self.ring, self.wait)
                 .try_send(endpoint, value)
-                .map(|committed| committed.notified.map_err(text))
+                .map(|committed| committed.into_parts().1.map_err(text))
         } else {
             endpoint.try_send(value).map(|()| Ok(()))
         }
@@ -202,7 +203,10 @@ impl Local<'_> {
         if WAIT {
             Signals::new(self.ring, self.wait)
                 .adopt(received, pool)
-                .map(|committed| committed.notified.map(|()| committed.value).map_err(text))
+                .map(|committed| {
+                    let (value, notified) = committed.into_parts();
+                    notified.map(|()| value).map_err(text)
+                })
         } else {
             received.adopt(pool).map(Ok)
         }
@@ -212,7 +216,8 @@ impl Local<'_> {
         if WAIT {
             Signals::new(self.ring, self.wait)
                 .close_tx(tx)
-                .notified
+                .into_parts()
+                .1
                 .map_err(text)
         } else {
             tx.close();
@@ -374,13 +379,13 @@ impl<M, O, D, const SPINS: usize, const WAIT: bool> Client<'_, M, O, D, SPINS, W
 impl<'a, M, O, D, const SPINS: usize, const WAIT: bool> drive::Endpoint
     for Client<'a, M, O, D, SPINS, WAIT>
 where
-    M: FnMut(u64, Vec<u8>) -> Result<evering::Transfer<'a, Envelope>, String>,
+    M: FnMut(u64, &[u8]) -> Result<evering::Transfer<'a, Envelope>, String>,
     O: for<'p> FnMut((Envelope, evering::Block<'p, [u8]>), Expected) -> Result<bool, String>,
     D: FnMut(evering::Transfer<'a, Envelope>) -> Result<(), String>,
 {
     type Error = String;
 
-    fn stage(&mut self, operation: u64, payload: Vec<u8>) -> Result<(), String> {
+    fn stage(&mut self, operation: u64, payload: &[u8]) -> Result<(), String> {
         if self.staged.is_some() {
             return Err("already staged".into());
         }
@@ -388,7 +393,7 @@ where
         Ok(())
     }
 
-    fn try_send(&mut self, path: &mut Path) -> Result<Step<(), String>, String> {
+    fn try_send(&mut self, path: &mut PathCounts) -> Result<Step<(), String>, String> {
         let value = self.staged.take().ok_or("nothing staged")?;
         match self.local.try_send::<WAIT, _>(&self.tx, value) {
             Ok(notified) => {
@@ -398,12 +403,13 @@ where
             }
             Err(TrySendError::Full(value)) => {
                 self.staged = Some(value);
-                path.send_stalled = true;
+                path.send_full().map_err(|_| "path count overflow")?;
                 Ok(Step::Pending)
             }
             Err(TrySendError::Busy(value)) => {
                 self.staged = Some(value);
                 self.contended = true;
+                path.send_busy().map_err(|_| "path count overflow")?;
                 Ok(Step::Pending)
             }
             Err(TrySendError::Disconnected(value)) => {
@@ -415,7 +421,7 @@ where
 
     fn try_recv(
         &mut self,
-        path: &mut Path,
+        path: &mut PathCounts,
         expected: Expected,
     ) -> Result<Step<bool, String>, String> {
         match self.rx.claim() {
@@ -433,11 +439,12 @@ where
                 Err(error) => Err(format!("transfer admission failed: {error:?}")),
             },
             Err(evering::ReceiveError::Empty) => {
-                path.recv_stalled = true;
+                path.recv_empty().map_err(|_| "path count overflow")?;
                 Ok(Step::Pending)
             }
             Err(evering::ReceiveError::Busy) => {
                 self.contended = true;
+                path.recv_busy().map_err(|_| "path count overflow")?;
                 Ok(Step::Pending)
             }
             Err(evering::ReceiveError::Closed) => Err("sender disconnected".into()),
@@ -448,7 +455,7 @@ where
         &mut self,
         interest: Interest,
         deadline: Deadline,
-        path: &mut Path,
+        path: &mut PathCounts,
     ) -> Result<(), String> {
         if self.contended {
             self.contended = false;
@@ -468,18 +475,18 @@ where
             return Ok(());
         }
         if self.woke && !self.progressed {
-            path.stale_wake = true;
+            path.stale_wake().map_err(|_| "path count overflow")?;
         }
         self.woke = false;
         self.progressed = false;
-        path.wait_entered = true;
+        path.wait().map_err(|_| "path count overflow")?;
         let timeout = deadline.remaining(Instant::now()).unwrap_or_default();
         let entered = self.local.runtime.enter();
         let future = tokio::time::timeout(timeout, self.local.wait.wait());
         drop(entered);
         match self.local.runtime.block_on(future) {
             Ok(Ok(())) => {
-                path.wait_returned = true;
+                path.wake().map_err(|_| "path count overflow")?;
                 self.woke = true;
                 Ok(())
             }
@@ -519,7 +526,7 @@ fn serve<const SPINS: usize, const WAIT: bool>(
     };
     loop {
         let deadline = Deadline::after(Instant::now(), timeout)?;
-        let (header, mut value) =
+        let (mut header, value) =
             match retry_adopt::<SPINS, WAIT, Envelope, [u8]>(&rx, pool.as_ref(), local, deadline) {
                 Ok(value) => value,
                 Err(error) if error == "sender disconnected" => {
@@ -529,8 +536,8 @@ fn serve<const SPINS: usize, const WAIT: bool>(
                 Err(error) => return Err(error),
             };
         match header.kind {
-            DATA => value.iter_mut().for_each(|byte| *byte ^= 0xa5),
-            READY if value.is_empty() => {}
+            DATA => header.digest = model::digest(&value),
+            READY if value.is_empty() => header.digest = 0,
             _ => return Err("worker rejected message envelope".into()),
         }
         let record = value.transfer(header);
@@ -555,8 +562,8 @@ fn open_worker(address: &str) -> Result<Worker, String> {
     let (port, pool, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).map_err(text)?;
-    let parent_event = unsafe { evering::os::Event::from_owned_fd(resources.remove(0)) };
-    let child_ring = unsafe { evering::os::Ring::from_owned_fd(resources.remove(0)) };
+    let parent_event = evering::os::Event::from_owned_fd(resources.remove(0));
+    let child_ring = evering::os::Ring::from_owned_fd(resources.remove(0));
     let session = open_session(source, extent)?;
     let wait = evering::runtime::Wait::new(parent_event).map_err(text)?;
     Ok((session, port, pool, child_ring, wait))
@@ -565,17 +572,14 @@ fn open_worker(address: &str) -> Result<Worker, String> {
 #[cfg(windows)]
 fn open_worker(address: &str) -> Result<Worker, String> {
     use evering::os::windows::{Section, process::Socket};
-    use std::os::windows::io::IntoRawHandle;
 
     let socket = Socket::connect(address).map_err(text)?;
     let (bootstrap, resources) = socket.recv(3).map_err(text)?.into_parts();
     let (port, pool, extent) = parse(bootstrap.as_ref())?;
     let mut resources = resources.into_vec();
     let source = Section::from_owned_handle(resources.remove(0));
-    let parent_event =
-        unsafe { evering::os::Event::from_owned_handle(resources.remove(0).into_raw_handle()) };
-    let child_ring =
-        unsafe { evering::os::Ring::from_owned_handle(resources.remove(0).into_raw_handle()) };
+    let parent_event = evering::os::Event::from_owned_handle(resources.remove(0));
+    let child_ring = evering::os::Ring::from_owned_handle(resources.remove(0));
     let session = open_session(source, extent)?;
     let wait = evering::runtime::Wait::new(parent_event).map_err(text)?;
     Ok((session, port, pool, child_ring, wait))
@@ -808,12 +812,13 @@ fn run_with<const SPINS: usize, const WAIT: bool>(
         ..Counts::default()
     };
     let pool = setup.pool.as_ref();
-    let make = move |operation, payload: Vec<u8>| {
-        pool.copy(&payload)
+    let make = move |operation, payload: &[u8]| {
+        pool.copy(payload)
             .map(|block| {
                 block.transfer(Envelope {
                     kind: if operation == u64::MAX { READY } else { DATA },
                     operation,
+                    digest: 0,
                 })
             })
             .map_err(|error| format!("allocate request: {error:?}"))
@@ -824,7 +829,8 @@ fn run_with<const SPINS: usize, const WAIT: bool>(
         } else {
             DATA
         };
-        Ok(header.kind == kind && expected.matches(header.operation, &value))
+        Ok(header.kind == kind
+            && expected.matches_digest(header.operation, header.digest, value.len()))
     };
     let discard = move |record| {
         drop(record);

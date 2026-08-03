@@ -1,4 +1,11 @@
-use super::model::{Cell, Journal, Scheduled};
+use super::{
+    model::{Cell, Scheduled},
+    study::{
+        self, Compiler, Context, Header, Host, Identity as StudyIdentity,
+        Observation as EvidenceRow, Recorder, Run, Scheduled as StudyScheduled, Schema, Source,
+        Unit,
+    },
+};
 
 pub fn progress(kind: &str, done: usize, total: usize, cell: &Cell) -> String {
     format!(
@@ -13,10 +20,16 @@ pub struct Identity {
     pub family: String,
     pub family_revision: u32,
     pub revision: String,
+    pub dirty: bool,
     pub diff: String,
     pub target: String,
+    pub os: String,
+    pub arch: String,
     pub rustc: String,
+    pub host: String,
     pub environment: String,
+    pub command: String,
+    pub started: String,
     pub seed: u64,
     pub warmup: u64,
     pub timeout_ms: u64,
@@ -36,137 +49,233 @@ pub struct Row {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct Manifest {
-    pub identity: Identity,
-    pub rows: Vec<Row>,
+pub struct Specification {
+    algorithm: u32,
+    family: String,
+    family_revision: u32,
 }
 
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
-enum Line {
-    Header { identity: Identity, expected: usize },
-    Row(Row),
-    Abort { cell: Cell, reason: String },
-    End { rows: usize, digest: String },
+impl StudyIdentity for Specification {
+    fn identity(&self, hash: &mut blake3::Hasher) {
+        self.algorithm.identity(hash);
+        self.family.identity(hash);
+        self.family_revision.identity(hash);
+    }
+}
+
+impl StudyIdentity for Cell {
+    fn identity(&self, hash: &mut blake3::Hasher) {
+        self.arm.identity(hash);
+        self.payload.identity(hash);
+        self.capacity.identity(hash);
+        self.in_flight.identity(hash);
+        self.memory.identity(hash);
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Measure {
+    count: u64,
+    observations: Vec<Observation>,
+}
+
+pub struct Calibration;
+
+pub type Evidence = study::Study<Calibration>;
+
+impl Schema for Calibration {
+    const NAME: &'static str = "calibration";
+    const REVISION: u32 = 2;
+    type Specification = Specification;
+    type Case = Cell;
+    type Measure = Measure;
+
+    fn validate_header(header: &Header<Specification, Cell>) -> Result<(), String> {
+        let mut unique = std::collections::HashSet::with_capacity(header.cases.len());
+        if header.cases.iter().any(|cell| !unique.insert(cell)) {
+            return Err("duplicate calibration case".into());
+        }
+        (header.run.schedule.len() == header.cases.len())
+            .then_some(())
+            .ok_or_else(|| "incomplete calibration schedule".into())
+    }
+
+    fn validate(
+        header: &Header<Specification, Cell>,
+        observation: &EvidenceRow<Measure>,
+    ) -> Result<(), String> {
+        let cell = header
+            .cases
+            .get(observation.case as usize)
+            .ok_or("foreign calibration case")?;
+        validate(
+            &Row {
+                cell: cell.clone(),
+                count: observation.measure.count,
+                observations: observation.measure.observations.clone(),
+            },
+            header.run.warmup,
+        )
+    }
+}
+
+fn header(identity: &Identity, cases: Vec<Cell>) -> Result<Header<Specification, Cell>, String> {
+    let schedule = (0..cases.len())
+        .map(|order| {
+            let order = u32::try_from(order).map_err(|_| "too many calibration cases")?;
+            Ok(StudyScheduled {
+                unit: Unit { block: 0, order },
+                case: order,
+            })
+        })
+        .collect::<Result<_, &str>>()?;
+    Ok(Header::new::<Calibration>(
+        Context {
+            source: Source {
+                revision: identity.revision.clone(),
+                dirty: identity.dirty,
+                diff: identity.diff.clone(),
+            },
+            compiler: Compiler {
+                target: identity.target.clone(),
+                rustc: identity.rustc.clone(),
+            },
+            host: Host {
+                os: identity.os.clone(),
+                arch: identity.arch.clone(),
+                description: identity.host.clone(),
+                environment: identity.environment.clone(),
+            },
+        },
+        Specification {
+            algorithm: identity.algorithm,
+            family: identity.family.clone(),
+            family_revision: identity.family_revision,
+        },
+        cases,
+        Run {
+            seed: identity.seed,
+            started: identity.started.clone(),
+            command: identity.command.clone(),
+            warmup: identity.warmup,
+            budget_ms: identity.timeout_ms,
+            schedule,
+        },
+    ))
+}
+
+pub fn identity(evidence: &Evidence) -> Identity {
+    let header = &evidence.header;
+    Identity {
+        algorithm: header.specification.algorithm,
+        family: header.specification.family.clone(),
+        family_revision: header.specification.family_revision,
+        revision: header.context.source.revision.clone(),
+        dirty: header.context.source.dirty,
+        diff: header.context.source.diff.clone(),
+        target: header.context.compiler.target.clone(),
+        os: header.context.host.os.clone(),
+        arch: header.context.host.arch.clone(),
+        rustc: header.context.compiler.rustc.clone(),
+        host: header.context.host.description.clone(),
+        environment: header.context.host.environment.clone(),
+        command: header.run.command.clone(),
+        started: header.run.started.clone(),
+        seed: header.run.seed,
+        warmup: header.run.warmup,
+        timeout_ms: header.run.budget_ms,
+    }
 }
 
 pub fn record(
     path: &std::path::Path,
     identity: Identity,
-    expected: usize,
-    rows: impl IntoIterator<Item = (Cell, Result<Row, String>)>,
+    cases: Vec<Cell>,
+    rows: impl IntoIterator<Item = Result<Row, String>>,
 ) -> Result<String, String> {
-    let mut journal = Journal::create(path)?;
-    journal.append(&Line::Header {
-        identity: identity.clone(),
-        expected,
-    })?;
-    let mut manifest = Manifest {
-        identity,
-        rows: Vec::with_capacity(expected),
-    };
-    for (cell, result) in rows {
+    let expected = cases.len();
+    let mut recorder = Recorder::<Calibration>::create(path, header(&identity, cases.clone())?)
+        .map_err(|error| format!("{error:?}"))?;
+    let mut recorded = 0;
+    for (order, result) in rows.into_iter().enumerate() {
+        let unit = Unit {
+            block: 0,
+            order: u32::try_from(order).map_err(|_| "too many calibration rows")?,
+        };
         let row = match result {
             Ok(row) => row,
             Err(error) => {
-                journal.append(&Line::Abort {
-                    cell,
-                    reason: error.replace(['\t', '\n', '\r'], " "),
-                })?;
+                recorder
+                    .abort(Some(unit), &error)
+                    .map_err(|error| format!("{error:?}"))?;
                 return Err(error);
             }
         };
-        validate(&row, manifest.identity.warmup)?;
-        if manifest.rows.len() == expected
-            || manifest.rows.iter().any(|value| value.cell == row.cell)
-        {
-            return Err("duplicate or excess pilot row".into());
+        if cases.get(order) != Some(&row.cell) {
+            recorder
+                .abort(Some(unit), "calibration row does not match case")
+                .map_err(|error| format!("{error:?}"))?;
+            return Err("calibration row does not match case".into());
         }
-        journal.append(&Line::Row(row.clone()))?;
-        manifest.rows.push(row);
+        recorder
+            .observe(EvidenceRow {
+                unit,
+                case: unit.order,
+                measure: Measure {
+                    count: row.count,
+                    observations: row.observations,
+                },
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        recorded += 1;
     }
-    if manifest.rows.len() != expected {
-        return Err("incomplete pilot manifest".into());
+    if expected == 0 || recorded != expected {
+        recorder
+            .abort(None, "incomplete calibration")
+            .map_err(|error| format!("{error:?}"))?;
+        return Err("incomplete calibration".into());
     }
-    let digest = journal.digest();
-    journal.seal(&Line::End {
-        rows: manifest.rows.len(),
-        digest: digest.clone(),
-    })?;
-    Ok(digest)
+    recorder.complete().map_err(|error| format!("{error:?}"))
 }
 
-pub fn load(path: &std::path::Path) -> Result<(Manifest, String), String> {
-    let input = std::fs::read_to_string(path).map_err(|error| error.to_string())?;
-    if !input.ends_with('\n') {
-        return Err("truncated pilot manifest".into());
-    }
-    let mut header = None;
-    let mut rows = Vec::new();
-    let mut end = None;
-    let mut digest = blake3::Hasher::new();
-    for raw in input.split_inclusive('\n') {
-        let line: Line = serde_json::from_str(raw.strip_suffix('\n').unwrap())
-            .map_err(|error| error.to_string())?;
-        match line {
-            Line::Header { identity, expected } if header.is_none() && rows.is_empty() => {
-                header = Some((identity, expected));
-                digest.update(raw.as_bytes());
-            }
-            Line::Row(row) if header.is_some() && end.is_none() => {
-                rows.push(row);
-                digest.update(raw.as_bytes());
-            }
-            Line::End { rows, digest } if header.is_some() && end.is_none() => {
-                end = Some((rows, digest));
-            }
-            Line::Abort { .. } => return Err("aborted pilot manifest".into()),
-            _ => return Err("invalid pilot manifest".into()),
-        }
-    }
-    let (identity, expected) = header.ok_or("missing pilot header")?;
-    let (sealed_rows, sealed_digest) = end.ok_or("incomplete pilot manifest")?;
-    if rows.len() != expected
-        || rows.len() != sealed_rows
-        || sealed_digest != digest.finalize().to_hex().as_str()
-    {
-        return Err("pilot digest mismatch".into());
-    }
-    rows.iter()
-        .try_for_each(|row| validate(row, identity.warmup))?;
-    Ok((Manifest { identity, rows }, sealed_digest))
+pub fn load(path: &std::path::Path) -> Result<(Evidence, String), String> {
+    let evidence = study::load::<Calibration>(path).map_err(|error| format!("{error:?}"))?;
+    let digest = evidence.complete.content.clone();
+    Ok((evidence, digest))
 }
 
 pub fn admit(
-    manifest: &Manifest,
+    evidence: &Evidence,
     identity: &Identity,
     scheduled: &[Scheduled],
 ) -> Result<Vec<u64>, String> {
-    use std::collections::HashSet;
-
-    if identity.algorithm != 3 || &manifest.identity != identity {
+    let actual = self::identity(evidence);
+    let mut expected = identity.clone();
+    expected.command.clone_from(&actual.command);
+    expected.started.clone_from(&actual.started);
+    if identity.algorithm != 4 || actual != expected {
         return Err("foreign pilot identity".into());
     }
-    let expected: HashSet<_> = scheduled.iter().map(|entry| entry.cell()).collect();
-    let mut present = HashSet::new();
-    for row in &manifest.rows {
-        if !present.insert(row.cell.clone()) || !expected.contains(&row.cell) {
-            return Err("duplicate or foreign pilot row".into());
-        }
-        validate(row, identity.warmup)?;
-    }
-    if present != expected {
+    let expected: std::collections::HashSet<_> =
+        scheduled.iter().map(|entry| entry.cell()).collect();
+    let actual: std::collections::HashSet<_> = evidence.header.cases.iter().cloned().collect();
+    if evidence.header.cases.len() != evidence.observations.len()
+        || actual.len() != evidence.header.cases.len()
+        || actual != expected
+    {
         return Err("incomplete pilot manifest".into());
     }
     scheduled
         .iter()
         .map(|entry| {
             let cell = entry.cell();
-            manifest
-                .rows
+            evidence
+                .header
+                .cases
                 .iter()
-                .find(|row| row.cell == cell)
-                .map(|row| row.count)
+                .position(|value| value == &cell)
+                .and_then(|index| evidence.observations.get(index))
+                .map(|row| row.measure.count)
                 .ok_or_else(|| "missing pilot row".into())
         })
         .collect()
@@ -220,7 +329,7 @@ fn validate(row: &Row, warmup: u64) -> Result<(), String> {
         }
     }
     let last = row.observations.last().unwrap();
-    (row.count == scaled(last.count, last.elapsed_ns, 500_000_000, window)?)
+    (row.count == scaled(last.count, last.elapsed_ns, 250_000_000, window)?)
         .then_some(())
         .ok_or_else(|| "invalid frozen pilot count".into())
 }
@@ -246,7 +355,7 @@ pub fn calibrate(
         }
         observations.push(Observation { count, elapsed_ns });
         if elapsed_ns >= 50_000_000 {
-            count = scaled(count, elapsed_ns, 500_000_000, window)?;
+            count = scaled(count, elapsed_ns, 250_000_000, window)?;
             if count
                 .checked_add(warmup)
                 .is_some_and(|last| last < u64::MAX)

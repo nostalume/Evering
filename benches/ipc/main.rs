@@ -3,104 +3,60 @@ mod drive;
 mod environment;
 mod evering;
 mod family;
+mod fixture;
 pub mod geometry;
 #[cfg(all(unix, feature = "local-socket"))]
 mod local;
+mod mechanism;
 mod model;
 mod pilot;
 #[cfg(feature = "plot")]
 mod plot;
 mod stream;
+mod study;
+mod system;
 
 use std::{
     env,
     io::Write,
     path::Path,
-    process::{Command, ExitCode},
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    process::ExitCode,
+    time::{Duration, Instant},
 };
 
 use drive::Deadline;
-use model::{
-    Meta, Scheduled, Status, Trial, load, record as record_evidence, schedule, schedule_id,
-};
+use model::{Scheduled, schedule};
+use study::{Header, Observation, Recorder, Run, Unit};
 
 fn number<T: core::str::FromStr>(value: &str, name: &str) -> Result<T, String> {
     value.parse().map_err(|_| format!("invalid {name}"))
 }
 
-fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
-    let output = Command::new(program)
-        .args(arguments)
-        .output()
-        .map_err(|error| format!("{program}: {error}"))?;
-    if !output.status.success() {
-        return Err(format!("{program} failed"));
-    }
-    String::from_utf8(output.stdout)
-        .map(|value| value.trim().to_owned())
-        .map_err(|error| error.to_string())
-}
-
-fn metadata(
+fn pilot_identity(
     family: &family::Family,
-    mode: &str,
-    run: (u64, u64, u32, u64),
-    schedule: (u64, usize),
-    environment: &environment::Snapshot,
-) -> Result<Meta, String> {
-    let (seed, warmup, blocks, timeout_ms) = run;
-    let (schedule, expected) = schedule;
-    let rustc = output("rustc", &["--version", "--verbose"])?;
-    let target = rustc
-        .lines()
-        .find_map(|line| line.strip_prefix("host: "))
-        .ok_or("rustc omitted host target")?
-        .to_owned();
-    let state = output("git", &["status", "--porcelain"])?;
-    let diff = output("git", &["diff", "HEAD", "--no-ext-diff", "--binary"])?;
-    Ok(Meta {
-        format: 5,
+    capture: &environment::Capture,
+    seed: u64,
+    warmup: u64,
+    timeout_ms: u64,
+) -> pilot::Identity {
+    pilot::Identity {
+        algorithm: 4,
         family: family.key.into(),
         family_revision: family.revision,
-        revision: output("git", &["rev-parse", "HEAD"])?,
-        dirty: !state.is_empty(),
-        diff: environment::digest(format!("{state}\n{diff}").as_bytes()),
-        target,
-        os: env::consts::OS.into(),
-        arch: env::consts::ARCH.into(),
-        rustc: rustc.replace(['\t', '\n', '\r'], " "),
-        command: env::args().collect::<Vec<_>>().join(" "),
-        started: SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|error| error.to_string())?
-            .as_millis()
-            .to_string(),
-        mode: mode.into(),
+        revision: capture.context.source.revision.clone(),
+        dirty: capture.context.source.dirty,
+        diff: capture.context.source.diff.clone(),
+        target: capture.context.compiler.target.clone(),
+        os: capture.context.host.os.clone(),
+        arch: capture.context.host.arch.clone(),
+        rustc: capture.context.compiler.rustc.clone(),
+        host: capture.context.host.description.clone(),
+        environment: capture.context.host.environment.clone(),
+        command: capture.command.clone(),
+        started: capture.started.clone(),
         seed,
         warmup,
-        blocks,
         timeout_ms,
-        schedule,
-        expected,
-        host: environment.text.clone(),
-        spin: evering::ADAPTIVE_SPINS as u32,
-    })
-}
-
-fn pilot_identity(meta: &Meta, environment: &environment::Snapshot) -> pilot::Identity {
-    pilot::Identity {
-        algorithm: 3,
-        family: meta.family.clone(),
-        family_revision: meta.family_revision,
-        revision: meta.revision.clone(),
-        diff: meta.diff.clone(),
-        target: meta.target.clone(),
-        rustc: meta.rustc.clone(),
-        environment: environment.digest.clone(),
-        seed: meta.seed,
-        warmup: meta.warmup,
-        timeout_ms: meta.timeout_ms,
     }
 }
 
@@ -116,51 +72,20 @@ fn execute(
     seed: u64,
     deadline: Deadline,
     environment: &str,
-) -> Trial {
+) -> Result<system::Measure, String> {
     let cell = scheduled.cell();
-    let trial = Trial {
-        block: scheduled.block,
-        order: scheduled.order,
-        cell,
+    let counts = (scheduled.arm.run)(&cell, requested, warmup, seed, deadline, environment)
+        .map_err(|error| format!("{:?}: {}", error.status, error.message))?;
+    Ok(system::Measure {
         requested,
-        accepted: 0,
-        completed: 0,
-        validated: 0,
-        elapsed_ns: None,
-        phase_ns: [0; 3],
-        observed: None,
-        path: drive::Path::default(),
-        status: Status::Unsupported,
-        error: None,
-    };
-    let result = (scheduled.arm.run)(&trial.cell, requested, warmup, seed, deadline, environment);
-    match result {
-        Ok(counts) => Trial {
-            accepted: counts.accepted,
-            completed: counts.completed,
-            validated: counts.validated,
-            elapsed_ns: Some(counts.elapsed_ns),
-            phase_ns: counts.phase_ns,
-            observed: counts.observed,
-            path: counts.path,
-            status: Status::Ok,
-            ..trial
-        },
-        Err(error) => {
-            let counts = *error.counts;
-            Trial {
-                accepted: counts.accepted,
-                completed: counts.completed,
-                validated: counts.validated,
-                status: error.status,
-                error: Some(error.message),
-                phase_ns: counts.phase_ns,
-                observed: counts.observed,
-                path: counts.path,
-                ..trial
-            }
-        }
-    }
+        accepted: counts.accepted,
+        completed: counts.completed,
+        validated: counts.validated,
+        elapsed_ns: counts.elapsed_ns,
+        phase_ns: counts.phase_ns,
+        observed: counts.observed.ok_or("runner omitted observed resources")?,
+        path: counts.path,
+    })
 }
 
 struct Record<'a> {
@@ -171,10 +96,86 @@ struct Record<'a> {
     blocks: u32,
     seed: u64,
     requested: u64,
-    manifest: Option<(pilot::Manifest, String)>,
+    manifest: Option<(pilot::Evidence, String)>,
     warmup: u64,
     timeout_ms: u64,
     deadline: Deadline,
+}
+
+fn system_header(
+    input: &Record<'_>,
+    capture: environment::Capture,
+    calibration: Option<String>,
+) -> Result<Header<system::Specification, system::Case>, String> {
+    let mut cases = Vec::new();
+    let mut execution = Vec::with_capacity(input.selected.len());
+    for scheduled in &input.selected {
+        let case = system::Case {
+            workload: scheduled.cell(),
+            resources: scheduled.arm.resources(),
+        };
+        let index = match cases.iter().position(|known| known == &case) {
+            Some(index) => index,
+            None => {
+                cases.push(case);
+                cases.len() - 1
+            }
+        };
+        execution.push(study::Scheduled {
+            unit: Unit {
+                block: scheduled.block,
+                order: scheduled.order,
+            },
+            case: u32::try_from(index).map_err(|_| "too many system cases")?,
+        });
+    }
+    let contrasts = cases
+        .iter()
+        .filter(|case| case.workload.arm != input.family.baseline.key)
+        .filter_map(|candidate| {
+            let baseline = cases.iter().find(|case| {
+                case.workload.condition() == candidate.workload.condition()
+                    && case.workload.arm == input.family.baseline.key
+            })?;
+            Some(system::Contrast {
+                candidate: study::case_id::<system::System>(candidate),
+                baseline: study::case_id::<system::System>(baseline),
+                delta: 0.05,
+                role: system::Role::Primary,
+            })
+        })
+        .collect();
+    Ok(Header::new::<system::System>(
+        capture.context,
+        system::Specification {
+            family: input.family.key.into(),
+            family_revision: input.family.revision,
+            mode: input.mode.into(),
+            blocks: input.blocks,
+            spin: evering::ADAPTIVE_SPINS as u32,
+            timeout_ms: input.timeout_ms,
+            alpha: 0.05,
+            calibration,
+            contrasts,
+        },
+        cases,
+        Run {
+            seed: input.seed,
+            started: capture.started,
+            command: capture.command,
+            warmup: input.warmup,
+            budget_ms: u64::try_from(
+                input
+                    .family
+                    .mode(input.mode)
+                    .ok_or("unknown family mode")?
+                    .0
+                    .as_millis(),
+            )
+            .map_err(|_| "family budget exceeds u64 milliseconds")?,
+            schedule: execution,
+        },
+    ))
 }
 
 fn record(input: Record<'_>) -> Result<(), String> {
@@ -185,53 +186,83 @@ fn record(input: Record<'_>) -> Result<(), String> {
         return Err("blocks, fixed operations, and timeout must be nonzero".into());
     }
     let environment = environment::capture()?;
-    let mut meta = metadata(
-        input.family,
-        input.mode,
-        (input.seed, input.warmup, input.blocks, input.timeout_ms),
-        (schedule_id(&input.selected), input.selected.len()),
-        &environment,
-    )?;
-    let counts = if let Some((manifest, digest)) = input.manifest {
+    let capture = environment::metadata(&environment)?;
+    let counts = if let Some((manifest, digest)) = input.manifest.as_ref() {
         let counts = pilot::admit(
-            &manifest,
-            &pilot_identity(&meta, &environment),
+            manifest,
+            &pilot_identity(
+                input.family,
+                &capture,
+                input.seed,
+                input.warmup,
+                input.timeout_ms,
+            ),
             &input.selected,
         )?;
-        meta.host += &format!(";pilot={digest}");
-        counts
+        (counts, Some(digest.clone()))
     } else {
-        vec![input.requested; input.selected.len()]
+        (vec![input.requested; input.selected.len()], None)
     };
     let timeout = Duration::from_millis(input.timeout_ms);
     let total = input.selected.len();
-    let mut done = 0;
-    record_evidence(
-        Path::new(input.path),
-        meta,
-        input
-            .selected
-            .into_iter()
-            .zip(counts)
-            .map(|(scheduled, requested)| {
-                let deadline = input.deadline.within(Instant::now(), timeout)?;
-                let trial = execute(
+    let header = system_header(&input, capture, counts.1)?;
+    let execution = header.run.schedule.clone();
+    let mut recorder = Recorder::<system::System>::create(Path::new(input.path), header)
+        .map_err(|error| format!("{error:?}"))?;
+    for (done, ((scheduled, requested), expected)) in input
+        .selected
+        .into_iter()
+        .zip(counts.0)
+        .zip(execution)
+        .enumerate()
+    {
+        let unit = Unit {
+            block: scheduled.block,
+            order: scheduled.order,
+        };
+        let result = input
+            .deadline
+            .within(Instant::now(), timeout)
+            .and_then(|deadline| {
+                execute(
                     scheduled,
                     requested,
                     input.warmup,
                     input.seed,
                     deadline,
                     &environment.digest,
-                );
-                done += 1;
-                progress(&pilot::progress("trial", done, total, &trial.cell));
-                if done == total || done.is_multiple_of(total / input.blocks as usize) {
-                    progress(&format!("block {} complete", trial.block));
-                }
-                Ok(trial)
-            }),
-    )?;
-    Ok(())
+                )
+            });
+        let measure = match result {
+            Ok(measure) => measure,
+            Err(error) => {
+                recorder
+                    .abort(Some(unit), &error)
+                    .map_err(|error| format!("{error:?}"))?;
+                return Err(error);
+            }
+        };
+        recorder
+            .observe(Observation {
+                unit,
+                case: expected.case,
+                measure,
+            })
+            .map_err(|error| format!("{error:?}"))?;
+        progress(&pilot::progress(
+            "trial",
+            done + 1,
+            total,
+            &scheduled.cell(),
+        ));
+        if done + 1 == total || (done + 1).is_multiple_of(total / input.blocks as usize) {
+            progress(&format!("block {} complete", scheduled.block));
+        }
+    }
+    recorder
+        .complete()
+        .map(drop)
+        .map_err(|error| format!("{error:?}"))
 }
 
 fn pilot(
@@ -248,16 +279,11 @@ fn pilot(
     let command = family.deadline("pilot", began)?;
     let selected = schedule(&(family.members)("screening").unwrap(), 1, seed);
     let environment = environment::capture()?;
-    let meta = metadata(
-        family,
-        "pilot",
-        (seed, warmup, 1, timeout_ms),
-        (schedule_id(&selected), selected.len()),
-        &environment,
-    )?;
+    let capture = environment::metadata(&environment)?;
     let timeout = Duration::from_millis(timeout_ms);
-    let identity = pilot_identity(&meta, &environment);
+    let identity = pilot_identity(family, &capture, seed, warmup, timeout_ms);
     let total = selected.len();
+    let cases = selected.iter().map(|scheduled| scheduled.cell()).collect();
     let rows = selected
         .iter()
         .copied()
@@ -267,28 +293,23 @@ fn pilot(
             progress(&pilot::progress("pilot-start", index + 1, total, &cell));
             let result = pilot::calibrate(cell.clone(), warmup, |requested| {
                 let deadline = command.within(Instant::now(), timeout)?;
-                let trial = execute(
+                let measure = execute(
                     scheduled,
                     requested,
                     warmup,
                     seed,
                     deadline,
                     &environment.digest,
-                );
-                let result = if trial.status == Status::Ok {
-                    Ok(trial.elapsed_ns.unwrap())
-                } else {
-                    Err(trial.error.unwrap_or_else(|| "pilot trial failed".into()))
-                };
+                )?;
                 command.remaining(Instant::now())?;
-                result
+                Ok(measure.elapsed_ns)
             });
             if result.is_ok() {
                 progress(&pilot::progress("pilot-complete", index + 1, total, &cell));
             }
-            (cell, result)
+            result
         });
-    let digest = pilot::record(Path::new(path), identity, total, rows)?;
+    let digest = pilot::record(Path::new(path), identity, cases, rows)?;
     println!("pilot {digest}: {total} frozen arm counts");
     Ok(())
 }
@@ -318,20 +339,17 @@ fn dispatch() -> Result<(), String> {
             )
         }
         [command, path] if command == "validate" => {
-            let loaded = load(Path::new(path))?;
-            let study = loaded.study;
-            let state = if loaded.complete {
-                "complete"
-            } else {
-                "partial"
-            };
+            let evidence = system::load(Path::new(path))?;
             println!(
-                "valid {state}: {} blocks, {} trials, revision {}",
-                study.meta.blocks,
-                study.trials.len(),
-                study.meta.revision
+                "valid complete: {} blocks, {} observations, revision {}",
+                evidence.header.specification.blocks,
+                evidence.observations.len(),
+                evidence.header.context.source.revision
             );
             Ok(())
+        }
+        [command, specification, output] if command == "mechanism" => {
+            fixture::record(Path::new(specification), Path::new(output))
         }
         [command, paths @ ..] if command == "analyze" && !paths.is_empty() => {
             print!("{}", analysis::command(paths)?);
@@ -340,14 +358,7 @@ fn dispatch() -> Result<(), String> {
         [command, paths @ ..] if command == "geometry" && !paths.is_empty() => {
             let studies = paths
                 .iter()
-                .map(|path| {
-                    load(Path::new(path)).and_then(|loaded| {
-                        loaded
-                            .complete
-                            .then_some(loaded.study)
-                            .ok_or("partial evidence".into())
-                    })
-                })
+                .map(|path| system::load(Path::new(path)))
                 .collect::<Result<Vec<_>, _>>()?;
             print!("{}", geometry::evidence_report(&studies)?);
             Ok(())
@@ -370,9 +381,10 @@ fn dispatch() -> Result<(), String> {
             let family = family::find(family).ok_or_else(|| format!("unknown family: {family}"))?;
             let deadline = family.deadline(command, Instant::now())?;
             let (pilot, digest) = pilot::load(Path::new(manifest))?;
-            let seed = pilot.identity.seed;
-            let warmup = pilot.identity.warmup;
-            let timeout = pilot.identity.timeout_ms;
+            let identity = pilot::identity(&pilot);
+            let seed = identity.seed;
+            let warmup = identity.warmup;
+            let timeout = identity.timeout_ms;
             let blocks = family.mode(command).unwrap().1;
             let members = (family.members)(command).unwrap();
             let selected = schedule(&members, blocks, seed);
@@ -409,7 +421,8 @@ fn dispatch() -> Result<(), String> {
             })
         }
         _ => Err(
-            "usage: ipc validate <file> | ipc analyze <file>... | ipc geometry <file>... | \
+            "usage: ipc validate <file> | ipc mechanism <spec.json> <new-output> | \
+             ipc analyze <file>... | ipc geometry <file>... | \
              ipc plot <output-dir> <file>... | \
              ipc pilot <family> <manifest> <seed> <warmup> <timeout-ms> | \
              ipc screening|focused <family> <file> <manifest> | \

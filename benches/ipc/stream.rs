@@ -4,7 +4,7 @@ use std::{
     net::TcpStream,
 };
 
-use super::drive::{self, Deadline, Interest, Path};
+use super::drive::{self, Deadline, Interest, PathCounts};
 use super::environment;
 use super::model::Status;
 #[cfg(any(feature = "process", test))]
@@ -27,7 +27,7 @@ pub struct Counts {
     pub validated: u64,
     pub elapsed_ns: u64,
     pub phase_ns: [u64; 3],
-    pub path: Path,
+    pub path: PathCounts,
     #[cfg(feature = "process")]
     pub observed: Option<Observed>,
 }
@@ -156,12 +156,20 @@ socket!(tokio::net::TcpStream, TcpStream);
 #[cfg(all(unix, feature = "local-socket"))]
 socket!(tokio::net::UnixStream, std::os::unix::net::UnixStream);
 
-fn try_read<S: Socket>(stream: &S, bytes: &mut [u8], path: &mut Path) -> io::Result<Option<usize>> {
+fn count(result: Result<(), drive::CountOverflow>) -> io::Result<()> {
+    result.map_err(|_| io::Error::other("path count overflow"))
+}
+
+fn try_read<S: Socket>(
+    stream: &S,
+    bytes: &mut [u8],
+    path: &mut PathCounts,
+) -> io::Result<Option<usize>> {
     match stream.try_read(bytes) {
         Ok(0) => Err(ErrorKind::UnexpectedEof.into()),
         Ok(read) => Ok(Some(read)),
         Err(error) if would_block(&error) => {
-            path.recv_stalled = true;
+            count(path.recv_empty())?;
             Ok(None)
         }
         Err(error) => Err(error),
@@ -243,19 +251,19 @@ impl<S: Socket> Client<S> {
 impl<S: Socket> drive::Endpoint for Client<S> {
     type Error = io::Error;
 
-    fn stage(&mut self, operation: u64, payload: Vec<u8>) -> io::Result<()> {
+    fn stage(&mut self, operation: u64, payload: &[u8]) -> io::Result<()> {
         if self.send.is_some() {
             return Err(io::Error::new(ErrorKind::InvalidInput, "already staged"));
         }
         let mut bytes = Vec::with_capacity(12 + payload.len());
         bytes.extend_from_slice(&operation.to_le_bytes());
         bytes.extend_from_slice(&(payload.len() as u32).to_le_bytes());
-        bytes.extend_from_slice(&payload);
+        bytes.extend_from_slice(payload);
         self.send = Some(Pending { bytes, offset: 0 });
         Ok(())
     }
 
-    fn try_send(&mut self, path: &mut Path) -> io::Result<drive::Step<(), io::Error>> {
+    fn try_send(&mut self, path: &mut PathCounts) -> io::Result<drive::Step<(), io::Error>> {
         let pending = self
             .send
             .as_mut()
@@ -269,13 +277,12 @@ impl<S: Socket> drive::Endpoint for Client<S> {
                     self.send = None;
                     Ok(drive::Step::Committed(Ok(())))
                 } else {
-                    path.send_stalled = true;
-                    path.partial_io = true;
+                    count(path.partial_io(written))?;
                     Ok(drive::Step::Pending)
                 }
             }
             Err(error) if would_block(&error) => {
-                path.send_stalled = true;
+                count(path.send_full())?;
                 Ok(drive::Step::Pending)
             }
             Err(error) => Err(error),
@@ -284,7 +291,7 @@ impl<S: Socket> drive::Endpoint for Client<S> {
 
     fn try_recv(
         &mut self,
-        path: &mut Path,
+        path: &mut PathCounts,
         expected: drive::Expected,
     ) -> io::Result<drive::Step<bool, io::Error>> {
         while self.header_offset < self.header.len() {
@@ -295,7 +302,7 @@ impl<S: Socket> drive::Endpoint for Client<S> {
             self.progressed = true;
             self.header_offset += read;
             if self.header_offset < self.header.len() {
-                path.partial_io = true;
+                count(path.partial_io(read))?;
                 return Ok(drive::Step::Pending);
             }
             let len = u32::from_le_bytes(self.header[8..].try_into().unwrap()) as usize;
@@ -313,7 +320,7 @@ impl<S: Socket> drive::Endpoint for Client<S> {
             self.progressed = true;
             self.body_offset += read;
             if self.body_offset < self.body.len() {
-                path.partial_io = true;
+                count(path.partial_io(read))?;
                 return Ok(drive::Step::Pending);
             }
         }
@@ -325,9 +332,14 @@ impl<S: Socket> drive::Endpoint for Client<S> {
         Ok(drive::Step::Committed(Ok(result)))
     }
 
-    fn wait(&mut self, interest: Interest, deadline: Deadline, path: &mut Path) -> io::Result<()> {
+    fn wait(
+        &mut self,
+        interest: Interest,
+        deadline: Deadline,
+        path: &mut PathCounts,
+    ) -> io::Result<()> {
         if self.woke && !self.progressed {
-            path.stale_wake = true;
+            count(path.stale_wake())?;
         }
         self.woke = false;
         self.progressed = false;
@@ -339,7 +351,7 @@ impl<S: Socket> drive::Endpoint for Client<S> {
                 return Err(io::Error::new(ErrorKind::InvalidInput, "no wait interest"));
             }
         };
-        path.wait_entered = true;
+        count(path.wait())?;
         let timeout = deadline
             .remaining(Instant::now())
             .map_err(|_| ErrorKind::TimedOut)?;
@@ -349,7 +361,7 @@ impl<S: Socket> drive::Endpoint for Client<S> {
         let result = self.runtime.block_on(future);
         match result {
             Ok(Ok(_)) => {
-                path.wait_returned = true;
+                count(path.wake())?;
                 self.woke = true;
                 Ok(())
             }
@@ -365,9 +377,13 @@ impl<S: Socket> drive::Endpoint for Client<S> {
 }
 
 pub fn serve(mut stream: impl Read + Write) -> io::Result<()> {
-    while let Some((operation, mut request)) = read_frame(&mut stream)? {
-        request.iter_mut().for_each(|byte| *byte ^= 0xa5);
-        write_frame(&mut stream, operation, &request)?;
+    while let Some((operation, request)) = read_frame(&mut stream)? {
+        let digest = super::model::digest(&request).to_le_bytes();
+        write_frame(
+            &mut stream,
+            operation,
+            if operation == u64::MAX { &[] } else { &digest },
+        )?;
     }
     Ok(())
 }

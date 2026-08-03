@@ -13,7 +13,7 @@ pub fn digest(bytes: &[u8]) -> String {
     )
 }
 
-fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
+pub fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
     let output = std::process::Command::new(program)
         .args(arguments)
         .output()
@@ -22,8 +22,53 @@ fn output(program: &str, arguments: &[&str]) -> Result<String, String> {
         return Err(format!("{program} failed"));
     }
     String::from_utf8(output.stdout)
-        .map(|value| value.trim().replace(['\t', '\n', '\r'], " "))
+        .map(|value| value.trim().to_owned())
         .map_err(|error| error.to_string())
+}
+
+pub struct Capture {
+    pub context: crate::study::Context,
+    pub command: String,
+    pub started: String,
+}
+
+pub fn metadata(environment: &Snapshot) -> Result<Capture, String> {
+    use crate::study::{Compiler, Context, Host, Source};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    let rustc = output("rustc", &["--version", "--verbose"])?;
+    let target = rustc
+        .lines()
+        .find_map(|line| line.strip_prefix("host: "))
+        .ok_or("rustc omitted host target")?
+        .to_owned();
+    let state = output("git", &["status", "--porcelain"])?;
+    let diff = output("git", &["diff", "HEAD", "--no-ext-diff", "--binary"])?;
+    Ok(Capture {
+        context: Context {
+            source: Source {
+                revision: output("git", &["rev-parse", "HEAD"])?,
+                dirty: !state.is_empty(),
+                diff: digest(format!("{state}\n{diff}").as_bytes()),
+            },
+            compiler: Compiler {
+                target,
+                rustc: rustc.replace(['\t', '\n', '\r'], " "),
+            },
+            host: Host {
+                os: std::env::consts::OS.into(),
+                arch: std::env::consts::ARCH.into(),
+                description: environment.text.clone(),
+                environment: environment.digest.clone(),
+            },
+        },
+        command: std::env::args().collect::<Vec<_>>().join(" "),
+        started: SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_err(|error| error.to_string())?
+            .as_millis()
+            .to_string(),
+    })
 }
 
 #[cfg(windows)]

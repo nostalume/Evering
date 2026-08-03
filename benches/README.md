@@ -15,19 +15,18 @@ necessarily performs. Those differences are part of the whole-system estimand,
 not proof that any single queue, allocator, or notification mechanism caused the
 result. Mechanism attribution requires separate symmetric measurements.
 
-No confirmatory performance result exists yet. Historical revision-1
-Tumbleweed screening completed 108 core and 30 Local trials. A clean-source
-revision-2 Local screening at `e7b513ffc9699623e238d2263d5f7cb20f867614`
-completed 30/30 trials after replacing implicit adaptive Pool geometry with one
-registered `64 B..64 KiB` range. Its three-block Evering/UDS ratios range from
-1.132 to 2.938. Screening is descriptive and authorizes no
-faster/slower/equivalent decision. Revision 2 entered the notified wait path;
-it therefore supersedes revision 1 only as current implementation evidence, not
-as a controlled longitudinal comparison.
+The newest complete focused Tumbleweed delivery study contains 90/90 conserved
+trials over empty, 1-KiB, and 64-KiB payloads. Its paired Evering/UDS effects are
+3.097 `[2.767,3.341]`, 3.064 `[2.953,3.197]`, and 2.934
+`[2.879,3.136]`; all satisfy the registered Faster decision. These conclusions
+apply only to the persistent one-coordinator/one-worker digest workload.
 
-Earlier incomplete Windows artifacts remain diagnostic only. Their stream
-failure motivated the shared sliding-window driver and constrained-buffer
-regression; no row from an incomplete artifact enters analysis.
+The later Windows B6 run is diagnostic rather than confirmatory. One-block
+system smoke exposed short-session setup dominance. A matched 64-KiB Pool
+mechanism run measured a -58.377 ns/op paired difference against local-copy
+control, showing that Pool allocation metadata is not the observed end-to-end
+bottleneck. Different source identities prevent a causal join, and the remaining
+payload and scheduling shares are not attributed.
 
 ## Research question and estimand
 
@@ -148,32 +147,65 @@ of a whole-system comparison.
 | Windows 10-block exploratory run | valid partial, not complete | The matrix exposed a stream batching defect |
 | Tumbleweed core revision-1 screening | historical: 3 blocks, 108/108 trials | Descriptive conditioned ratios only |
 | Tumbleweed Local revision-1 screening | historical: 3 blocks, 30/30 trials | Descriptive conditioned ratios only |
-| Tumbleweed Local revision-2 screening | current: 3 blocks, 30/30 trials | Descriptive conditioned ratios only; no cross-revision decision |
+| Tumbleweed Local revision-2 screening | historical: 3 blocks, 30/30 trials | Descriptive conditioned ratios only; no cross-revision decision |
+| Tumbleweed focused delivery | complete: 15 blocks, 90/90 trials | Faster for the three registered persistent-connection conditions |
+| Windows B6 system/mechanism | complete diagnostic smoke and matched mechanism | Setup diagnosis and allocator bottleneck rejection; no system decision or causal attribution |
 | Windows excluded pilot/count manifest | complete locally, not retained evidence | Confirms the calibration and admission path works; no throughput claim |
 | Windows one-block manifest-authorized run | complete locally, diagnostic only | Confirms per-arm count conservation; too few blocks for an estimate |
-| Focused confirmation | authorized but not run | No practical faster/slower/equivalent decision |
 
-The retained [core evidence](evidence/core-ipc-tumbleweed-screening-20260731.jsonl),
-[Local evidence](evidence/local-ipc-unix-tumbleweed-screening-20260731.jsonl),
-and generated [combined report](report.md) have SHA-256 digests
+The retained historical [core evidence](evidence/core-ipc-tumbleweed-screening-20260731.jsonl)
+and [Local evidence](evidence/local-ipc-unix-tumbleweed-screening-20260731.jsonl)
+have SHA-256 digests
 `00c6fc9f052bf0b805e7e418ae49fff9b309fef8394394963b16e5e0d6b9c693`,
-`cfd9af2e35459f644537e545a720cba51501f8308f09825ec1b2a5b28e5b0b71`,
-and `33d287506fffae59297794a682a009ae38da1ee7367b9c8fa80be7da0f1defc6`.
+and `cfd9af2e35459f644537e545a720cba51501f8308f09825ec1b2a5b28e5b0b71`.
 Local and core record dirty digests `14b86ac1df9347d1` and
 `6e0718d77b9964a5` because this paper and retained artifacts changed between
 family runs. Benchmark production code did not change; the families remain
 independent and are not pooled.
 
-The current [Local revision-2 evidence](evidence/local-ipc-unix-tumbleweed-screening-20260802.jsonl),
-[generated report](report-local-v2.md), and
-[SVG](plots/20260802/local-ipc-unix.svg) have SHA-256 digests
-`2b5eaa9ef08cb3c18d55cc68ac619efa4d08328ce50a75e52573fd26593a30fb`,
-`2b094a7254aa2d18ea2fc214a9233387fac46b461679493c593264dcfc31425a`,
-and `c089080c2bd3434a3064d0e2b21438abe64090175456edf7c22429742ac62d7f`.
+The historical [Local revision-2 evidence](evidence/local-ipc-unix-tumbleweed-screening-20260802.jsonl)
+has SHA-256 digest
+`2b5eaa9ef08cb3c18d55cc68ac619efa4d08328ce50a75e52573fd26593a30fb`.
 It is clean (`dirty=false`), uses family revision 2, seed `20260802`, a fixed
 32-MiB condition extent, and records the actual 16,515,072-byte Pool geometry.
 
-### Current revision-2 Local snapshot
+### Current focused delivery result
+
+The persistent-connection family fixes capacity and in-flight window at eight,
+uses a 32-MiB extent, generates payloads and expected digests outside timed
+work, reads every request byte inside the worker, and returns one fixed-size
+digest. Screening completed before the 15-block focused run. Focused execution
+finished 90/90 trials in 33.6 seconds; setup, timed work, and drain were recorded
+separately, and every accepted operation was completed and validated.
+
+| Payload | Evering / UDS paired effect | 95% interval | Decision |
+|---:|---:|---:|---|
+| 0 | 3.097 | [2.767, 3.341] | Faster |
+| 1 KiB | 3.064 | [2.953, 3.197] | Faster |
+| 64 KiB | 2.934 | [2.879, 3.136] | Faster |
+
+Evidence identity is `6103c79d…8a1992`. The result is a conditioned deployment
+comparison, not a latency, CPU-efficiency, allocator, or universal transport
+claim.
+
+### Latest Windows bottleneck diagnostic
+
+The bounded B6 smoke sealed five observations in 4.838 seconds. Its single-block
+adaptive/TCP, busy/TCP, and notified/TCP ratios were 40.813, 52.720, and 3.191;
+they are smoke diagnostics, not intervals or decisions. Per-case setup took
+450--783 ms while measured transfer took 0.10--45.10 ms, so setup dominates this
+short-lived topology.
+
+The matched 64-KiB Pool mechanism run used three 19,828-operation AB/BA pairs.
+Gross shared-Pool batches took 30.52--31.26 ms and local-copy control took
+31.68--32.48 ms. The paired median was -58.377 ns/op with interval
+[-61.474, -55.679] ns/op. Pool allocation metadata is therefore rejected as the
+observed 140-us/message system bottleneck. Payload generation, worker mutation,
+bytewise validation, and cross-process scheduling remain residual candidates;
+their shares are not isolated. The Windows system and mechanism artifacts have
+different source identities, so no causal join is asserted.
+
+### Earlier revision-2 Local snapshot
 
 The bounded pilot completed ten cells in 6.2 seconds; screening completed all
 30 rows in 17.2 seconds. Every row conserves requested, accepted, completed,
@@ -203,8 +235,7 @@ Local contains 30/30 rows at the same revision, dirty digest
 `14b86ac1df9347d1`, and evidence SHA-256
 `cfd9af2e35459f644537e545a720cba51501f8308f09825ec1b2a5b28e5b0b71`.
 Both used format 5, family revision 1, seed 7, three screening blocks,
-x86_64 Tumbleweed under WSL, and rustc 1.97 nightly. The combined report digest
-is `33d287506fffae59297794a682a009ae38da1ee7367b9c8fa80be7da0f1defc6`.
+x86_64 Tumbleweed under WSL, and rustc 1.97 nightly.
 
 A later run gets a new artifact name and retains the old bytes. It must match
 family revision, condition matrix, mode, target, host class, and observation
@@ -232,8 +263,9 @@ and in-flight bound:
 | 65536 | 1.198 | 1.315 | 1.152 |
 
 The eight notified boundary comparisons at payload 1024 range from 3.058 to
-14.143; the complete condition table and descriptive intervals are in the
-combined report. Core timed trials range from 335.916 to 637.739 ms.
+14.143. The analyzer can regenerate the complete condition table and
+descriptive intervals from the retained JSONL. Core timed trials range from
+335.916 to 637.739 ms.
 
 The 22-second Local command contains 18.612 seconds of recorded trial phases:
 1.360 setup/warmup, 17.195 timed work, and 0.056 drain.
@@ -369,7 +401,7 @@ terminal state.
 
 ## Work and resource equivalence
 
-- Each arm uses its exact frozen requested count and deterministic payloads.
+- Each arm reuses the same deterministic payload, prepared before timed work.
 - Paired counts may differ; operation semantics, duration class, window,
   topology, phase meaning, and validation remain matched.
 - Capacity is the maximum application-visible outstanding record count.
@@ -390,18 +422,18 @@ class; merely recording a value does not make it controlled.
 
 | Condition | Role | Registered values or rule | Current observability |
 |---|---|---|---|
-| Payload | experimental factor | 0, 64, 1,024, 16,384, 65,536 bytes | requested and observed |
+| Payload | experimental factor | Local: 0, 1,024, 65,536 bytes | requested and observed |
 | Evering retry | experimental factor | busy, adaptive, notified | format 5 records path presence; exact fallback/coalescing counts remain separate diagnostics |
 | Capacity | experimental factor | reference 8; boundary 1 and 256 | requested and observed |
 | In-flight | experimental factor | reference 8; boundary 1 and 64 | requested and observed |
 | Platform | separate family | native Windows; openSUSE Tumbleweed under WSL | OS, target, architecture, host string |
 | Topology | fixed | one coordinator, one worker, one channel/connection | recorded as `1c1w` |
-| Logical transform | fixed | every payload byte XOR `0xa5` | validated byte-for-byte |
+| Logical work | fixed | worker reads the full payload and returns an 8-byte digest | operation and digest validated |
 | Connection count | fixed | one | implied by runner; not an evidence field |
-| Stream framing | fixed | 8-byte operation, 4-byte length, full payload | fixed by implementation; not versioned separately |
+| Stream framing | fixed | 8-byte operation, 4-byte length, request payload or digest response | fixed by implementation |
 | Stream transport | fixed | IPv4 loopback TCP with `TCP_NODELAY` and coordinator readiness | transport and observed socket buffer sizes |
-| Shared extent | derived factor | `next_page(4 MiB + 2 × capacity × max(payload, 64))` | requested and observed |
-| Allocator geometry | derived factor | `Geometry::auto(extent)` | observed debug representation |
+| Shared extent | fixed | 32 MiB | requested and observed |
+| Allocator geometry | derived factor | registered Pool range in that extent | observed debug representation |
 | Warmup | fixed per artifact | registered before execution | metadata |
 | Operation count | fixed per arm after pilot | predetermined and conserved; paired arms may differ to enter one duration class | pilot manifest and each evidence row |
 | Block and arm order | randomized control | deterministic from seed | schedule identity and row order |
@@ -473,14 +505,14 @@ includes:
 
 | Cost | Evering | Stream |
 |---|---|---|
-| Deterministic request generation | included | included |
+| Deterministic request generation | excluded; one payload is prebuilt | excluded; one payload is prebuilt |
 | Request allocation | recoverable Pool reservation | frame and payload `Vec` allocation |
 | Request payload copy | into shared allocation | into user frame, then through socket path |
 | Request publication/transport | ring publication and possible notification | framed socket writes |
 | Worker receive | shared allocation admission | frame read and payload allocation |
-| Transform | in-place XOR | in-place XOR |
-| Response transport | same allocation republished | full framed socket response |
-| Coordinator receive/validation | shared allocation open and byte validation | frame read, payload allocation, byte validation |
+| Worker consumption | full payload read and digest | full payload read and digest |
+| Response transport | digest in envelope; allocation ownership returned | framed 8-byte digest response |
+| Coordinator receive/validation | allocation open, O(1) digest validation, release | frame read and O(1) digest validation |
 | Setup, mapping, spawn, handle exchange | excluded | excluded |
 | Drain, child wait, channel removal | excluded | excluded |
 | Evidence persistence | excluded | excluded |
@@ -529,14 +561,14 @@ The core family has 36 arm rows per block:
 - boundary pairs `(capacity, in-flight)` of `(1,1)`, `(1,64)`, `(256,1)`, and
   `(256,64)` at payload 1024, notified.
 
-The Local family has ten arm rows per block: five payloads times Evering
+The Local family has six arm rows per block: three payloads times Evering
 adaptive and UDS readiness at capacity 8 and in-flight 8. Screening uses three
 complete paired blocks. Its intervals and capacity/in-flight observations are
 descriptive.
 
 ### Focused confirmation
 
-The focused family is fixed before screening: five payload contrasts between
+The focused family is fixed before screening: three payload contrasts between
 Evering adaptive and the readiness baseline at capacity 8 and in-flight 8. It
 uses 15 complete paired blocks per platform. Capacity, in-flight,
 memory-geometry, or topology confirmation
@@ -551,10 +583,10 @@ Before screening, an excluded pilot selects one exact operation count per
 approaching the timed deadline. Paired counts may differ, but each is frozen
 before block 0 and exactly conserved during evidence execution.
 
-For `W = min(capacity, in_flight)`, algorithm 3 begins at
+For `W = min(capacity, in_flight)`, algorithm 4 begins at
 `max(64, 32 × W)` rounded to a multiple of `W`. Fresh trials scale toward a
 measurable 50 ms observation for at most eight attempts, then freeze a checked
-500 ms target count. The manifest records every ramp, the selected count,
+250 ms target count. The manifest records every ramp, the selected count,
 source/environment/condition identity, and digest. Calibration failure appends
 one sanitized `ABORT` row; an incomplete manifest is neither admissible nor
 resumable. Pilot rows are excluded from performance evidence.
@@ -562,8 +594,8 @@ resumable. Pilot rows are excluded from performance evidence.
 One absolute command deadline governs whether new work may start and caps each
 trial through setup, warmup, measurement, drain, and child reap. Each trial
 receives the lesser of the family command remainder and its recorded per-trial
-limit. Local pilot, screening, and focused limits are respectively 45, 90, and
-240 seconds. A supervising process may add at most 20 seconds only to clean up
+limit. Local pilot, screening, and focused limits are respectively 45, 60, and
+90 seconds. A supervising process may add at most 20 seconds only to clean up
 a failed command. Budget expiry is an error and can never be encoded as low
 throughput.
 
@@ -672,14 +704,11 @@ sorted `Analysis` values as Markdown; it does not recompute estimates, pool
 families, rank arms, or promote screening intervals to decisions. It emits one
 byte-stable logarithmic ratio plot per family.
 
-Each row spells out the policy, payload per message, queue capacity, maximum
-messages in flight, and total shared-memory extent; binary sizes use KiB/MiB.
+Each row spells out the policy, payload, queue capacity, messages in flight,
+shared extent, candidate/baseline op/s and useful MiB/s, ratio, and interval.
 
-![Core IPC screening ratios](plots/core-ipc.svg)
-
-![Local IPC screening ratios](plots/local-ipc-unix.svg)
-
-![Current Local IPC revision-2 screening ratios](plots/20260802/local-ipc-unix.svg)
+Plots are generated on demand from admitted evidence and are not retained as
+authoritative artifacts.
 
 The timed execution/transport core retains its 2,000 nonblank, noncomment line
 ceiling. Offline native analysis and its command admission have a separate

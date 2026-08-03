@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use super::model::{payload, valid_response};
+use super::model::{digest, payload};
 
 #[derive(Clone, Copy)]
 pub struct Deadline(Instant);
@@ -26,23 +26,106 @@ impl Deadline {
 pub struct Expected {
     operation: u64,
     payload_len: usize,
-    seed: u64,
+    digest: u64,
 }
 
 impl Expected {
     pub fn matches(self, operation: u64, bytes: &[u8]) -> bool {
-        operation == self.operation && valid_response(self.seed, operation, self.payload_len, bytes)
+        operation == self.operation
+            && if operation == u64::MAX {
+                bytes.is_empty()
+            } else {
+                bytes == self.digest.to_le_bytes()
+            }
+    }
+
+    pub fn matches_digest(self, operation: u64, digest: u64, payload_len: usize) -> bool {
+        operation == self.operation && digest == self.digest && payload_len == self.payload_len
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CountOverflow;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
-pub struct Path {
-    pub send_stalled: bool,
-    pub recv_stalled: bool,
-    pub wait_entered: bool,
-    pub wait_returned: bool,
-    pub stale_wake: bool,
-    pub partial_io: bool,
+pub struct PathCounts {
+    pub send_attempts: u64,
+    pub send_full: u64,
+    pub send_busy: u64,
+    pub recv_attempts: u64,
+    pub recv_empty: u64,
+    pub recv_busy: u64,
+    pub waits: u64,
+    pub wakes: u64,
+    pub stale_wakes: u64,
+    pub partial_io_events: u64,
+    pub partial_io_bytes: u64,
+}
+
+impl PathCounts {
+    #[inline(always)]
+    fn add(value: &mut u64) -> Result<(), CountOverflow> {
+        *value = value.checked_add(1).ok_or(CountOverflow)?;
+        Ok(())
+    }
+
+    #[inline(always)]
+    pub fn send_attempt(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.send_attempts)
+    }
+
+    #[inline(always)]
+    pub fn send_full(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.send_full)
+    }
+
+    #[inline(always)]
+    pub fn send_busy(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.send_busy)
+    }
+
+    #[inline(always)]
+    pub fn recv_attempt(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.recv_attempts)
+    }
+
+    #[inline(always)]
+    pub fn recv_empty(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.recv_empty)
+    }
+
+    #[inline(always)]
+    pub fn recv_busy(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.recv_busy)
+    }
+
+    #[inline(always)]
+    pub fn wait(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.waits)
+    }
+
+    #[inline(always)]
+    pub fn wake(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.wakes)
+    }
+
+    #[inline(always)]
+    pub fn stale_wake(&mut self) -> Result<(), CountOverflow> {
+        Self::add(&mut self.stale_wakes)
+    }
+
+    #[inline(always)]
+    pub fn partial_io(&mut self, bytes: usize) -> Result<(), CountOverflow> {
+        let events = self.partial_io_events.checked_add(1).ok_or(CountOverflow)?;
+        let bytes = u64::try_from(bytes).map_err(|_| CountOverflow)?;
+        let total = self
+            .partial_io_bytes
+            .checked_add(bytes)
+            .ok_or(CountOverflow)?;
+        self.partial_io_events = events;
+        self.partial_io_bytes = total;
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -69,7 +152,7 @@ pub struct Work {
 
 pub struct Measured {
     pub counts: Counts,
-    pub path: Path,
+    pub path: PathCounts,
     pub setup_ns: u64,
     pub elapsed_ns: u64,
 }
@@ -77,7 +160,7 @@ pub struct Measured {
 pub struct MeasureError<E> {
     pub timed: bool,
     pub error: Error<E>,
-    pub path: Path,
+    pub path: PathCounts,
 }
 
 #[derive(Debug)]
@@ -90,6 +173,7 @@ pub enum Step<T, E> {
 pub enum Kind<E> {
     Endpoint(E),
     Deadline,
+    CountOverflow,
     InvalidRange,
     InvalidResponse(u64),
 }
@@ -103,18 +187,18 @@ pub struct Error<E> {
 pub trait Endpoint {
     type Error;
 
-    fn stage(&mut self, operation: u64, payload: Vec<u8>) -> Result<(), Self::Error>;
-    fn try_send(&mut self, path: &mut Path) -> Result<Step<(), Self::Error>, Self::Error>;
+    fn stage(&mut self, operation: u64, payload: &[u8]) -> Result<(), Self::Error>;
+    fn try_send(&mut self, path: &mut PathCounts) -> Result<Step<(), Self::Error>, Self::Error>;
     fn try_recv(
         &mut self,
-        path: &mut Path,
+        path: &mut PathCounts,
         expected: Expected,
     ) -> Result<Step<bool, Self::Error>, Self::Error>;
     fn wait(
         &mut self,
         interest: Interest,
         deadline: Deadline,
-        path: &mut Path,
+        path: &mut PathCounts,
     ) -> Result<(), Self::Error>;
     fn abort(&mut self) -> Result<(), Self::Error>;
 }
@@ -124,11 +208,13 @@ fn abort<E: Endpoint>(endpoint: &mut E, kind: Kind<E::Error>, counts: Counts) ->
     Error { kind, counts }
 }
 
-pub fn transfer<E: Endpoint>(
+fn transfer_inner<const COUNT: bool, E: Endpoint>(
     endpoint: &mut E,
     work: Work,
+    payload: &[u8],
+    expected_digest: u64,
     deadline: Deadline,
-    path: &mut Path,
+    path: &mut PathCounts,
 ) -> Result<Counts, Error<E::Error>> {
     if work.window == 0
         || work
@@ -151,7 +237,7 @@ pub fn transfer<E: Endpoint>(
             if !staged {
                 let operation = work.start + counts.accepted;
                 endpoint
-                    .stage(operation, payload(work.seed, operation, work.payload))
+                    .stage(operation, payload)
                     .map_err(|error| abort(endpoint, Kind::Endpoint(error), counts))?;
                 staged = true;
             }
@@ -176,7 +262,7 @@ pub fn transfer<E: Endpoint>(
                     Expected {
                         operation: expected,
                         payload_len: work.payload,
-                        seed: work.seed,
+                        digest: expected_digest,
                     },
                 )
                 .map_err(|error| abort(endpoint, Kind::Endpoint(error), counts))?;
@@ -202,7 +288,52 @@ pub fn transfer<E: Endpoint>(
             )
             .map_err(|error| abort(endpoint, Kind::Endpoint(error), counts))?;
     }
+    if COUNT {
+        let send_pending = path
+            .send_full
+            .checked_add(path.send_busy)
+            .and_then(|pending| counts.accepted.checked_add(pending));
+        let recv_pending = path
+            .recv_empty
+            .checked_add(path.recv_busy)
+            .and_then(|pending| counts.completed.checked_add(pending));
+        let (Some(send_attempts), Some(recv_attempts)) = (send_pending, recv_pending) else {
+            return Err(abort(endpoint, Kind::CountOverflow, counts));
+        };
+        path.send_attempts = send_attempts;
+        path.recv_attempts = recv_attempts;
+    }
     Ok(counts)
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The executable uses measure; isolated tests exercise transfer directly.
+pub fn transfer<E: Endpoint>(
+    endpoint: &mut E,
+    work: Work,
+    deadline: Deadline,
+    path: &mut PathCounts,
+) -> Result<Counts, Error<E::Error>> {
+    let payload = payload(work.seed, 0, work.payload);
+    transfer_inner::<true, _>(endpoint, work, &payload, digest(&payload), deadline, path)
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Used by the separate optimized overhead gate, not the benchmark binary.
+pub fn transfer_control<E: Endpoint>(
+    endpoint: &mut E,
+    work: Work,
+    deadline: Deadline,
+) -> Result<Counts, Error<E::Error>> {
+    let payload = payload(work.seed, 0, work.payload);
+    transfer_inner::<false, _>(
+        endpoint,
+        work,
+        &payload,
+        digest(&payload),
+        deadline,
+        &mut PathCounts::default(),
+    )
 }
 
 pub fn measure<E: Endpoint>(
@@ -212,19 +343,23 @@ pub fn measure<E: Endpoint>(
     began: Instant,
     deadline: Deadline,
 ) -> Result<Measured, MeasureError<E::Error>> {
-    let mut path = Path::default();
-    let setup = transfer(
+    let payload = payload(work.seed, 0, work.payload);
+    let expected_digest = digest(&payload);
+    let mut path = PathCounts::default();
+    let setup = transfer_inner::<true, _>(
         endpoint,
         Work {
             start: work.count,
             count: warmup,
             ..work
         },
+        &payload,
+        expected_digest,
         deadline,
         &mut path,
     )
     .and_then(|_| {
-        transfer(
+        transfer_inner::<true, _>(
             endpoint,
             Work {
                 start: u64::MAX,
@@ -233,6 +368,8 @@ pub fn measure<E: Endpoint>(
                 payload: 0,
                 seed: work.seed,
             },
+            &[],
+            0,
             deadline,
             &mut path,
         )
@@ -245,9 +382,16 @@ pub fn measure<E: Endpoint>(
         });
     }
     let setup_ns = began.elapsed().as_nanos().max(1) as u64;
-    path = Path::default();
+    path = PathCounts::default();
     let started = Instant::now();
-    match transfer(endpoint, work, deadline, &mut path) {
+    match transfer_inner::<true, _>(
+        endpoint,
+        work,
+        &payload,
+        expected_digest,
+        deadline,
+        &mut path,
+    ) {
         Ok(counts) => Ok(Measured {
             counts,
             path,
