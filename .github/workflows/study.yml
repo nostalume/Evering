@@ -1,0 +1,48 @@
+name: IPC study
+
+on:
+  pull_request:
+    paths: ["benches/**", "Cargo.toml", "Cargo.lock"]
+  workflow_dispatch:
+    inputs:
+      family:
+        description: Registered study family
+        required: true
+        default: core-ipc
+
+permissions:
+  contents: read
+
+concurrency:
+  group: study-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  model:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-19
+      - run: cargo test --features benchmark --test ipc-study
+
+  smoke:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-05-19
+      - run: mkdir -p artifacts
+      - run: cargo bench --bench ipc --features benchmark -- smoke "${{ inputs.family }}" "artifacts/${{ inputs.family }}.jsonl"
+      - run: cargo bench --bench ipc --features benchmark -- analyze "artifacts/${{ inputs.family }}.jsonl" > "artifacts/${{ inputs.family }}.md"
+      - run: cargo bench --bench ipc --features benchmark,plot -- plot artifacts/plots "artifacts/${{ inputs.family }}.jsonl"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ipc-study-${{ inputs.family }}
+          path: artifacts/
+          retention-days: 14
