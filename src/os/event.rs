@@ -106,3 +106,33 @@ impl AsHandle for Ring {
         unsafe { BorrowedHandle::borrow_raw(self.as_raw_handle()) }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Event, event};
+    use crate::notify::Notify;
+
+    use windows_sys::Win32::{Foundation::WAIT_OBJECT_0, System::Threading::WaitForSingleObject};
+
+    /// Asks the kernel whether the event is set without taking anything: a wait with no
+    /// timeout reports the state and leaves it. `Event::clear` cannot report this because
+    /// the wake-set clause needs an already-reset event to succeed.
+    fn signaled(event: &Event) -> bool {
+        unsafe { WaitForSingleObject(event.handle(), 0) == WAIT_OBJECT_0 }
+    }
+
+    #[test]
+    fn one_clear_consumes_every_pending_kick() {
+        let (ring, event) = event().unwrap();
+        assert!(!signaled(&event), "a fresh latch holds nothing");
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        assert!(signaled(&event), "three kicks are one bit, not a count");
+        event.clear().unwrap();
+        assert!(
+            !signaled(&event),
+            "one clear must reset the latch every waiter shares"
+        );
+    }
+}

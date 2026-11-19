@@ -109,13 +109,18 @@ impl Status {
 
 /// A process-shared layout body with an independently recorded schema and information value.
 ///
+/// `Self` and `Info` are `Sync` because an admitted record is reachable as `&L` from every thread
+/// that holds the mapping, not only from the thread that admitted it. A layout with interior
+/// mutability must therefore state its own synchronization rule by implementing `Sync`; without the
+/// bound, that rule would be a comment on the mapping type while the mutable access came from here.
+///
 /// # Safety
 ///
 /// Implementors must give the declared schema a stable shared representation.
 /// `init` must fully initialize `destination` without first reading it.
-pub unsafe trait Layout: SharedSchema + Sized {
+pub unsafe trait Layout: SharedSchema + Sized + Sync {
     type Config: Copy;
-    type Info: LayoutInfo;
+    type Info: LayoutInfo + Sync;
 
     const MAGIC: Magic;
 
@@ -219,6 +224,13 @@ pub struct RecoveryContext<'a, L: Layout> {
 type RecoverFn =
     unsafe fn(&crate::dir::MapDirectory, crate::dir::Id<()>, RecordedLayout, u8, u8) -> bool;
 
+/// One layout's standing to settle a dead participant's member of that layout.
+///
+/// A reap matches a handler to a member by the [`SchemaKey`] and [`AbiProfile`] the member's own
+/// header recorded, never by what the caller expects to find there. A handler that does not match is
+/// not run, a member no handler matches stops the reap, and a member two handlers match stops it
+/// too. Build one with [`RecoveryHandler::of`], or for a channel's payload with
+/// [`crate::layout::recovery_handler`].
 #[derive(Clone, Copy)]
 pub struct RecoveryHandler {
     pub(crate) schema: SchemaKey,
@@ -227,6 +239,7 @@ pub struct RecoveryHandler {
 }
 
 impl RecoveryHandler {
+    /// A handler for `L` as this build's ABI profile implements it.
     pub const fn of<L: Layout>() -> Self {
         Self {
             schema: L::SCHEMA,
@@ -312,7 +325,7 @@ impl<T: Layout + core::fmt::Debug> core::fmt::Debug for RcHeader<T> {
     }
 }
 
-impl<T: Layout> const Deref for RcHeader<T> {
+const impl<T: Layout> Deref for RcHeader<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -563,6 +576,9 @@ impl<T: Layout> RcHeader<T> {
         let info = match unsafe { Self::inspect_at(pointer, ctx) } {
             Ok(info) => info,
             Err(AdmitError::Mismatch(field)) => return Some(field),
+            // A closed, contended, already-attached or structurally unreadable header: nothing below
+            // is reachable until the state word makes sense, so `State` is the truest name left and
+            // the arm stays one because a caller's answer to all four is the same refusal.
             Err(_) => return Some(LayoutField::State),
         };
         let Some(layout) = T::storage(conf) else {

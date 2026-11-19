@@ -1,4 +1,5 @@
 mod analysis;
+mod boundary;
 mod drive;
 mod environment;
 mod evering;
@@ -85,6 +86,8 @@ fn execute(
         phase_ns: counts.phase_ns,
         observed: counts.observed.ok_or("runner omitted observed resources")?,
         path: counts.path,
+        boundary: counts.boundary,
+        worker: counts.worker,
     })
 }
 
@@ -323,19 +326,22 @@ fn dispatch() -> Result<(), String> {
         return Ok(());
     }
     match args.as_slice() {
-        [command, address, environment] if command == "worker-stream" => {
-            stream::worker(address, environment)
+        [command, address, environment, trailer] if command == "worker-stream" => {
+            stream::worker(address, environment, trailer)
         }
         #[cfg(all(unix, feature = "local-socket"))]
-        [command, path, environment] if command == "worker-local" => {
-            local::worker(path, environment)
+        [command, path, environment, trailer] if command == "worker-local" => {
+            local::worker(path, environment, trailer)
         }
-        [command, address, policy, timeout, environment] if command == "worker-evering" => {
+        [command, address, policy, timeout, environment, trailer]
+            if command == "worker-evering" =>
+        {
             evering::worker(
                 address,
                 policy,
                 Duration::from_millis(number(timeout, "timeout")?),
                 environment,
+                trailer,
             )
         }
         [command, path] if command == "validate" => {

@@ -128,6 +128,7 @@ fn send_bounded<T>(
             Err(TrySendError::Disconnected(_returned)) => {
                 panic!("peer disconnected while sending")
             }
+            Err(TrySendError::Authority) => panic!("block lost its Pool authority"),
         }
         assert!(Instant::now() < deadline, "queue remained full");
         thread::yield_now();

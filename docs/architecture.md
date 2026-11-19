@@ -50,7 +50,8 @@ validated metadata; it never serves as transferable ownership evidence.
 | Transfer allocation | Pool lifecycle word | Reserve, detach, adopt, release, or reclaim one generation of one slot |
 | Transport position | Queue sequence and cursors | Publish, claim, cancel, recycle, and establish terminal drain |
 | Channel direction | Admitted role generation | Derive the only legal transmit and receive sides |
-| Progress advice | Borrowed local Signals | Notify after commit or wait before retrying authoritative shared state |
+| Progress advice | Borrowed local Signals | Notify after commit, withhold one notification per batch of commits, or wait before retrying authoritative shared state |
+| Retry patience | A policy the retrying caller holds | Spend local spins, wait for the peer, or stop the operation |
 | Process death | Exact supervisor or platform evidence | Authorize recovery only for the named participant generation |
 
 The principal data flow is mapping admission, layout admission, Pool
@@ -153,11 +154,44 @@ operations but cannot wait; the type system prevents an async claim without a
 real wait source.
 
 Publication, recycling, and close update shared truth before notifying the
-peer. Notification failure therefore cannot revoke committed work or return
+peer, unless a batch withholds that notification. `Signals::defer` hands out one
+guard, every batched publish or recycle must hold it mutably, and it delivers
+the withheld notification when the batch asks or, if the batch never asks, when
+the guard leaves scope. A withheld notification therefore has a deadline, and a
+batch that committed nothing rings nothing. Close is deliberately not
+batchable: a peer parked on a terminal state must be told before the batch ends.
+Notification failure therefore cannot revoke committed work or return
 moved input. A committed result exposes its value separately from notification
 health. Waiting registers process-local interest, observes and consumes sticky
 readiness, then immediately retries shared truth. Wakers, callbacks, reference
 counts, and native handles never enter the shared protocol.
+
+A latch is defined by what it must guarantee, not by its primitive. Every
+adapter is sticky, may coalesce without counting, and consumes nothing when a
+wait is cancelled. It promises nothing about how many waiters one notification
+releases or about which change caused it, and the model survives both answers
+because one primitive is paired with one condition — one ring, one direction —
+so a wake that releases only its head waiter, as a kernel notification does,
+still leads to re-examined shared truth. Whether a latch is empty after a park is
+not observable through a wait, so an adapter's further properties are proved
+against the primitive itself in its own module. An extension that reports a cause
+would be admissible only where a provider can both carry it and be checked
+carrying it, and only to skip work a re-examination could have found. The clauses
+a new provider is checked against are recorded in `tests/latch_conformance.rs`.
+
+How long that retry continues is a policy the caller holds, not a constant in
+the queue. Each failed attempt reports its reason, local contention or a
+peer-bound condition, and the policy answers with a spin, a wait, or a stop.
+The library's ladder bounds the local spins of one operation and then waits on
+the peer's readiness, restoring that bound after a wait. Keeping the two
+reasons apart is what makes a policy safe to inject: waiting for the peer on
+local contention can sleep through the progress that would have resolved it.
+A policy that always waits instead runs one operation to commit, and an agent
+holding both sides of a duplex channel stops reading while it does that. If the
+peer is written the same way, each waits on the ring the other would free by
+reading, and nothing inside either loop can notice, so an agent with both roles
+bounds its budget or attempts a read between publishes.
+`tests/duplex_patience.rs` demonstrates both shapes against one geometry.
 
 Native latches may coalesce signals or wake spuriously. Concurrent waiters are
 allowed, cancellation unregisters only local interest, and a later notification

@@ -41,6 +41,9 @@ impl Request {
 
 /// Produces one exclusively owned process-local mapping.
 ///
+/// The `os` adapters report `io::Error` for every platform's mapping failure, so
+/// `SessionError<S::Error>` stays one type across them.
+///
 /// # Safety
 ///
 /// An implementation must return a valid, suitably aligned mapping with the
@@ -290,8 +293,11 @@ pub(crate) struct Region {
     detached: bool,
 }
 
-// Region exposes only atomic root operations; typed projections independently
-// require `T: Sync`. Drop has unique ownership, and Map admission requires its
+// Safety: Region exposes only atomic root operations to a shared holder, and its typed projections
+// require `T: Sync`. `reserve` is the one method that hands out a mutable raw pointer from `&self`,
+// and sharing it is sound because a pointer from it is worthless until `commit` wins the layout's
+// admission CAS — the permission bits only say the mapping may be written, and that CAS is what
+// says this participant may write it. Drop has unique ownership, and Map admission requires its
 // release function to be callable from any owning thread.
 unsafe impl Send for Region {}
 unsafe impl Sync for Region {}
@@ -596,8 +602,10 @@ pub(crate) struct Mapped<T: AdmitLayout> {
     ptr: NonNull<T>,
     attached: bool,
 }
-// Safety: Region erasure admits only cache-coherent process-shared mappings;
-// the projected layout controls whether immutable cross-thread access is safe.
+// Safety: Region erasure admits only cache-coherent process-shared mappings, and the projected
+// layout is what makes cross-thread access sound: `Mapped<T>` itself is Sync only for `T: Sync`,
+// and the only other way this type reaches memory — `ref_at` — is bounded the same way, so a
+// projection cannot hand out a shared reference to a type the promise was never made about.
 unsafe impl<T: AdmitLayout + Sync> Send for Mapped<T> {}
 unsafe impl<T: AdmitLayout + Sync> Sync for Mapped<T> {}
 
@@ -618,7 +626,7 @@ impl<T: AdmitLayout> Drop for Mapped<T> {
     }
 }
 
-impl<T: AdmitLayout> const Deref for Mapped<T> {
+const impl<T: AdmitLayout> Deref for Mapped<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {
@@ -669,7 +677,12 @@ impl<T: AdmitLayout> Mapped<T> {
             .ok_or(ProjectionError::OutOfBounds)
     }
 
-    pub(crate) unsafe fn ref_at<U>(&self, offset: usize) -> Result<&U, ProjectionError> {
+    /// Projects `U` at `offset` inside this mapping.
+    ///
+    /// `U: Sync` is part of the contract, not a convenience: it is `Mapped<T>: Sync` that lets two
+    /// threads hold this value at once, and a projection hands out `&U` for a type the compiler never
+    /// saw, so a `U` with interior mutability would be shared through a promise made about `T`.
+    pub(crate) unsafe fn ref_at<U: Sync>(&self, offset: usize) -> Result<&U, ProjectionError> {
         let end = offset
             .checked_add(core::mem::size_of::<U>())
             .ok_or(ProjectionError::ArithmeticOverflow)?;

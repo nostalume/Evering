@@ -1,80 +1,170 @@
 use std::{
-    io,
-    os::fd::AsFd,
-    sync::atomic::{AtomicU64, Ordering},
+    env, io,
+    os::fd::{AsFd, AsRawFd, RawFd},
+    os::unix::process::CommandExt,
+    process::Command,
     time::Instant,
 };
 
+use nix::unistd::{getppid, getuid};
+
 use crate::{
     os::{
-        Event, ReceivedResources, Ring,
+        Event, Peer, ReceivedResources, Ring,
         unix::{UnixFd, process::Socket},
     },
-    process::{Bootstrap, Supervisor},
+    process::{Bootstrap, RENDEZVOUS, Supervisor},
 };
-
-static NEXT: AtomicU64 = AtomicU64::new(0);
 
 pub type Shared = UnixFd<std::os::fd::OwnedFd>;
 
+/// The descriptor number a granted rendezvous is installed at in the process it is granted to.
+/// Three keeps it clear of the standard handles, which are the only descriptors `Command` itself
+/// redirects, and the number is announced through the environment because the number is not the
+/// authority: the descriptor behind it is.
+const INHERITED: RawFd = 3;
+
+/// Creates the shared object a peer receives as a descriptor.
+///
+/// `name` labels the object for the host's own inspection, and `access` is not applied
+/// here: a memfd carries no per-object permission, so every side gets its protection at
+/// map time, where `Access` becomes the mapping's `ProtFlags`. A caller asking for access
+/// at creation therefore gets an object that is not yet restricted, and the restriction
+/// arrives with each mapping instead.
 pub fn shared(name: &str, size: usize, _access: crate::mapping::Access) -> io::Result<Shared> {
     UnixFd::memfd(name, size, false).map_err(io::Error::from)
 }
 
 pub struct Handoff {
-    address: String,
+    socket: Socket,
+}
+
+/// The capability to admit exactly one process to one meeting.
+///
+/// There is nothing here to read, copy, or hand over a command line: the rendezvous is a pair of
+/// connected descriptors, and admitting a process means giving it one of them at `exec`. A name
+/// that can be looked up can be claimed by whoever looks it up first; a descriptor that has to be
+/// inherited cannot, which is why `Grant` replaced the address string.
+pub struct Grant {
+    socket: Socket,
 }
 
 impl Handoff {
-    pub fn bind() -> io::Result<Self> {
-        let serial = NEXT.fetch_add(1, Ordering::Relaxed);
-        let path =
-            std::env::temp_dir().join(format!("evering-{}-{serial}.sock", std::process::id()));
-        let address = path
-            .into_os_string()
-            .into_string()
-            .map_err(|_| io::ErrorKind::InvalidData)?;
-        let _ = std::fs::remove_file(&address);
-        Ok(Self { address })
+    /// Creates one meeting and the single-use grant that admits a participant to it.
+    pub fn bind() -> io::Result<(Self, Grant)> {
+        let (here, there) = Socket::pair()?;
+        Ok((Self { socket: here }, Grant { socket: there }))
     }
 
-    pub fn address(&self) -> &str {
-        &self.address
-    }
-
+    /// Moves the region, the doorbell and the ring to the process the grant was admitted to.
+    ///
+    /// `child` and `deadline` carry no weight on this platform, and the reason is worth stating:
+    /// the rendezvous is already connected when `bind` returns, so there is nothing to wait for and
+    /// no peer identity the kernel will report here that is not this process's own — a socketpair
+    /// reports its creator at both ends. What binds the handover to `child` is that only a process
+    /// `child` was `exec`d from can hold the granted descriptor, and the receiver attests on the
+    /// other side of it. Windows, where the parent listens, checks `child` and needs `deadline`.
     pub fn send<F: AsFd>(
         self,
         _child: &Supervisor,
-        deadline: Instant,
+        _deadline: Instant,
         bootstrap: &Bootstrap,
         mapping: &UnixFd<F>,
         event: &Event,
         ring: &Ring,
     ) -> io::Result<()> {
-        let socket = loop {
-            match Socket::connect(&self.address) {
-                Ok(socket) => break socket,
-                Err(_) if Instant::now() < deadline => std::thread::yield_now(),
-                Err(error) => return Err(error),
-            }
-        };
-        socket.send(bootstrap, &[mapping.as_fd(), event.as_fd(), ring.as_fd()])
+        self.socket
+            .send(bootstrap, &[mapping.as_fd(), event.as_fd(), ring.as_fd()])
     }
 
-    pub fn receive(address: &str) -> io::Result<ReceivedResources> {
-        let (bootstrap, resources) = Socket::bind(address)?.recv(3)?.into_parts();
+    /// Takes the handover this process was granted, and attests the peer before anything is read.
+    ///
+    /// The order is the whole point of the call: on a connected pair the kernel's answer is available
+    /// as soon as the descriptor is, so a process that merely announces a number, or owns a socket it
+    /// made itself, is refused without ever blocking on a message it was never sent — and without any
+    /// descriptor being installed in its table first.
+    pub fn receive() -> io::Result<(Peer, ReceivedResources)> {
+        let socket = granted_socket()?;
+        let peer = attested(&socket)?;
+        let (bootstrap, resources) = socket.recv(3)?.into_parts();
+        drop(socket);
         let mut resources = resources.into_vec();
-        Ok(ReceivedResources {
-            bootstrap,
-            mapping: UnixFd::from_fd(resources.remove(0)).map_err(io::Error::from)?,
-            event: Event::from_owned_fd(resources.remove(0)),
-            ring: Ring::from_owned_fd(resources.remove(0)),
-        })
+        Ok((
+            peer,
+            ReceivedResources {
+                bootstrap,
+                mapping: UnixFd::from_fd(resources.remove(0)).map_err(io::Error::from)?,
+                event: Event::from_owned_fd(resources.remove(0)),
+                ring: Ring::from_owned_fd(resources.remove(0)),
+            },
+        ))
     }
 }
 
-impl Drop for Handoff {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.address);
+impl Grant {
+    /// Installs this rendezvous in `command`, so that the process it spawns holds the granted end.
+    ///
+    /// Consuming `self` is what makes the grant single-use: after this call the sender has no way to
+    /// point a second child at the same meeting, and no name left for anyone else to claim first.
+    pub fn admit(self, command: &mut Command) -> io::Result<()> {
+        command.env(RENDEZVOUS, INHERITED.to_string());
+        let granted = self.socket;
+        // SAFETY: the hook runs between fork and exec in the child, and calls only `dup2`, which is
+        // async-signal-safe. `granted` is moved into it so the descriptor stays open until the
+        // command is spawned, and is closed with the command if it never is.
+        unsafe {
+            command.pre_exec(move || {
+                let here = granted.as_fd().as_raw_fd();
+                if nix::libc::dup2(here, INHERITED) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        Ok(())
     }
+}
+
+fn refused(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, reason)
+}
+
+/// Adopts the descriptor the grant installed, if the claim in the environment checks out.
+fn granted_socket() -> io::Result<Socket> {
+    let announced = env::var(RENDEZVOUS)
+        .map_err(|_| refused("no evering rendezvous was granted to this process"))?;
+    let raw: RawFd = announced
+        .parse()
+        .map_err(|_| refused("the announced rendezvous is not a descriptor number"))?;
+    if raw < 0 {
+        return Err(refused(
+            "the announced rendezvous is not a descriptor number",
+        ));
+    }
+    // SAFETY: the number is a claim from the environment, not a descriptor this module owns, so it
+    // is classified through a borrow and taken over only once it is known to be a rendezvous.
+    unsafe { Socket::granted(raw) }
+}
+
+/// The kernel's own answer about the peer, checked against this process's parent.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn attested(socket: &Socket) -> io::Result<Peer> {
+    let credentials = socket.peer_credentials()?;
+    let parent = getppid().as_raw();
+    if credentials.pid() != parent || credentials.uid() != getuid().as_raw() {
+        return Err(refused(
+            "the peer behind the granted rendezvous is not this process's parent",
+        ));
+    }
+    Ok(Peer::introduced(credentials.pid() as u32))
+}
+
+/// No other unix variant is refused for lack of a mechanism name, but for lack of one that has been
+/// written and run here: an unattested handover completes nowhere unless a policy says so out loud,
+/// which is card 3.4's `Agreement` clause and is not implemented by this file.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn attested(_socket: &Socket) -> io::Result<Peer> {
+    Err(refused(
+        "this platform has no peer attestation implemented, and an unattested handover is refused",
+    ))
 }

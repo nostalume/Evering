@@ -5,6 +5,7 @@ pub use nix::{
     unistd,
 };
 use std::{
+    io,
     os::fd::{AsFd, BorrowedFd, OwnedFd},
     path::{Path, PathBuf},
 };
@@ -145,7 +146,7 @@ impl<F: AsFd> UnixFd<F> {
     }
 }
 
-impl const From<Access> for ProtFlags {
+const impl From<Access> for ProtFlags {
     fn from(value: Access) -> Self {
         let mut prot = ProtFlags::empty();
         if value.contains(Access::READ) {
@@ -187,16 +188,10 @@ impl<F: AsFd> FdMap<F> {
         self.flags = flags;
         self
     }
-}
 
-unsafe fn release(start: NonNull<u8>, len: usize) -> bool {
-    unsafe { nix::sys::mman::munmap(start.cast(), len) }.is_ok()
-}
-
-unsafe impl<F: AsFd> Source for FdMap<F> {
-    type Error = nix::Error;
-
-    fn map(self, request: Request) -> Result<Map, Self::Error> {
+    /// Maps in the backend's own error type, so the `Source` boundary converts
+    /// once instead of every syscall site.
+    fn mapping(self, request: Request) -> Result<Map, nix::Error> {
         use core::num::NonZeroUsize;
         use nix::sys::mman;
 
@@ -218,8 +213,20 @@ unsafe impl<F: AsFd> Source for FdMap<F> {
     }
 }
 
+unsafe fn release(start: NonNull<u8>, len: usize) -> bool {
+    unsafe { nix::sys::mman::munmap(start.cast(), len) }.is_ok()
+}
+
+unsafe impl<F: AsFd> Source for FdMap<F> {
+    type Error = io::Error;
+
+    fn map(self, request: Request) -> Result<Map, Self::Error> {
+        self.mapping(request).map_err(io::Error::from)
+    }
+}
+
 unsafe impl<F: AsFd> Source for UnixFd<F> {
-    type Error = nix::Error;
+    type Error = io::Error;
 
     fn map(self, request: Request) -> Result<Map, Self::Error> {
         self.mapping().map(request)
@@ -244,7 +251,7 @@ mod tests {
             size: usize,
             access: Access,
             fd: UnixFd<std::os::fd::OwnedFd>,
-        ) -> nix::Result<Map> {
+        ) -> std::io::Result<Map> {
             fd.map(Request::new(size, access))
         }
     }

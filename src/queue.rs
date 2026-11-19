@@ -122,7 +122,11 @@ impl<'a, T> Reserved<'a, T> {
     fn reserved_owner(&self) -> u8 {
         let source = (self.slot.control.load(Ordering::Relaxed) & SOURCE_MASK) >> SOURCE_SHIFT;
         debug_assert_ne!(source, 0);
-        (source - 1) as u8
+        // A zero source field means our reservation was overwritten, which no correct peer
+        // does. `wrapping_sub` stores the byte a release build already stored, where overflow
+        // checks are off, so the peer reads a non-canonical word and rejects it rather than
+        // this process aborting on someone else's write.
+        (source.wrapping_sub(1)) as u8
     }
 
     fn skip(&mut self) {
@@ -529,6 +533,9 @@ pub enum TrySendError<T> {
     /// Local retry may progress without receiver action.
     Busy(T),
     Disconnected(T),
+    /// A Pool-backed transfer lost its block authority before publication. Nothing was sent, and
+    /// the value cannot be returned because its block now belongs to another participant.
+    Authority,
 }
 
 #[derive(Debug)]
@@ -772,6 +779,9 @@ mod ownership_tests {
                                 assert_eq!(returned, value);
                                 rejected.fetch_add(1, Ordering::Relaxed);
                                 break;
+                            }
+                            Err(TrySendError::Authority) => {
+                                unreachable!("a queue of values carries no Pool authority")
                             }
                         }
                     }

@@ -7,16 +7,20 @@ use std::{process::Command, time::Instant};
 use evering::process::Supervisor;
 
 use super::{
+    boundary,
     drive::Deadline,
     environment,
     model::{Cell, Status},
     stream::{self, Counts, RunError},
 };
 
-pub fn worker(path: &str, expected_environment: &str) -> Result<(), String> {
+pub fn worker(path: &str, expected_environment: &str, trailer: &str) -> Result<(), String> {
     environment::admit(expected_environment)?;
-    stream::serve(UnixStream::connect(path).map_err(|error| error.to_string())?)
-        .map_err(|error| error.to_string())
+    stream::serve(
+        UnixStream::connect(path).map_err(|error| error.to_string())?,
+        trailer,
+    )
+    .map_err(|error| error.to_string())
 }
 
 pub fn run(
@@ -39,11 +43,19 @@ pub fn run(
     }
     let listener = stream::setup(UnixListener::bind(&endpoint))?;
     let executable = stream::setup(std::env::current_exe())?;
+    let trailer = stream::setup(boundary::Trailer::claim())?;
     let path = endpoint
         .to_str()
         .ok_or_else(|| stream::fail(Status::SetupError, "non-UTF-8 endpoint", None))?;
     let mut command = Command::new(executable);
-    command.args(["worker-local", path, environment]);
+    command.args([
+        "worker-local",
+        path,
+        environment,
+        trailer
+            .as_ref()
+            .map_or(boundary::ABSENT, |trailer| trailer.argument()),
+    ]);
     let mut child = stream::setup(Supervisor::spawn(&mut command))?;
     stream::setup(listener.set_nonblocking(true))?;
     let socket = stream::accept(&mut child, deadline, || {
@@ -57,6 +69,6 @@ pub fn run(
         "unix-domain-stream",
     )?;
     stream::exchange::<tokio::net::UnixStream>(
-        socket, child, observed, work, warmup, began, deadline,
+        socket, child, observed, work, warmup, began, deadline, trailer,
     )
 }

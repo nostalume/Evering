@@ -292,11 +292,69 @@ fn corrupt_transfer_evidence_retains_the_dead_participant() {
     core::mem::forget(pool);
     core::mem::forget(second);
 
-    first.abandon_heap_for_test(dead.slot());
     let recovery = unsafe { first.assume_dead(dead) }.unwrap();
-    assert!(recovery.reap().is_err());
+    let handlers = [crate::layout::recovery_handler::<()>()];
+    assert!(
+        recovery.reap_with(&handlers).is_err(),
+        "a staged token whose Pool is unreachable is evidence, not a free slot"
+    );
     let replacement = peer_session(&mut pt);
     assert_ne!(replacement.peer().slot(), dead.slot());
+    core::mem::forget(channel);
+}
+
+/// A peer that judges a still-running participant dead reclaims the block it staged, and the
+/// publisher must report that loss instead of handing the peer a block it no longer owns.
+#[test]
+fn reclaimed_authority_reports_publish_failure_without_committing() {
+    let mut pt = [0; MAX_ADDR];
+    let issuer = mock_session(&mut pt, 0, MAX_ADDR);
+    let pool_id = transfer_pool(&issuer).id();
+    let (channel, port) = issuer.create_channel::<TestProtocol>(1).unwrap();
+    let sender = peer_session(&mut pt);
+    let pool = sender.open_pool(pool_id).unwrap();
+    let sender_channel = sender.adopt(port).unwrap();
+    let (send, _) = sender_channel.split();
+    let staged = send
+        .reserve()
+        .unwrap()
+        .stage(pool.as_ref().put(17_u64).unwrap().transfer(()));
+
+    let dead = sender.peer();
+    let recovery = unsafe { issuer.assume_dead(dead) }.unwrap();
+    let recovery = recovery.reap().expect_err(
+        "a region holding a channel member is not reapable without that member's handler",
+    );
+    let handlers = [crate::layout::recovery_handler::<TestProtocol>()];
+    assert!(
+        recovery.reap_with(&handlers).is_ok(),
+        "a well-formed staged token is repairable evidence, and a failed reap hands the authority \
+         back to try again with the handler"
+    );
+
+    assert!(
+        matches!(staged.publish(), Err(crate::channel::PublishError)),
+        "a reclaimed block must not publish"
+    );
+    let (_, recv) = channel.split();
+    let delivered = recv.claim();
+    // `Busy` belongs in this position: it reports a slot that needs a local retry, never a value.
+    assert!(
+        delivered.is_err(),
+        "a rolled-back slot must not deliver a value"
+    );
+    assert!(
+        matches!(recv.claim(), Err(crate::channel::ReceiveError::Empty)),
+        "the retry finds the slot empty, so nothing was published"
+    );
+    assert_eq!(
+        *pool.as_ref().put(23_u64).unwrap(),
+        23,
+        "the Pool keeps allocating after the abandoned block"
+    );
+    core::mem::forget(sender_channel);
+    core::mem::forget(pool);
+    core::mem::forget(sender);
     core::mem::forget(channel);
 }
 
@@ -353,6 +411,49 @@ fn pool_errors_keep_values_and_concurrent_claims_unique() {
     assert_eq!(*pool.put(101_u64).unwrap(), 101);
 }
 
+/// A free-list word naming a state nobody writes is damage, not capacity. Reported as
+/// `Unavailable` it becomes a shortage that never clears: the caller's only remedy, waiting for a
+/// release, cannot change the word.
+#[test]
+fn a_damaged_authority_word_is_not_reported_as_a_full_pool() {
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    let range = crate::BlockRange::new(64, 64).unwrap();
+    let pool = session.create_pool(32 * 1024, Some(range)).unwrap();
+    let total = pool.class(0).expect("one class").slots;
+    let pool = pool.as_ref();
+    pool.corrupt_authority_word_for_test(0, 0);
+
+    // The damaged slot is skipped and every other slot is still claimable, so the damage does not
+    // disable the free list; the refusal that ends the run is where the two answers separate.
+    let mut held = Vec::new();
+    loop {
+        match pool.put(1_u64) {
+            Ok(block) => held.push(block),
+            Err(error) => {
+                assert_eq!(
+                    error,
+                    crate::PoolReserveError::Corrupted(1),
+                    "an unusable slot is not a shortage, and waiting for a release cannot fix it"
+                );
+                break;
+            }
+        }
+    }
+    assert_eq!(
+        held.len(),
+        total - 1,
+        "the damaged slot was never handed out, and the rest of the Pool kept working"
+    );
+
+    drop(held.pop());
+    assert_eq!(
+        *pool.put(2_u64).unwrap(),
+        2,
+        "a claim with room ignores the damage, so it cannot be used to lock the Pool"
+    );
+}
+
 #[test]
 fn pool_geometry_is_queryable_aligned_and_nonoverlapping() {
     let mut pt = [0; MAX_ADDR];
@@ -370,14 +471,55 @@ fn pool_geometry_is_queryable_aligned_and_nonoverlapping() {
     }
     assert_eq!((range.min(), range.max()), (64, previous));
 
-    let pool = pool.as_ref();
-    let small = pool.copy(&[1_u8; 64]).unwrap();
-    let large = pool.copy(&[2_u8; 128]).unwrap();
+    let pool_ref = pool.as_ref();
+    let small = pool_ref.copy(&[1_u8; 64]).unwrap();
+    let large = pool_ref.copy(&[2_u8; 128]).unwrap();
     let small = small.as_ptr() as usize..small.as_ptr() as usize + small.len();
     let large = large.as_ptr() as usize..large.as_ptr() as usize + large.len();
     assert_eq!(small.start % 64, 0);
     assert_eq!(large.start % 128, 0);
     assert!(small.end <= large.start || large.end <= small.start);
+
+    // The two samples above are the geometry's own base alignment; every class has to carry its own
+    // size, because that is the alignment its payload area was extended to. A `[u8]` slice asks for one
+    // byte of alignment, so any alignment its block carries comes from the class layout, and a request
+    // exactly one block wide lands in that class and no larger one.
+    for index in 0.. {
+        let Some(class) = pool.class(index) else {
+            break;
+        };
+        let request = vec![0_u8; class.bytes];
+        let block = match pool_ref.copy(&request) {
+            Ok(block) => block,
+            Err(error) => panic!("{} bytes refused at class {index}: {error:?}", class.bytes),
+        };
+        assert_eq!(
+            block.as_ptr() as usize % class.bytes,
+            0,
+            "class {index} returned a block that is not {}-aligned",
+            class.bytes
+        );
+    }
+}
+
+#[test]
+fn an_empty_pool_request_is_answered_without_spending_a_slot() {
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    let pool = session.create_pool(64 * 1024, None).unwrap();
+    let reference = pool.as_ref();
+    let empty = reference.copy::<u64>(&[]).unwrap();
+    let address = empty.as_ptr() as usize;
+    assert_ne!(address, 0, "a zero-sized block may not be null");
+    assert_eq!(address % core::mem::align_of::<u64>(), 0);
+    assert!(empty.is_empty());
+    drop(empty);
+    // More empty requests than the smallest class has slots: one that spent a slot would run out.
+    let slots = pool.class(0).unwrap().slots;
+    for _ in 0..slots + 8 {
+        assert!(reference.copy::<u64>(&[]).is_ok());
+    }
+    assert_eq!(&*reference.copy::<u64>(&[7]).unwrap(), &[7]);
 }
 
 #[test]

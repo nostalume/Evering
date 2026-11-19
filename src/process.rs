@@ -8,6 +8,21 @@ pub const MAX_BOOTSTRAP: usize = 4096;
 pub const MAX_RESOURCES: usize = 8;
 pub(crate) const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 
+/// The one key by which a granted rendezvous is announced to the process it was granted to.
+///
+/// Its value names the rendezvous rather than locating it: on Linux the descriptor number the
+/// granting process installed before `exec`, on Windows the pipe instance the listener created.
+/// Knowledge of the value is not what authorises a handover — possession of the rendezvous is —
+/// so this key carries no secret and the value is safe to place in the child's environment.
+#[cfg(all(feature = "process", any(unix, windows)))]
+pub(crate) const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
+
+/// Windows only: the process id of the party that admitted the grant, which the receiver matches
+/// against the kernel's own answer for the pipe server. Linux needs no second key because the
+/// descriptor it was granted already reports its creator, and `getppid` is the check there.
+#[cfg(all(feature = "process", windows))]
+pub(crate) const INTRODUCER: &str = "EVERING_INTRODUCER";
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Bootstrap(Box<[u8]>);
 
@@ -44,6 +59,12 @@ impl AsRef<[u8]> for Bootstrap {
 #[test]
 fn handoff_version_is_frozen() {
     assert_eq!(HANDOFF_MAGIC, *b"EVR1");
+}
+
+#[cfg(all(test, feature = "process", any(unix, windows)))]
+#[test]
+fn a_granted_rendezvous_is_announced_by_one_frozen_key() {
+    assert_eq!(RENDEZVOUS, "EVERING_RENDEZVOUS");
 }
 
 /// Linear ownership of one exact child instance.

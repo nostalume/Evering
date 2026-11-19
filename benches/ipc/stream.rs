@@ -4,6 +4,7 @@ use std::{
     net::TcpStream,
 };
 
+use super::boundary::{self, Accounting};
 use super::drive::{self, Deadline, Interest, PathCounts};
 use super::environment;
 use super::model::Status;
@@ -28,6 +29,8 @@ pub struct Counts {
     pub elapsed_ns: u64,
     pub phase_ns: [u64; 3],
     pub path: PathCounts,
+    pub boundary: Option<Accounting>,
+    pub worker: Option<boundary::Witness>,
     #[cfg(feature = "process")]
     pub observed: Option<Observed>,
 }
@@ -54,8 +57,14 @@ pub(super) fn measured<E: std::fmt::Debug>(
     counts: &mut Counts,
     result: Result<drive::Measured, drive::MeasureError<E>>,
 ) -> Result<(), RunError> {
-    let (done, path, setup_ns, elapsed_ns) = match result {
-        Ok(done) => (done.counts, done.path, done.setup_ns, done.elapsed_ns),
+    let (done, path, setup_ns, elapsed_ns, cost) = match result {
+        Ok(done) => (
+            done.counts,
+            done.path,
+            done.setup_ns,
+            done.elapsed_ns,
+            done.boundary,
+        ),
         Err(error) => {
             counts.path = error.path;
             counts.accepted = error.error.counts.accepted;
@@ -76,6 +85,7 @@ pub(super) fn measured<E: std::fmt::Debug>(
     counts.completed = done.completed;
     counts.validated = done.validated;
     counts.path = path;
+    counts.boundary = cost;
     counts.phase_ns[0] = setup_ns;
     counts.elapsed_ns = elapsed_ns;
     counts.phase_ns[1] = counts.elapsed_ns;
@@ -376,7 +386,13 @@ impl<S: Socket> drive::Endpoint for Client<S> {
     }
 }
 
-pub fn serve(mut stream: impl Read + Write) -> io::Result<()> {
+/// The probe frame is the last thing setup sends before the coordinator opens
+/// its timed window, so the worker brackets itself from that frame to the
+/// shutdown it reads as end of file, and warmup stays outside the bracket.
+/// `boundary::ABSENT` as the trailer keeps a hand-run or in-process worker from
+/// writing accounting anywhere at all.
+pub fn serve(mut stream: impl Read + Write, trailer: &str) -> io::Result<()> {
+    let mut phase: Option<boundary::Phase> = None;
     while let Some((operation, request)) = read_frame(&mut stream)? {
         let digest = super::model::digest(&request).to_le_bytes();
         write_frame(
@@ -384,20 +400,30 @@ pub fn serve(mut stream: impl Read + Write) -> io::Result<()> {
             operation,
             if operation == u64::MAX { &[] } else { &digest },
         )?;
+        if operation == u64::MAX && phase.is_none() {
+            phase = boundary::Phase::begin(trailer);
+        }
+    }
+    if let Some(phase) = phase {
+        phase.record(trailer).map_err(io::Error::other)?;
     }
     Ok(())
 }
 
-pub fn worker(address: &str, expected_environment: &str) -> Result<(), String> {
+pub fn worker(address: &str, expected_environment: &str, trailer: &str) -> Result<(), String> {
     environment::admit(expected_environment)?;
     let stream = TcpStream::connect(address).map_err(|error| error.to_string())?;
     stream
         .set_nodelay(true)
         .map_err(|error| error.to_string())?;
-    serve(stream).map_err(|error| error.to_string())
+    serve(stream, trailer).map_err(|error| error.to_string())
 }
 
 #[cfg(feature = "process")]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "one run needs transport, child, expectation, window, and its accounting file"
+)]
 pub(super) fn exchange<S: Socket>(
     stream: S::Native,
     mut child: Supervisor,
@@ -406,6 +432,7 @@ pub(super) fn exchange<S: Socket>(
     warmup: u64,
     began: Instant,
     deadline: Deadline,
+    trailer: Option<boundary::Trailer>,
 ) -> Result<Counts, RunError> {
     let mut counts = Counts {
         observed: Some(observed),
@@ -427,6 +454,10 @@ pub(super) fn exchange<S: Socket>(
     if !exit {
         return Err(fail(Status::DrainError, "exit", Some(&counts)));
     }
+    // Reading the trailer is only sound once the writer has exited: a child
+    // killed at the deadline may have left the file empty, which is absence and
+    // must never be read as a worker that consumed no run time.
+    counts.worker = trailer.as_ref().and_then(|trailer| trailer.read());
     Ok(counts)
 }
 
@@ -475,8 +506,16 @@ pub fn run(
     let listener = setup(TcpListener::bind(("127.0.0.1", 0)))?;
     let address = setup(listener.local_addr())?;
     let executable = setup(std::env::current_exe())?;
+    let trailer = setup(boundary::Trailer::claim())?;
     let mut command = Command::new(executable);
-    command.args(["worker-stream", &address.to_string(), environment]);
+    command.args([
+        "worker-stream",
+        &address.to_string(),
+        environment,
+        trailer
+            .as_ref()
+            .map_or(boundary::ABSENT, |trailer| trailer.argument()),
+    ]);
     let mut child = setup(Supervisor::spawn(&mut command))?;
     setup(listener.set_nonblocking(true))?;
     let stream = accept(&mut child, deadline, || {
@@ -490,5 +529,7 @@ pub fn run(
         seed,
         "ipv4-loopback",
     )?;
-    exchange::<tokio::net::TcpStream>(stream, child, observed, work, warmup, began, deadline)
+    exchange::<tokio::net::TcpStream>(
+        stream, child, observed, work, warmup, began, deadline, trailer,
+    )
 }

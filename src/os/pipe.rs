@@ -78,8 +78,22 @@ impl AsFd for Ring {
 
 #[cfg(test)]
 mod tests {
-    use super::event;
+    use super::{Event, event};
     use crate::notify::Notify;
+
+    use std::io::{ErrorKind, Read};
+
+    /// Reads what the latch holds without the backend's tolerance for an empty one,
+    /// which the wake-set clause needs. A pipe shows its state by what it gives back:
+    /// bytes mean pending, `WouldBlock` means drained.
+    fn pending(event: &Event) -> bool {
+        let mut bytes = [0; 64];
+        match (&event.0).read(&mut bytes) {
+            Ok(_) => true,
+            Err(error) if error.kind() == ErrorKind::WouldBlock => false,
+            Err(error) => panic!("latch unreadable: {error}"),
+        }
+    }
 
     #[test]
     fn notification_is_sticky_and_coalesced() {
@@ -88,5 +102,19 @@ mod tests {
         ring.notify().unwrap();
         event.clear().unwrap();
         event.clear().unwrap();
+    }
+
+    #[test]
+    fn one_clear_consumes_every_pending_kick() {
+        let (ring, event) = event().unwrap();
+        assert!(!pending(&event), "a fresh latch holds nothing");
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        event.clear().unwrap();
+        assert!(
+            !pending(&event),
+            "one clear must drain every kick, not one byte of them"
+        );
     }
 }

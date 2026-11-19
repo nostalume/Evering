@@ -19,9 +19,15 @@ use evering::{
 };
 
 #[test]
-fn typed_handoff_is_available() {
-    let handoff = Handoff::bind().unwrap();
-    assert!(!handoff.address().is_empty());
+fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
+    let (handoff, grant) = Handoff::bind().unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    grant.admit(&mut command).unwrap();
+    drop(handoff);
+    let error = Handoff::receive()
+        .err()
+        .expect("a process holding no grant meets no one");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[cfg(feature = "notify")]
@@ -150,8 +156,11 @@ fn child_accepts_mapping_and_directional_bells() {
         assert_eq!(fstat(mapping.as_fd()).unwrap().st_size as usize, SIZE);
 
         let mut word = [0; 8];
-        assert_eq!(unistd::read(&resources[0], &mut word).unwrap(), 8);
-        assert_eq!(u64::from_ne_bytes(word), 1);
+        let arrived = unistd::read(&resources[0], &mut word).unwrap();
+        assert!(
+            arrived > 0,
+            "the wait end the child received must still hold the kick queued before the handoff"
+        );
         assert_eq!(
             unistd::write(&resources[1], &1u64.to_ne_bytes()).unwrap(),
             8

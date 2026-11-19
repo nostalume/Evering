@@ -1,7 +1,6 @@
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-#![cfg_attr(test, feature(allocator_api))]
 #![feature(const_trait_impl, const_convert, const_cmp)]
-#![feature(layout_for_ptr, slice_ptr_get, unsafe_cell_access)]
+#![feature(slice_ptr_get)]
 
 extern crate alloc;
 
@@ -51,8 +50,8 @@ mod token;
 /// ```
 pub use boxed::PBox;
 pub use channel::{
-    AdoptError, Channel, Id as ChannelId, Port, ReceiveError, Received, Rx, SendReserveError,
-    TransferReserved, TransferStaged, TrySendError, Tx,
+    AdoptError, Channel, Id as ChannelId, Port, PublishError, ReceiveError, Received, Rx,
+    SendReserveError, TransferReserved, TransferStaged, TrySendError, Tx,
 };
 pub use msg::Encoded;
 pub use pool::{
@@ -98,7 +97,7 @@ mod numeric {
 
     macro_rules! align {
         ($ty:ty) => {
-            impl const Alignable for $ty {
+            const impl Alignable for $ty {
                 #[inline(always)]
                 fn align_down(self, align: Self) -> Self {
                     debug_assert!(align.is_power_of_two());

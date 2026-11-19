@@ -108,10 +108,22 @@ pub enum PoolCreateError {
     Storage,
 }
 
+/// Why a Pool declined to hand out a block, with the value that could not be stored.
+///
+/// The arm says whether waiting would help. `Unavailable` is a capacity fact: every slot that could
+/// hold the request is claimed, so a release somewhere else can make the next attempt succeed.
+/// `BlockTooLarge` is a geometry fact, and only a smaller request changes the answer. `Corrupted`
+/// is neither of those: a slot's authority word names a state no participant writes, so no release
+/// changes it and the region needs adjudication before any Pool answer can be trusted.
 #[derive(Debug, PartialEq, Eq)]
 pub enum ReserveError<T> {
+    /// The request needs a block larger than the Pool's largest class.
     BlockTooLarge(T),
+    /// Every slot that could hold the request is claimed.
     Unavailable(T),
+    /// A slot's authority word is not one any participant could have written. Reported only when
+    /// nothing else was claimable, so one damaged word cannot hide a free slot behind it.
+    Corrupted(T),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -174,6 +186,9 @@ impl Geometry {
             min: MIN_BLOCK,
             max: DEFAULT_MAX,
         });
+        // Both bounds come from `BlockRange::new` or from the default below, and each has been rounded
+        // up to a power of two at or above `MIN_BLOCK` with `min <= max` required — that normalization
+        // is what keeps this subtraction and the one in `claim` from underflowing.
         let mut count = range.max.ilog2() - range.min.ilog2() + 1;
         loop {
             let minimum = 64usize
@@ -205,13 +220,32 @@ impl Geometry {
         }
     }
 
+    /// Lays out one class per power-of-two size, and refuses a geometry it cannot describe.
+    ///
+    /// `min` doubles as an alignment: `bytes` is both the block size of class `index` and the alignment
+    /// its payload area is extended to, which is what makes every block in that class `bytes`-aligned
+    /// once the allocation base is aligned to the largest class. So `min` must be a power of two, and
+    /// `Layout`'s own validation of the `align` argument was the only thing enforcing it; the check
+    /// below states it where the geometry consumes it. `min` arrives from a caller's `BlockRange` here
+    /// and from a peer-written `Info` through `recorded`, so a bad one is a typed refusal in both builds
+    /// rather than a debug assertion.
     fn build(min: usize, count: u32, base: usize) -> Result<Self, PoolCreateError> {
+        // Doubling `min` cannot survive more than one class per address bit, so a wider set is already
+        // inadmissible and the loop below would reject it. Refusing it here is what keeps a
+        // peer-written `Info.classes` count — which reaches this function through `recorded` — from
+        // sizing the reserve below before that loop ever runs.
+        if u64::from(count) > u64::from(usize::BITS) {
+            return Err(PoolCreateError::InvalidExtent);
+        }
         let mut layout = AllocLayout::new::<RcHeader<Storage>>();
         let mut classes = Vec::with_capacity(count as usize);
         for index in 0..count as usize {
             let bytes = min
                 .checked_shl(index as u32)
                 .ok_or(PoolCreateError::InvalidExtent)?;
+            if !bytes.is_power_of_two() {
+                return Err(PoolCreateError::InvalidExtent);
+            }
             let slots = base >> (index / 2);
             let controls = AllocLayout::array::<AtomicU32>(slots)
                 .map_err(|_| PoolCreateError::InvalidExtent)?;
@@ -460,6 +494,7 @@ impl<'p> PoolRef<'p> {
             Ok(vacant) => Ok(vacant.write(value)),
             Err(ReserveError::BlockTooLarge(())) => Err(ReserveError::BlockTooLarge(value)),
             Err(ReserveError::Unavailable(())) => Err(ReserveError::Unavailable(value)),
+            Err(ReserveError::Corrupted(())) => Err(ReserveError::Corrupted(value)),
         }
     }
 
@@ -517,10 +552,14 @@ impl<'p> PoolRef<'p> {
             return Err(ReserveError::BlockTooLarge(()));
         };
         let first = self.geometry.classes[0].bytes;
+        // The class index is a difference of logarithms, which is exact only because `build` requires
+        // every class size to be a power of two; the same requirement is what makes a class's blocks
+        // `bytes`-aligned.
         let preferred = needed.max(first).ilog2() - first.ilog2();
         if preferred as usize >= self.geometry.classes.len() {
             return Err(ReserveError::BlockTooLarge(()));
         }
+        let mut corrupted = false;
         for (index, class) in self
             .geometry
             .classes
@@ -533,12 +572,21 @@ impl<'p> PoolRef<'p> {
                 let slot = (start + probe) % class.slots;
                 let control = unsafe { &*class.control(self.base.as_ptr(), slot) };
                 let free = State(control.load(Ordering::Acquire));
+                if !free.canonical() {
+                    // Owner bits with the allocation bit clear: `State` has no constructor that
+                    // produces that word, so the slot is damaged rather than busy. Keep scanning,
+                    // because one damaged word must not retire a free list that still has room, and
+                    // remember it, because a capacity answer here sends the caller waiting for a
+                    // release that cannot change the word. Checked before the arithmetic below so a
+                    // damaged generation field cannot hide the damage.
+                    corrupted = true;
+                    continue;
+                }
                 let generation = free.generation().saturating_add(1);
                 let Some(local) = State::local(generation, self.owner.slot()) else {
                     continue;
                 };
-                if free.canonical()
-                    && !free.allocated()
+                if !free.allocated()
                     && free.generation() < MAX_GENERATION
                     && control
                         .compare_exchange(free.0, local.0, Ordering::AcqRel, Ordering::Acquire)
@@ -558,7 +606,23 @@ impl<'p> PoolRef<'p> {
                 }
             }
         }
+        if corrupted {
+            // A damaged word is not a shortage, and the difference is the whole point: a caller that
+            // hears `Unavailable` retries forever, and the region stays damaged either way.
+            return Err(ReserveError::Corrupted(()));
+        }
         Err(ReserveError::Unavailable(()))
+    }
+
+    /// Writes an authority word naming a state no participant writes into one slot of `class`.
+    /// Test-only: the control array's address is this module's layout knowledge, so a scribbled word
+    /// is otherwise unreachable from a test — a peer's stray write and a crash that lands between
+    /// the read and the CAS here both leave exactly this shape.
+    #[cfg(test)]
+    pub(crate) fn corrupt_authority_word_for_test(&self, class: usize, slot: usize) {
+        let class = self.geometry.classes[class];
+        let control = unsafe { &*class.control(self.base.as_ptr(), slot) };
+        control.store(State(1).0, Ordering::Relaxed);
     }
 
     fn release(self, class: usize, slot: usize, generation: u32) {
@@ -690,6 +754,14 @@ impl<'p> Allocation<'p> {
         self.live = false;
         Ok(())
     }
+
+    /// Gives up a block whose control word another participant restated.
+    ///
+    /// A failed `detach` proves the word is no longer ours to change, so the
+    /// release a `Drop` would attempt would act on a block someone else now owns.
+    pub(crate) fn abandon(&mut self) {
+        self.live = false;
+    }
 }
 
 impl Drop for Allocation<'_> {
@@ -768,7 +840,12 @@ impl<'p, T> Vacant<'p, [MaybeUninit<T>]> {
         unsafe { self.pointer.as_mut() }
     }
 
+    /// # Safety
+    /// Every one of the `len` elements behind the pointer must be initialized: the returned
+    /// `Block<[T]>` dereferences all of them. The block's size and alignment are `claim`'s business,
+    /// not this function's.
     unsafe fn assume_all_init(self) -> Block<'p, [T]> {
+        // `PoolRef::init` is the only caller, and its loop writes each element before reaching here.
         let len = self.pointer.len();
         let this = ManuallyDrop::new(self);
         Block {
@@ -918,6 +995,30 @@ pub(crate) fn release_token<H: Repr>(
             }
         })
         .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::{Geometry, PoolCreateError};
+
+    /// A peer writes the `Info` that `recorded` rebuilds a geometry from, so the class count is peer
+    /// input before it is arithmetic input. The loop in `build` rejects a shift that cannot be
+    /// represented, but it runs after the class vector has been sized from that same number, which is
+    /// why the refusal has to come first.
+    #[test]
+    fn an_oversized_class_count_is_refused_before_it_is_reserved() {
+        assert_eq!(
+            Geometry::build(64, u32::MAX, 64).err(),
+            Some(PoolCreateError::InvalidExtent)
+        );
+        assert_eq!(
+            Geometry::build(64, usize::BITS + 1, 64).err(),
+            Some(PoolCreateError::InvalidExtent)
+        );
+        // The bound itself stays admissible: nothing is rejected that the loop would have accepted.
+        assert!(Geometry::build(64, usize::BITS, 64).is_err());
+        assert!(Geometry::build(64, 3, 64).is_ok());
+    }
 }
 
 #[cfg(test)]

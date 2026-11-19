@@ -1,7 +1,7 @@
 use std::{
     io::{self, IoSlice, IoSliceMut},
     os::{
-        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd},
         unix::net::UnixDatagram,
     },
     path::Path,
@@ -10,8 +10,14 @@ use std::{
 use nix::{
     cmsg_space,
     fcntl::{FcntlArg, FdFlag, fcntl},
-    sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg},
+    sys::socket::{
+        ControlMessage, ControlMessageOwned, MsgFlags, SockType, getsockopt, recvmsg, sendmsg,
+        sockopt,
+    },
 };
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub use nix::sys::socket::UnixCredentials;
 
 use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
 
@@ -50,6 +56,42 @@ impl Socket {
 
     pub fn from_owned_fd(fd: OwnedFd) -> Self {
         Self(UnixDatagram::from(fd))
+    }
+
+    /// Adopts the descriptor number a grant announced to this process.
+    ///
+    /// The number arrives from the environment, so it is a claim rather than authority, and it is
+    /// classified through a borrow before anything is owned: only a datagram or seqpacket endpoint is
+    /// taken over. A descriptor that is not a socket at all is therefore left exactly as it was, which
+    /// is what keeps a false claim from closing something the process opened for its own reasons. A
+    /// socket that fails the peer check *is* closed, because the meeting it was offered is over either
+    /// way.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must name a descriptor that was given to this process by the process that granted it,
+    /// and that no other owner will close.
+    pub unsafe fn granted(raw: RawFd) -> io::Result<Self> {
+        // SAFETY: borrowed, not owned, for exactly as long as it takes to decide whether the claim
+        // is a rendezvous at all; ownership is taken only on the path that returns `Ok`.
+        let announced = unsafe { BorrowedFd::borrow_raw(raw) };
+        let kind = getsockopt(&announced, sockopt::SockType).map_err(io::Error::from)?;
+        if !matches!(kind, SockType::Datagram | SockType::SeqPacket) {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the announced descriptor is not a datagram endpoint",
+            ));
+        }
+        Ok(Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw) }))
+    }
+
+    /// What the kernel recorded about the process that owns the peer end.
+    ///
+    /// On a unix socketpair this is the creator of the pair, captured when the kernel connected
+    /// the two ends: neither side can assert it, and neither can revoke it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn peer_credentials(&self) -> io::Result<UnixCredentials> {
+        getsockopt(&self.0, sockopt::PeerCredentials).map_err(io::Error::from)
     }
 
     pub fn send(&self, bootstrap: &Bootstrap, resources: &[BorrowedFd<'_>]) -> io::Result<()> {

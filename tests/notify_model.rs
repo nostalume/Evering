@@ -108,3 +108,120 @@ fn local_contention_never_admits_peer_only_wait() {
     let producer_waiter_is_notified = false;
     assert!(local_producer_will_publish && !producer_waiter_is_notified);
 }
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+struct Batch {
+    commits: usize,
+    visible: usize,
+    owed: bool,
+    rung: usize,
+    guard_open: bool,
+    parked: bool,
+    latched: bool,
+}
+
+const BATCH_LIMIT: usize = 4;
+
+#[test]
+fn a_deferred_batch_rings_once_and_can_never_end_owing() {
+    let mut pending = vec![Batch {
+        commits: 0,
+        visible: 0,
+        owed: false,
+        rung: 0,
+        guard_open: true,
+        parked: false,
+        latched: false,
+    }];
+    let mut seen = HashSet::new();
+
+    while let Some(state) = pending.pop() {
+        if !seen.insert(state) {
+            continue;
+        }
+        assert!(
+            !(state.owed && !state.guard_open),
+            "a guard that left scope delivered what its batch owed"
+        );
+        assert!(
+            state.rung <= state.commits,
+            "a doorbell cannot be rung more times than the batch committed"
+        );
+        assert!(
+            !(state.latched && state.rung == 0),
+            "only a ring can set the peer's latch"
+        );
+        assert!(
+            !(state.visible > 0 && state.parked && !state.latched && !state.guard_open),
+            "committed bytes a parked peer has not seen cannot outlive their doorbell"
+        );
+
+        if state.guard_open {
+            if state.commits < BATCH_LIMIT {
+                pending.push(Batch {
+                    commits: state.commits + 1,
+                    visible: state.visible + 1,
+                    owed: true,
+                    ..state
+                });
+            }
+            if state.owed {
+                pending.push(Batch {
+                    owed: false,
+                    rung: state.rung + 1,
+                    latched: true,
+                    ..state
+                });
+            }
+        }
+        if state.parked && state.visible > 0 {
+            pending.push(Batch {
+                visible: state.visible - 1,
+                parked: false,
+                latched: false,
+                ..state
+            });
+        } else if state.visible > 0 {
+            pending.push(Batch {
+                visible: state.visible - 1,
+                latched: false,
+                ..state
+            });
+        }
+        if !state.parked && state.visible == 0 {
+            pending.push(Batch {
+                parked: true,
+                ..state
+            });
+        }
+        pending.push(Batch {
+            guard_open: false,
+            owed: false,
+            rung: if state.owed {
+                state.rung + 1
+            } else {
+                state.rung
+            },
+            latched: if state.owed { true } else { state.latched },
+            ..state
+        });
+    }
+
+    assert!(
+        seen.iter().any(|state| state.commits == BATCH_LIMIT
+            && state.visible == BATCH_LIMIT
+            && state.rung == 1),
+        "several commits must be able to sit behind one doorbell"
+    );
+    assert!(
+        seen.iter()
+            .any(|state| state.commits == 0 && state.rung == 0 && !state.guard_open),
+        "an empty batch must cost no trap"
+    );
+    assert!(
+        !seen
+            .iter()
+            .any(|state| state.commits == 0 && state.rung > 0),
+        "a batch that committed nothing may not wake its peer"
+    );
+}

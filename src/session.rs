@@ -186,6 +186,15 @@ pub struct Session {
     alloc: talc::MapTalc,
 }
 
+/// Authority to repair what one dead participant left in this region.
+///
+/// [`Session::assume_dead`] hands one out after marking an exact peer generation dead. Dropping the
+/// handle repairs nothing: the peer stays marked dead with its evidence in place, so a reap either
+/// runs here or the handle moves to whichever participant will run it.
+///
+/// Holding the authority does not mean this process can finish the job. The repairs are per-layout,
+/// and the layouts a region can hold are chosen by its users, not by the library: see
+/// [`Recovery::reap`] for what the built-ins cover and [`Recovery::reap_with`] for the rest.
 #[must_use = "recovery authority must be completed or durably delegated"]
 pub struct Recovery<'a> {
     session: &'a Session,
@@ -193,14 +202,42 @@ pub struct Recovery<'a> {
 }
 
 impl Recovery<'_> {
+    /// The peer this authority is for: the slot and generation marked dead.
     pub fn peer(&self) -> Peer {
         Peer::from_parts(self.member.slot, self.member.generation)
     }
 
+    /// Reaps with only the built-in handler, which is the Pool's own storage.
+    ///
+    /// Every published member of the region must be adjudicated for a reap to finish, and each is
+    /// matched to a handler by the schema and ABI profile recorded in its header. A member that
+    /// matches no handler fails the reap rather than being skipped, so `reap()` cannot finish a
+    /// region that holds anything beyond Pool storage — the member a `Channel<H>` publishes is a
+    /// `Duplex<H>`, and its handler is [`crate::layout::recovery_handler`]. Without it the reap
+    /// settles what it can and returns the authority, so the caller either supplies the handler or
+    /// leaves the member for a participant that has it.
     pub fn reap(self) -> Result<(), Self> {
         self.reap_with(&[])
     }
 
+    /// Adjudicates the dead peer's leftover state, extending the built-in handler with `handlers`.
+    ///
+    /// One call runs in this order. The directory transaction is settled first, and only a
+    /// transaction that names the dead peer is repairable here: one held by any live participant —
+    /// including the caller's own, mid-send — fails the reap untouched. The allocator's in-flight
+    /// mutation is then closed, or poisoned if it cannot be attributed. Then every published member
+    /// is visited, each handed to exactly one handler whose schema and profile match it; an
+    /// ambiguous match is refused the same way a missing one is. The walk must complete twice, so a
+    /// repair that leaves another member unsettled is caught by the second pass instead of being
+    /// reported as done. Finally the member is removed from every header that still names it and
+    /// its directory slot is released.
+    ///
+    /// `Ok(())` means the region no longer names `peer()` anywhere and its blocks are claimable.
+    /// `Err(self)` means something in that sequence was not this process's to decide. Nothing is
+    /// rewound when a reap fails: each member repair that already ran is durable, so a retry — by
+    /// this participant or one holding the handle later — continues from what is left rather than
+    /// starting over. A reap that keeps failing with the same cause is a region holding a layout no
+    /// caller has supplied a handler for.
     pub fn reap_with(self, handlers: &[RecoveryHandler]) -> Result<(), Self> {
         let session = self.session;
         if self.peer() == session.dir.peer() {
@@ -211,6 +248,11 @@ impl Recovery<'_> {
         match session.dir.transaction_owner() {
             None => {}
             Some(owner) if owner == dead => {
+                // The cause is discarded deliberately. Every answer `recover` gives from here ends
+                // the reap the same way — hand the authority back so a participant that can name the
+                // handler tries again — and `reap_with` returns the session rather than an error, so
+                // there is no place to put a cause a caller could act on. A typed recovery failure
+                // reopens when one caller's branch actually differs by cause, not before.
                 if session.dir.recover(&session.alloc, dead).is_err() {
                     return Err(self);
                 }
@@ -423,6 +465,11 @@ impl Session {
 
     /// Marks an exact process generation as permanently unable to access
     /// this session's region.
+    ///
+    /// Returns the [`Recovery`] authority for that member, or `None` when the slot is neither live nor
+    /// already dead at exactly `peer`'s generation: a free slot, a superseded generation, or a retired
+    /// one. A `None` is not evidence that the peer is gone, only that this region has no member to
+    /// reap under that identity.
     ///
     /// # Safety
     ///

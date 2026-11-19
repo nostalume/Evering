@@ -9,11 +9,12 @@ use evering::{
     BlockRange, Channel, ChannelId as Id, Pool, PoolId, Port, Rx, Session, TrySendError, Tx,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
     mapping::{Access, Request, Source},
-    notify::{Signals, Wait as _},
+    notify::{Contention, Patience, ProgressError, Signals, Wait as _},
     process::{Bootstrap, Supervisor},
 };
 
 use super::{
+    boundary::{self, Trailer},
     drive::{self, Deadline, Expected, Interest, PathCounts, Step},
     environment,
     model::{self, Cell, Observed, Status, window},
@@ -226,56 +227,129 @@ impl Local<'_> {
     }
 }
 
-fn retry_send<'p, const SPINS: usize, const WAIT: bool, H: Repr>(
-    endpoint: &Tx<H>,
-    local: Local<'_>,
+/// The study's own waiting policy: the ladder these arms were written against, run
+/// through the library's retry loop so an arm's headline number is attributable to
+/// shipped surface.
+///
+/// It differs from `notify::Adaptive` in the two ways that are the subject of the
+/// measurement rather than incidental detail: the spin budget is spent once per call
+/// and a park does not refill it, and the arm that never parks yields the OS thread
+/// instead of spinning. The deadline lives here, which is why the loop it drives has
+/// no clock of its own.
+struct Ladder<'a> {
+    local: Local<'a>,
     deadline: Deadline,
-    mut value: evering::Transfer<'p, H>,
-) -> Result<(), String> {
-    let mut spins = SPINS;
-    loop {
-        match local.try_send::<WAIT, _>(endpoint, value) {
-            Ok(notified) => return notified,
-            Err(TrySendError::Disconnected(_)) => return Err("disconnected".into()),
-            Err(TrySendError::Busy(_)) if deadline.remaining(Instant::now()).is_err() => {
-                return Err("timeout".into());
-            }
-            Err(TrySendError::Busy(returned)) => {
-                value = returned;
-                std::hint::spin_loop();
-            }
-            Err(TrySendError::Full(_)) if deadline.remaining(Instant::now()).is_err() => {
-                return Err("timeout".into());
-            }
-            Err(TrySendError::Full(returned)) if spins > 0 => {
-                value = returned;
-                if WAIT {
-                    spins -= 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            Err(TrySendError::Full(returned)) => {
-                value = returned;
-                let timeout = {
-                    let _entered = local.runtime.enter();
-                    tokio::time::timeout(
-                        deadline.remaining(Instant::now()).unwrap_or_default(),
-                        local.wait.wait(),
-                    )
-                };
-                match local.runtime.block_on(timeout) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return Err(text(error)),
-                    Err(_) => return Err("timeout".into()),
-                }
-            }
+    budget: usize,
+    left: usize,
+    park: bool,
+}
+
+impl<'a> Ladder<'a> {
+    fn new<const SPINS: usize, const WAIT: bool>(local: Local<'a>, deadline: Deadline) -> Self {
+        Self {
+            local,
+            deadline,
+            budget: SPINS,
+            left: SPINS,
+            park: WAIT,
         }
     }
 }
 
-fn retry_adopt<'p, const SPINS: usize, const WAIT: bool, H, T>(
+impl Patience for Ladder<'_> {
+    type Error = std::io::Error;
+
+    fn begin(&mut self) {
+        self.left = self.budget;
+    }
+
+    async fn step(&mut self, reason: Contention) -> Result<bool, Self::Error> {
+        let remaining = self
+            .deadline
+            .remaining(Instant::now())
+            .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))?;
+        match reason {
+            // A busy slot is resolved inside this process, so the ladder spends one
+            // pause and re-attempts; only a peer-bound reason may spend the budget or
+            // reach the latch, which is what lets a park be counted as one wait.
+            Contention::Busy => std::hint::spin_loop(),
+            Contention::Full | Contention::Empty if !self.park => std::thread::yield_now(),
+            Contention::Full | Contention::Empty if self.left > 0 => {
+                self.left -= 1;
+                std::hint::spin_loop();
+            }
+            Contention::Full | Contention::Empty => {
+                tokio::time::timeout(remaining, self.local.wait.wait())
+                    .await
+                    .map_err(|_| std::io::Error::from(std::io::ErrorKind::TimedOut))??;
+            }
+        }
+        Ok(true)
+    }
+}
+
+/// The step-end strings the two arms reported before the loop was shared: a stopped
+/// policy and an expired deadline are the loop's own outcomes, not the peer's.
+fn send_stop(error: ProgressError<std::io::Error>) -> String {
+    match error {
+        ProgressError::Closed => "disconnected".into(),
+        ProgressError::Busy => "waiting policy stopped".into(),
+        ProgressError::Wait(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            "timeout".into()
+        }
+        ProgressError::Wait(error) => text(error),
+    }
+}
+
+fn adopt_stop(error: ProgressError<std::io::Error>) -> String {
+    match error {
+        ProgressError::Closed => "sender disconnected".into(),
+        ProgressError::Busy => "waiting policy stopped".into(),
+        ProgressError::Wait(error) if error.kind() == std::io::ErrorKind::TimedOut => {
+            "timeout".into()
+        }
+        ProgressError::Wait(error) => format!("receive wait failed: {error:?}"),
+    }
+}
+
+async fn retry_send<'p, const SPINS: usize, const WAIT: bool, H: Repr>(
+    endpoint: &Tx<H>,
+    local: Local<'_>,
+    deadline: Deadline,
+    value: evering::Transfer<'p, H>,
+) -> Result<(), String> {
+    let mut ladder = Ladder::new::<SPINS, WAIT>(local, deadline);
+    // An arm that never parks is also an arm that never rings: the same library loop
+    // over a notifier that cannot notify, which is the shape `Local::try_send` selects
+    // for `WAIT = false`.
+    if WAIT {
+        let signals = Signals::new(local.ring, local.wait);
+        let permit = signals
+            .reserve_with(endpoint, &mut ladder)
+            .await
+            .map_err(send_stop)?;
+        permit
+            .send(value)
+            .map_err(|_| "lost block authority".to_string())?
+            .into_parts()
+            .1
+            .map_err(text)
+    } else {
+        let signals = Signals::none();
+        let permit = signals
+            .reserve_with(endpoint, &mut ladder)
+            .await
+            .map_err(send_stop)?;
+        permit
+            .send(value)
+            .map_err(|_| "lost block authority".to_string())?
+            .into_parts()
+            .1
+            .map_err(text)
+    }
+}
+
+async fn retry_adopt<'p, const SPINS: usize, const WAIT: bool, H, T>(
     endpoint: &Rx<H>,
     pool: evering::PoolRef<'p>,
     local: Local<'_>,
@@ -285,45 +359,15 @@ where
     H: Repr,
     T: Repr + evering::layout::Shape + ?Sized,
 {
-    let mut spins = SPINS;
-    loop {
-        match endpoint.claim() {
-            Ok(received) => match local.adopt::<WAIT, H, T>(received, pool) {
-                Ok(value) => return value,
-                Err(error) => return Err(format!("transfer admission failed: {error:?}")),
-            },
-            Err(evering::ReceiveError::Closed) => return Err("sender disconnected".into()),
-            Err(evering::ReceiveError::Busy) if deadline.remaining(Instant::now()).is_err() => {
-                return Err("timeout".into());
-            }
-            Err(evering::ReceiveError::Busy) => std::hint::spin_loop(),
-            Err(evering::ReceiveError::Empty) if deadline.remaining(Instant::now()).is_err() => {
-                return Err("timeout".into());
-            }
-            Err(evering::ReceiveError::Empty) if spins > 0 => {
-                if WAIT {
-                    spins -= 1;
-                    std::hint::spin_loop();
-                } else {
-                    std::thread::yield_now();
-                }
-            }
-            Err(evering::ReceiveError::Empty) => {
-                let timeout = {
-                    let _entered = local.runtime.enter();
-                    tokio::time::timeout(
-                        deadline.remaining(Instant::now()).unwrap_or_default(),
-                        local.wait.wait(),
-                    )
-                };
-                match local.runtime.block_on(timeout) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => return Err(format!("receive wait failed: {error:?}")),
-                    Err(_) => return Err("timeout".into()),
-                }
-            }
-        }
-    }
+    let mut ladder = Ladder::new::<SPINS, WAIT>(local, deadline);
+    let signals = Signals::new(local.ring, local.wait);
+    let received = signals
+        .claim_with(endpoint, &mut ladder)
+        .await
+        .map_err(adopt_stop)?;
+    local
+        .adopt::<WAIT, H, T>(received, pool)
+        .map_err(|error| format!("transfer admission failed: {error:?}"))?
 }
 
 struct Client<'a, M, O, D, const SPINS: usize, const WAIT: bool> {
@@ -416,6 +460,7 @@ where
                 self.staged = Some(value);
                 Err("disconnected".into())
             }
+            Err(TrySendError::Authority) => Err("lost block authority".into()),
         }
     }
 
@@ -457,6 +502,13 @@ where
         deadline: Deadline,
         path: &mut PathCounts,
     ) -> Result<(), String> {
+        // Deliberately not `Signals::reserve_with`: the library loop runs one direction
+        // to commit, while this side owns both directions of the duplex and must drain
+        // responses between attempts. Looping here would put a task poll on every
+        // attempt of the non-parking arm — the quantity under measurement — and would
+        // stall the send until the response ring drains at a window above one. The
+        // worker side, which serves one direction per iteration, does run the library
+        // loop; this loop is shared with the framed control arms and stays as it is.
         if self.contended {
             self.contended = false;
             std::hint::spin_loop();
@@ -503,14 +555,13 @@ where
     }
 }
 
-fn serve<const SPINS: usize, const WAIT: bool>(
+async fn serve<const SPINS: usize, const WAIT: bool>(
     session: Session,
     port: Port<Envelope>,
     pool: PoolId,
-    ring: evering::os::Ring,
-    wait: evering::runtime::Wait,
-    runtime: &tokio::runtime::Runtime,
+    local: Local<'_>,
     timeout: Duration,
+    trailer: &str,
 ) -> Result<(), String> {
     let pool = session
         .open_pool(pool)
@@ -519,30 +570,45 @@ fn serve<const SPINS: usize, const WAIT: bool>(
         .adopt(port)
         .map_err(|error| format!("worker could not adopt channel: {error:?}"))?;
     let (tx, rx) = channel.split();
-    let local = Local {
-        ring: &ring,
-        wait: &wait,
-        runtime,
-    };
-    loop {
+    let mut phase: Option<boundary::Phase> = None;
+    let served = 'rounds: loop {
         let deadline = Deadline::after(Instant::now(), timeout)?;
         let (mut header, value) =
-            match retry_adopt::<SPINS, WAIT, Envelope, [u8]>(&rx, pool.as_ref(), local, deadline) {
+            match retry_adopt::<SPINS, WAIT, Envelope, [u8]>(&rx, pool.as_ref(), local, deadline)
+                .await
+            {
                 Ok(value) => value,
                 Err(error) if error == "sender disconnected" => {
-                    local.close::<WAIT, _>(&tx)?;
-                    return Ok(());
+                    if let Err(error) = local.close::<WAIT, _>(&tx) {
+                        break 'rounds Err(error);
+                    }
+                    break 'rounds Ok(());
                 }
-                Err(error) => return Err(error),
+                Err(error) => break 'rounds Err(error),
             };
+        let mut ready = false;
         match header.kind {
             DATA => header.digest = model::digest(&value),
-            READY if value.is_empty() => header.digest = 0,
-            _ => return Err("worker rejected message envelope".into()),
+            READY if value.is_empty() => {
+                header.digest = 0;
+                ready = true;
+            }
+            _ => break 'rounds Err("worker rejected message envelope".into()),
         }
         let record = value.transfer(header);
-        retry_send::<SPINS, WAIT, _>(&tx, local, deadline, record)?;
+        if let Err(error) = retry_send::<SPINS, WAIT, _>(&tx, local, deadline, record).await {
+            break 'rounds Err(error);
+        }
+        // The READY frame is the probe that closes setup, so bracketing from it
+        // keeps warmup out of the worker figure and off the accounting path.
+        if ready && phase.is_none() {
+            phase = boundary::Phase::begin(trailer);
+        }
+    };
+    if let Some(phase) = phase {
+        phase.record(trailer)?;
     }
+    served
 }
 
 type Worker = (
@@ -588,12 +654,24 @@ fn open_worker(address: &str) -> Result<Worker, String> {
 fn worker_with<const SPINS: usize, const WAIT: bool>(
     address: &str,
     timeout: Duration,
+    trailer: &str,
 ) -> Result<(), String> {
     let runtime = runtime()?;
     let entered = runtime.enter();
     let (session, port, pool, ring, wait) = open_worker(address)?;
     drop(entered);
-    serve::<SPINS, WAIT>(session, port, pool, ring, wait, &runtime, timeout)
+    runtime.block_on(serve::<SPINS, WAIT>(
+        session,
+        port,
+        pool,
+        Local {
+            ring: &ring,
+            wait: &wait,
+            runtime: &runtime,
+        },
+        timeout,
+        trailer,
+    ))
 }
 
 pub fn worker(
@@ -601,12 +679,13 @@ pub fn worker(
     policy: &str,
     timeout: Duration,
     expected_environment: &str,
+    trailer: &str,
 ) -> Result<(), String> {
     environment::admit(expected_environment)?;
     match policy {
-        "busy" => worker_with::<{ usize::MAX }, false>(address, timeout),
-        "adaptive" => worker_with::<ADAPTIVE_SPINS, true>(address, timeout),
-        "notified" => worker_with::<0, true>(address, timeout),
+        "busy" => worker_with::<{ usize::MAX }, false>(address, timeout, trailer),
+        "adaptive" => worker_with::<ADAPTIVE_SPINS, true>(address, timeout, trailer),
+        "notified" => worker_with::<0, true>(address, timeout, trailer),
         _ => Err("unknown Evering retry policy".into()),
     }
 }
@@ -619,6 +698,7 @@ struct Setup {
     runtime: tokio::runtime::Runtime,
     ring: evering::os::Ring,
     wait: evering::runtime::Wait,
+    trailer: Option<Trailer>,
     #[cfg(unix)]
     _socket_path: SocketPath,
 }
@@ -662,12 +742,16 @@ fn setup(
     ));
     let mut command = Command::new(std::env::current_exe().map_err(text)?);
     let timeout = deadline.remaining(Instant::now())?.as_millis().to_string();
+    let trailer = Trailer::claim()?;
     command.args([
         "worker-evering",
         path.to_string_lossy().as_ref(),
         policy,
         &timeout,
         environment,
+        trailer
+            .as_ref()
+            .map_or(boundary::ABSENT, |trailer| trailer.argument()),
     ]);
     let mut child = Supervisor::spawn(&mut command).map_err(text)?;
     let socket = loop {
@@ -700,6 +784,7 @@ fn setup(
         runtime,
         ring: parent_ring,
         wait,
+        trailer,
         _socket_path: SocketPath(path),
     })
 }
@@ -721,12 +806,16 @@ fn setup(
     let listener = Listener::bind().map_err(text)?;
     let mut command = Command::new(std::env::current_exe().map_err(text)?);
     let timeout = deadline.remaining(Instant::now())?.as_millis().to_string();
+    let trailer = Trailer::claim()?;
     command.args([
         "worker-evering",
         listener.name(),
         policy,
         &timeout,
         environment,
+        trailer
+            .as_ref()
+            .map_or(boundary::ABSENT, |trailer| trailer.argument()),
     ]);
     let child = Supervisor::spawn(&mut command).map_err(text)?;
     let now = Instant::now();
@@ -765,6 +854,7 @@ fn setup(
         runtime,
         ring: parent_ring,
         wait,
+        trailer,
     })
 }
 
@@ -869,6 +959,7 @@ fn run_with<const SPINS: usize, const WAIT: bool>(
         .remove(setup.channel)
         .map_err(|_| fail(Status::DrainError, "channel remained busy", Some(&counts)))?;
     counts.phase_ns[2] = drain.elapsed().as_nanos().max(1) as u64;
+    counts.worker = setup.trailer.as_ref().and_then(|trailer| trailer.read());
     Ok(counts)
 }
 

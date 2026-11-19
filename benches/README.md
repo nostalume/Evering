@@ -193,6 +193,17 @@ workload. Windows, bare-metal Linux, another architecture, concurrent clients,
 open-loop arrivals, crash-heavy operation, and other transports require
 separate evidence.
 
+Execution reliability on that host carries two recorded limits, descriptive and not
+admission rules. In the evidence written on 2026-11-18, a worker process failed to open
+a `Pool` its parent had already published in 6 of 225 shared-memory trials and in none of
+134 stream trials; the same failure appeared in a checkout of the published commit, and
+eight hundred milliseconds of retries inside the worker did not clear it, so one
+three-block screening — 69 shared-memory trials — completes roughly one time in seven.
+Separately, the recorder discards the clause name when it rejects a measure, and it
+validates before writing the row, so a rejected trial leaves no inspectable evidence of
+what it rejected. A screening interrupted by either is an inadmissible prefix like any
+other; neither limit licenses accepting a trial that failed admission.
+
 ## Recovery evidence
 
 Recovery is tested as correctness, not throughput. A worker is terminated after

@@ -1,6 +1,7 @@
 #![allow(dead_code)]
 
 mod analysis;
+mod boundary;
 mod drive;
 mod environment;
 mod evering;

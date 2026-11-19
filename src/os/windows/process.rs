@@ -18,9 +18,9 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId, PIPE_NOWAIT,
-            PIPE_READMODE_MESSAGE, PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT,
-            SetNamedPipeHandleState,
+            ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
+            GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
+            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState,
         },
         Threading::GetCurrentProcess,
     },
@@ -143,6 +143,20 @@ impl Socket {
         } else {
             Ok(Self(unsafe { OwnedHandle::from_raw_handle(handle.cast()) }))
         }
+    }
+
+    /// What the kernel says about the process that owns the server end of this pipe instance.
+    ///
+    /// The mirror of `Listener::accept`'s check, and needed beside it: `FILE_FLAG_FIRST_PIPE_INSTANCE`
+    /// makes a name that is already taken a failure for the listener rather than something to delete,
+    /// but a process that connects to a pipe it does not own would still be handed whatever that pipe
+    /// sends. This is the read that tells it apart.
+    pub fn server_pid(&self) -> io::Result<u32> {
+        let mut server = 0;
+        if unsafe { GetNamedPipeServerProcessId(raw(&self.0), &mut server) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(server)
     }
 
     pub fn send(

@@ -76,6 +76,162 @@ fn crash_after(point: usize) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    /// The slot of a live participant whose heap mutation a test lets finish between the failed
+    /// clear of a dead participant's mutation and the read that decides what that failure meant.
+    static STAND_DOWN_WINDOW: core::cell::Cell<Option<u8>> = const { core::cell::Cell::new(None) };
+}
+
+/// Opens [`STAND_DOWN_WINDOW`] for the next `Directory::recover` on this thread.
+#[cfg(test)]
+pub(crate) fn stand_down_window_for_test(live: u8) {
+    STAND_DOWN_WINDOW.with(|window| window.set(Some(live)));
+}
+
+#[cfg(test)]
+fn stand_down(heap: &crate::talc::MapTalc) {
+    if let Some(live) = STAND_DOWN_WINDOW.with(|window| window.take()) {
+        assert!(
+            heap.clear_dead_owner(live),
+            "the mutation the window was armed for is already gone"
+        );
+    }
+}
+
+#[cfg(test)]
+static RESUME_WINDOW: AtomicUsize = AtomicUsize::new(0);
+
+/// Opens the window between a resumer's read of the transaction word and the heap mutation it waits
+/// on, so the first thread through `resume_rollback` stops there and the next one is the resumer that
+/// would finish the rollback while the first is away. 0 closed, 1 open, 2 parked, 3 released.
+#[cfg(test)]
+pub(crate) fn open_resume_window_for_test() {
+    RESUME_WINDOW.store(1, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn resume_window_parked_for_test() -> bool {
+    RESUME_WINDOW.load(Ordering::Acquire) == 2
+}
+
+#[cfg(test)]
+pub(crate) fn close_resume_window_for_test() {
+    RESUME_WINDOW.store(3, Ordering::Release);
+}
+
+#[cfg(test)]
+fn park_in_resume_window() {
+    // One-shot on purpose: only the first thread through the window stops.
+    if RESUME_WINDOW
+        .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+        .is_err()
+    {
+        return;
+    }
+    while RESUME_WINDOW.load(Ordering::Acquire) == 2 {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+static REAP_TARGET: AtomicUsize = AtomicUsize::new(usize::MAX);
+#[cfg(test)]
+static REAP_GATE: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static REAP_HELD: AtomicUsize = AtomicUsize::new(0);
+#[cfg(test)]
+static REAP_READS: AtomicUsize = AtomicUsize::new(0);
+
+/// Two stop points around the claim in `recover`'s `REMOVE` arm, which together put one reaper between
+/// the entry gates and the claim and a second one behind the claim with the cell already read. The
+/// `dead` slot names which reap stops: the windows are process-wide and other tests reap `REMOVE`
+/// transactions of their own, and a reaper of another test that walked into an open window would wait
+/// for a release nobody there intends to make. 0 closed, 1 open, 2 parked, 3 released.
+#[cfg(test)]
+pub(crate) fn open_reap_windows_for_test(dead: u8) {
+    REAP_READS.store(0, Ordering::Relaxed);
+    REAP_GATE.store(0, Ordering::Relaxed);
+    REAP_HELD.store(0, Ordering::Relaxed);
+    REAP_TARGET.store(usize::from(dead), Ordering::Release);
+    REAP_GATE.store(1, Ordering::Release);
+    REAP_HELD.store(1, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn reap_gate_parked_for_test() -> bool {
+    REAP_GATE.load(Ordering::Acquire) == 2
+}
+
+#[cfg(test)]
+pub(crate) fn release_reap_gate_for_test() {
+    REAP_GATE.store(3, Ordering::Release);
+}
+
+#[cfg(test)]
+pub(crate) fn reap_held_parked_for_test() -> bool {
+    REAP_HELD.load(Ordering::Acquire) == 2
+}
+
+#[cfg(test)]
+pub(crate) fn release_reap_held_for_test() {
+    REAP_TARGET.store(usize::MAX, Ordering::Release);
+    REAP_HELD.store(3, Ordering::Release);
+}
+
+#[cfg(test)]
+fn reap_window_applies(dead: u8) -> bool {
+    REAP_TARGET.load(Ordering::Acquire) == usize::from(dead)
+}
+
+#[cfg(test)]
+fn park_at_reap_gate(dead: u8) {
+    // One-shot on purpose: only the first matching thread through the window stops.
+    if !reap_window_applies(dead)
+        || REAP_GATE
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    while REAP_GATE.load(Ordering::Acquire) == 2 {
+        std::thread::yield_now();
+    }
+}
+
+#[cfg(test)]
+fn park_at_reap_held(dead: u8) {
+    if !reap_window_applies(dead)
+        || REAP_HELD
+            .compare_exchange(1, 2, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+    {
+        return;
+    }
+    while REAP_HELD.load(Ordering::Acquire) == 2 {
+        std::thread::yield_now();
+    }
+}
+
+/// Counts this reap's read of the staged span and stops the reader that holds the claim, so a test can
+/// look at the arm from the other side while the cell is claimed.
+#[cfg(test)]
+fn note_reap_read(dead: u8) {
+    if reap_window_applies(dead) {
+        REAP_READS.fetch_add(1, Ordering::Relaxed);
+        park_at_reap_held(dead);
+    }
+}
+
+/// Takes the number of reads `recover`'s `REMOVE` arm has made of the staged span for the armed reap.
+/// The ordering the claim buys is invisible from a verdict — a reaper that lost the CAS answers
+/// `Busy` either way, because the claim it tried to take is what names the holder — so what a test has
+/// to observe is whether it looked at the cell on the way to that answer.
+#[cfg(test)]
+pub(crate) fn take_reap_reads_for_test() -> usize {
+    REAP_READS.swap(0, Ordering::AcqRel)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Error {
     Busy(u8),
@@ -135,6 +291,12 @@ impl MapDirectory {
                             return Ok(false);
                         }
                     }
+                    // An entry between states: the walk cannot promise an enumeration of a directory
+                    // whose transaction is still deciding this member, so `InUse` here means "a
+                    // transaction is open at this entry", not "the slot is taken".
+                    // `Session::scan_recovery` discards it because every handler answer to it is the
+                    // same one: reap again, or hand the authority to a participant that holds the
+                    // transaction.
                     _ => return Err(Error::InUse),
                 }
             }
@@ -632,6 +794,48 @@ impl MapDirectory {
         Ok(entry.offset.load(Ordering::Relaxed))
     }
 
+    /// Refuses a staged block span this region cannot reach.
+    ///
+    /// `pending` holds whatever the participant that last owned the transaction word left there, and
+    /// recovery dereferences it: it reads the member's closed flag at that span and hands the span to
+    /// `deallocate`, which reads a block header just below it. The span is therefore peer input, and it
+    /// has to lie inside the region and sit at an address the allocator can use before either of those
+    /// happens — the same test `recover_growth` runs on the slab its peer staged.
+    fn staged_span_reachable(
+        &self,
+        heap: &crate::talc::MapTalc,
+        meta: &crate::talc::Meta,
+    ) -> Result<(), Error> {
+        let pointer = heap.pointer(meta);
+        let block = core::mem::size_of::<header::RcHeader<()>>();
+        self.offset_of(pointer, block.max(meta.layout().size()))
+            .map_err(Error::Admission)?;
+        if !crate::talc::block_aligned(pointer) {
+            return Err(Error::Admission(crate::mem::ProjectionError::Misaligned));
+        }
+        Ok(())
+    }
+
+    /// Adjudicates what a dead participant left in the shared transaction.
+    ///
+    /// The reads that decide the outcome — `pending`, the member's closed flag, the heap's mutation
+    /// state, the entry's own state word — are taken after `transfer` claims the transaction word. That
+    /// order is what makes the non-atomic cell trustworthy: the writer claims before it touches the cell
+    /// (`claim`, then `Transaction::persist`), so a reader that holds the claim cannot overlap a writer,
+    /// and the value it decides on cannot be torn underneath it. `recover_growth` and the `REMOVE` and
+    /// `CREATE` arms all claim first; what may still be inspected before the claim is an atomic word —
+    /// the heap's owner and the entry's own state — and a compare-exchange on one of those cannot be
+    /// half-applied, so the worst a stale read of those can do is name the wrong holder, which is what
+    /// the stand-down re-read answers.
+    ///
+    /// A claim that decides nothing then has one way to be dropped and one way to be closed. A refusal —
+    /// transient or permanent — uses `Transaction::restore` to hand back the word exactly as it was read,
+    /// because `recover` returns `Stale` on a clean word and a clean word erases the only evidence that
+    /// this member has work outstanding; the caller is told the cause on the same edge, and a later reap
+    /// either finishes the work or reports the same refusal. `CLEAN` is written only with a verdict: the
+    /// successful stores, and `quarantine_held` for a poisoned heap. Nothing in this function leaves a
+    /// claim to `Drop`'s demotion: that path marks a participant abandoning its own interrupted
+    /// transaction, and there is no `REMOVE` resume arm that could finish one left on a live slot.
     pub(crate) fn recover(
         &self,
         heap: &crate::talc::MapTalc,
@@ -681,16 +885,55 @@ impl MapDirectory {
         let generation = state >> STATE_BITS;
         let operation = (kind, state & STATE_MASK, phase);
         if matches!(operation, (REMOVE, CLOSING, EVIDENCE | ROLLING_BACK)) {
+            // The claim is taken before anything that reads `pending` or the member's closed flag. That
+            // is what makes the reads whole: the writer takes the claim before it touches the cell
+            // (`claim` then `Transaction::persist`), so holding it excludes every writer and every other
+            // reaper. `clear_dead_owner` moved behind the claim too, which costs nothing here and buys
+            // one thing: a reaper that lost the CAS no longer rewrites the dead participant's heap word.
+            #[cfg(test)]
+            park_at_reap_gate(dead);
+            let mut transaction = self.transfer(word, dead, phase)?;
             if !heap.clear_dead_owner(dead) {
+                #[cfg(test)]
+                stand_down(heap);
                 return match heap.mutation_state() {
-                    MutationState::Owned(owner) => Err(Error::Busy(owner)),
-                    MutationState::Poisoned => self.quarantine(word, entry),
-                    MutationState::Clean => unreachable!(),
+                    // Every arm below is a refusal of a condition that can change, so the claim goes
+                    // back as it was read instead of being committed: `recover` will not enter on a
+                    // clean word, and a clean word is the only record that this member still has a
+                    // `REMOVE` outstanding.
+                    MutationState::Owned(owner) => {
+                        // The result is ignored on purpose: only a peer scribbling the word can make
+                        // this CAS fail, and re-validating a word only an honest peer writes is
+                        // outside the stage (delta 19).
+                        let _ = transaction.restore(word);
+                        Err(Error::Busy(owner))
+                    }
+                    MutationState::Poisoned => Ok(self.quarantine_held(entry, transaction)),
+                    // `clear_dead_owner` counts an already-clean heap as success, so a false
+                    // return that reads back as `Clean` means the word moved to clean inside that
+                    // window: a live participant finished a mutation of its own, and this reaper
+                    // never saw the state it tried to change. Standing down fails this reap and
+                    // hands the handle back, so the next one reads a heap it actually observed
+                    // instead of clearing or poisoning a mutation someone still running owns.
+                    MutationState::Clean => {
+                        let _ = transaction.restore(word);
+                        Err(Error::Stale)
+                    }
                 };
             }
-            let meta = unsafe { (*self.inner.pending.get()).assume_init_ref() };
-            if !unsafe { header::closed_at(heap.pointer(meta).as_ptr()) } {
-                let mut transaction = self.transfer(word, dead, phase)?;
+            let meta = *transaction.pending();
+            #[cfg(test)]
+            note_reap_read(dead);
+            if let Err(error) = self.staged_span_reachable(heap, &meta) {
+                // Refusing a span the same way as before the reorder — evidence kept, word as read — is
+                // what `recovery_refuses_a_staged_span_outside_the_region` pins: the member stays
+                // `CLOSING` for a participant that can adjudicate it, and committing here would erase the
+                // only record that this reap had anything left to do. The copy above is what the free
+                // below uses, because the claim now guarantees nobody wrote the cell in between.
+                let _ = transaction.restore(word);
+                return Err(error);
+            }
+            if !unsafe { header::closed_at(heap.pointer(&meta).as_ptr()) } {
                 entry
                     .state
                     .store((generation << STATE_BITS) | PUBLISHED, Ordering::Release);
@@ -698,11 +941,28 @@ impl MapDirectory {
                 transaction.commit();
                 return Ok(Recovered::RolledBack);
             }
-            let (mutation, mut transaction) =
-                self.claim_heap_and_transfer(heap, dead, word, phase)?;
-            let meta = transaction.pending();
+            let mutation = match heap.begin_mutation() {
+                Ok(mutation) => mutation,
+                Err(error) => {
+                    let _ = transaction.restore(word);
+                    return Err(Error::Heap(error));
+                }
+            };
+            if self.inner.transaction.load(Ordering::Acquire)
+                != Directory::owner_word(transaction.owner, transaction.phase)
+            {
+                // A resumer of this same slot took the heap first. Its filter is a value check, not a
+                // claim — the transaction already names this participant, so a CAS onto the same value
+                // succeeds for both threads and only this re-read, on the far side of the lock the
+                // resumer had to wait for, tells them apart. Dropping the claim here is deliberate: the
+                // demotion CAS can only fail, because the word is no longer this thread's to move.
+                mutation.commit();
+                return Err(Error::Stale);
+            }
+            // The copy taken under the claim is what the free below uses, because the re-check above
+            // proves nobody has been able to write the cell since: recovery frees what it checked.
             unsafe {
-                heap.deallocate_during(&mutation, heap.pointer(meta), meta.layout());
+                heap.deallocate_during(&mutation, heap.pointer(&meta), meta.layout());
             }
             entry
                 .state
@@ -717,10 +977,12 @@ impl MapDirectory {
         }
         if matches!(operation, (REMOVE, RELEASED, EVIDENCE | ROLLING_BACK)) {
             if !heap.clear_dead_owner(dead) {
+                #[cfg(test)]
+                stand_down(heap);
                 return match heap.mutation_state() {
                     MutationState::Owned(owner) => Err(Error::Busy(owner)),
                     MutationState::Poisoned => self.quarantine(word, entry),
-                    MutationState::Clean => unreachable!(),
+                    MutationState::Clean => Err(Error::Stale),
                 };
             }
             let mut transaction = self.transfer(word, dead, phase)?;
@@ -774,9 +1036,14 @@ impl MapDirectory {
                 }
                 let (mutation, mut transaction) =
                     self.claim_heap_and_transfer(heap, dead, word, phase)?;
-                let meta = transaction.pending();
+                let meta = *transaction.pending();
+                if let Err(error) = self.staged_span_reachable(heap, &meta) {
+                    mutation.commit();
+                    transaction.commit();
+                    return Err(error);
+                }
                 unsafe {
-                    heap.deallocate_during(&mutation, heap.pointer(meta), meta.layout());
+                    heap.deallocate_during(&mutation, heap.pointer(&meta), meta.layout());
                 }
                 entry
                     .state
@@ -789,9 +1056,14 @@ impl MapDirectory {
             (REMOVE, REMOVING, EVIDENCE | ROLLING_BACK) => {
                 let (mutation, mut transaction) =
                     self.claim_heap_and_transfer(heap, dead, word, phase)?;
-                let meta = transaction.pending();
+                let meta = *transaction.pending();
+                if let Err(error) = self.staged_span_reachable(heap, &meta) {
+                    mutation.commit();
+                    transaction.commit();
+                    return Err(error);
+                }
                 unsafe {
-                    heap.deallocate_during(&mutation, heap.pointer(meta), meta.layout());
+                    heap.deallocate_during(&mutation, heap.pointer(&meta), meta.layout());
                 }
                 entry
                     .state
@@ -808,6 +1080,19 @@ impl MapDirectory {
         }
     }
 
+    /// Reclaims a transaction whose participant died while growing the slab chain.
+    ///
+    /// The claim is taken before anything that needs `pending`, which is what makes the cell's contents
+    /// trustworthy here: only a holder of the transaction word writes it. The cost is that every exit
+    /// below the claim leaves the word held by this participant, and `GROW` can pay it because
+    /// `Transaction`'s drop demotes such a claim to `ROLLING_BACK` and `create_in` hands its own
+    /// `ROLLING_BACK` straight back here — a reaper that bails on a bad pointer retries rather than
+    /// stranding the record. `recover`'s REMOVE arm cannot take the same shape, because
+    /// `resume_rollback` answers `Busy` for `REMOVE` and an exit below that claim has nowhere to finish.
+    ///
+    /// Two threads of one participant can both hold this claim, since resuming one's own transaction
+    /// CASes the word onto the value it already has. The `Clean` arm therefore re-reads the word under
+    /// `begin_mutation` — the thing those two actually contend for — and the late one stands down.
     fn recover_growth(
         &self,
         heap: &crate::talc::MapTalc,
@@ -818,24 +1103,30 @@ impl MapDirectory {
     ) -> Result<Recovered, Error> {
         use crate::talc::MutationState;
 
+        let mut transaction = self.transfer(word, owner, phase)?;
         let slab_index = u32::try_from(self.inner.pending_slab.load(Ordering::Relaxed))
             .map_err(|_| Error::Stale)?;
         let predecessor = slab_index.checked_sub(1).ok_or(Error::Stale)?;
-        let meta = unsafe { (*self.inner.pending.get()).assume_init_ref() };
-        let pointer = heap.pointer(meta);
+        let meta = *transaction.pending();
+        let pointer = heap.pointer(&meta);
         let offset = self
             .offset_of(pointer, core::mem::size_of::<Slab>())
             .map_err(Error::Admission)?;
+        if !crate::talc::block_aligned(pointer) {
+            return Err(Error::Admission(crate::mem::ProjectionError::Misaligned));
+        }
         let link = self.slab(predecessor)?.next().load(Ordering::Acquire);
 
         if link == offset {
-            let mut transaction = self.transfer(word, owner, phase)?;
+            // The peer's own store won: the slab it staged is the one the chain already points at, so
+            // the chain is whole and only the claim has to be let go.
             transaction.clear_pending();
             transaction.commit();
             return Ok(Recovered::Retained);
         }
         if link != 0 {
-            let mut transaction = self.transfer(word, owner, phase)?;
+            // Another slab owns the link, so the staged span is unreachable from the chain: not the
+            // tail's successor, and not freeable either, since nothing here can prove what it holds.
             transaction.clear_pending();
             transaction.commit();
             return Ok(Recovered::Quarantined);
@@ -846,11 +1137,19 @@ impl MapDirectory {
         }
         match heap.mutation_state() {
             MutationState::Clean => {
-                let (mutation, mut transaction) =
-                    self.claim_heap_and_transfer(heap, owner, word, phase)?;
+                let mutation = heap.begin_mutation().map_err(Error::Heap)?;
+                if self.inner.transaction.load(Ordering::Acquire)
+                    != Directory::owner_word(transaction.owner, transaction.phase)
+                {
+                    mutation.commit();
+                    return Err(Error::Stale);
+                }
                 unsafe {
                     heap.deallocate_during(&mutation, pointer, core::alloc::Layout::new::<Slab>())
                 };
+                // `clear_pending` before the heap goes back: it moves the word off the value the other
+                // resumer re-reads, so the window between releasing the heap and committing the
+                // transaction cannot be entered as two winners.
                 transaction.clear_pending();
                 mutation.commit();
                 transaction.commit();
@@ -858,7 +1157,6 @@ impl MapDirectory {
             }
             MutationState::Owned(found) => Err(Error::Busy(found)),
             MutationState::Poisoned => {
-                let mut transaction = self.transfer(word, owner, phase)?;
                 transaction.clear_pending();
                 transaction.commit();
                 Ok(Recovered::Quarantined)
@@ -866,7 +1164,20 @@ impl MapDirectory {
         }
     }
 
+    /// Claims the transaction word from the exact value `word` the caller read.
+    ///
+    /// `Busy` names whoever holds the transaction now, which is the only thing a losing reaper can
+    /// honestly say about a word it lost. A current word that names nobody is not that: the
+    /// transaction went clean inside this window, so somebody finished what this reaper came to do
+    /// and no participant holds anything. `Stale` is the arm for that, the same answer `recover`
+    /// gives at its own entry for the same condition — `Stale` means "there is nothing left here for
+    /// you to recover", not "somebody is busy". Reporting `dead` instead, as this arm did, asserted
+    /// that a participant that just stopped existing still holds the transaction.
     fn transfer(&self, word: usize, dead: u8, phase: usize) -> Result<Transaction<'_>, Error> {
+        // Every caller reaches here with a word it read for the participant it came to recover from,
+        // and the CAS below is only meaningful against that word. `resume_rollback`'s arm passes its
+        // own slot as `dead`, which is the case where the resumer is finishing its own transaction.
+        debug_assert_eq!(Directory::word_owner(word), Some(dead));
         let live = self.peer().slot();
         self.inner
             .transaction
@@ -876,7 +1187,10 @@ impl MapDirectory {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .map_err(|current| Error::Busy(Directory::word_owner(current).unwrap_or(dead)))?;
+            .map_err(|current| match Directory::word_owner(current) {
+                Some(owner) => Error::Busy(owner),
+                None => Error::Stale,
+            })?;
         Ok(Transaction {
             directory: &self.inner,
             owner: live,
@@ -911,14 +1225,30 @@ impl MapDirectory {
         let dead = Directory::word_owner(transaction).ok_or(Error::Stale)?;
         let phase = transaction & ((1 << TRANSACTION_BITS) - 1);
         let held = self.transfer(transaction, dead, phase)?;
+        Ok(self.quarantine_held(entry, held))
+    }
+
+    /// The same verdict for a reaper that already holds the claim: the store and the commit, with no
+    /// second `transfer`, which against the word this transaction moved could only fail.
+    fn quarantine_held(&self, entry: &Entry, transaction: Transaction<'_>) -> Recovered {
         let generation = entry.state.load(Ordering::Acquire) >> STATE_BITS;
         entry
             .state
             .store((generation << STATE_BITS) | QUARANTINED, Ordering::Release);
-        debug_assert!(held.commit());
-        Ok(Recovered::Quarantined)
+        debug_assert!(transaction.commit());
+        Recovered::Quarantined
     }
 
+    /// Finishes a `ROLLING_BACK` transaction its own owner left behind.
+    ///
+    /// The check at the top is only a filter: two threads of one participant both pass it, because a
+    /// resumer claims no word — the transaction already names this participant, so a CAS onto the
+    /// same value would succeed for both. The authority is the re-check below, taken with the heap
+    /// mutation held: `begin_mutation` serializes the resumers and the second one then sees the word
+    /// the first committed and stands down. Without that re-check the second reads `pending` again
+    /// and frees the span the first already returned to the free list; the two-resumer test in
+    /// `src/tests/mock.rs` fails on exactly that, and `talc.rs:1180` is what catches it in a debug
+    /// build.
     fn resume_rollback(&self, heap: &crate::talc::MapTalc, owner: u8) -> Result<(), Error> {
         let expected = Directory::owner_word(owner, ROLLING_BACK);
         if self.inner.transaction.load(Ordering::Acquire) != expected {
@@ -932,14 +1262,32 @@ impl MapDirectory {
             CREATE => {}
             _ => return Err(Error::Busy(owner)),
         }
+        let mutation = {
+            #[cfg(test)]
+            park_in_resume_window();
+            heap.begin_mutation().map_err(Error::Heap)?
+        };
+        if self.inner.transaction.load(Ordering::Acquire) != expected {
+            // A second resumer of one `ROLLING_BACK` transaction reaches here while the first still
+            // holds the heap; once it does not, the first has finished. `clear_pending` rewrites the
+            // transaction word and leaves the staged span in the cell, so reading `pending` again
+            // would free a block the winner already returned to the free list. The heap goes back
+            // untouched and no transaction handle is fabricated over a word nobody holds.
+            mutation.commit();
+            return Err(Error::Stale);
+        }
         let mut transaction = Transaction {
             directory: &self.inner,
             owner,
             phase: ROLLING_BACK,
         };
-        let mutation = heap.begin_mutation().map_err(Error::Heap)?;
-        let meta = transaction.pending();
-        let pointer = heap.pointer(meta);
+        let meta = *transaction.pending();
+        if let Err(error) = self.staged_span_reachable(heap, &meta) {
+            mutation.commit();
+            transaction.commit();
+            return Err(error);
+        }
+        let pointer = heap.pointer(&meta);
         unsafe { heap.deallocate_during(&mutation, pointer, meta.layout()) };
         let slab = u32::try_from(self.inner.pending_slab.load(Ordering::Relaxed))
             .map_err(|_| Error::Stale)?;
@@ -1019,6 +1367,14 @@ impl MapDirectory {
         core::mem::forget(transaction);
     }
 
+    /// Overwrites the block span a staged transaction names. A participant that dies holding the
+    /// transaction word leaves that field to whatever it last wrote, so recovery has to treat it as
+    /// peer-supplied; this lets a test leave something no allocator would have produced.
+    #[cfg(test)]
+    pub(crate) fn forge_pending_span_for_test(&self, meta: crate::talc::Meta) {
+        unsafe { (*self.inner.pending.get()).write(meta) };
+    }
+
     #[cfg(test)]
     pub(crate) fn abandon_held_reservation_for_test(&self, dead: u8) {
         let slot = self.reserve().unwrap();
@@ -1031,8 +1387,9 @@ impl MapDirectory {
             .store(Directory::owner_word(dead, HELD), Ordering::Release);
     }
 
+    /// Stages a create `owner` was given a block for and never finished, in the phase `phase`.
     #[cfg(test)]
-    pub(crate) fn abandon_allocated_create_for_test(&self, dead: u8, meta: crate::talc::Meta) {
+    fn abandon_create_in(&self, owner: u8, phase: usize, meta: crate::talc::Meta) {
         let slot = self.reserve().unwrap();
         self.entry(slot.slab, slot.entry)
             .unwrap()
@@ -1048,7 +1405,19 @@ impl MapDirectory {
         unsafe { (*self.inner.pending.get()).write(meta) };
         self.inner
             .transaction
-            .store(Directory::owner_word(dead, EVIDENCE), Ordering::Release);
+            .store(Directory::owner_word(owner, phase), Ordering::Release);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn abandon_allocated_create_for_test(&self, dead: u8, meta: crate::talc::Meta) {
+        self.abandon_create_in(dead, EVIDENCE, meta);
+    }
+
+    /// Stages a create owned by a live participant that reached the phase only its own owner resumes,
+    /// so a test can race two of that participant's threads through `resume_rollback`.
+    #[cfg(test)]
+    pub(crate) fn abandon_rolling_back_create_for_test(&self, owner: u8, meta: crate::talc::Meta) {
+        self.abandon_create_in(owner, ROLLING_BACK, meta);
     }
 
     #[cfg(test)]
@@ -1247,7 +1616,11 @@ pub(crate) struct Directory {
     entries: [Entry; CAPACITY],
 }
 
-// Safety: the single Directory transaction exclusively owns `pending`.
+// Safety: every field but `pending` is an atomic or an immutable-after-admission entry, so a shared
+// `&Directory` never races on them. `pending` is plain non-atomic memory: the transaction word is
+// the lock that gates its stores, which happen only through `Transaction::persist` and
+// `clear_pending`, and every read of the cell — the live path's and every recovery arm's, including
+// `recover`'s `REMOVE` — is taken holding that claim, which is the rule stated on `recover`.
 unsafe impl Sync for Directory {}
 
 pub(crate) type Header = header::RcHeader<Directory>;
@@ -1360,6 +1733,37 @@ impl Transaction<'_> {
             .is_ok();
         core::mem::forget(self);
         committed
+    }
+
+    /// Hands the transaction word back the exact value a reaper read before it claimed, and is the bail
+    /// for a claim that decided nothing.
+    ///
+    /// `commit` writes `CLEAN`, which belongs to a verdict: the successful edges end in `clear_pending`
+    /// and then `commit`, and so does `quarantine_held`, whose store says what the member has become.
+    /// Neither is right for a refusal. `recover` returns `Stale` on a clean word, so committing to
+    /// `CLEAN` on a refusal erases the only record that this member still has a `REMOVE` outstanding —
+    /// and that holds whether the refused condition can change (a live mutation that has not finished) or
+    /// cannot (a span that does not resolve inside the region), because in both cases the next reap is
+    /// what reports it. Nor is `Drop`'s demotion to `ROLLING_BACK` right: that marks a participant
+    /// abandoning its *own* transaction, and a `REMOVE` claim left on a live slot has no way to be
+    /// finished, since `resume_rollback` answers `Busy` for `REMOVE` and every other reap of that
+    /// participant is refused by the owner check at `recover`'s entry. Restoring the observed word puts
+    /// the cell back exactly as this reaper found it, which is what makes the next reap see the same
+    /// condition and, when that condition was a live mutation that has since finished, act on it. Only
+    /// this reaper can have moved the word, because the claim it holds is the only door to it.
+    fn restore(self, observed: usize) -> bool {
+        let restored = self
+            .directory
+            .transaction
+            .compare_exchange(
+                Directory::owner_word(self.owner, self.phase),
+                observed,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok();
+        core::mem::forget(self);
+        restored
     }
 }
 

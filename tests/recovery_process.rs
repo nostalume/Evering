@@ -1,4 +1,4 @@
-#![cfg(all(feature = "process", feature = "notify"))]
+#![cfg(all(feature = "process", feature = "notify", feature = "tokio"))]
 
 use std::{
     env, fs,
@@ -128,7 +128,7 @@ fn crash(session: TestSession, port: Port<()>, pool: PoolId, ring: Ring, cut: Cu
         }
         Cut::Published => {
             let record = pool.as_ref().put(VALUE).unwrap().transfer(());
-            send.reserve().unwrap().stage(record).publish();
+            send.reserve().unwrap().stage(record).publish().unwrap();
             announce(peer, &ring, cut.code());
         }
         Cut::Claimed => {

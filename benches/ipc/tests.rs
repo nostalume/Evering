@@ -1,6 +1,6 @@
 use super::{
-    analysis, drive, environment, evering, family, fixture, geometry, mechanism, model, pilot,
-    stream, study, system,
+    analysis, boundary, drive, environment, evering, family, fixture, geometry, mechanism, model,
+    pilot, stream, study, system,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -1192,7 +1192,9 @@ fn framed_stream_returns_only_the_delivery_digest() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
-    let worker = std::thread::spawn(move || stream::serve(listener.accept().unwrap().0).unwrap());
+    let worker = std::thread::spawn(move || {
+        stream::serve(listener.accept().unwrap().0, boundary::ABSENT).unwrap()
+    });
     let mut client = TcpStream::connect(address).unwrap();
     let payload = model::payload(7, 11, 4096);
     client.write_all(&11_u64.to_le_bytes()).unwrap();
@@ -1220,7 +1222,7 @@ fn framing_is_transport_independent() {
     };
 
     let (mut client, server) = UnixStream::pair().unwrap();
-    let worker = std::thread::spawn(move || stream::serve(server).unwrap());
+    let worker = std::thread::spawn(move || stream::serve(server, boundary::ABSENT).unwrap());
     client.write_all(&7_u64.to_le_bytes()).unwrap();
     client.write_all(&3_u32.to_le_bytes()).unwrap();
     client.write_all(&[1, 2, 3]).unwrap();
@@ -1240,7 +1242,9 @@ fn framed_stream_ready_is_a_validated_round_trip() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
-    let worker = std::thread::spawn(move || stream::serve(listener.accept().unwrap().0).unwrap());
+    let worker = std::thread::spawn(move || {
+        stream::serve(listener.accept().unwrap().0, boundary::ABSENT).unwrap()
+    });
     let mut client = TcpStream::connect(address).unwrap();
     client
         .set_read_timeout(Some(Duration::from_millis(100)))
@@ -1271,7 +1275,7 @@ fn readiness_stream_progresses_with_constrained_duplex_buffers() {
         let socket = socket2::SockRef::from(&stream);
         socket.set_send_buffer_size(4096).unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
-        stream::serve(stream).unwrap();
+        stream::serve(stream, boundary::ABSENT).unwrap();
     });
     let client = TcpStream::connect(address).unwrap();
     let socket = socket2::SockRef::from(&client);
@@ -1500,6 +1504,8 @@ fn system_measure(case: &system::Case, elapsed_ns: u64) -> system::Measure {
             recv_attempts: requested,
             ..drive::PathCounts::default()
         },
+        boundary: None,
+        worker: None,
     }
 }
 
@@ -1945,4 +1951,404 @@ fn warmup_consumption_cannot_reset_the_measured_deadline() {
     .unwrap();
     assert!(error.timed);
     assert_eq!(error.error.kind, drive::Kind::Deadline);
+}
+
+#[test]
+fn procfs_text_parsing_keeps_tick_and_nanosecond_resolution_apart() {
+    assert_eq!(
+        boundary::text::schedstat("987654321 12 34\n"),
+        Some((987_654, boundary::Source::Nanoseconds))
+    );
+    assert_eq!(boundary::text::schedstat("run\n"), None);
+    // The command name is parenthesised and may contain the separator, so the
+    // tick fields are only addressable from the end of the line.
+    let ticks = "9 (worker) S 1 2 3 4 5 6 7 8 9 10 100 200 13 14 15\n";
+    let embedded = "9 (a) b) S 1 2 3 4 5 6 7 8 9 10 100 200 13 14 15\n";
+    let expected = Some((3_000_000, boundary::Source::Ticks));
+    assert_eq!(boundary::text::stat(ticks), expected);
+    assert_eq!(boundary::text::stat(embedded), expected);
+    assert_eq!(boundary::text::stat("9 (worker S 1 2\n"), None);
+    assert_eq!(boundary::text::stat("9 (worker) S 1 2 3 4\n"), None);
+    let status = "Name:\tevering\nvoluntary_ctxt_switches:\t41\nnonvoluntary_ctxt_switches:\t7\n";
+    assert_eq!(boundary::text::switches(status), Some((41, 7)));
+    let reversed = "nonvoluntary_ctxt_switches:\t7\nvoluntary_ctxt_switches:\t41\n";
+    assert_eq!(boundary::text::switches(reversed), Some((41, 7)));
+    assert_eq!(
+        boundary::text::switches("nonvoluntary_ctxt_switches:\t7\n"),
+        None
+    );
+}
+
+#[test]
+fn sample_delta_rejects_regressions_and_mixed_resolutions() {
+    let before = boundary::Sample {
+        runtime: (1_000, boundary::Source::Nanoseconds),
+        voluntary: 10,
+        involuntary: 2,
+    };
+    let after = boundary::Sample {
+        runtime: (2_500, boundary::Source::Nanoseconds),
+        voluntary: 14,
+        involuntary: 2,
+    };
+    assert_eq!(
+        before.since(after).unwrap(),
+        boundary::Accounting {
+            source: boundary::Source::Nanoseconds,
+            runtime_us: 1_500,
+            voluntary_switches: 4,
+            involuntary_switches: 0,
+        }
+    );
+    assert!(after.since(before).is_none());
+    let coarser = boundary::Sample {
+        runtime: (3_000, boundary::Source::Ticks),
+        ..after
+    };
+    assert!(before.since(coarser).is_none());
+}
+
+#[test]
+fn boundary_accounting_is_admitted_only_within_the_timed_window() {
+    let header = system_header("focused");
+    let execution = header.run.schedule[0];
+    let case = header.cases[execution.case as usize].clone();
+    let admit = |cost| {
+        let mut measure = system_measure(&case, 2_000_000);
+        measure.boundary = Some(cost);
+        <system::System as study::Schema>::validate(
+            &header,
+            &study::Observation {
+                unit: execution.unit,
+                case: execution.case,
+                measure,
+            },
+        )
+    };
+    let cost = |source, runtime_us| boundary::Accounting {
+        source,
+        runtime_us,
+        voluntary_switches: 0,
+        involuntary_switches: 0,
+    };
+    let nanoseconds = boundary::Source::Nanoseconds;
+    let ticks = boundary::Source::Ticks;
+    // The sample window sits inside the timed window, so attributed run time
+    // cannot exceed the phase that contains it.
+    assert!(admit(cost(nanoseconds, 2_001)).is_err());
+    assert!(admit(cost(ticks, 2_001)).is_err());
+    // Either source may floor to zero: the kernel refreshes run time at
+    // scheduling events, so this bounds the claim, not the validity.
+    admit(cost(nanoseconds, 0)).unwrap();
+    admit(cost(ticks, 0)).unwrap();
+    admit(cost(nanoseconds, 1_999)).unwrap();
+}
+
+#[test]
+fn measure_round_trips_an_absent_and_a_present_boundary() {
+    let header = system_header("focused");
+    let case = header.cases[header.run.schedule[0].case as usize].clone();
+    let mut measure = system_measure(&case, 2_000_000);
+    let encoded = serde_json::to_string(&measure).unwrap();
+    assert!(!encoded.contains("boundary"));
+    assert_eq!(
+        serde_json::from_str::<system::Measure>(&encoded).unwrap(),
+        measure
+    );
+    measure.boundary = Some(boundary::Accounting {
+        source: boundary::Source::Nanoseconds,
+        runtime_us: 1_500,
+        voluntary_switches: 4,
+        involuntary_switches: 1,
+    });
+    let encoded = serde_json::to_string(&measure).unwrap();
+    assert!(encoded.contains("boundary"));
+    assert_eq!(
+        serde_json::from_str::<system::Measure>(&encoded).unwrap(),
+        measure
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn procfs_sample_sees_a_blocking_phase() {
+    let before = boundary::sample().expect("procfs is readable");
+    // A CPU-only phase proves nothing: the kernel refreshes run time at
+    // scheduling events, so only a phase that blocks exercises the counters.
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let cost = before
+        .since(boundary::sample().expect("procfs is readable"))
+        .unwrap();
+    assert!(
+        cost.voluntary_switches > 0,
+        "a blocking phase must register a voluntary switch"
+    );
+    let zeros = before.since(before).unwrap();
+    assert_eq!(
+        (
+            zeros.runtime_us,
+            zeros.voluntary_switches,
+            zeros.involuntary_switches
+        ),
+        (0, 0, 0)
+    );
+}
+
+#[test]
+fn trailer_text_round_trips_a_witness_and_rejects_every_other_shape() {
+    let witness = boundary::Witness {
+        cost: boundary::Accounting {
+            source: boundary::Source::Ticks,
+            runtime_us: 300,
+            voluntary_switches: 7,
+            involuntary_switches: 0,
+        },
+        bracket_ns: 9_000_000_000,
+    };
+    let encoded = boundary::text::encode(&witness);
+    assert_eq!(boundary::text::decode(&encoded).unwrap(), witness);
+    for malformed in [
+        "",
+        "runtime_us=1 voluntary=1 involuntary=1 bracket_ns=1",
+        "source=nanoseconds runtime_us=1 voluntary=1 involuntary=1",
+        "source=uptime runtime_us=1 voluntary=1 involuntary=1 bracket_ns=1",
+        "runtime_us=1 source=nanoseconds voluntary=1 involuntary=1 bracket_ns=1",
+        "source=nanoseconds runtime_us=x voluntary=1 involuntary=1 bracket_ns=1",
+        "source=nanoseconds runtime_us=-1 voluntary=1 involuntary=1 bracket_ns=1",
+        "source=nanoseconds runtime_us=1 voluntary=1 involuntary=1 bracket_ns=1 trailing=2",
+    ] {
+        assert!(
+            boundary::text::decode(malformed).is_none(),
+            "{malformed:?} must not read as a witness"
+        );
+    }
+}
+
+#[test]
+fn worker_witness_is_admitted_only_inside_its_bracket_and_the_trial_span() {
+    let header = system_header("focused");
+    let execution = header.run.schedule[0];
+    let case = header.cases[execution.case as usize].clone();
+    let witness = |bracket_ns, runtime_us| boundary::Witness {
+        cost: boundary::Accounting {
+            source: boundary::Source::Nanoseconds,
+            runtime_us,
+            voluntary_switches: 0,
+            involuntary_switches: 0,
+        },
+        bracket_ns,
+    };
+    let admit = |worker| {
+        let mut measure = system_measure(&case, 2_000_000);
+        measure.worker = worker;
+        <system::System as study::Schema>::validate(
+            &header,
+            &study::Observation {
+                unit: execution.unit,
+                case: execution.case,
+                measure,
+            },
+        )
+    };
+    // The worker bracket opens at the probe and closes when the peer shuts the
+    // channel down, so it legitimately runs past the timed window: only the
+    // whole trial span bounds it.
+    admit(Some(witness(2_000_001, 1))).unwrap();
+    assert!(admit(Some(witness(2_000_003, 1))).is_err());
+    // Run time cannot exceed the bracket it was measured over, and a
+    // zero-length bracket is not a measurement of anything.
+    assert!(admit(Some(witness(1_000, 2))).is_err());
+    assert!(admit(Some(witness(0, 0))).is_err());
+    // An unobserved worker is a state, not a zero.
+    admit(None).unwrap();
+}
+
+#[test]
+fn measure_omits_an_absent_worker_and_restores_a_present_one() {
+    let header = system_header("focused");
+    let execution = header.run.schedule[0];
+    let case = header.cases[execution.case as usize].clone();
+    let mut measure = system_measure(&case, 2_000_000);
+    let encoded = serde_json::to_string(&measure).unwrap();
+    assert!(!encoded.contains("worker"));
+    measure.worker = Some(boundary::Witness {
+        cost: boundary::Accounting {
+            source: boundary::Source::Nanoseconds,
+            runtime_us: 1,
+            voluntary_switches: 0,
+            involuntary_switches: 0,
+        },
+        bracket_ns: 2,
+    });
+    let encoded = serde_json::to_string(&measure).unwrap();
+    assert!(encoded.contains("worker"));
+    assert_eq!(
+        serde_json::from_str::<system::Measure>(&encoded).unwrap(),
+        measure
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn a_claimed_trailer_reports_absence_until_the_worker_fills_it() {
+    let trailer = boundary::Trailer::claim()
+        .expect("a writable temporary directory")
+        .expect("procfs is readable on this host");
+    // Claiming creates the file empty, so an unread report is absence before
+    // any worker has written one, and never a zero.
+    assert!(trailer.read().is_none());
+    let other = boundary::Trailer::claim().unwrap().unwrap();
+    assert_ne!(trailer.argument(), other.argument());
+    let path = trailer.argument().to_owned();
+    let phase = boundary::Phase::begin(trailer.argument()).expect("a claimed trailer brackets");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    phase.record(&path).expect("the trailer is writable");
+    let witness = trailer.read().expect("the worker reported its bracket");
+    assert!(
+        witness.bracket_ns > 10_000_000,
+        "the bracket must span the phase the worker blocked in"
+    );
+    assert!(witness.cost.voluntary_switches > 0);
+    assert!(witness.cost.runtime_us <= witness.bracket_ns / 1_000);
+    drop(trailer);
+    assert!(
+        !std::path::Path::new(&path).exists(),
+        "a trailer must not outlive the trial that claimed it"
+    );
+}
+
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn an_unobservable_host_claims_no_trailer_at_all() {
+    assert!(matches!(boundary::Trailer::claim(), Ok(None)));
+}
+
+/// Stage 1.3's demo on the real provider. Stage 0.3a counted two doorbells per
+/// operation for the shared-memory arm: one when the producer publishes, one when
+/// the consumer recycles the slot. Batching spends one of each per group instead,
+/// so the same 40 operations cost `2 * groups` plus `2 * operations` entries rather
+/// than `2 * operations` everywhere. The counting adapter wraps the eventfd ring,
+/// so every entry it records is a real `write(2)` into the peer's latch, and the
+/// phase that batched is still admitted by the finished Stage 0 instrument.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_batched_publish_group_costs_one_doorbell_and_the_instrument_admits_it() {
+    use std::{cell::Cell, time::Instant};
+
+    use ::evering::{
+        Session,
+        layout::{Repr, SchemaId, SchemaKey},
+        mapping::{Access, Request},
+        notify::{Notify, Signals, Wait as _},
+        os, runtime,
+    };
+
+    #[derive(Debug)]
+    #[repr(C)]
+    struct Door(u64);
+
+    unsafe impl Repr for Door {
+        const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x73315f335f646f6f), 1);
+    }
+
+    struct Counted<'r>(&'r os::Ring, Cell<usize>);
+
+    impl Notify for Counted<'_> {
+        type Error = <os::Ring as Notify>::Error;
+
+        fn notify(&self) -> Result<(), Self::Error> {
+            self.1.set(self.1.get() + 1);
+            self.0.notify()
+        }
+    }
+
+    const PER_GROUP: u64 = 8;
+    const GROUPS: u64 = 4;
+
+    let source = os::unix::UnixFd::memfd("evering-s1-3", 1 << 20, false).unwrap();
+    let request = Request::new(1 << 20, Access::READ | Access::WRITE);
+    let writer = Session::create(source.borrow(), request, evering::REGION).unwrap();
+    let reader = Session::open(source.borrow(), request, evering::REGION).unwrap();
+    let pool = writer.create_pool(64 * 1024, None).unwrap();
+    let reader_pool = reader.open_pool(pool.id()).unwrap();
+    let (write_channel, port) = writer.create_channel::<Door>(PER_GROUP as usize).unwrap();
+    let read_channel = reader.adopt(port).unwrap();
+    let (tx, _) = write_channel.split();
+    let (_, rx) = read_channel.split();
+
+    let (ring, event) = os::event().unwrap();
+    let traps = Counted(&ring, Cell::new(0));
+    let signals = Signals::notify(&traps);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+
+    let (boundary, elapsed) = runtime.block_on(async move {
+        let wait = runtime::Wait::new(event).unwrap();
+        let before = boundary::sample();
+        let started = Instant::now();
+
+        let mut batch = signals.defer();
+        for group in 0..GROUPS {
+            for index in 0..PER_GROUP {
+                let ordinal = group * PER_GROUP + index;
+                signals
+                    .try_publish(
+                        &tx,
+                        pool.as_ref().put(ordinal).unwrap().transfer(Door(ordinal)),
+                        &mut batch,
+                    )
+                    .unwrap();
+            }
+            batch.deliver().unwrap();
+            wait.wait().await.unwrap();
+            for index in 0..PER_GROUP {
+                let door = batch
+                    .discard(rx.claim().unwrap(), reader_pool.as_ref())
+                    .unwrap();
+                assert_eq!(door.0, group * PER_GROUP + index);
+            }
+            batch.deliver().unwrap();
+        }
+
+        // The same exchange rung per operation, as the notified arm does today.
+        for ordinal in 0..PER_GROUP {
+            signals
+                .try_send(
+                    &tx,
+                    pool.as_ref().put(ordinal).unwrap().transfer(Door(ordinal)),
+                )
+                .unwrap();
+            wait.wait().await.unwrap();
+            let door = signals
+                .discard(rx.claim().unwrap(), reader_pool.as_ref())
+                .unwrap()
+                .into_parts()
+                .0;
+            assert_eq!(door.0, ordinal);
+        }
+        drop(batch);
+
+        let after = boundary::sample();
+        (
+            after.and_then(|after| before.and_then(|before| before.since(after))),
+            Instant::now().duration_since(started),
+        )
+    });
+
+    assert_eq!(
+        traps.1.get(),
+        (2 * GROUPS + 2 * PER_GROUP) as usize,
+        "{} operations cost two doorbells per group while {} cost two per operation",
+        GROUPS * PER_GROUP,
+        PER_GROUP
+    );
+    let Some(boundary) = boundary else {
+        panic!("a blocking batched phase must produce an admitted boundary figure");
+    };
+    assert!(
+        boundary.runtime_us <= u64::try_from(elapsed.as_micros()).unwrap(),
+        "attributed run time cannot exceed the window that contains it"
+    );
 }

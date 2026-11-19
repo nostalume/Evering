@@ -20,6 +20,8 @@ ownership transitions. Native resources and asynchronous waiting are adapters.
 | `Channel<H>` | Exchange fixed-representation headers through a bounded duplex queue. |
 | `Port<H>` | Hand one channel role to another process as stable bytes. |
 | `Signals` | Wait for progress and notify a peer after shared state commits. |
+| `Deferred` | Withhold that notification across a batch of commits and spend it once. |
+| `Patience` | Decide how long a retry spins, waits for the peer, and gives up. |
 
 A creator creates a `Session`, `Pool`, and channel, then hands the mapping,
 `PoolId`, and `Port` to a peer. The peer opens the session and adopts the port.
@@ -43,6 +45,10 @@ The default feature is `std`. `map`, `notify`, and `process` are composable;
 `os` selects all native adapters. `tokio` adds process-local waiting. The core
 also checks with default features disabled.
 
+The core declares `const` traits and `const` impls, so it needs a nightly
+toolchain. `rust-toolchain.toml` pins the version the checks below were run on
+(`nightly-2026-11-17`); `rustup` installs it on first use.
+
 ## Practical example
 
 The indexer hands shared storage and typed Channels to two workers, admits their
@@ -54,6 +60,20 @@ cargo run --example index --features os,tokio -- README.md Cargo.toml
 
 It prints bytes, lines, and a checksum for each file. Worker failure is reported
 and supervised, but abrupt in-flight application work is not replayed.
+
+A second example sends the same three compile jobs twice — once through a
+daemon in another process, once through a matched framed-TCP server — then
+retires the peer and reclaims what it left behind.
+
+```console
+cargo run --release --example compile_cache --features os,tokio
+```
+
+Release is the intended profile; the example's own digest over a 1 MiB payload
+dominates a debug build. `--geometry` first prints the reservation each exact
+block range asks for, which is a floor set by the largest class rather than by
+traffic. The comparison favours TCP on purpose: its server is a thread inside
+the parent, while the Evering peer crosses `exec` and owns the other process.
 
 ## Benchmark evidence
 

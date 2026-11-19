@@ -1745,6 +1745,16 @@ impl MapTalc {
         poison_mutation(&self.header.mutation, owner)
     }
 
+    /// Lets go of a mutation word the dead `owner` held.
+    ///
+    /// `true` covers two states — this call wrote `MUTATION_CLEAN` over the dead owner's word, and the
+    /// word already read `MUTATION_CLEAN` — which every handler acts on the same way: the heap is not
+    /// holding anything the dead owner left. `false` means the CAS met some other value, and it is not
+    /// "the reclaim failed": a caller may report who holds the heap only from what it reads after
+    /// this call, never from this return. `recovery_stands_down_when_a_live_mutation_finishes_inside_its_clear`
+    /// drives the interleaving where the two readings differ, and it is why a tri-state that carried the
+    /// compare-exchange's own observation would be the worse type: the value seen here can already be
+    /// out of date by the time a handler has a name for it.
     pub(crate) fn clear_dead_owner(&self, owner: u8) -> bool {
         match self.header.mutation.compare_exchange(
             owner_word(owner),
@@ -1795,7 +1805,17 @@ impl TryFrom<Build> for MapTalc {
     }
 }
 
-#[derive(Debug, PartialEq, Eq)]
+/// Alignment a block pointer must have for this allocator to touch it: `deallocate` reads the
+/// [`Tag`] it wrote just below the pointer it is handed.
+pub(crate) const BLOCK_ALIGN: usize = core::mem::align_of::<Tag>();
+
+/// Whether the allocator may read its own header at `pointer`. A span that arrives from shared
+/// memory is whatever a peer chose, so its address has to be checked before it is freed through.
+pub(crate) fn block_aligned(pointer: NonNull<u8>) -> bool {
+    pointer.addr().get().is_multiple_of(BLOCK_ALIGN)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
     view: AddrSpan,
 }
@@ -1824,6 +1844,15 @@ impl Meta {
     #[inline]
     pub(crate) const fn is_null(&self) -> bool {
         self.view.is_null()
+    }
+
+    /// Names `offset..offset + size` in whichever mapping reads it, checked against nothing.
+    /// Test-only: every honest `Meta` comes from the allocator through `from_ptr`.
+    #[cfg(test)]
+    pub(crate) const fn span_at_for_test(offset: Offset, size: Size) -> Self {
+        Self {
+            view: AddrSpan::new(offset, size),
+        }
     }
 
     #[inline]

@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use super::{
+    boundary::{Accounting, Witness},
     drive::PathCounts,
     model::{Cell, Observed},
     study::{self, Header, Identity, Observation, Schema},
@@ -122,6 +123,19 @@ pub struct Measure {
     pub phase_ns: [u64; 3],
     pub observed: Observed,
     pub path: PathCounts,
+    /// Absent means the host could not observe the boundary, which is not the
+    /// same statement as a boundary that cost nothing. A present but zero figure
+    /// is likewise not proof of an idle phase: the kernel refreshes run time at
+    /// scheduling events, so a short CPU-only phase can read zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boundary: Option<Accounting>,
+    /// The worker process's own accounting, over the bracket the worker itself
+    /// reported. That bracket runs past the timed window, because the worker
+    /// learns the phase ended only when the coordinator shuts the channel down,
+    /// so the figure is admitted against the whole trial span and never against
+    /// `elapsed_ns` alone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker: Option<Witness>,
 }
 
 pub struct System;
@@ -192,6 +206,17 @@ impl Schema for System {
         let measure = &row.measure;
         let pending_send = measure.path.send_full.checked_add(measure.path.send_busy);
         let pending_recv = measure.path.recv_empty.checked_add(measure.path.recv_busy);
+        let conserved = measure
+            .boundary
+            .is_none_or(|boundary| boundary.runtime_us <= measure.elapsed_ns / 1_000);
+        let span = measure.phase_ns[0]
+            .checked_add(measure.elapsed_ns)
+            .and_then(|value| value.checked_add(measure.phase_ns[2]));
+        let attributed = measure.worker.is_none_or(|worker| {
+            worker.bracket_ns != 0
+                && worker.cost.runtime_us <= worker.bracket_ns / 1_000
+                && span.is_some_and(|span| worker.bracket_ns <= span)
+        });
         if measure.requested == 0
             || measure.accepted != measure.requested
             || measure.completed != measure.accepted
@@ -211,6 +236,8 @@ impl Schema for System {
             || measure.path.stale_wakes > measure.path.wakes
             || pending_send.is_none_or(|count| count > measure.path.send_attempts)
             || pending_recv.is_none_or(|count| count > measure.path.recv_attempts)
+            || !conserved
+            || !attributed
         {
             return Err("invalid system measure".into());
         }

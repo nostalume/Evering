@@ -873,10 +873,10 @@ impl<H: Repr> Tx<H> {
         value: crate::Transfer<'p, H>,
     ) -> Result<(), TrySendError<crate::Transfer<'p, H>>> {
         match self.reserve() {
-            Ok(reserved) => {
-                reserved.stage(value).publish();
-                Ok(())
-            }
+            Ok(reserved) => reserved
+                .stage(value)
+                .publish()
+                .map_err(|_| TrySendError::Authority),
             Err(ReserveError::Closed) => Err(TrySendError::Disconnected(value)),
             Err(ReserveError::Full) => Err(TrySendError::Full(value)),
             Err(ReserveError::Busy) => Err(TrySendError::Busy(value)),
@@ -906,13 +906,25 @@ impl<'a, H: Repr> TransferReserved<'a, H> {
     }
 }
 
+/// The Pool authority behind a staged transfer was reclaimed before it was published.
+///
+/// Another participant restated the block's control word — a repair that decided its holder was
+/// gone, or a reclamation at a newer generation — so publishing would hand the peer a block this
+/// process no longer owns. Nothing was published: the Queue slot was rolled back and the block was
+/// left to whoever took it. The transfer cannot be handed back either, because reading or writing
+/// its storage would touch a block owned elsewhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PublishError;
+
 impl<'a, 'p, H: Repr> TransferStaged<'a, 'p, H> {
-    pub fn publish(mut self) {
-        assert!(
-            self.allocation.detach().is_ok(),
-            "linear transfer lost its Pool authority before publication"
-        );
+    /// Detaches the allocation and publishes the token that names it.
+    pub fn publish(mut self) -> Result<(), PublishError> {
+        if self.allocation.detach().is_err() {
+            self.allocation.abandon();
+            return Err(PublishError);
+        }
         self.staged.publish();
+        Ok(())
     }
 
     pub fn cancel(self) -> crate::Transfer<'p, H> {

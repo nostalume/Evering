@@ -1,5 +1,6 @@
 use std::time::{Duration, Instant};
 
+use super::boundary;
 use super::model::{digest, payload};
 
 #[derive(Clone, Copy)]
@@ -155,6 +156,7 @@ pub struct Measured {
     pub path: PathCounts,
     pub setup_ns: u64,
     pub elapsed_ns: u64,
+    pub boundary: Option<boundary::Accounting>,
 }
 
 pub struct MeasureError<E> {
@@ -336,6 +338,16 @@ pub fn transfer_control<E: Endpoint>(
     )
 }
 
+fn bounded(
+    before: Option<boundary::Sample>,
+    after: Option<boundary::Sample>,
+) -> Option<boundary::Accounting> {
+    let (Some(before), Some(after)) = (before, after) else {
+        return None;
+    };
+    before.since(after)
+}
+
 pub fn measure<E: Endpoint>(
     endpoint: &mut E,
     work: Work,
@@ -384,6 +396,7 @@ pub fn measure<E: Endpoint>(
     let setup_ns = began.elapsed().as_nanos().max(1) as u64;
     path = PathCounts::default();
     let started = Instant::now();
+    let before = boundary::sample();
     match transfer_inner::<true, _>(
         endpoint,
         work,
@@ -396,6 +409,7 @@ pub fn measure<E: Endpoint>(
             counts,
             path,
             setup_ns,
+            boundary: bounded(before, boundary::sample()),
             elapsed_ns: started.elapsed().as_nanos().max(1) as u64,
         }),
         Err(error) => Err(MeasureError {

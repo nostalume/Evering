@@ -31,12 +31,12 @@ pub fn event() -> io::Result<(Ring, Event)> {
 }
 
 impl Notify for Ring {
-    type Error = Errno;
+    type Error = io::Error;
 
     fn notify(&self) -> Result<(), Self::Error> {
         match self.0.write(1) {
             Ok(_) | Err(Errno::EAGAIN) => Ok(()),
-            Err(error) => Err(error),
+            Err(error) => Err(error.into()),
         }
     }
 }
@@ -82,8 +82,22 @@ impl AsRawFd for Event {
 
 #[cfg(test)]
 mod tests {
-    use super::event;
+    use super::{Event, event};
     use crate::notify::Notify;
+
+    use nix::errno::Errno;
+
+    /// Reads the latch as the kernel sees it: a counter read returns the pending total
+    /// and leaves nothing behind. `Event::clear` cannot report this, because the
+    /// wake-set clause needs an already-consumed latch to succeed, so consumption is
+    /// probed at the primitive instead of inferred from a park that stayed asleep.
+    fn pending(event: &Event) -> u64 {
+        match event.0.read() {
+            Ok(counter) => counter,
+            Err(Errno::EAGAIN) => 0,
+            Err(error) => panic!("latch unreadable: {error}"),
+        }
+    }
 
     #[test]
     fn notification_is_sticky_and_coalesced() {
@@ -92,5 +106,24 @@ mod tests {
         ring.notify().unwrap();
         event.clear().unwrap();
         event.clear().unwrap();
+    }
+
+    #[test]
+    fn one_clear_consumes_every_pending_kick() {
+        let (ring, event) = event().unwrap();
+        assert_eq!(pending(&event), 0, "a fresh latch holds nothing");
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        ring.notify().unwrap();
+        event.clear().unwrap();
+        assert_eq!(
+            pending(&event),
+            0,
+            "one clear must take the whole counter, not one kick"
+        );
+        ring.notify().unwrap();
+        // The primitive itself counts, which is what the wait layer collapses: the
+        // read that observes the count is also the read that consumes it.
+        assert_eq!(pending(&event), 1, "a pending kick is a counter, not a bit");
     }
 }

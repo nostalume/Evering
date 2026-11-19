@@ -171,12 +171,10 @@ fn spawn(
     event: &Event,
     ring: &Ring,
 ) -> Result<Supervisor> {
-    let handoff = evering::os::Handoff::bind().map_err(text)?;
+    let (handoff, grant) = evering::os::Handoff::bind().map_err(text)?;
     let mut command = Command::new(std::env::current_exe().map_err(text)?);
-    command
-        .arg("--worker")
-        .arg(handoff.address())
-        .arg(index.to_string());
+    command.arg("--worker").arg(index.to_string());
+    grant.admit(&mut command).map_err(text)?;
     let child = Supervisor::spawn(&mut command).map_err(text)?;
     handoff
         .send(
@@ -191,8 +189,8 @@ fn spawn(
     Ok(child)
 }
 
-fn attach(address: &str) -> Result<(Bootstrap, Session, Event, Ring)> {
-    let resources = evering::os::Handoff::receive(address).map_err(text)?;
+fn attach() -> Result<(Bootstrap, Session, Event, Ring)> {
+    let (_peer, resources) = evering::os::Handoff::receive().map_err(text)?;
     let session = Session::open(
         resources.mapping,
         Request::new(EXTENT, Access::READ | Access::WRITE),
@@ -248,6 +246,7 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
             let block = pool.as_ref().copy(&body).map_err(text)?;
             permit
                 .send(block.encode(JOB))
+                .map_err(text)?
                 .into_parts()
                 .1
                 .map_err(text)?;
@@ -294,8 +293,8 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
         .collect()
 }
 
-async fn worker(address: &str, index: usize) -> Result<()> {
-    let (boot, session, event, ring) = attach(address)?;
+async fn worker(index: usize) -> Result<()> {
+    let (boot, session, event, ring) = attach()?;
     let (pool_id, jobs, results) = decode_boot(&boot, index)?;
     let pool = session.open_pool(pool_id).map_err(text)?;
     let jobs = session.adopt(jobs).map_err(text)?;
@@ -326,6 +325,7 @@ async fn worker(address: &str, index: usize) -> Result<()> {
         let block = pool.as_ref().copy(&body).map_err(text)?;
         permit
             .send(block.encode(OUTCOME))
+            .map_err(text)?
             .into_parts()
             .1
             .map_err(text)?;
@@ -341,10 +341,8 @@ fn main() {
         .build()
         .unwrap();
     let result = if args.first().map(String::as_str) == Some("--worker") {
-        let index = args[2].parse().expect("numeric worker index");
-        runtime
-            .block_on(worker(&args[1], index))
-            .map(|_| Vec::new())
+        let index = args[1].parse().expect("numeric worker index");
+        runtime.block_on(worker(index)).map(|_| Vec::new())
     } else {
         let paths = std::env::args_os().skip(1).map(PathBuf::from).collect();
         runtime.block_on(coordinator(paths))

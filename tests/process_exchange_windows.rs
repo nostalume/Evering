@@ -24,9 +24,15 @@ use evering::{
 };
 
 #[test]
-fn typed_handoff_is_available() {
-    let handoff = Handoff::bind().unwrap();
-    assert!(!handoff.address().is_empty());
+fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
+    let (handoff, grant) = Handoff::bind().unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    grant.admit(&mut command).unwrap();
+    drop(handoff);
+    let error = Handoff::receive()
+        .err()
+        .expect("a process holding no grant meets no one");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[cfg(feature = "notify")]
