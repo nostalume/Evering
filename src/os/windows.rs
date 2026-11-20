@@ -10,11 +10,12 @@
 //! Placement is not asked of the kernel — `MapViewOfFile` takes no address, so where a view lands is the
 //! allocator's choice, and `mem::REGION_ALIGN`'s non-unix value of `1 << 16` is the section allocation
 //! granularity rather than something arranged here; a pool whose blocks have to sit at the same residue
-//! in two processes is therefore relying on the kernel, not on this file. And the access a section is
-//! created with is enforced for every mapper, which is the opposite of the Unix arm, where a memfd
-//! carries none and each mapping decides: a caller that reads one arm's `Access` behaviour into the
-//! other gets a refusal on one host and silent over-permission on the other. None of this has been
-//! executed on the host writing it.
+//! in two processes is therefore relying on the kernel, not on this file. And the two arms keep
+//! different reach with the same refusal: the bound a section is created with limits *every* process
+//! that maps it, while the Unix arm records the maker's word and can only bind the maker — which is
+//! why `Section::map` checks a claim the kernel would enforce anyway, and why a handle adopted from
+//! another process records no bound at all here either. None of this has been executed on the host
+//! writing it.
 
 #[cfg(feature = "process")]
 pub mod process;
@@ -37,6 +38,10 @@ use crate::mem::{Access, Map, Request, Source};
 
 pub struct Section<F: AsHandle> {
     handle: F,
+    /// The access the section was created under, when this process created it. `None` is the received
+    /// case: the protection is the object's own and the kernel answers for it, but nobody here can
+    /// read it back, so no claim is made about it.
+    bound: Option<Access>,
 }
 
 impl Section<OwnedHandle> {
@@ -72,11 +77,15 @@ impl Section<OwnedHandle> {
         }
         Ok(Self {
             handle: unsafe { OwnedHandle::from_raw_handle(handle.cast()) },
+            bound: Some(access),
         })
     }
 
     pub fn from_owned_handle(handle: OwnedHandle) -> Self {
-        Self { handle }
+        Self {
+            handle,
+            bound: None,
+        }
     }
 }
 
@@ -90,6 +99,7 @@ impl<F: AsHandle> Section<F> {
     pub fn borrow(&self) -> Section<BorrowedHandle<'_>> {
         Section {
             handle: self.handle.as_handle(),
+            bound: self.bound,
         }
     }
 }
@@ -102,6 +112,19 @@ unsafe impl<F: AsHandle> Source for Section<F> {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "mapping requires nonzero readable extent",
+            ));
+        }
+        // What limits a view is the protection the section was created with, and the kernel enforces
+        // that for every process. This first check is the promise this process made itself: a section
+        // it made under one word is not mapped under a wider one. A handle that arrived from another
+        // process claims nothing, so the kernel is the only one answerable for it.
+        if !self
+            .bound
+            .is_none_or(|bound| bound.contains(request.access))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the mapping asks for access wider than the section was created under",
             ));
         }
         let mut access = FILE_MAP_READ;

@@ -1,8 +1,10 @@
 //! Owns no bytes of its own: it is the only type that pairs one directory with one heap under one
 //! member identity, and the only one that authorizes the dead-mark which rewrites a member's word in
-//! the region header. `create`, `create_with` and `open` join a member; `create_pool`,
-//! `create_channel`, `adopt` and `remove` drive the record writes and the heap claim; and a dead
-//! member's words move only inside `Recovery::reap_with`.
+//! the region header. `create`, `create_with` and `open` join a member; `reserve_seat` promises one
+//! for a process that has not started yet, `Seat`'s drop gives a promise back and `open_as` arrives
+//! in one instead of claiming a slot; `create_pool`, `create_channel`, `adopt` and `remove` drive the
+//! record writes and the heap claim; and a dead member's words move only inside
+//! `Recovery::reap_with`.
 //!
 //! `reap_with` walks the region twice before it clears a member, because the second walk is what
 //! proves the first changed nothing — a single walk returns `Ok` for a region that still names the
@@ -14,7 +16,7 @@ use crate::channel::{self as shared, Channel, CloseError, Id, Port};
 use crate::{
     boxed::PBox,
     dir,
-    header::{Member, RecoveryHandler},
+    header::{Claim, Member, RecoveryHandler},
     mem::{self, Build, MemOps, Peer, Request, Source},
     msg::Repr,
     pool, talc,
@@ -175,6 +177,8 @@ pub enum SessionError<E> {
     Poisoned,
     Overflow,
     ParticipantExhausted,
+    ParticipantReserved,
+    ArrivalRefused,
 }
 
 impl<E> SessionError<E> {
@@ -196,6 +200,8 @@ impl<E> SessionError<E> {
             mem::Error::PoisonedComposition => Self::Poisoned,
             mem::Error::ArithmeticOverflow => Self::Overflow,
             mem::Error::ParticipantExhausted => Self::ParticipantExhausted,
+            mem::Error::ParticipantReserved => Self::ParticipantReserved,
+            mem::Error::ArrivalRefused => Self::ArrivalRefused,
         }
     }
 }
@@ -224,6 +230,12 @@ impl<E: core::fmt::Debug> core::fmt::Display for SessionError<E> {
             Self::Poisoned => f.write_str("this composition was refused as poisoned"),
             Self::Overflow => f.write_str("the requested size or offset overflowed"),
             Self::ParticipantExhausted => f.write_str("the region holds no free member slot"),
+            Self::ParticipantReserved => {
+                f.write_str("every member slot is held, or promised to a process not yet arrived")
+            }
+            Self::ArrivalRefused => {
+                f.write_str("the member slot named for arrival was not promised to it")
+            }
         }
     }
 }
@@ -470,6 +482,78 @@ impl Recovery<'_> {
     }
 }
 
+/// A member slot this session keeps open for a process that has not started yet.
+///
+/// [`Session::reserve_seat`] takes one: the region's roster then names the slot and the generation
+/// its holder will answer to, while nobody has joined it. Dropping the seat gives the slot back —
+/// with its generation spent, so an identity that was announced under the promise is never announced
+/// twice — which is what makes a child that never started cost a number and nothing else. A child
+/// that did arrive consumes the promise, and from then on the seat is not its holder's to return:
+/// [`Session::assume_dead`] is what releases the member it became.
+///
+/// A seat is a claim on a slot, not an authority over the region. Any process that can map the region
+/// may [`Session::open`] and join as a member of its own, so what [`Seat::peer`] names is a place to
+/// be filled rather than a secret to keep.
+#[must_use = "a seat nobody holds is given back when it is dropped"]
+pub struct Seat<'a> {
+    session: &'a Session,
+    member: Member,
+}
+
+impl Seat<'_> {
+    /// The identity the promised process arrives as, and the one [`Session::open_as`] takes.
+    pub fn peer(&self) -> Peer {
+        Peer::from_parts(self.member.slot, self.member.generation)
+    }
+
+    /// The region the promised slot belongs to.
+    pub fn region(&self) -> RegionId {
+        self.session.dir.region_id()
+    }
+
+    /// What the process this slot is promised to is told, which is the only way an announcement is
+    /// made.
+    ///
+    /// A caller could name the region and the slot itself, and the roster would refuse an invention
+    /// exactly as plainly as it refuses a misremembered promise — so the check is not why this is the
+    /// entrance. It is the entrance because an announcement is a promise somebody has to answer for,
+    /// and a promise one holds is the only thing that can.
+    #[cfg(feature = "process")]
+    pub fn introduction(&self) -> crate::process::Introduction {
+        crate::process::Introduction::new(self.region(), self.peer())
+    }
+}
+
+impl Drop for Seat<'_> {
+    fn drop(&mut self) {
+        let _ = self.session.dir.cancel_member(self.member);
+    }
+}
+
+/// Why no member slot could be promised.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SeatError {
+    /// Every slot is free or held, and nothing more can be promised until the region grows.
+    Exhausted,
+    /// Every slot is taken, but some stand promised to a process that has not arrived: dropping that
+    /// seat, or waiting for its arrival, is what can make room.
+    Promised,
+}
+
+impl core::fmt::Display for SeatError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Exhausted => f.write_str("the region holds no member slot left to promise"),
+            Self::Promised => {
+                f.write_str("every member slot is held or promised to a process not yet arrived")
+            }
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for SeatError {}
+
 impl Session {
     pub fn create<S: Source>(
         source: S,
@@ -504,6 +588,43 @@ impl Session {
             crate::schema::RegionAdmission::Expect(region),
             None,
         )
+    }
+
+    /// Promise this region's next free member slot to a process that does not exist yet.
+    ///
+    /// This is the only way an identity in a region can be announced before the process that will
+    /// answer to it: the slot is named in the roster from now on, so a later [`Session::open`] cannot
+    /// be handed it, and [`Seat::peer`] says which generation the arrival must claim. Until someone
+    /// arrives the slot belongs to no process, so the death machinery has nothing to say about it —
+    /// a child that never started is undone by dropping the seat, not by reaping.
+    pub fn reserve_seat(&self) -> Result<Seat<'_>, SeatError> {
+        match self.dir.reserve_member() {
+            Claim::Taken(member) => Ok(Seat {
+                session: self,
+                member,
+            }),
+            Claim::Promised => Err(SeatError::Promised),
+            Claim::Full => Err(SeatError::Exhausted),
+        }
+    }
+
+    /// Open a region as the member a live participant promised, instead of as whoever claims a slot.
+    ///
+    /// The twin of [`Session::open`] for a process that was told which slot it owns — the pair
+    /// `region` and `peer` is exactly what [`Seat`] names. Nothing here checks that the promise was
+    /// this process's to keep: it is the arrival's word that the roster still reads `RESERVED` at
+    /// that generation, and a slot already taken up, given back, or never promised is refused with
+    /// [`SessionError::ArrivalRefused`] without this process joining anything.
+    pub fn open_as<S: Source>(
+        source: S,
+        request: Request,
+        region: RegionId,
+        peer: Peer,
+    ) -> Result<Self, SessionError<S::Error>> {
+        let map = source.map(request).map_err(SessionError::Source)?;
+        let area = Build::arriving_as(map, crate::schema::RegionAdmission::Expect(region), peer)
+            .map_err(SessionError::admission)?;
+        Self::from(area).map_err(SessionError::admission)
     }
 
     fn admit<S: Source>(
@@ -672,9 +793,10 @@ impl Session {
     /// this session's region.
     ///
     /// Returns the [`Recovery`] authority for that member, or `None` when the slot is neither live nor
-    /// already dead at exactly `peer`'s generation: a free slot, a superseded generation, or a retired
-    /// one. A `None` is not evidence that the peer is gone, only that this region has no member to
-    /// reap under that identity.
+    /// already dead at exactly `peer`'s generation: a free slot, a superseded generation, a retired
+    /// one, or one still promised to a process that has not arrived. A `None` is not evidence that the
+    /// peer is gone, only that this region has no member to reap under that identity. A promised slot
+    /// is not a member yet, so it is [`Seat`]'s to give back rather than anything to reap.
     ///
     /// # Safety
     ///

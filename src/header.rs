@@ -1,8 +1,10 @@
 //! Authors each record's words — status, format and profile, magic, schema key and revision, extent
 //! and the alignment that extent was made at — plus the member bitset and the root's per-slot member
 //! word. A record is written once, by the winner of `admit`, which stores the fields and then
-//! publishes; later joiners only set or clear their own bit through `claim` and `leave`, and moving a
-//! member word is confined to `mark_dead`, `release_dead` and `leave`.
+//! publishes; later joiners only set or clear their own bit through `claim` and `leave`. A member word
+//! moves only through `Root`: `join` and `reserve` take a free slot, `materialise` and `cancel` end a
+//! promise, and `leave`, `mark_dead` and `release_dead` end a membership — each one a
+//! compare-exchange on the exact generation it names, so no process moves a word it cannot cite.
 //!
 //! The non-atomic fields are readable only because that publishing store says they are: `recorded_at`
 //! acquire-loads the status and reads the rest plainly, and `dir::scan` hands it a relaxed-loaded
@@ -687,13 +689,18 @@ impl AdmitLayout for () {
 }
 
 pub(crate) const PARTICIPANT_CAPACITY: usize = usize::BITS as usize - 1;
-const MEMBER_STATE_BITS: usize = 2;
+const MEMBER_STATE_BITS: usize = 3;
 const MEMBER_STATE_MASK: usize = (1 << MEMBER_STATE_BITS) - 1;
 const MEMBER_FREE: usize = 0;
 const MEMBER_LIVE: usize = 1;
 const MEMBER_DEAD: usize = 2;
 const MEMBER_RETIRED: usize = 3;
+const MEMBER_RESERVED: usize = 4;
 const MEMBER_GENERATION_MAX: usize = usize::MAX >> MEMBER_STATE_BITS;
+
+// Five states in three bits: 5, 6 and 7 stay unused, and the freeze is what makes taking one of them
+// a deliberate act — a further state has to be said so here before the word will hold it.
+const _: () = assert!(MEMBER_RESERVED == 4 && MEMBER_RESERVED + 1 < 1 << MEMBER_STATE_BITS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct Member {
@@ -701,6 +708,32 @@ pub(crate) struct Member {
     pub(crate) generation: usize,
 }
 
+/// The result of trying to take a member slot, which says more than whether one was had.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Claim {
+    Taken(Member),
+    /// Nothing was free, but a slot stands promised to a process that has not arrived. Cancelling
+    /// that promise makes room, so this is a refusal a caller may retry rather than a capacity limit.
+    Promised,
+    /// Every slot is held by a member that is live, dead or retired.
+    Full,
+}
+
+/// The region's roster: one word per participant slot, `(generation << 3) | state`.
+///
+/// A slot is claimed at map time by [`Root::join`] and released by [`Root::leave`], and a generation
+/// is spent by whichever of the two claims it, so a word never repeats an identity that was already
+/// answerable for. `RESERVED` is the one state a process does not write about itself: a holder-to-be
+/// is named there by somebody else ([`Root::reserve`]) and taken up by the process it names
+/// ([`Root::materialise`]), which is what leaves the reserver something to cancel
+/// ([`Root::cancel`]) if that process never arrives.
+///
+/// # Ordering
+///
+/// Every transition is a compare-exchange on the exact word it expects, so no state is reached from
+/// a neighbour it is not listed under: only `FREE` becomes `LIVE` or `RESERVED`, only `LIVE` becomes
+/// `DEAD` or `FREE`, and a `RESERVED` slot is invisible to the death machinery, which is the point —
+/// nobody has died if nobody arrived.
 #[repr(C)]
 #[derive(Debug)]
 pub struct Root {
@@ -710,7 +743,9 @@ pub struct Root {
 pub type RootHeader = RcHeader<Root>;
 
 impl SharedSchema for Root {
-    const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.root"), 1);
+    /// Revision 2 widened the member state field to make room for `RESERVED`, which re-fits the
+    /// generation beside it; a region rostered under revision 1 is refused rather than reinterpreted.
+    const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.root"), 2);
 }
 
 unsafe impl Layout for Root {
@@ -738,15 +773,31 @@ unsafe impl Layout for Root {
 }
 
 impl Root {
-    pub(crate) fn join(&self) -> Option<Member> {
-        for (slot, state) in self.members.iter().enumerate() {
-            let observed = state.load(Ordering::Acquire);
+    pub(crate) fn join(&self) -> Claim {
+        self.claim(MEMBER_LIVE)
+    }
+
+    /// Name a holder for a slot that nobody has taken yet, at the generation they will arrive at.
+    pub(crate) fn reserve(&self) -> Claim {
+        self.claim(MEMBER_RESERVED)
+    }
+
+    /// Take the lowest unheld slot and park it in `state`, spending the generation its next holder
+    /// answers to.
+    ///
+    /// A slot at the last generation is retired on the way past rather than claimed, because the
+    /// next generation would not fit in the word; both paths need that, so neither scans on its own.
+    fn claim(&self, state: usize) -> Claim {
+        let mut promised = false;
+        for (slot, cell) in self.members.iter().enumerate() {
+            let observed = cell.load(Ordering::Acquire);
             if observed & MEMBER_STATE_MASK != MEMBER_FREE {
+                promised |= observed & MEMBER_STATE_MASK == MEMBER_RESERVED;
                 continue;
             }
             let prior = observed >> MEMBER_STATE_BITS;
             if prior == MEMBER_GENERATION_MAX {
-                let _ = state.compare_exchange(
+                let _ = cell.compare_exchange(
                     observed,
                     Self::word(
                         Member {
@@ -761,18 +812,22 @@ impl Root {
                 continue;
             }
             let generation = prior + 1;
-            let live = (generation << MEMBER_STATE_BITS) | MEMBER_LIVE;
-            if state
-                .compare_exchange(observed, live, Ordering::AcqRel, Ordering::Acquire)
+            let next = (generation << MEMBER_STATE_BITS) | state;
+            if cell
+                .compare_exchange(observed, next, Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                return Some(Member {
+                return Claim::Taken(Member {
                     slot: slot as u8,
                     generation,
                 });
             }
         }
-        None
+        if promised {
+            Claim::Promised
+        } else {
+            Claim::Full
+        }
     }
 
     fn word(member: Member, state: usize) -> usize {
@@ -784,13 +839,33 @@ impl Root {
     }
 
     pub(crate) fn leave(&self, member: Member) -> bool {
+        self.transition(member, MEMBER_LIVE, MEMBER_FREE)
+    }
+
+    /// Arrive in the slot that was reserved for this process, at the generation it was reserved at.
+    ///
+    /// A word that no longer reads `RESERVED(G)` is owned by somebody else now, so an arrival cannot
+    /// displace a live member, a slot that was given back, or one that was never promised.
+    pub(crate) fn materialise(&self, member: Member) -> bool {
+        self.transition(member, MEMBER_RESERVED, MEMBER_LIVE)
+    }
+
+    /// Give back a slot nobody arrived to take. The generation it burned stays spent, and a slot
+    /// somebody else took up or holds is not this one's to return.
+    pub(crate) fn cancel(&self, member: Member) -> bool {
+        self.transition(member, MEMBER_RESERVED, MEMBER_FREE)
+    }
+
+    /// Move `member`'s word from one state to the next, which is what makes every transition in this
+    /// roster a compare-exchange on the exact generation it names.
+    fn transition(&self, member: Member, from: usize, to: usize) -> bool {
         let Some(state) = self.member(member) else {
             return false;
         };
         state
             .compare_exchange(
-                Self::word(member, MEMBER_LIVE),
-                Self::word(member, MEMBER_FREE),
+                Self::word(member, from),
+                Self::word(member, to),
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
@@ -798,17 +873,7 @@ impl Root {
     }
 
     pub(crate) fn mark_dead(&self, member: Member) -> bool {
-        let Some(state) = self.member(member) else {
-            return false;
-        };
-        state
-            .compare_exchange(
-                Self::word(member, MEMBER_LIVE),
-                Self::word(member, MEMBER_DEAD),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_ok()
+        self.transition(member, MEMBER_LIVE, MEMBER_DEAD)
     }
 
     pub(crate) fn is_dead(&self, member: Member) -> bool {
@@ -1023,7 +1088,7 @@ mod admission_tests {
             unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) },
             Ok(())
         );
-        let first = unsafe { (*pointer).inner.join() }.unwrap();
+        let first = taken(unsafe { (*pointer).inner.join() });
         assert_eq!(
             unsafe {
                 <Header<Root> as AdmitLayout>::admit(
@@ -1057,29 +1122,200 @@ mod admission_tests {
     }
 
     #[test]
-    fn participant_generation_blocks_stale_owner_and_dead_reuse() {
-        let root = Root {
-            members: [const { AtomicUsize::new(0) }; super::PARTICIPANT_CAPACITY],
+    fn a_root_rostered_under_the_previous_encoding_is_refused_by_name() {
+        // Revision 2 widened the member state field, which re-fits the generation beside it: a roster
+        // written under revision 1 would otherwise be read with the wrong shifts and report somebody
+        // else's identities as free slots.
+        assert_eq!(Root::SCHEMA.revision, 2);
+        let mut storage = MaybeUninit::<Header<Root>>::zeroed();
+        let header = storage.as_mut_ptr();
+        let ctx = LayoutContext {
+            region: RegionId::new(41, 42),
+            offset: 0,
+            allow_init: true,
         };
-        let first = root.join().unwrap();
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(header, (), ctx, None) },
+            Ok(())
+        );
+        let reattach = LayoutContext {
+            allow_init: false,
+            ..ctx
+        };
+        unsafe { core::ptr::addr_of_mut!((*header).record.revision).write(1u32.to_le_bytes()) };
+        assert_eq!(
+            unsafe { Header::<Root>::mismatch_at(header, &(), reattach) },
+            Some(LayoutField::Revision)
+        );
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(header, (), reattach, None) },
+            Err(AdmitError::Mismatch(LayoutField::Revision))
+        );
+        unsafe { core::ptr::addr_of_mut!((*header).record.revision).write(2u32.to_le_bytes()) };
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(header, (), reattach, None) },
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn participant_generation_blocks_stale_owner_and_dead_reuse() {
+        let root = roster();
+        let first = taken(root.join());
         let others = (1..super::PARTICIPANT_CAPACITY)
-            .map(|_| root.join().unwrap())
+            .map(|_| taken(root.join()))
             .collect::<Vec<_>>();
-        assert!(root.join().is_none());
+        assert_eq!(root.join(), super::Claim::Full);
 
         assert!(root.mark_dead(first));
         assert!(root.is_dead(first));
         assert!(!root.leave(first));
-        assert!(root.join().is_none());
+        assert_eq!(root.join(), super::Claim::Full);
         assert!(root.release_dead(first));
 
-        let replacement = root.join().unwrap();
+        let replacement = taken(root.join());
         assert_eq!(replacement.slot, first.slot);
         assert_ne!(replacement.generation, first.generation);
         assert!(!root.leave(first));
         assert!(root.leave(replacement));
         for member in others {
             assert!(root.leave(member));
+        }
+    }
+
+    fn taken(claim: super::Claim) -> super::Member {
+        match claim {
+            super::Claim::Taken(member) => member,
+            super::Claim::Promised => panic!("the roster promised a slot nobody took"),
+            super::Claim::Full => panic!("the roster held no free slot"),
+        }
+    }
+
+    fn roster() -> Root {
+        Root {
+            members: [const { AtomicUsize::new(0) }; super::PARTICIPANT_CAPACITY],
+        }
+    }
+
+    #[test]
+    fn a_reservation_holds_its_slot_against_every_other_claim() {
+        let root = roster();
+        let reserved = taken(root.reserve());
+        assert_eq!(reserved.slot, 0);
+        assert_eq!(reserved.generation, 1);
+
+        // A promise keeps the slot out of circulation: the next join is handed the one after it.
+        let other = taken(root.join());
+        assert_eq!(other.slot, 1);
+        assert_eq!(
+            root.reserve(),
+            super::Claim::Taken(super::Member {
+                slot: 2,
+                generation: 1
+            })
+        );
+
+        // Arrival happens at exactly the promised generation, once.
+        for generation in [reserved.generation + 1, reserved.generation - 1] {
+            assert!(!root.materialise(super::Member {
+                slot: reserved.slot,
+                generation
+            }));
+        }
+        assert!(root.materialise(reserved));
+        assert!(!root.materialise(reserved));
+        assert!(!root.cancel(reserved));
+
+        // Only after arrival is the slot somebody's, and so somebody's to reap.
+        assert!(root.mark_dead(reserved));
+        assert!(root.release_dead(reserved));
+        let again = taken(root.join());
+        assert_eq!(again.slot, reserved.slot);
+        assert_eq!(again.generation, reserved.generation + 1);
+    }
+
+    #[test]
+    fn a_reserved_slot_cannot_die_be_left_or_reaped_because_nobody_holds_it() {
+        let root = roster();
+        let reserved = taken(root.reserve());
+        assert!(!root.mark_dead(reserved));
+        assert!(!root.is_dead(reserved));
+        assert!(!root.release_dead(reserved));
+        assert!(!root.leave(reserved));
+        // None of that touched the promise, which is still the reserver's to give back.
+        assert!(root.cancel(reserved));
+    }
+
+    #[test]
+    fn a_cancelled_reservation_frees_its_slot_and_keeps_the_generation_spent() {
+        let root = roster();
+        let reserved = taken(root.reserve());
+        assert!(root.cancel(reserved));
+        assert!(!root.cancel(reserved));
+        assert!(!root.materialise(reserved));
+
+        let arrived = taken(root.join());
+        assert_eq!(arrived.slot, reserved.slot);
+        assert_eq!(arrived.generation, reserved.generation + 1);
+        // A promise that was given back cannot be cancelled into somebody else's membership.
+        assert!(!root.cancel(reserved));
+        assert!(!root.cancel(arrived));
+        assert!(root.leave(arrived));
+
+        let second = taken(root.reserve());
+        assert_eq!(second.generation, arrived.generation + 1);
+    }
+
+    #[test]
+    fn a_roster_of_promises_refuses_a_join_for_a_different_reason_than_capacity() {
+        let root = roster();
+        for _ in 0..super::PARTICIPANT_CAPACITY {
+            assert!(matches!(root.reserve(), super::Claim::Taken(_)));
+        }
+        assert_eq!(root.join(), super::Claim::Promised);
+        assert_eq!(root.reserve(), super::Claim::Promised);
+
+        // A live member on its own is the capacity answer, because nothing of it is coming back.
+        let idle = roster();
+        let member = taken(idle.join());
+        for _ in 1..super::PARTICIPANT_CAPACITY {
+            assert!(matches!(idle.join(), super::Claim::Taken(_)));
+        }
+        assert_eq!(idle.join(), super::Claim::Full);
+        assert!(idle.mark_dead(member));
+        assert_eq!(idle.join(), super::Claim::Full);
+        assert!(idle.release_dead(member));
+        assert_eq!(taken(idle.join()).slot, member.slot);
+    }
+
+    #[test]
+    fn the_last_generation_is_retired_rather_than_claimed_by_either_path() {
+        let exhausted = super::Member {
+            slot: 0,
+            generation: super::MEMBER_GENERATION_MAX,
+        };
+        for reserve in [false, true] {
+            let root = roster();
+            root.members[0].store(Root::word(exhausted, super::MEMBER_FREE), Ordering::Relaxed);
+            let parked = if reserve { root.reserve() } else { root.join() };
+            let slot = match parked {
+                super::Claim::Taken(member) => member.slot,
+                other => panic!("a roster with free slots refused one: {other:?}"),
+            };
+            assert_ne!(slot, 0);
+            assert_eq!(
+                root.members[0].load(Ordering::Acquire),
+                Root::word(exhausted, super::MEMBER_RETIRED),
+                "the exhausted slot is retired by the scan that passed it"
+            );
+            assert_eq!(
+                root.members[slot as usize].load(Ordering::Acquire) & super::MEMBER_STATE_MASK,
+                if reserve {
+                    super::MEMBER_RESERVED
+                } else {
+                    super::MEMBER_LIVE
+                }
+            );
         }
     }
 

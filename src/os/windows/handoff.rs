@@ -1,18 +1,21 @@
 //! The Windows half of a handover: a named-pipe listener is the meeting, and the grant is the pipe's
-//! address plus this process's own pid, both installed in the admitted child's environment by `admit`,
-//! which consumes the grant. `send` accepts the client and refuses anything that is not the `child` it
-//! was given, bounded by `deadline` because the pipe instance exists long before the child runs;
-//! `receive` connects, asks the kernel whose pipe this is and refuses unless that answer matches the
-//! announced introducer, and only then reads the offer. `shared` is where a section's protection is
-//! fixed, since that is the earliest point a Windows object can be restricted.
+//! address plus this process's own pid, both — with the member slot `Grant::promising` named — installed
+//! in the admitted child's environment by `admit`, which consumes the grant. `send` accepts the client
+//! and refuses anything that is not the `child` it was given, bounded by `deadline` because the pipe
+//! instance exists long before the child runs; `receive` connects, asks the kernel whose pipe this is and
+//! refuses unless that answer matches the announced introducer, and only then reads the offer. `shared`
+//! is where a section's protection is fixed, since that is the earliest point a Windows object can be
+//! restricted.
 //!
 //! Both legs are load-bearing in a way the Unix arm's are not: the address is discoverable by any
 //! process on the host while the pipe exists, so nothing but `accept`'s check and `server_pid`'s
 //! protects the offer from a claimant that merely read it — drop either and the impostor test that
 //! covers the other direction would still pass. What the two arms must keep agreeing on is not here:
 //! `recv(3)`'s count and the order the three handles are removed in are the same positional contract the
-//! Unix leg implements, and `Grant` staying single-use is what stops one address admitting two
-//! children. Nothing in this file has been executed on the host writing it.
+//! Unix leg implements, and so are the promised slot's text and the fact that both legs read it only
+//! after the kernel has answered, which is what keeps one arm's child able to meet the other arm's
+//! parent. And `Grant` staying single-use is what stops one address admitting two children. Nothing in
+//! this file has been executed on the host writing it.
 
 use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 
@@ -24,7 +27,7 @@ use crate::{
             process::{Listener, Socket},
         },
     },
-    process::{Bootstrap, INTRODUCER, RENDEZVOUS, Supervisor},
+    process::{Bootstrap, INTRODUCER, Introduction, RENDEZVOUS, SEAT, Supervisor},
 };
 
 pub type Shared = Section<std::os::windows::io::OwnedHandle>;
@@ -52,6 +55,7 @@ pub struct Handoff {
 pub struct Grant {
     address: String,
     introducer: u32,
+    promised: Option<Introduction>,
 }
 
 fn refused(reason: &'static str) -> io::Error {
@@ -68,6 +72,7 @@ impl Handoff {
             Grant {
                 address,
                 introducer: std::process::id(),
+                promised: None,
             },
         ))
     }
@@ -111,6 +116,7 @@ impl Handoff {
                 "the peer behind the granted rendezvous is not the process that granted it",
             ));
         }
+        let promised = announced_seat()?;
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
         Ok((
@@ -120,20 +126,52 @@ impl Handoff {
                 mapping: Section::from_owned_handle(resources.remove(0)),
                 event: Event::from_owned_handle(resources.remove(0)),
                 ring: Ring::from_owned_handle(resources.remove(0)),
+                seat: promised,
             },
         ))
     }
 }
 
+/// The member slot this process was told to arrive at, if its parent announced one.
+///
+/// Read after the introducer check, like the Unix leg reads it after its attestation: the environment
+/// is this process's own, so nothing here can be forged into a handover, and a slot announced in a
+/// shape no slot has is refused as the malformed text it is rather than arrived at.
+fn announced_seat() -> io::Result<Option<Introduction>> {
+    let announced = match env::var(SEAT) {
+        Ok(announced) => announced,
+        Err(env::VarError::NotPresent) => return Ok(None),
+        Err(_) => return Err(refused("the announced member slot is not text")),
+    };
+    Introduction::announced(&announced)
+        .map(Some)
+        .ok_or_else(|| refused("the announced member slot names no slot at all"))
+}
+
 impl Grant {
+    /// Name the member slot the process this grant admits is to arrive at.
+    ///
+    /// Nothing here is a capability: a slot the admitting session does not hold promised is refused by
+    /// the roster when the child arrives, so the promise has to be made with
+    /// [`Session::reserve_seat`](crate::Session::reserve_seat) and kept — by holding the `Seat` — until
+    /// that arrival or until it is given back.
+    pub fn promising(mut self, seat: Introduction) -> Self {
+        self.promised = Some(seat);
+        self
+    }
+
     /// Installs this rendezvous in `command`, so the process it spawns is the one meeting.
     ///
     /// Consuming `self` is what makes the grant single-use: a second `admit` cannot be written, and
     /// the address never becomes something a caller threads through arguments, where every process
-    /// on the host could read it.
+    /// on the host could read it. It also means a promised slot is announced to exactly one child,
+    /// because the second child would have to be admitted by a grant that no longer exists.
     pub fn admit(self, command: &mut Command) -> io::Result<()> {
         command.env(RENDEZVOUS, self.address.as_str());
         command.env(INTRODUCER, self.introducer.to_string());
+        if let Some(promised) = &self.promised {
+            command.env(SEAT, promised.announcement());
+        }
         Ok(())
     }
 }

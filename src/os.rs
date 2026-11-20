@@ -6,10 +6,20 @@
 //! Resources travel positionally: the order a sender puts the mapping, the event and the ring into a
 //! handover is matched by index on the receiving side, and `ReceivedResources` carries no tag saying
 //! which is which, so a sender and a reader disagreeing about that order receive each other's objects
-//! with nothing to complain. The whole map is also gated on `std`, so it simply is not there under
+//! with nothing to complain. The promised member slot beside them is the one thing the map carries
+//! that is not positional — it is announced through the environment, and only the roster decides
+//! whether it was ever promised. The whole map is also gated on `std`, so it simply is not there under
 //! `--no-default-features`. Each backend keeps its own obligations — the unix leg reserves a window
 //! before placing the file, the Windows leg goes through a section and a view — and only the paths a
 //! suite actually reaches on a given host have been executed.
+//!
+//! A target that is neither of those two hosts replaces this map rather than a piece of it: bytes that
+//! live in the program's own image answer for themselves through [`crate::mapping::Source`], whose
+//! safety text names [`crate::mapping::REGION_ALIGN`] as the residue to arrange, and a doorbell that
+//! arrives by an interrupt or a scheduled callback implements [`crate::notify::Notify`] and
+//! [`crate::notify::Wait`] on its own type. Nothing in `session`, `pool` or `channel` names anything in
+//! this module, so a target with no descriptor, no handle and no process to hand one to is not missing
+//! a port here — it has no reason to compile one.
 #![cfg(feature = "std")]
 
 #[cfg(all(feature = "map", unix))]
@@ -72,6 +82,16 @@ pub struct ReceivedResources {
     pub mapping: Shared,
     pub event: Event,
     pub ring: Ring,
+    /// The member slot the admitted process was told it holds, absent when nothing was promised.
+    ///
+    /// It comes through the environment beside the rendezvous rather than among the four fields
+    /// above, so it is the one part of a handover that is announced instead of delivered: the objects
+    /// travel positionally and are the sender's to hand over, while this only says which member word
+    /// the sender left open. The roster is what answers for it, and it answers by refusing an arrival
+    /// nobody promised — which is why an attested handover and an unmade-up number are not the same
+    /// evidence, and why this is a claim a caller hands to [`crate::Session::open_as`] rather than a
+    /// fact the handover vouches for.
+    pub seat: Option<crate::process::Introduction>,
 }
 
 #[cfg(all(test, feature = "notify"))]

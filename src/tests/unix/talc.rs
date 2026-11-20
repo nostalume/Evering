@@ -6,7 +6,8 @@
 //!
 //! Two things these cases cannot show. Both mappings of one file live in this process, so the ordering
 //! that only a second process exposes — a peer mapping while the creator is still publishing its
-//! header — is claimed by `tests/ipc_process.rs` and `src/tests/unix/recovery.rs`, not by this file. And
+//! header, or still holding a promise over a slot — is claimed by `tests/ipc_process.rs` and
+//! `src/tests/unix/recovery.rs`, not by this file. And
 //! the class widths used here sit under the platform's geometry cap, so an over-wide class is refused by
 //! the mock suite's `ClassTooWide` case and never arrives on a real mapping.
 
@@ -139,4 +140,104 @@ fn real_mapping_reuse_and_boxes() {
 
     tests::alloc_lines::<2048, 200, 5>(mock_alloc(NAME, SIZE));
     tests::pbox_rand::<100, 1>(mock_alloc("talc-rand", SIZE));
+}
+
+/// A member slot can be named in the roster before the process that will fill it exists, which makes
+/// it a promise two mappings have to agree about: one holds it, the other arrives in it, and neither
+/// can be fooled about which is which.
+#[test]
+fn a_promised_seat_is_arrived_in_by_its_generation_and_by_nobody_else() {
+    const SIZE: usize = 1 << 20;
+    const REGION: RegionId = RegionId::new(0x0053_E470, 1);
+    let fd = UnixFd::memfd("promised-seat", SIZE, false).expect("create shared memory");
+    let request = || Request::new(SIZE, Access::WRITE | Access::READ);
+    let peer = || fd.dup().expect("duplicate shared-memory handle").mapping();
+    let parent = crate::Session::create(peer(), request(), REGION).expect("create session");
+    let seat = parent.reserve_seat().expect("promise a member slot");
+    let promised = seat.peer();
+    assert_eq!(seat.region(), REGION);
+    assert_ne!(promised.slot(), parent.peer().slot());
+
+    // The promise keeps its slot out of the ordinary claim, so a peer that joins without one is
+    // somebody else.
+    let joiner = crate::Session::open(peer(), request(), REGION).expect("join as a new member");
+    assert_ne!(joiner.peer(), promised);
+
+    let arrived = crate::Session::open_as(peer(), request(), seat.region(), promised)
+        .expect("arrive in the promised slot");
+    assert_eq!(arrived.peer(), promised);
+
+    // Arrival consumes the promise: the seat is no longer its holder's to give back, and the member
+    // it named is not a second arrival's to take.
+    drop(seat);
+    assert_eq!(arrived.peer(), promised);
+    let displaced = crate::Session::open_as(peer(), request(), REGION, promised);
+    assert!(matches!(
+        displaced,
+        Err(crate::SessionError::ArrivalRefused)
+    ));
+}
+
+#[test]
+fn a_seat_given_back_before_its_arrival_returns_its_slot_to_the_next_join() {
+    const SIZE: usize = 1 << 20;
+    const REGION: RegionId = RegionId::new(0x0053_E471, 1);
+    let fd = UnixFd::memfd("returned-seat", SIZE, false).expect("create shared memory");
+    let request = || Request::new(SIZE, Access::WRITE | Access::READ);
+    let peer = || fd.dup().expect("duplicate shared-memory handle").mapping();
+    let parent = crate::Session::create(peer(), request(), REGION).expect("create session");
+    let seat = parent.reserve_seat().expect("promise a member slot");
+    let promised = seat.peer();
+    drop(seat);
+
+    let later = crate::Session::open(peer(), request(), REGION)
+        .expect("join after the promise was given back");
+    assert_eq!(later.peer().slot(), promised.slot());
+    assert_eq!(
+        later.peer().generation(),
+        promised.generation() + 1,
+        "a promise spends its generation even when nobody arrives in it"
+    );
+
+    let late = crate::Session::open_as(peer(), request(), REGION, promised);
+    assert!(matches!(late, Err(crate::SessionError::ArrivalRefused)));
+}
+
+#[test]
+fn a_roster_full_of_promises_refuses_a_join_differently_than_a_roster_full_of_members() {
+    const SIZE: usize = 1 << 20;
+    const REGION: RegionId = RegionId::new(0x0053_E472, 1);
+    let fd = UnixFd::memfd("promised-out", SIZE, false).expect("create shared memory");
+    let request = || Request::new(SIZE, Access::WRITE | Access::READ);
+    let peer = || fd.dup().expect("duplicate shared-memory handle").mapping();
+    let parent = crate::Session::create(peer(), request(), REGION).expect("create session");
+
+    let mut seats = Vec::new();
+    while let Ok(seat) = parent.reserve_seat() {
+        seats.push(seat);
+    }
+    assert_eq!(
+        seats.len(),
+        crate::header::PARTICIPANT_CAPACITY - 1,
+        "the member the region was created with holds one slot"
+    );
+    assert!(matches!(
+        parent.reserve_seat(),
+        Err(crate::SeatError::Promised)
+    ));
+
+    // Nothing has arrived in any of them, so the region holds no member for anybody to reap: the
+    // refusal is one a caller can wait out, which is the answer `ParticipantExhausted` does not give.
+    let refused = crate::Session::open(peer(), request(), REGION);
+    assert!(matches!(
+        refused,
+        Err(crate::SessionError::ParticipantReserved)
+    ));
+
+    let freed = seats.pop().expect("a promise to give back");
+    let slot = freed.peer().slot();
+    drop(freed);
+    let joined = crate::Session::open(peer(), request(), REGION)
+        .expect("join into the slot a promise gave back");
+    assert_eq!(joined.peer().slot(), slot);
 }

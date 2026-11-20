@@ -1,9 +1,12 @@
 //! The file-descriptor side of a region on Unix: `UnixFd` holds the bytes — a memfd, a `/dev/shm` file,
 //! or an fd adopted from elsewhere — and `FdMap` decides where they enter this address space.
-//! `memfd`/`shm_create`/`shm_open`/`from_fd` make or take the object, `mapping`/`at`/`with_flags` state
-//! the placement, and `Source::map` is the only path that calls `mmap`: it grows the file if the request
-//! is longer than it, reserves an anonymous window, places the file at the aligned address inside that
-//! window with `MAP_FIXED`, and hands back the two remainders as unmapped.
+//! `memfd`/`shm_create`/`shm_open`/`from_fd` make or take the object, `bound_to` keeps the access a
+//! maker named, `mapping`/`at`/`with_flags` state the placement, and `Source::map` is the only path that
+//! calls `mmap`: it grows the file if the request is longer than it, reserves an anonymous window,
+//! places the file at the aligned address inside that window with `MAP_FIXED`, and hands back the two
+//! remainders as unmapped. A bound belongs to the object and not to a handle, so `borrow` and `dup`
+//! carry it and `from_fd` — the adopted case, where the maker's word stayed with its maker — carries
+//! none.
 //!
 //! The reserve-then-place order is what makes an aligned block address reproducible rather than lucky,
 //! and it is the reason `mapping`'s residue and `mem::REGION_ALIGN` agree for every mapper: address and
@@ -58,6 +61,10 @@ pub struct UnixFd<F: AsFd> {
     fd: F,
     size: usize,
     kind: FdKind,
+    /// The access the object was made under, when the maker named one. `None` is not "everything is
+    /// permitted" — it is "nobody promised", which is what a descriptor adopted from elsewhere always
+    /// is, because the promise a maker holds does not travel with the bytes.
+    bound: Option<Access>,
 }
 
 impl<F: AsFd> core::fmt::Debug for UnixFd<F> {
@@ -65,6 +72,7 @@ impl<F: AsFd> core::fmt::Debug for UnixFd<F> {
         f.debug_struct("UnixFd")
             .field("size", &self.size)
             .field("fdkind", &self.kind)
+            .field("bound", &self.bound)
             .finish()
     }
 }
@@ -85,6 +93,7 @@ impl UnixFd<OwnedFd> {
             fd,
             kind: FdKind::MemFd,
             size,
+            bound: None,
         })
     }
 
@@ -102,6 +111,7 @@ impl UnixFd<OwnedFd> {
             fd,
             kind: FdKind::Shm,
             size,
+            bound: None,
         })
     }
 
@@ -115,6 +125,7 @@ impl UnixFd<OwnedFd> {
             fd,
             kind: FdKind::Shm,
             size,
+            bound: None,
         })
     }
 
@@ -130,16 +141,35 @@ impl UnixFd<OwnedFd> {
             fd,
             kind: FdKind::FromFd,
             size,
+            bound: None,
         })
     }
 }
 
 impl<F: AsFd> UnixFd<F> {
+    /// Hold this object to one access, so that a mapping wider than it is refused.
+    ///
+    /// The promise is this crate's and not the host's: a memfd carries no per-object permission, and a
+    /// `/dev/shm` file's mode bits answer a process that opens it by name, not a descriptor this
+    /// process already holds. What the bound buys is that one program cannot make an object under one
+    /// word and map it under a wider one, which is the only part of the asymmetry between the two
+    /// hosts that a caller can be given a hold on.
+    ///
+    /// It is a claim about the object, not a capability over the process: a second process reaching
+    /// the same file by name is answered for by the host, and a descriptor that arrives over a
+    /// [`Handoff`](crate::os::Handoff) carries no bound because the maker's word did not cross the
+    /// socket.
+    pub const fn bound_to(mut self, access: Access) -> Self {
+        self.bound = Some(access);
+        self
+    }
+
     pub fn borrow(&self) -> UnixFd<BorrowedFd<'_>> {
         UnixFd {
             fd: self.fd.as_fd(),
             kind: self.kind.clone(),
             size: self.size,
+            bound: self.bound,
         }
     }
 
@@ -149,6 +179,7 @@ impl<F: AsFd> UnixFd<F> {
             fd,
             kind: self.kind.clone(),
             size: self.size,
+            bound: self.bound,
         })
     }
 
@@ -199,6 +230,14 @@ impl<F: AsFd> FdMap<F> {
         self
     }
 
+    /// Replaces the flags the mapping is made with, which defaults to `MAP_SHARED`.
+    ///
+    /// This is the one place a caller reaches past the crate's own decision about the object, and the
+    /// flag it is most likely to want — `MAP_PRIVATE` — is the one that opts out of the agreement this
+    /// file exists to keep: the writes land in this process's copy while the directory's
+    /// compare-exchanges still report success. The placement is left alone here for the same reason
+    /// `at` is advisory: the reserve-then-place path is what makes the residue reproducible, and a
+    /// caller who breaks it finds out at a peer's admission, not here.
     pub fn with_flags(mut self, flags: MapFlags) -> Self {
         self.flags = flags;
         self
@@ -209,6 +248,17 @@ impl<F: AsFd> FdMap<F> {
     fn mapping(self, request: Request) -> Result<Map, nix::Error> {
         use core::num::NonZeroUsize;
         use nix::sys::mman;
+
+        // A maker that named an access is answered for here, on the one path that reaches `mmap`, so
+        // neither `at` nor `with_flags` can route around it. An object nobody bounded is left to the
+        // host, which on this platform restricts nothing by descriptor.
+        if !self
+            .fd
+            .bound
+            .is_none_or(|bound| bound.contains(request.access))
+        {
+            return Err(nix::Error::EACCES);
+        }
 
         let fd = self.fd.fd.as_fd();
         let fsize = nix::sys::stat::fstat(fd)?.st_size;
@@ -487,5 +537,97 @@ mod tests {
         drop(blk1);
         drop(blk2);
         let _ = UnixFd::shm_unlink(NAME);
+    }
+
+    /// The promise a maker named is refused at map time, before the object is touched.
+    #[test]
+    fn a_wider_mapping_than_the_bound_is_refused() {
+        const NAME: &str = "bound_refused";
+        const SIZE: usize = 4096;
+
+        let object = UnixFd::memfd(NAME, SIZE, false)
+            .expect("should create")
+            .bound_to(Access::READ);
+
+        let wider = object
+            .borrow()
+            .map(Request::new(SIZE, Access::READ | Access::WRITE));
+        assert!(
+            matches!(&wider, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "a bound object is supposed to refuse, and it returned {wider:?}"
+        );
+
+        // Refusing consumed nothing, so the access that was promised still maps.
+        let promised = object
+            .borrow()
+            .map(Request::new(SIZE, Access::READ))
+            .expect("the promised access stays available");
+        assert!(promised.permits(Access::READ).is_ok());
+        let denied = promised.permits(Access::WRITE);
+        assert!(
+            matches!(
+                denied,
+                Err(crate::mem::Error::PermissionDenied { requested })
+                    if requested == Access::WRITE
+            ),
+            "the narrower mapping is what the bound allowed, and it is recorded as {promised:?}"
+        );
+    }
+
+    /// The bound belongs to the object, so every handle to it carries the same refusal.
+    #[test]
+    fn the_bound_travels_with_a_dup_or_a_borrow() {
+        const NAME: &str = "bound_travels";
+        const SIZE: usize = 4096;
+
+        let object = UnixFd::memfd(NAME, SIZE, false)
+            .expect("should create")
+            .bound_to(Access::READ);
+        let twin = object.dup().expect("should dup");
+
+        for refused in [twin.borrow(), object.borrow()] {
+            let wide = refused.map(Request::new(SIZE, Access::READ | Access::WRITE));
+            assert!(
+                matches!(&wide, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+                "a second handle to the same object is supposed to refuse too, and it returned {wide:?}"
+            );
+        }
+    }
+
+    /// What arrives from elsewhere is bytes and no claim: the host answers for it, not the maker.
+    #[test]
+    fn an_adopted_descriptor_claims_nothing() {
+        const NAME: &str = "adopted_claim";
+        const SIZE: usize = 4096;
+        const VALUE: &[u8] = b"hello";
+
+        let object = UnixFd::memfd(NAME, SIZE, false)
+            .expect("should create")
+            .bound_to(Access::READ);
+        let granted = unistd::dup(object.as_fd()).expect("should dup");
+        // This is the shape `Handoff::receive` produces: a descriptor this process did not make.
+        let adopted = UnixFd::from_fd(granted).expect("should adopt");
+
+        let writable = TestMap
+            .shared(SIZE, Access::READ | Access::WRITE, adopted)
+            .expect("an adopted descriptor is answered for by the host");
+        unsafe {
+            writable.write(VALUE);
+        }
+
+        // The bytes are the same object, while the claim that refused them here is still in force.
+        let reader = object
+            .borrow()
+            .map(Request::new(SIZE, Access::READ))
+            .expect("the promised access stays available");
+        let written = unsafe { reader.read_in(VALUE.len(), 0) };
+        assert_eq!(written, VALUE);
+        let refused = object
+            .borrow()
+            .map(Request::new(SIZE, Access::READ | Access::WRITE));
+        assert!(
+            matches!(&refused, Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied),
+            "the maker's own handle keeps its promise, and it returned {refused:?}"
+        );
     }
 }

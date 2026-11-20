@@ -100,7 +100,7 @@ pub use pool::{
 };
 pub use session::{
     AdmitError, ChannelCreateError, GeneralHeap, OpenPoolError, PutError, Recovery, RemoveError,
-    Session, SessionError, SessionOptions,
+    Seat, SeatError, Session, SessionError, SessionOptions,
 };
 pub use talc::{
     Geometry as HeapGeometry, GeometryError as HeapGeometryError, MutationError as GeneralHeapError,

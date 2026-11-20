@@ -1,20 +1,24 @@
 //! Owns the linear account of one process-local mapping: the cursor that turns a sequence of composed
 //! layouts into addresses, and the arithmetic that reserves a span inside it. `Build`'s `push` and
 //! `reserve`, committed through `Reservation::commit`, extend the composition; `Map`'s `reserve` and
-//! `commit` do the address arithmetic and the compare-exchange that keeps it honest; `Map::close`
-//! hands the account back once.
+//! `commit` do the address arithmetic and the compare-exchange that keeps it honest; `Map::close` hands
+//! the account back once, if the extent has an account to hand back — one declared with
+//! `Map::from_static` is simply let go. `Region::new` is the one place a mapping names the member it
+//! owns, and it takes that word one of two ways: `join` claims whatever slot is next, `materialise`
+//! arrives in a slot a live member promised.
 //!
 //! The cursor advances by `size_of`, never by the extent a configuration says a type needs, so a
 //! record whose extent grows with its contents has to be composed last. Nothing asserts that, and a
 //! region composed the other way round still opens. The residue a composition records is likewise a
-//! promise about the mapping underneath it, and a `Source` written outside this crate can hand back a
-//! `Map` that does not keep it.
+//! promise about the mapping underneath it: `REGION_ALIGN` says what the promise is, so a port can meet
+//! it on purpose, and a `Source` written outside this crate can still hand back a `Map` that misses it —
+//! which a peer finds out at its own admission, not here.
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use core::{marker::PhantomData, ops::Deref};
 
 use crate::{
-    header::{AdmitError, AdmitLayout, Layout, Member, RootHeader},
+    header::{AdmitError, AdmitLayout, Claim, Layout, Member, RootHeader},
     schema::{LayoutContext, RegionAdmission, RegionId},
 };
 
@@ -23,11 +27,28 @@ pub use crate::header::LayoutField;
 pub use alloc::alloc::AllocError;
 
 bitflags::bitflags! {
+    /// What a mapping may do to the bytes, and the only access language a port has to answer in.
+    ///
+    /// The three bits mean different things on the two hosts, and a caller that reads one arm's
+    /// behaviour into the other gets a refusal on one and silence on the other. On Unix they become the
+    /// protection of *one mapping*, so each process decides for itself and the object underneath
+    /// restricts nobody — except that an object made through `os::shared` keeps the set it was made
+    /// under as its own bound, which this crate then refuses to widen. On Windows they select the
+    /// protection a section is *created* with, which limits every process that maps it, and a view can
+    /// only narrow from it.
     #[repr(transparent)]
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub struct Access: u8 {
+        /// Read the bytes. The Windows arm requires it twice — of the section as it is created and of
+        /// the view as it is opened — and refuses the call itself when it is absent, while the Unix arm
+        /// asks for nothing and passes the request straight to `mmap` as protection bits.
         const READ = 0x1;
+        /// Write the bytes, which is what admitting a layout to a region requires — every composition
+        /// in this crate asks for it, because the header and the directory are written, not read.
         const WRITE = 0x1 << 1;
+        /// Execute the bytes. Nothing in this crate asks for it: it exists because a port's host may
+        /// grant it and a caller has to be able to say so, and on Windows it changes the protection the
+        /// section is created under rather than only the view.
         const EXEC = 0x1 << 2;
     }
 }
@@ -53,13 +74,20 @@ impl Request {
 /// Produces one exclusively owned process-local mapping.
 ///
 /// The `os` adapters report `io::Error` for every platform's mapping failure, so
-/// `SessionError<S::Error>` stays one type across them.
+/// `SessionError<S::Error>` stays one type across them. A target with no mapping
+/// call at all — a region fixed in the program's own image — implements this trait
+/// by returning a [`Map::from_static`], and is the only kind of implementation the
+/// safety note below does not constrain away.
 ///
 /// # Safety
 ///
-/// An implementation must return a valid, suitably aligned mapping with the
-/// requested access and extent. Its release function must remain callable and
-/// release that mapping exactly once from any thread that may own it.
+/// An implementation must return a valid mapping with the requested access and extent, based at an
+/// address that is a multiple of [`REGION_ALIGN`]. That bound is what makes a block address
+/// reproducible in a peer: a pool caps its widest class at it, and `header::recorded_at` refuses a
+/// member whose own base is not a multiple of the extent alignment the region recorded. A release
+/// function must remain callable and release that mapping exactly once from any thread that may own
+/// it; an extent with nothing to release is declared with [`Map::from_static`] rather than by a release
+/// that lies.
 pub unsafe trait Source: Sized {
     type Error: core::fmt::Debug;
 
@@ -77,6 +105,8 @@ pub enum Error {
     PoisonedComposition,
     ArithmeticOverflow,
     ParticipantExhausted,
+    ParticipantReserved,
+    ArrivalRefused,
 }
 
 impl core::error::Error for Error {}
@@ -104,6 +134,14 @@ impl core::fmt::Debug for Error {
             Self::PoisonedComposition => f.write_str("Layout composition is poisoned"),
             Self::ArithmeticOverflow => f.write_str("Layout cursor arithmetic overflow"),
             Self::ParticipantExhausted => f.write_str("No shared-memory participant slot is free"),
+            Self::ParticipantReserved => f.write_str(
+                "No shared-memory participant slot is free, and some stand promised to a process \
+                 that has not arrived",
+            ),
+            Self::ArrivalRefused => f.write_str(
+                "The shared-memory participant slot named for arrival is not promised at that \
+                 generation",
+            ),
         }
     }
 }
@@ -183,10 +221,14 @@ impl AddrSpan<usize> {
 /// is coarser than any class the Unix-side tests here lay out, and has not been executed. A test
 /// backend that hands every session a slice of one buffer cannot vary its residue, so it exercises
 /// neither the arrangement nor the refusal.
+///
+/// This is also the number a `Source` written outside the crate has to meet, which is why it is
+/// published rather than only assumed by a safety note: a port arranges its own base, and the multiple
+/// of the extent alignment a region recorded is what a joining member is refused for missing.
 #[cfg(unix)]
-pub(crate) const REGION_ALIGN: usize = 1 << 21;
+pub const REGION_ALIGN: usize = 1 << 21;
 #[cfg(not(unix))]
-pub(crate) const REGION_ALIGN: usize = 1 << 16;
+pub const REGION_ALIGN: usize = 1 << 16;
 
 /// Linear owner of one process-local mapping.
 pub struct Map {
@@ -248,6 +290,28 @@ impl Map {
         }
     }
 
+    /// Owns an extent this process was given and can never give back.
+    ///
+    /// This is the shape of a region that lives in the program's own image: there is no host object to
+    /// unmap, so no release function exists to name, and dropping the owner simply lets the bytes go.
+    /// A caller that has a real mapping to release uses [`Map::from_raw_parts`] instead — declaring an
+    /// extent static when it is not leaves whatever the host allocated behind mapped after this owner
+    /// is gone.
+    ///
+    /// # Safety
+    ///
+    /// `start..start + len` must stay valid, carry no [`REGION_ALIGN`] residue, and be exclusively
+    /// owned for the declared access for as long as this process lives. Nothing here can keep another
+    /// owner out, and nothing here will try to release it.
+    pub const unsafe fn from_static(start: NonNull<u8>, len: usize, access: Access) -> Self {
+        Self {
+            start,
+            len,
+            access,
+            release: None,
+        }
+    }
+
     #[inline]
     pub fn permits(&self, access: Access) -> Result<(), Error> {
         if !self.access.contains(access) {
@@ -257,7 +321,10 @@ impl Map {
     }
 
     fn close(mut self) -> bool {
-        let release = self.release.take().expect("live map has release authority");
+        // A static extent has nothing to give back, so closing it succeeds by being let go.
+        let Some(release) = self.release.take() else {
+            return true;
+        };
         unsafe { release(self.start, self.len) }
     }
 
@@ -376,7 +443,11 @@ impl Drop for Region {
 }
 
 impl Region {
-    fn new(map: Map, admission: RegionAdmission) -> Result<(Arc<Self>, usize), Error> {
+    fn new(
+        map: Map,
+        admission: RegionAdmission,
+        promised: Option<Peer>,
+    ) -> Result<(Arc<Self>, usize), Error> {
         let (ptr, offset) = unsafe { map.reserve::<RootHeader>(0) }?;
         let region = match admission {
             RegionAdmission::Create(id) | RegionAdmission::Expect(id) => id,
@@ -392,9 +463,23 @@ impl Region {
             allow_init,
         };
         let header = unsafe { map.commit(ptr, (), ctx) }?;
-        let member = match unsafe { header.as_ref() }.inner.join() {
-            Some(member) => member,
-            None => return Err(Error::ParticipantExhausted),
+        let root = &unsafe { header.as_ref() }.inner;
+        let member = match promised {
+            // Arriving means taking up the one slot somebody promised this generation, and nobody
+            // else's: the compare-exchange is what says the promise still stands.
+            Some(promised) => {
+                let member = promised.0;
+                if root.materialise(member) {
+                    member
+                } else {
+                    return Err(Error::ArrivalRefused);
+                }
+            }
+            None => match root.join() {
+                Claim::Taken(member) => member,
+                Claim::Promised => return Err(Error::ParticipantReserved),
+                Claim::Full => return Err(Error::ParticipantExhausted),
+            },
         };
         Ok((
             Arc::new(Self {
@@ -488,6 +573,16 @@ impl Region {
     pub(crate) fn release_dead(&self, member: Member) -> bool {
         self.header().inner.release_dead(member)
     }
+
+    /// Hold a member slot for a process this one has not started yet.
+    pub(crate) fn reserve_member(&self) -> Claim {
+        self.header().inner.reserve()
+    }
+
+    /// Give back a slot the promised process never arrived in.
+    pub(crate) fn cancel_member(&self, member: Member) -> bool {
+        self.header().inner.cancel(member)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -546,7 +641,24 @@ unsafe impl MemOps for Build {
 impl Build {
     #[inline]
     pub(crate) fn new(map: Map, admission: RegionAdmission) -> Result<Self, Error> {
-        let (area, offset) = Region::new(map, admission)?;
+        Self::establish(map, admission, None)
+    }
+
+    /// Build as the member a live participant promised, rather than as whoever claims a slot next.
+    pub(crate) fn arriving_as(
+        map: Map,
+        admission: RegionAdmission,
+        promised: Peer,
+    ) -> Result<Self, Error> {
+        Self::establish(map, admission, Some(promised))
+    }
+
+    fn establish(
+        map: Map,
+        admission: RegionAdmission,
+        promised: Option<Peer>,
+    ) -> Result<Self, Error> {
+        let (area, offset) = Region::new(map, admission, promised)?;
         Ok(Self {
             area,
             offset,
@@ -686,6 +798,14 @@ impl<T: AdmitLayout> Mapped<T> {
 
     pub(crate) fn release_dead(&self, member: Member) -> bool {
         self.handle.release_dead(member)
+    }
+
+    pub(crate) fn reserve_member(&self) -> Claim {
+        self.handle.reserve_member()
+    }
+
+    pub(crate) fn cancel_member(&self, member: Member) -> bool {
+        self.handle.cancel_member(member)
     }
 
     pub(crate) fn offset_of(
