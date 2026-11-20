@@ -2,11 +2,11 @@ pub const MEMORY: u64 = 32 * 1024 * 1024;
 
 pub fn digest(bytes: &[u8]) -> u64 {
     let mut state = bytes.len() as u64;
-    let mut chunks = bytes.chunks_exact(8);
-    for chunk in &mut chunks {
-        state = state.rotate_left(7) ^ u64::from_le_bytes(chunk.try_into().unwrap());
+    let (chunks, remainder) = bytes.as_chunks::<8>();
+    for chunk in chunks {
+        state = state.rotate_left(7) ^ u64::from_le_bytes(*chunk);
     }
-    for &byte in chunks.remainder() {
+    for &byte in remainder {
         state = state.rotate_left(7) ^ u64::from(byte);
     }
     state

@@ -3,7 +3,12 @@
 //! changes the answer, and neither the sentence nor the right to be treated as an error depends on
 //! whether the value it hands back happens to be printable.
 
-use crate::{BlockRangeError, PoolReserveError, ReceiveError, TrySendError};
+use std::error::Error as _;
+
+use crate::{
+    BlockRangeError, PoolReserveError, ReceiveError, SessionError, TrySendError,
+    notify::ProgressError,
+};
 
 /// A payload with no `Debug`, which is what makes the dependency visible: the caller's value and the
 /// library's diagnosis are two different parts, and only one of them is being reported.
@@ -60,4 +65,30 @@ fn a_refusal_is_reportable_whatever_it_carries_back() {
     says(&refused[0], "claimed");
     says(&refused[3], "nothing was sent");
     assert_eq!(refused.len(), 6);
+}
+
+/// The two cause slots are the case where the carried value *is* the reason, so the dependency belongs
+/// in the bound rather than in a format string: the outer sentence states this layer's judgement alone,
+/// and the provider's own words arrive typed, from `source()`, where a caller can keep or print them.
+#[test]
+fn a_wrapped_cause_arrives_typed_rather_than_quoted() {
+    let wait = ProgressError::Wait(std::io::Error::other("the latch was poisoned"));
+    let source = SessionError::Source(std::io::Error::other("the name is already taken"));
+    says(&wait, "waiting on the progress source failed");
+    says(&source, "the provider refused the mapping");
+    assert_eq!(
+        wait.source().expect("the cause is the report").to_string(),
+        "the latch was poisoned"
+    );
+    assert_eq!(
+        source
+            .source()
+            .expect("the cause is the report")
+            .to_string(),
+        "the name is already taken"
+    );
+    assert!(ProgressError::<std::io::Error>::Busy.source().is_none());
+    assert!(SessionError::<std::io::Error>::Closed.source().is_none());
+    let boxed: Box<dyn std::error::Error> = Box::new(wait);
+    says(&boxed, "progress source");
 }

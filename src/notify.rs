@@ -222,18 +222,25 @@ pub enum ProgressError<E> {
     Wait(E),
 }
 
-impl<E: core::fmt::Debug> core::fmt::Display for ProgressError<E> {
+impl<E> core::fmt::Display for ProgressError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             Self::Busy => f.write_str("the waiting policy gave up before the operation committed"),
             Self::Closed => f.write_str("the queue is closed"),
-            Self::Wait(error) => write!(f, "waiting on the progress source failed: {error:?}"),
+            Self::Wait(_) => f.write_str("waiting on the progress source failed"),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl<E: core::fmt::Debug> std::error::Error for ProgressError<E> {}
+impl<E: std::error::Error + 'static> std::error::Error for ProgressError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Wait(error) => Some(error),
+            Self::Busy | Self::Closed => None,
+        }
+    }
+}
 
 /// Borrowed process-local progress capabilities for concrete Channel endpoints.
 pub struct Signals<'a, N: ?Sized, W: ?Sized> {

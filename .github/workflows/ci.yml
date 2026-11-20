@@ -19,7 +19,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-05-19
+          toolchain: nightly-2026-11-17
           components: rustfmt, clippy, rust-docs
           targets: i686-unknown-linux-gnu
       - run: cargo fmt --all --check
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-05-19
+          toolchain: nightly-2026-11-17
           components: rustfmt, clippy
       - run: cargo test --features os,tokio,tracing
       - run: cargo check --all-targets --all-features

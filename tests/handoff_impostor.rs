@@ -64,7 +64,7 @@ fn attacker() -> i32 {
     // no longer owns.
     core::mem::forget(claimed);
     let outcome = match Handoff::receive() {
-        Ok((_, resources)) => {
+        Ok((_, resources, _report)) => {
             eprintln!(
                 "attacker was handed a {}-byte region",
                 resources.mapping.size()
@@ -86,7 +86,7 @@ fn child() -> i32 {
         .parse()
         .expect("a numeric peer id");
     match Handoff::receive() {
-        Ok((peer, resources)) => {
+        Ok((peer, resources, _report)) => {
             if peer.pid() != expected {
                 eprintln!(
                     "attested peer {} is not the expected {expected}",

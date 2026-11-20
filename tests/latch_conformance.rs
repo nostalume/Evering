@@ -26,6 +26,10 @@
 //   two conditions are ever parked on one primitive. An adapter that multiplexed
 //   causes onto a single latch would need the wake to name its cause, which is the
 //   badge a bounded notification word carries and a byte queue or a bit does not.
+// - The synchronous park over a *set* of latches, `Event::wait_any`, is none of these
+//   clauses: it multiplexes latches rather than causes, so each condition still owns
+//   one pair. Its own claims — one latch reported per park, the rest of the set kept
+//   ready — are checked in `src/os/mux.rs`, beside the leg that makes them.
 
 use std::time::Duration;
 

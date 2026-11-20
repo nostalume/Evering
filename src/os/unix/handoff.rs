@@ -20,6 +20,19 @@
 //! `Socket::granted`, not here. And the non-Linux arm refuses for lack of a mechanism, which is a
 //! policy statement rather than a placeholder: writing one for another host should not quietly turn an
 //! unattested handover into a permitted one.
+//!
+//! The return leg is the receipt, and it changes what a meeting *ends* when: the granted descriptor is
+//! now the child's way back, so `Attendance::arrival` is what reconciles the child's own word about the
+//! member it took with the slot this file's promise named, and `Death` is only reachable through both.
+//! What this leg decides and no test can undo is that three separate statements have to agree before an
+//! arrival means anything — the kernel's answer about who wrote, the identity the writer reported, and
+//! the identity the grant promised. Reading only the first two would let a child that arrived in a
+//! stranger's slot hand the parent authority to reap it.
+//!
+//! What the receipt cannot say is which member a *death* reached for a process this file never promised:
+//! no promise, no comparison, and so no arrival — an unpromised child that joined as a member of its own
+//! leaves its parent exactly where it was, with [`assume_dead`](crate::Session::assume_dead) and its own
+//! word as the only evidence. That is a boundary of the design, not a gap in this file.
 
 use std::{
     env, io,
@@ -32,11 +45,12 @@ use std::{
 use nix::unistd::{getppid, getuid};
 
 use crate::{
+    layout::RegionId,
     os::{
         Event, Peer, ReceivedResources, Ring,
         unix::{UnixFd, process::Socket},
     },
-    process::{Bootstrap, Introduction, RENDEZVOUS, SEAT, Supervisor},
+    process::{Arrival, Bootstrap, Introduction, RENDEZVOUS, SEAT, Supervisor},
 };
 
 pub type Shared = UnixFd<std::os::fd::OwnedFd>;
@@ -88,6 +102,7 @@ impl Handoff {
     /// Creates one meeting and the single-use grant that admits a participant to it.
     pub fn bind() -> io::Result<(Self, Grant)> {
         let (here, there) = Socket::pair()?;
+        here.credit_writers()?;
         Ok((
             Self { socket: here },
             Grant {
@@ -105,6 +120,11 @@ impl Handoff {
     /// reports its creator at both ends. What binds the handover to `child` is that only a process
     /// `child` was `exec`d from can hold the granted descriptor, and the receiver attests on the
     /// other side of it. Windows, where the parent listens, checks `child` and needs `deadline`.
+    ///
+    /// The rendezvous is not spent by the offer: what `send` hands back is the same end, now read for
+    /// the receipt the admitted process writes down that end. Keeping it is the only way the parent
+    /// learns which member its promise filled, and dropping it is what tells the child that nobody is
+    /// taking attendance any more.
     pub fn send<F: AsFd>(
         self,
         _child: &Supervisor,
@@ -113,9 +133,10 @@ impl Handoff {
         mapping: &UnixFd<F>,
         event: &Event,
         ring: &Ring,
-    ) -> io::Result<()> {
-        self.socket
-            .send(bootstrap, &[mapping.as_fd(), event.as_fd(), ring.as_fd()])
+    ) -> io::Result<Attendance> {
+        let socket = self.socket;
+        socket.send(bootstrap, &[mapping.as_fd(), event.as_fd(), ring.as_fd()])?;
+        Ok(Attendance { socket })
     }
 
     /// Takes the handover this process was granted, and attests the peer before anything is read.
@@ -124,12 +145,15 @@ impl Handoff {
     /// as soon as the descriptor is, so a process that merely announces a number, or owns a socket it
     /// made itself, is refused without ever blocking on a message it was never sent — and without any
     /// descriptor being installed in its table first.
-    pub fn receive() -> io::Result<(Peer, ReceivedResources)> {
+    ///
+    /// The granted end is kept rather than closed, because it is the one channel back to the process
+    /// that admitted this one: the [`Receipt`] it returns is how this process says which member it
+    /// became.
+    pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
         let socket = granted_socket()?;
         let peer = attested(&socket)?;
         let promised = announced_seat()?;
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
-        drop(socket);
         let mut resources = resources.into_vec();
         Ok((
             peer,
@@ -140,7 +164,67 @@ impl Handoff {
                 ring: Ring::from_owned_fd(resources.remove(0)),
                 seat: promised,
             },
+            Receipt { socket },
         ))
+    }
+}
+
+/// The parent's end of a meeting it has held, which is where an admitted process reports what it became.
+///
+/// [`Handoff::send`] is the only way to obtain one, so there is no reading of an arrival before the
+/// handover it answers. What it answers for is narrower than the offer did: one receipt, of the one
+/// process the consumed [`Grant`] admitted, against the one identity that grant promised.
+pub struct Attendance {
+    socket: Socket,
+}
+
+/// The admitted process's end of the rendezvous, which is how it reports the member it arrived as.
+///
+/// [`Handoff::receive`] keeps the granted descriptor open rather than closing it, and this is the whole
+/// reason: a receipt is only worth having if it arrives by a channel the writer cannot choose, and the
+/// end this process was handed is the only one it holds that the kernel will credit to nobody else.
+pub struct Receipt {
+    socket: Socket,
+}
+
+impl Attendance {
+    /// Reads the receipt the promised process wrote, and refuses one that says anything else.
+    ///
+    /// `promised` is not a courtesy: the receipt is the child's own word about which member it took, and
+    /// a child can take a different one than it was told. Compared against the promise, the two answers
+    /// either agree — which is the record that the promised slot was *stood in*, not merely left open —
+    /// or they do not, and then this process has been told something it did not ask about and nothing is
+    /// bound to anything. [`Death`](crate::process::Death) cannot be built from a refusal, and that is
+    /// the point: an unreconciled promise stays an [`assume_dead`](crate::Session::assume_dead) decision
+    /// or a [`Seat`](crate::Seat) to give back.
+    ///
+    /// `deadline` bounds the read, and on this endpoint it is the only bound there is: a datagram rendezvous
+    /// answers a peer's departure with no readiness and no hangup, so `TimedOut` covers a child that is slow
+    /// exactly as it covers a child that met, said nothing and exited. `UnexpectedEof` is the answer a
+    /// seqpacket rendezvous gives, which the host does report as an end. Which is also why a parent that has
+    /// to know its child is gone asks the child and not the socket: [`Supervisor::wait`] reaps, and a
+    /// [`Death`](crate::process::Death) is that answer beside an arrival rather than either alone.
+    pub fn arrival(
+        self,
+        child: &Supervisor,
+        promised: Introduction,
+        deadline: Instant,
+    ) -> io::Result<Arrival> {
+        credited(&self.socket, child, promised, deadline)
+    }
+}
+
+impl Receipt {
+    /// Reports the member this process holds to the process that admitted it.
+    ///
+    /// The two parts come from this process's own `Session` — the region it mapped and the identity the
+    /// roster gave it — and not from the announcement in its environment: reporting what it was *told*
+    /// would echo the parent's promise back at it and prove nothing, while reporting what it *became* is
+    /// the one thing the parent cannot establish alone. What the child writes is not trusted for its
+    /// content either way; the promise is what decides whether the report is news.
+    pub fn arrived(&self, region: RegionId, member: crate::mapping::Peer) -> io::Result<()> {
+        self.socket
+            .report(&Introduction::new(region, member).announcement())
     }
 }
 
@@ -157,6 +241,12 @@ impl Grant {
     }
 
     /// Installs this rendezvous in `command`, so that the process it spawns holds the granted end.
+    ///
+    /// `dup2` is the whole mechanism and one of its details is load-bearing: both ends of the pair this
+    /// module makes are close-on-exec, and `dup2` clears that flag on the descriptor it writes, which is
+    /// what lets the granted end survive the `exec` that every other descriptor here does not. A rewrite
+    /// that inherited the number instead — or that re-set the flag afterwards — would hand the child a
+    /// closed descriptor and the failure would surface as a rendezvous that announces nothing.
     ///
     /// Consuming `self` is what makes the grant single-use: after this call the sender has no way to
     /// point a second child at the same meeting, and no name left for anyone else to claim first. It
@@ -222,7 +312,7 @@ fn announced_seat() -> io::Result<Option<Introduction>> {
         .ok_or_else(|| refused("the announced member slot names no slot at all"))
 }
 
-/// The kernel's own answer about the peer, checked against this process's parent.
+/// The kernel's own answer about the process that owns the peer end, checked against this process's parent.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn attested(socket: &Socket) -> io::Result<Peer> {
     let credentials = socket.peer_credentials()?;
@@ -242,5 +332,56 @@ fn attested(socket: &Socket) -> io::Result<Peer> {
 fn attested(_socket: &Socket) -> io::Result<Peer> {
     Err(refused(
         "this platform has no peer attestation implemented, and an unattested handover is refused",
+    ))
+}
+
+/// The receipt this rendezvous carries, credited to the admitted process and reconciled with the promise.
+///
+/// Three checks, each answering a different way the two halves could fail to be about the same thing. The
+/// kernel's pid and uid, because a report from anybody else says nothing about this child. The promise,
+/// because a report of a *different* member is a child that arrived somewhere else and a `Death` built
+/// from it would reap whoever does stand there. And the frame's own grammar, refused by `Socket::arrival`
+/// before any of this sees the text, so a scribbled receipt is never compared with anything.
+///
+/// The pid arrives with the message rather than before it, which is the one difference from `attested`: a
+/// receipt is credited at the read, and there is nothing in it to adopt — no descriptor, no object, no
+/// state this process changes — so nothing is installed ahead of the answer about who wrote it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn credited(
+    socket: &Socket,
+    child: &Supervisor,
+    promised: Introduction,
+    deadline: Instant,
+) -> io::Result<Arrival> {
+    let (arrived, credentials) = socket.arrival(deadline)?;
+    if credentials.pid != child.id() || credentials.uid != getuid().as_raw() {
+        return Err(refused(
+            "the receipt on this rendezvous was not written by the process it was promised to",
+        ));
+    }
+    if arrived != promised {
+        return Err(refused(
+            "the arrival reported is not the member slot that was promised",
+        ));
+    }
+    Ok(Arrival::reported(
+        arrived.region(),
+        arrived.peer(),
+        credentials.pid,
+    ))
+}
+
+/// The arms that credit no writer get the same answer `attested` gives them, for the same reason: an
+/// arrival nobody can attribute is not evidence of anything, and a value a caller would hand to
+/// `Session::recover` would be exactly the unattested handover this file refuses to complete.
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+fn credited(
+    _socket: &Socket,
+    _child: &Supervisor,
+    _promised: Introduction,
+    _deadline: Instant,
+) -> io::Result<Arrival> {
+    Err(refused(
+        "this platform credits no writer, and an uncredited arrival is refused",
     ))
 }

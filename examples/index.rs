@@ -190,7 +190,7 @@ fn spawn(
 }
 
 fn attach() -> Result<(Bootstrap, Session, Event, Ring)> {
-    let (_peer, resources) = evering::os::Handoff::receive().map_err(text)?;
+    let (_peer, resources, _report) = evering::os::Handoff::receive().map_err(text)?;
     let session = Session::open(
         resources.mapping,
         Request::new(EXTENT, Access::READ | Access::WRITE),

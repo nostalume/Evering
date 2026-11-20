@@ -13,6 +13,15 @@
 //! that survives an `exec` leaks a peer's object into a third process, and `Credentials` has to keep
 //! `pid`, because the attestation in `super::handoff` is a comparison of that field against `getppid()`
 //! and a pair of `uid`/`gid` cannot carry the check.
+//!
+//! The second frame is the receipt: `ARRIVAL_MAGIC`, the arrival text, and no descriptors. It is read
+//! under a bound the caller names rather than one left on the socket, because the endpoint is the same
+//! one the offer crossed and a `SO_RCVTIMEO` would be a change to what the other end of the meeting
+//! experiences — and because on a datagram pair the host answers a peer's departure with nothing at all, so
+//! a bound is the only end a reader of this rendezvous can be given. What no test here catches is the
+//! pairing of the two tags: a `read_receipt` that accepted
+//! `EVR1` would report a handover the receiver never got, and a `recv` that accepted `EVA1` would take a
+//! child's report as an offer and hand back three resources that were never sent.
 
 use std::{
     io::{self, IoSlice, IoSliceMut},
@@ -32,7 +41,20 @@ use nix::{
     },
 };
 
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use std::time::Instant;
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use nix::{
+    errno::Errno,
+    poll::{PollFd, PollFlags, PollTimeout, poll},
+    sys::socket::{UnixCredentials, setsockopt},
+};
+
 use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+use crate::process::Introduction;
 
 const HEADER: usize = 8;
 
@@ -125,6 +147,28 @@ impl Socket {
         })
     }
 
+    /// Asks the kernel to name, beside every message this end reads, the process that wrote it.
+    ///
+    /// This is a different answer from `peer_credentials`, and the difference is what a receipt depends
+    /// on: the socket's peer field names whoever *created* the pair — the parent, at both ends — while
+    /// this names the writer of the one message being read, which on a granted rendezvous can only be the
+    /// process the grant was admitted to. The kernel fills the field in from its own records, so the
+    /// writer cannot choose it: a `sendmsg` that carries credentials not the sender's own is refused
+    /// outright and the message does not arrive.
+    ///
+    /// The other arms have nothing to ask for, and say so by leaving the endpoint exactly as it is: no
+    /// per-message writer is delivered to them by this mechanism, so the receipt that would need it is
+    /// refused at `super::handoff` rather than quietly accepted as an uncredited claim.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn credit_writers(&self) -> io::Result<()> {
+        setsockopt(&self.0, sockopt::PassCred, &true).map_err(io::Error::from)
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn credit_writers(&self) -> io::Result<()> {
+        Ok(())
+    }
+
     pub fn send(&self, bootstrap: &Bootstrap, resources: &[BorrowedFd<'_>]) -> io::Result<()> {
         if resources.len() > MAX_RESOURCES {
             return Err(io::Error::new(
@@ -137,15 +181,24 @@ impl Socket {
         bytes.extend_from_slice(&(bootstrap.as_ref().len() as u16).to_le_bytes());
         bytes.extend_from_slice(&(resources.len() as u16).to_le_bytes());
         bytes.extend_from_slice(bootstrap.as_ref());
-        let data = [IoSlice::new(&bytes)];
         let raw: Vec<_> = resources.iter().map(AsRawFd::as_raw_fd).collect();
-        let sent = if raw.is_empty() {
+        self.datagram(&bytes, &raw)
+    }
+
+    /// One datagram on this endpoint, with `rights` beside it when there are any.
+    ///
+    /// The two frames the seam writes — an offer with its descriptors, a receipt with none — differ only
+    /// in what rides beside the bytes, so both go through here and neither can drift from the other's
+    /// short-write rule.
+    fn datagram(&self, bytes: &[u8], rights: &[RawFd]) -> io::Result<()> {
+        let data = [IoSlice::new(bytes)];
+        let sent = if rights.is_empty() {
             sendmsg::<()>(self.0.as_raw_fd(), &data, &[], MsgFlags::empty(), None)
         } else {
             sendmsg::<()>(
                 self.0.as_raw_fd(),
                 &data,
-                &[ControlMessage::ScmRights(&raw)],
+                &[ControlMessage::ScmRights(rights)],
                 MsgFlags::empty(),
                 None,
             )
@@ -158,6 +211,122 @@ impl Socket {
             ));
         }
         Ok(())
+    }
+
+    /// Writes the member identity this process arrived as, as one receipt frame with nothing beside it.
+    ///
+    /// The text is the announcement grammar again, so the receiver parses it with the same function that
+    /// parses the environment key and refuses a scribble in it the same way. No credentials are attached:
+    /// the kernel fills the writer's identity in when the reading end has asked for it, which is why a
+    /// writer cannot name a process other than itself — and why this call has nothing to say about who
+    /// is reading.
+    pub fn report(&self, announcement: &str) -> io::Result<()> {
+        if announcement.len() > MAX_BOOTSTRAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receipt text too long",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(HEADER + announcement.len());
+        bytes.extend_from_slice(&crate::process::ARRIVAL_MAGIC);
+        bytes.extend_from_slice(&(announcement.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(announcement.as_bytes());
+        self.datagram(&bytes, &[])
+    }
+
+    /// Reads one receipt frame and the kernel's answer about the process that wrote it, by `deadline`.
+    ///
+    /// The bound is a `poll` in front of a non-blocking read rather than a socket option, so nothing is
+    /// left set on the endpoint behind the caller's back and the pair's other end keeps its own timing.
+    /// `poll` takes whole milliseconds and truncates, so a bound past its ceiling is taken in pieces: each
+    /// wake re-measures against `deadline`, which is what keeps a long one from ending early.
+    ///
+    /// Whether a departure is answerable at all depends on what kind of endpoint this is, and the two were
+    /// measured rather than assumed. On a seqpacket pair the kernel reports the peer gone as a readable
+    /// zero-byte datagram, which is answered here as an end rather than retried. On a datagram pair — the
+    /// kind `Socket::pair` makes, so the kind every handover this file carries crosses — it reports nothing:
+    /// no readiness, no hangup, only `EAGAIN` to a read. A parent waiting on a child that met and left
+    /// without writing is therefore answered by its own `deadline` and by no signal from the host, which is
+    /// why the bound is a parameter of this call rather than a policy inside it.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn arrival(&self, deadline: Instant) -> io::Result<(Introduction, Credentials)> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let budget = PollTimeout::from(remaining.as_millis().min(u16::MAX as u128) as u16);
+            let mut watched = [PollFd::new(self.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut watched, budget) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                // A signal is not a receipt, and an interrupted park is retried rather than reported.
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if watched[0].revents().is_none_or(|flags| flags.is_empty()) {
+                continue;
+            }
+            return self.read_receipt();
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn read_receipt(&self) -> io::Result<(Introduction, Credentials)> {
+        let mut bytes = [0; HEADER + MAX_BOOTSTRAP];
+        let mut data = [IoSliceMut::new(&mut bytes)];
+        let mut control = cmsg_space!(UnixCredentials);
+        let message = recvmsg::<()>(
+            self.0.as_raw_fd(),
+            &mut data,
+            Some(&mut control),
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
+        )
+        .map_err(io::Error::from)?;
+        let count = message.bytes;
+        let flags = message.flags;
+        let mut credited = None;
+        for item in message.cmsgs().map_err(io::Error::from)? {
+            match item {
+                ControlMessageOwned::ScmCredentials(creds) => {
+                    credited = Some(Credentials {
+                        pid: creds.pid() as u32,
+                        uid: creds.uid(),
+                        gid: creds.gid(),
+                    });
+                }
+                ControlMessageOwned::ScmRights(_) => {
+                    return Err(invalid("a receipt carries no descriptors"));
+                }
+                _ => {}
+            }
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the peer closed the rendezvous without reporting its arrival",
+            ));
+        }
+        if flags.intersects(MsgFlags::MSG_TRUNC) {
+            return Err(invalid("truncated receipt"));
+        }
+        let credentials = credited.ok_or_else(|| {
+            invalid("the receipt arrived with no answer about the process that wrote it")
+        })?;
+        if count < HEADER || bytes[..4] != crate::process::ARRIVAL_MAGIC {
+            return Err(invalid("malformed receipt header"));
+        }
+        let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let declared = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+        if len > MAX_BOOTSTRAP || count != HEADER + len || declared != 0 {
+            return Err(invalid("malformed receipt length"));
+        }
+        let text = std::str::from_utf8(&bytes[HEADER..count])
+            .map_err(|_| invalid("a receipt is not text"))?;
+        let arrived = Introduction::announced(text)
+            .ok_or_else(|| invalid("the receipt names no member identity"))?;
+        Ok((arrived, credentials))
     }
 
     pub fn recv(&self, expected: usize) -> io::Result<Offer> {

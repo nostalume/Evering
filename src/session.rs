@@ -6,6 +6,13 @@
 //! record writes and the heap claim; and a dead member's words move only inside
 //! `Recovery::reap_with`.
 //!
+//! Two entrances authorize the dead-mark and they differ only in who answers for the evidence:
+//! `assume_dead` takes an identity and the caller's word that its process cannot reach the mapping
+//! again, while `recover` takes a `Death` — the host's answer about which process reported arriving in
+//! that member, joined to the reaped exit of the same process — and needs no word from anybody. The
+//! region a `Death` names is checked here, because the evidence is about one roster and a caller holding
+//! two mappings could otherwise mark a member of the wrong one.
+//!
 //! `reap_with` walks the region twice before it clears a member, because the second walk is what
 //! proves the first changed nothing — a single walk returns `Ok` for a region that still names the
 //! peer it just removed. Those walks sit between `finish_recovery` and `release_dead` in that order,
@@ -206,10 +213,10 @@ impl<E> SessionError<E> {
     }
 }
 
-impl<E: core::fmt::Debug> core::fmt::Display for SessionError<E> {
+impl<E> core::fmt::Display for SessionError<E> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Source(error) => write!(f, "the provider refused the mapping: {error:?}"),
+            Self::Source(_) => f.write_str("the provider refused the mapping"),
             Self::PermissionDenied { requested } => {
                 write!(f, "the mapping does not permit {requested:?}")
             }
@@ -241,7 +248,14 @@ impl<E: core::fmt::Debug> core::fmt::Display for SessionError<E> {
 }
 
 #[cfg(feature = "std")]
-impl<E: core::fmt::Debug> std::error::Error for SessionError<E> {}
+impl<E: std::error::Error + 'static> std::error::Error for SessionError<E> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 /// Why a Pool could not be opened from an id another process published.
 ///
@@ -678,6 +692,15 @@ impl Session {
         self.dir.peer()
     }
 
+    /// The region this session's roster belongs to, beside the member this process stands in it as.
+    ///
+    /// A process that arrived over a handover reports both to the parent that admitted it: the pair is
+    /// what it *became*, and the region is what says which roster the answer is about — the same pair
+    /// `Seat::region` and `Seat::peer` name from the other side, before anybody arrives.
+    pub fn region(&self) -> RegionId {
+        self.dir.region_id()
+    }
+
     pub fn heap(&self) -> GeneralHeap<'_> {
         GeneralHeap {
             alloc: self.alloc.as_ref(),
@@ -803,6 +826,37 @@ impl Session {
     /// The caller must know that `peer` can never access the mapping again.
     pub unsafe fn assume_dead(&self, peer: Peer) -> Option<Recovery<'_>> {
         let member = unsafe { self.dir.mark_dead(peer) }?;
+        Some(Recovery {
+            session: self,
+            member,
+        })
+    }
+
+    /// Marks the member a proven death releases, and hands out the authority to repair what it left.
+    ///
+    /// This is the safe twin of [`Session::assume_dead`], and the difference is entirely in who answers
+    /// for the precondition. `assume_dead` takes an identity and asks the *caller* to know that the
+    /// process behind it can never reach this mapping again; a [`Death`](crate::process::Death) carries
+    /// that knowing, assembled by its constructor from two answers the host gave — the process that
+    /// reported arriving in this exact slot and generation, and the reaped exit of that same process. The
+    /// identity itself was already reconciled against the promise the admitting session held, so a report
+    /// about somebody else's member never reaches this call.
+    ///
+    /// `None` means what it means beside `assume_dead`: this region has no member to reap under that
+    /// identity — the generation was spent, the slot was never stood in, or the receipt names another
+    /// region's roster. That last case is why the region is checked before anything is marked, and it is
+    /// the one thing here a caller could otherwise get wrong silently: a `Death` is evidence about one
+    /// region, and a process holding mappings of two cannot be assumed to have asked the right session.
+    /// A `None` is still not a claim that the peer is gone, only that this roster owes nobody a reap.
+    #[cfg(all(feature = "process", any(unix, windows)))]
+    pub fn recover(&self, death: &crate::process::Death) -> Option<Recovery<'_>> {
+        if death.region() != self.dir.region_id() {
+            return None;
+        }
+        // SAFETY: what `assume_dead` asks its caller to know, this carries as evidence. A process the
+        // host reported reaped holds no mapping of anything any more, so the member its own receipt
+        // named can never be reached by the process that died.
+        let member = unsafe { self.dir.mark_dead(death.peer()) }?;
         Some(Recovery {
             session: self,
             member,

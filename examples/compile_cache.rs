@@ -8,8 +8,8 @@ use std::{
 use evering::{
     BlockRange, Channel, Pool, PoolCreateError, PoolId, Port, RemoveError, Session,
     layout::{self, RegionId, Repr, SchemaKey, compose_schema, schema_id},
-    mapping::{Access, Peer, Request},
-    notify::{Signals, Wait as _},
+    mapping::{Access, Peer, REGION_ALIGN, Request},
+    notify::Signals,
     os::{Handoff, Shared, event},
     process::{Bootstrap, Supervisor},
     runtime::Wait,
@@ -21,9 +21,15 @@ const PROBE_BYTES: usize = 2 * 1024 * 1024;
 /// A `BlockRange` is exact, and an exact range reserves its floor before any payload arrives: 64
 /// slots of every power-of-two class up to `LARGEST`, which is 256 MiB of Pool for a 1 MiB class.
 /// `compile_cache --geometry` prints the floor each range demands instead of trusting this number.
-const EXTENT: usize = 272 * 1024 * 1024;
-const POOL_BYTES: usize = 256 * 1024 * 1024;
-const LARGEST: usize = 1 << 20;
+const POOL_BYTES: usize = 256 * LARGEST;
+const EXTENT: usize = POOL_BYTES + 16 * 1024 * 1024;
+/// The widest class a peer's mapping is guaranteed to reproduce is the arm's `REGION_ALIGN`, so the
+/// largest object comes from the platform rather than from a number that only holds on one arm.
+const LARGEST: usize = if REGION_ALIGN < 1 << 20 {
+    REGION_ALIGN
+} else {
+    1 << 20
+};
 const BOOT_MAGIC: u64 = 0x4556_4552_4341_4301;
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// How long the daemon waits for the next request before it declares the handover dead and reports
@@ -141,7 +147,7 @@ fn spawn_serving(
 }
 
 async fn serve(dying: bool) -> Result<(), String> {
-    let (_peer, resources) = Handoff::receive().map_err(text)?;
+    let (_peer, resources, _report) = Handoff::receive().map_err(text)?;
     let session =
         Session::open(resources.mapping, Request::new(EXTENT, access()), REGION).map_err(text)?;
     let (pool_id, jobs_port, verdicts_port) = decode_boot(&resources.bootstrap)?;
@@ -408,21 +414,43 @@ async fn liveness(session: &Session, pool: &Pool, shared: &Shared) -> Result<(),
     let pid = child.id();
     let wait = Wait::new(my_wakes).map_err(text)?;
 
+    // The death is waited on rather than noticed. A witness parks this task on the child itself, so the
+    // round no longer re-arms a timer to find out whether the peer is gone, and the answer is not a poll
+    // that happened to land after the exit. The latch stays in the race because this peer rings before it
+    // exits: a wake that arrives first is the announcement arriving, not a reason to stop waiting.
     let started = Instant::now();
-    let mut woken = 0;
-    let status = loop {
-        if let Some(status) = child.try_wait().map_err(text)? {
-            break status;
-        }
-        if tokio::time::timeout(Duration::from_millis(1), wait.wait())
-            .await
-            .is_ok()
-        {
-            woken += 1;
-        }
-        if started.elapsed() >= TIMEOUT {
-            return Err("a daemon that never served was never observed exiting".into());
-        }
+    #[cfg(target_os = "linux")]
+    let (status, woken) = {
+        use evering::notify::Wait as _;
+        let death = child.exited().map_err(text)?;
+        let mut woken = 0;
+        let status = loop {
+            let Some(remaining) = TIMEOUT.checked_sub(started.elapsed()) else {
+                return Err("a daemon that never served was never observed exiting".into());
+            };
+            tokio::select! {
+                ready = wait.wait() => {
+                    ready.map_err(text)?;
+                    woken += 1;
+                }
+                gone = death.wait() => {
+                    gone.map_err(text)?;
+                    // The witness says the child is gone; only the owner can say what it returned, and
+                    // taking the status is what keeps the reap on the lane that owes it.
+                    break child.wait().map_err(text)?;
+                }
+                _ = tokio::time::sleep(remaining) => {
+                    return Err("a daemon that never served was never observed exiting".into());
+                }
+            }
+        };
+        (status, woken)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (status, woken) = {
+        // No death witness is written for this target, and `Supervisor::exited` names the reap as the
+        // way its child's end is reached, so this round ends there and reports nothing parked on.
+        (child.wait().map_err(text)?, 0)
     };
     let detected = started.elapsed();
     let code = status.status().code().unwrap_or_default();
@@ -467,9 +495,10 @@ fn geometry() -> Result<(), String> {
     ] {
         let range = BlockRange::new(min, max).map_err(text)?;
         let floor = match session.create_pool(1, Some(range)) {
-            Err(PoolCreateError::RequiredExtent { required, .. }) => required,
+            Err(PoolCreateError::RequiredExtent { required, .. }) => format!("{required}"),
+            Err(PoolCreateError::ClassTooWide(bytes)) => format!("refused-class-too-wide-{bytes}"),
             Err(other) => return Err(text(other)),
-            Ok(_) => 1,
+            Ok(_) => "1".to_owned(),
         };
         println!("GEOMETRY\t{min}\t{max}\t{floor}");
     }

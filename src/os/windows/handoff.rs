@@ -16,10 +16,20 @@
 //! after the kernel has answered, which is what keeps one arm's child able to meet the other arm's
 //! parent. And `Grant` staying single-use is what stops one address admitting two children. Nothing in
 //! this file has been executed on the host writing it.
+//!
+//! The return leg is the receipt, and it is where the two arms' mechanisms differ most even though their
+//! answers are the same shape. Here the credit is the instance: `accept` proved whose client connected,
+//! one instance serves one client, and `client_pid` re-asks at the read so the arrival is attributed to
+//! the process the caller is about to reap rather than to the pipe. On Unix the credit is a field the
+//! kernel writes beside the message. An arrival that means one thing means the other only if this leg's
+//! `nMaxInstances` stays `1` — widened, the report would come from whichever client connected, and the
+//! pid here would name a process that never held the promise. Which is another way of saying none of the
+//! three checks below has been run on a Windows host.
 
 use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 
 use crate::{
+    layout::RegionId,
     os::{
         Event, Peer, ReceivedResources, Ring,
         windows::{
@@ -27,7 +37,7 @@ use crate::{
             process::{Listener, Socket},
         },
     },
-    process::{Bootstrap, INTRODUCER, Introduction, RENDEZVOUS, SEAT, Supervisor},
+    process::{Arrival, Bootstrap, INTRODUCER, Introduction, RENDEZVOUS, SEAT, Supervisor},
 };
 
 pub type Shared = Section<std::os::windows::io::OwnedHandle>;
@@ -82,6 +92,10 @@ impl Handoff {
     /// `accept` asks the kernel whose client connected and refuses anything that is not `child`, and
     /// `deadline` bounds the wait for that client to appear — the pipe instance exists long before
     /// the child has run.
+    ///
+    /// What `accept` reached is kept rather than closed: the instance is the only channel this process
+    /// has back to the child it admitted, and one instance serves one client, so the same handle that
+    /// carried the offer is the one that takes the receipt.
     pub fn send<F: AsHandle>(
         self,
         child: &Supervisor,
@@ -90,17 +104,22 @@ impl Handoff {
         mapping: &Section<F>,
         event: &Event,
         ring: &Ring,
-    ) -> io::Result<()> {
-        self.listener.accept(child, deadline)?.send(
+    ) -> io::Result<Attendance> {
+        let socket = self.listener.accept(child, deadline)?;
+        socket.send(
             child,
             bootstrap,
             &[mapping.as_handle(), event.as_handle(), ring.as_handle()],
-        )
+        )?;
+        Ok(Attendance { socket })
     }
 
     /// Takes the handover this process was granted, and attests the peer before any of it is
     /// released to the caller.
-    pub fn receive() -> io::Result<(Peer, ReceivedResources)> {
+    ///
+    /// The client end is kept, because it is the way back: the [`Receipt`] this returns is how the
+    /// admitted process tells its parent which member it became.
+    pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
         let address = env::var(RENDEZVOUS)
             .map_err(|_| refused("no evering rendezvous was granted to this process"))?;
         let introducer: u32 = env::var(INTRODUCER)
@@ -128,7 +147,64 @@ impl Handoff {
                 ring: Ring::from_owned_handle(resources.remove(0)),
                 seat: promised,
             },
+            Receipt { socket },
         ))
+    }
+}
+
+/// The parent's end of the instance it accepted, which is where the admitted child reports what it became.
+///
+/// [`Handoff::send`] is the only way to obtain one: the instance exists only after the client behind it
+/// was named and checked, so an arrival read here is about the process that passed that check and nobody
+/// else.
+pub struct Attendance {
+    socket: Socket,
+}
+
+/// The admitted process's end of the pipe, which is how it reports the member it arrived as.
+pub struct Receipt {
+    socket: Socket,
+}
+
+impl Attendance {
+    /// Reads the receipt, attributed to the client of this instance and reconciled with the promise.
+    ///
+    /// The order is the Windows arm's own, and it is the one the Unix arm cannot have: `accept` already
+    /// proved whose instance this is, so the client is named *before* the message is read rather than
+    /// arriving beside it. Both arms end with the same three answers — whose, what, promised-what — and
+    /// both refuse a receipt that fails one of them, which is what lets a caller hand the result to
+    /// [`Death`](crate::process::Death) without knowing which leg it came off.
+    pub fn arrival(
+        self,
+        child: &Supervisor,
+        promised: Introduction,
+        deadline: Instant,
+    ) -> io::Result<Arrival> {
+        let client = self.socket.client_pid()?;
+        if client != child.id() {
+            return Err(refused(
+                "the client of this rendezvous is not the process it was promised to",
+            ));
+        }
+        let arrived = self.socket.arrival(deadline)?;
+        if arrived != promised {
+            return Err(refused(
+                "the arrival reported is not the member slot that was promised",
+            ));
+        }
+        Ok(Arrival::reported(arrived.region(), arrived.peer(), client))
+    }
+}
+
+impl Receipt {
+    /// Reports the member this process holds to the process that admitted it.
+    ///
+    /// The pair comes from this process's own session rather than from the announcement in its
+    /// environment: echoing the promise would tell the parent nothing it did not already know, while the
+    /// identity the roster actually gave this process is the record of who stood in the slot.
+    pub fn arrived(&self, region: RegionId, member: crate::mapping::Peer) -> io::Result<()> {
+        self.socket
+            .report(&Introduction::new(region, member).announcement())
     }
 }
 

@@ -8,7 +8,11 @@
 //! which is which, so a sender and a reader disagreeing about that order receive each other's objects
 //! with nothing to complain. The promised member slot beside them is the one thing the map carries
 //! that is not positional — it is announced through the environment, and only the roster decides
-//! whether it was ever promised. The whole map is also gated on `std`, so it simply is not there under
+//! whether it was ever promised. The one thing that goes back the other way is a receipt, and it is
+//! named by two types and no resource: `Receipt` is the admitted process's means of reporting the
+//! member it became, `Attendance` is the parent's bounded read of that report, and what makes a report
+//! evidence is that the host names its writer — a claim the writer cannot choose, and the reason no
+//! object travels with it. The whole map is also gated on `std`, so it simply is not there under
 //! `--no-default-features`. Each backend keeps its own obligations — the unix leg reserves a window
 //! before placing the file, the Windows leg goes through a section and a view — and only the paths a
 //! suite actually reaches on a given host have been executed.
@@ -20,6 +24,12 @@
 //! [`crate::notify::Wait`] on its own type. Nothing in `session`, `pool` or `channel` names anything in
 //! this module, so a target with no descriptor, no handle and no process to hand one to is not missing
 //! a port here — it has no reason to compile one.
+//!
+//! The one operation both unix arms share is the park over a set of latches (`mux`), because a latch is a
+//! readable descriptor on either: `Event::wait_any` is the arm's own method over that leg, which is why
+//! the ceiling a Windows wait array imposes — 64 objects, and a refusal above it — is written on that arm
+//! alone rather than in the seam. Editing the shared leg therefore changes two hosts at once, and no run
+//! on the third can show it.
 #![cfg(feature = "std")]
 
 #[cfg(all(feature = "map", unix))]
@@ -40,6 +50,9 @@ mod event;
 #[cfg(any(all(feature = "notify", unix), all(feature = "notify", windows)))]
 pub use event::{Event, Ring, event};
 
+#[cfg(all(unix, feature = "notify"))]
+mod mux;
+
 #[cfg(all(feature = "process", unix))]
 #[path = "os/unix/handoff.rs"]
 mod handoff;
@@ -47,7 +60,7 @@ mod handoff;
 #[path = "os/windows/handoff.rs"]
 mod handoff;
 #[cfg(all(feature = "process", any(unix, windows)))]
-pub use handoff::{Grant, Handoff, Shared, shared};
+pub use handoff::{Attendance, Grant, Handoff, Receipt, Shared, shared};
 
 /// The process at the other end of a completed handover, as the host kernel reported it and as
 /// checked against the process that admitted the grant.

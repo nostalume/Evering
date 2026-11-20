@@ -35,7 +35,7 @@ const FAILED: i32 = 1;
 /// that refusal by its reason: any other error would mean it never reached a pipe at all.
 fn attacker() -> i32 {
     match Handoff::receive() {
-        Ok((peer, _)) => {
+        Ok((peer, _, _report)) => {
             eprintln!(
                 "attacker was handed the meeting by a peer at {}",
                 peer.pid()
@@ -63,7 +63,7 @@ fn child() -> i32 {
         .parse()
         .expect("a numeric peer id");
     match Handoff::receive() {
-        Ok((peer, resources)) => {
+        Ok((peer, resources, _report)) => {
             if peer.pid() != expected {
                 eprintln!(
                     "attested peer {} is not the expected {expected}",

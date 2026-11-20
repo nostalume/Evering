@@ -15,20 +15,28 @@
 //! stay inside `MAX_MESSAGE` or `WriteFile` reports a short write; the header's size also bounds what a
 //! `Listener` can admit at all, since one instance serves one child. None of this has been executed on
 //! the host writing it.
+//!
+//! The receipt crosses the same instance in the other direction, one message with the arrival tag and no
+//! handles in it, and what it asks for is the read `accept` already does under a deadline — with a sleep
+//! instead of a spin, because the writer has work to do before it reports. Here the credit is not a field
+//! of the message at all: it is `GetNamedPipeClientProcessId`, which names the process that owns the
+//! client end of this instance, and that answer is only as good as the single instance the `Listener`
+//! created. Widen `nMaxInstances` and a receipt would arrive from whichever client happened to connect,
+//! which is the coupling between this file's read and `bind` that no test on either host would point at.
 
 use std::{
     ffi::c_void,
     io,
     os::windows::io::{AsRawHandle, BorrowedHandle, FromRawHandle, OwnedHandle},
     sync::atomic::{AtomicU64, Ordering},
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, DUPLICATE_CLOSE_SOURCE, DUPLICATE_SAME_ACCESS, DuplicateHandle,
-        ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE, GetLastError,
-        HANDLE, INVALID_HANDLE_VALUE,
+        ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, ERROR_PIPE_LISTENING, GENERIC_READ, GENERIC_WRITE,
+        GetLastError, HANDLE, INVALID_HANDLE_VALUE,
     },
     Storage::FileSystem::{
         CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_FIRST_PIPE_INSTANCE, OPEN_EXISTING,
@@ -38,13 +46,14 @@ use windows_sys::Win32::{
         Pipes::{
             ConnectNamedPipe, CreateNamedPipeW, GetNamedPipeClientProcessId,
             GetNamedPipeServerProcessId, PIPE_NOWAIT, PIPE_READMODE_MESSAGE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT, SetNamedPipeHandleState,
+            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_MESSAGE, PIPE_WAIT, PeekNamedPipe,
+            SetNamedPipeHandleState,
         },
         Threading::GetCurrentProcess,
     },
 };
 
-use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES, Supervisor};
+use crate::process::{Bootstrap, Introduction, MAX_BOOTSTRAP, MAX_RESOURCES, Supervisor};
 
 const HEADER: usize = 8;
 const MAX_MESSAGE: usize = HEADER + MAX_BOOTSTRAP + MAX_RESOURCES * size_of::<usize>();
@@ -222,6 +231,12 @@ impl Socket {
         for handle in &remote {
             message.extend_from_slice(&(*handle as usize).to_le_bytes());
         }
+        self.write(&message)
+            .inspect_err(|_| rollback(target, &remote))
+    }
+
+    /// Writes exactly one message, and reports a short write as the failure it is.
+    fn write(&self, message: &[u8]) -> io::Result<()> {
         let mut written = 0;
         if unsafe {
             WriteFile(
@@ -234,10 +249,133 @@ impl Socket {
         } == 0
             || written as usize != message.len()
         {
-            rollback(target, &remote);
             return Err(io::Error::last_os_error());
         }
         Ok(())
+    }
+
+    /// Writes the member identity this process arrived as: the arrival tag, the text, and no handles.
+    ///
+    /// Nothing is duplicated for the report, because nothing travels with it — which is also what makes
+    /// the message-mode write safe: one message, one boundary, and the server's read takes the whole
+    /// thing or reports the client gone.
+    pub fn report(&self, announcement: &str) -> io::Result<()> {
+        if announcement.len() > MAX_BOOTSTRAP {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "receipt text too long",
+            ));
+        }
+        let mut message = Vec::with_capacity(HEADER + announcement.len());
+        message.extend_from_slice(&crate::process::ARRIVAL_MAGIC);
+        message.extend_from_slice(&(announcement.len() as u16).to_le_bytes());
+        message.extend_from_slice(&0u16.to_le_bytes());
+        message.extend_from_slice(announcement.as_bytes());
+        self.write(&message)
+    }
+
+    /// The process that owns the client end of this instance, as the kernel answers for the pipe.
+    ///
+    /// `Listener::accept` asks this once before it will hand the instance over; asking again is what lets
+    /// a receipt be attributed to the process the caller is about to reap rather than to the pipe.
+    pub fn client_pid(&self) -> io::Result<u32> {
+        let mut client = 0;
+        if unsafe { GetNamedPipeClientProcessId(raw(&self.0), &mut client) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(client)
+    }
+
+    /// Reads the one receipt the client of this instance writes, bounded by `deadline`.
+    ///
+    /// The bound is a `PeekNamedPipe` loop, the shape `accept` already uses for the same problem on this
+    /// host: the instance sits in blocking message mode and the only way to give up on a deadline is to
+    /// ask how much is queued before committing to the read. Between peeks this sleeps rather than spins
+    /// the way `accept` does, because `accept` waits for a client that may already be blocked in
+    /// `CreateFileW` while this one waits for a process that has a session to join first, and a caller's
+    /// budget of seconds should not cost a core.
+    ///
+    /// The two faces of a peer that will not report are not as clean as they look, and no run here has shown
+    /// them: `ERROR_BROKEN_PIPE` says the client is gone, while a client that closes without writing leaves
+    /// the peek reporting an empty pipe, so that one is reached through `TimedOut` instead. The Unix leg was
+    /// measured and answers the same way for the rendezvous this crate actually makes — a datagram pair
+    /// reports a peer's departure as nothing at all, so a caller waiting on a silent child is stopped by its
+    /// own bound there too, and `UnexpectedEof` on that leg belongs to a seqpacket endpoint. Both faces here
+    /// mean nobody is going to report, and a caller that has to tell them apart has to bound the wait for its
+    /// own reasons anyway.
+    pub fn arrival(&self, deadline: Instant) -> io::Result<Introduction> {
+        loop {
+            let mut queued = 0;
+            let peeked = unsafe {
+                PeekNamedPipe(
+                    raw(&self.0),
+                    core::ptr::null_mut(),
+                    0,
+                    core::ptr::null_mut(),
+                    &mut queued,
+                    core::ptr::null_mut(),
+                )
+            };
+            if peeked == 0 {
+                let error = io::Error::last_os_error();
+                if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "the client closed the rendezvous without reporting its arrival",
+                    ));
+                }
+                return Err(error);
+            }
+            if queued > 0 {
+                return self.read_receipt();
+            }
+            if Instant::now() >= deadline {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// Takes one message and refuses anything that is not a well-formed receipt.
+    ///
+    /// A zero-handle read is not attempted after a peek reported nothing, so a `ReadFile` failure here is
+    /// the client leaving between the peek and the read: the same `ERROR_BROKEN_PIPE` answer, one step
+    /// later.
+    fn read_receipt(&self) -> io::Result<Introduction> {
+        let mut message = [0; MAX_MESSAGE];
+        let mut read = 0;
+        if unsafe {
+            ReadFile(
+                raw(&self.0),
+                message.as_mut_ptr().cast(),
+                message.len() as u32,
+                &mut read,
+                core::ptr::null_mut(),
+            )
+        } == 0
+        {
+            let error = io::Error::last_os_error();
+            return Err(if error.raw_os_error() == Some(ERROR_BROKEN_PIPE as i32) {
+                io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "the client closed the rendezvous without reporting its arrival",
+                )
+            } else {
+                error
+            });
+        }
+        let read = read as usize;
+        if read < HEADER || message[..4] != crate::process::ARRIVAL_MAGIC {
+            return Err(invalid("malformed receipt header"));
+        }
+        let len = u16::from_le_bytes([message[4], message[5]]) as usize;
+        let declared = u16::from_le_bytes([message[6], message[7]]) as usize;
+        if len > MAX_BOOTSTRAP || read != HEADER + len || declared != 0 {
+            return Err(invalid("malformed receipt length"));
+        }
+        let text = std::str::from_utf8(&message[HEADER..read])
+            .map_err(|_| invalid("the receipt text is not a report at all"))?;
+        Introduction::announced(text).ok_or_else(|| invalid("the receipt names no member identity"))
     }
 
     pub fn recv(&self, expected: usize) -> io::Result<Offer> {
@@ -275,8 +413,11 @@ impl Socket {
             return Err(invalid("malformed control length"));
         }
         let mut resources = Vec::with_capacity(declared);
-        for bytes in message[HEADER + len..].chunks_exact(size_of::<usize>()) {
-            let value = usize::from_le_bytes(bytes.try_into().unwrap());
+        for bytes in message[HEADER + len..]
+            .as_chunks::<{ size_of::<usize>() }>()
+            .0
+        {
+            let value = usize::from_le_bytes(*bytes);
             resources.push(unsafe { OwnedHandle::from_raw_handle(value as *mut c_void) });
         }
         if declared != expected {

@@ -163,8 +163,10 @@ batchable: a peer parked on a terminal state must be told before the batch ends.
 Notification failure therefore cannot revoke committed work or return
 moved input. A committed result exposes its value separately from notification
 health. Waiting registers process-local interest, observes and consumes sticky
-readiness, then immediately retries shared truth. Wakers, callbacks, reference
-counts, and native handles never enter the shared protocol.
+readiness, then immediately retries shared truth — except for the one readiness
+that cannot be consumed, a child's death, which keeps reporting itself until the
+owner that reaps it takes the status. Wakers, callbacks, reference counts, and
+native handles never enter the shared protocol.
 
 A latch is defined by what it must guarantee, not by its primitive. Every
 adapter is sticky, may coalesce without counting, and consumes nothing when a
@@ -178,6 +180,11 @@ against the primitive itself in its own module. An extension that reports a caus
 would be admissible only where a provider can both carry it and be checked
 carrying it, and only to skip work a re-examination could have found. The clauses
 a new provider is checked against are recorded in `tests/latch_conformance.rs`.
+
+A park can also be asked of a whole set of latches, which reports the one that
+answered and consumes that one alone. It multiplexes latches rather than causes, so
+one primitive is still paired with one condition, and a caller holding N peers
+parks once across them instead of keeping a task per peer.
 
 How long that retry continues is a policy the caller holds, not a constant in
 the queue. Each failed attempt reports its reason, local contention or a
@@ -206,11 +213,21 @@ received resource. Supervision retains one exact child identity and terminal
 status; a timeout or task cancellation is not proof that a process can no
 longer access shared memory.
 
+The same rendezvous carries the admitted process's report of the member it
+became, framed under its own magic and credited by the host rather than by the
+sender. A promise, that report, and a reaped exit of the same process are what
+authorize a death: a report that disagrees with the promise, or an exit of a
+different process, authorizes nothing. A report is read under a deadline the
+caller names, because a datagram rendezvous answers a peer's departure with no
+signal at all, so the reap and not the socket is the death evidence.
+
 ## Recovery model
 
-Recovery begins only with authoritative participant-death evidence. Participant
-slots carry generations so an observation about an earlier process cannot be
-applied to a replacement. Directory operations persist their transaction owner
+Recovery begins only with authoritative participant-death evidence. Two
+entrances carry it: a caller's own assumption about an identity it can name,
+which is unsafe by construction, and a receipt the host credited to a process
+that was then reaped, which is not. Participant slots carry generations so an
+observation about an earlier process cannot be applied to a replacement. Directory operations persist their transaction owner
 and phase. Recovery can finish or roll back from those states without inferring
 intent from payload bytes.
 
@@ -249,7 +266,10 @@ The essential invariants are:
 Current evidence covers model-level interleavings, typed admission failures,
 Directory and Pool generation reuse, queue contention and closure, malformed
 resource exchange, different-base process mappings, asynchronous notification,
-and bounded worker recovery on supported native platforms. The practical
+and bounded worker recovery. Two arms are exercised natively,
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; the arrival receipt is
+executed only on the first, because its tests name Unix, so that leg of the
+handover seam is compiled but untested on Windows. The practical
 indexer demonstrates public construction, process handoff, runtime waiting,
 typed payload admission, close, and removal.
 

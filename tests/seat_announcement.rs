@@ -72,7 +72,7 @@ fn expected() -> Peer {
 }
 
 fn announced() -> i32 {
-    let (_, resources) = match Handoff::receive() {
+    let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
         Err(error) => return fail(&format!("the promised child meets no one: {error}")),
     };
@@ -112,7 +112,7 @@ fn announced() -> i32 {
 }
 
 fn unannounced() -> i32 {
-    let (_, resources) = match Handoff::receive() {
+    let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
         Err(error) => return fail(&format!("the unpromised child meets no one: {error}")),
     };
@@ -147,7 +147,7 @@ fn scribbled() -> i32 {
 }
 
 fn vanished() -> i32 {
-    let (_, resources) = match Handoff::receive() {
+    let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
         Err(error) => return fail(&format!("the child that was to die meets no one: {error}")),
     };

@@ -9,7 +9,8 @@
 //! a park instead of a no-op, which no test here can show because `event` always sets them. The same
 //! file is also the only arm that *counts* — the pipe arm holds bytes and the Windows arm one bit — so a
 //! change that makes `clear` consume one notification instead of the total is correct here and wrong on
-//! the other two hosts.
+//! the other two hosts. `Event::wait_any` inherits that collapse: a park over a set reports which latch
+//! answered and never how many kicks it was holding.
 
 use std::{
     io,
@@ -72,6 +73,19 @@ impl Event {
             Ok(_) | Err(Errno::EAGAIN) => Ok(()),
             Err(error) => Err(error),
         }
+    }
+
+    /// Parks this thread until one of `events` is ready, consumes that latch's readiness and reports
+    /// which index it was.
+    ///
+    /// One park reports one latch and never a count: this counter coalesces every kick into one
+    /// readiness, so an answer that also said how many peers had rung would report something the latch
+    /// stopped recording the moment it was rung. The rest of a set keeps its readiness while one latch is
+    /// being served, so a caller loops and the next park answers at once until the set is drained. The
+    /// slice is borrowed exclusively because readiness taken from a latch a second park was watching is
+    /// a wake that went missing, and nothing but the borrow says no second park exists.
+    pub fn wait_any(events: &mut [Event]) -> io::Result<usize> {
+        crate::os::mux::park(events)
     }
 }
 

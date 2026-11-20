@@ -8,7 +8,9 @@
 //! departed notifier, so anything the wait layer does with that error is behaviour this host can show
 //! and the others cannot. And `from_owned_fd` adopts a stream without setting it nonblocking, unlike
 //! `event`: a received blocking latch turns `clear`'s drain loop into a park, which no test here can
-//! reach because every latch in this file was made by `event`.
+//! reach because every latch in this file was made by `event`. `Event::wait_any` inherits the drain whole
+//! — it asks `poll` which latch is readable and calls this `clear` on that one, so a queue holding ten
+//! bytes and one holding one are the same answer with the same index.
 
 use std::{
     io::{self, ErrorKind, Read, Write},
@@ -67,6 +69,23 @@ impl Event {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    /// Parks this thread until one of `events` is ready, consumes that latch's readiness and reports
+    /// which index it was.
+    ///
+    /// One park reports one latch and never a count, because a drain takes every byte the queue holds and
+    /// the wake contract already allows a hundred kicks to act as one. The rest of a set keeps its
+    /// readiness while one latch is being served, so a caller loops and the next park answers at once
+    /// until the set is drained. The slice is borrowed exclusively because readiness taken from a latch a
+    /// second park was watching is a wake that went missing, and nothing but the borrow says no second
+    /// park exists.
+    ///
+    /// This is the arm where a park can fail: a notifier that left closes the queue, and the hang-up the
+    /// park reports is answered by `clear` with `BrokenPipe` rather than by reporting a latch that could
+    /// never ring again.
+    pub fn wait_any(events: &mut [Event]) -> io::Result<usize> {
+        crate::os::mux::park(events)
     }
 }
 
