@@ -1,3 +1,15 @@
+//! The Windows arm of `crate::os::event`: one manual-reset event object behind an `Arc`, owned twice so
+//! `Ring` may set it and `Event` reset it, with the handle closed exactly once when the last local owner
+//! goes. `Ring::notify` is `SetEvent` and `Event::clear` is `ResetEvent`; the `Send`/`Sync` claims on
+//! `Handle` are what let the wait layer park on one thread while another rings, and they rest on the
+//! kernel accepting concurrent calls on one handle rather than on anything in this file.
+//!
+//! A manual-reset object is one bit shared by every holder, so `clear` takes the pending notification
+//! from *all* of them at once — including a peer in another process that received the handle through a
+//! handover and had not woken yet. Nothing here holds two processes, and the other two arms of this
+//! module hold a byte queue and a counter, so a change to this file cannot be checked against them from
+//! a Windows run either.
+
 use std::{
     io,
     os::windows::io::{

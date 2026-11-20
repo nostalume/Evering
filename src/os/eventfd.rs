@@ -1,3 +1,16 @@
+//! The Linux arm of `crate::os::event`: one `eventfd` counter held by two local owners, where `Ring`
+//! adds and `Event` consumes. `event` makes both ends `EFD_NONBLOCK | EFD_CLOEXEC`, `Ring::notify`
+//! writes one and `Event::clear` reads the whole counter, and both count the full and empty answers
+//! (`EAGAIN`) as success — a saturated counter is already a pending notification, and a read that found
+//! nothing is already clear.
+//!
+//! Those two tolerances are only non-blocking because of the flags, and `from_owned_fd` adopts a
+//! descriptor without looking at them: a latch that arrives from elsewhere blocking turns `clear` into
+//! a park instead of a no-op, which no test here can show because `event` always sets them. The same
+//! file is also the only arm that *counts* — the pipe arm holds bytes and the Windows arm one bit — so a
+//! change that makes `clear` consume one notification instead of the total is correct here and wrong on
+//! the other two hosts.
+
 use std::{
     io,
     os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},

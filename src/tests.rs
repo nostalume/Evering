@@ -1,3 +1,11 @@
+//! The in-crate suite and nothing else: the file is gated `#![cfg(test)]`, so it publishes no API and
+//! compiles into nothing anyone ships. It aggregates two worlds — a byte-level mock page table for the
+//! protocol tests, and real unix mappings for the ones that need a kernel — beside the helpers the
+//! tests share and the bench bodies that keep those helpers from rotting.
+//!
+//! The mock writes raw bytes straight through a mapping, past every protocol owner, and the bound on
+//! that is a `debug_assert`: only the permission check panics. So a green run here is evidence about
+//! behaviour, not about extents, and the suites outside `src` are what measure the difference.
 #![cfg(test)]
 #![allow(dead_code)]
 

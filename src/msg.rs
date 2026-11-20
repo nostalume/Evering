@@ -1,3 +1,13 @@
+//! Authors no bytes: it decides who may cross a process boundary, through the `Repr` clause and the
+//! `TypeId` composed from a schema key, and what a payload travels in — `Encoded`, which only
+//! `Block::encode` builds. Identity is stated solely by a type's own `SCHEMA`, and the blanket impls
+//! for primitives and slices are what keep that statement honest.
+//!
+//! `VALID`, the "this type has no destructor for the receiving side to skip" clause, holds only where
+//! somebody forces it: `reserve` and `put` in the pool, `put` and `copy` on the heap, and a channel's
+//! item. A new entry taking `T: Repr` without forcing it loses the guarantee silently, and nothing in
+//! this file's tests forces it either. The mixing constants behind `type_id_for` are wire identity,
+//! checked here only by inequality, and the revision `Encoded` carries is pinned outside this file.
 use crate::schema::{SchemaKey, compose_schema, schema_id};
 
 pub type TypeId = u64;

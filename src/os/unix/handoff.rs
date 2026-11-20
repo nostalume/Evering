@@ -1,3 +1,20 @@
+//! The Unix half of a handover: a connected socketpair is the meeting, and the single-use `Grant` is
+//! one end of it, so admitting a process means inheriting a descriptor rather than publishing a name
+//! somebody else could reach first. `bind` makes the pair, `Grant::admit` installs its end at
+//! `INHERITED` in the child and consumes itself, `Handoff::send` moves the bootstrap plus the mapping,
+//! event and ring, and `Handoff::receive` attests the peer *before* adopting anything — the order is the
+//! point, since on a pair the kernel's answer is available the moment the descriptor is, so a process
+//! that merely announced a number is refused without blocking and without a foreign object installed in
+//! its table. `shared` creates the memfd and applies no access, because a memfd carries none.
+//!
+//! Three obligations leave this file. The count `receive` passes to `Socket::recv` and the order it then
+//! removes the three resources in are one contract with `super::process` and with every sender, and a
+//! mismatch delivers one peer's event as another's mapping with nothing to complain about. The adoption
+//! rule that makes the attestation testable — classify by borrow, own only on the accepting path — lives
+//! in `Socket::granted`, not here. And the non-Linux arm refuses for lack of a mechanism, which is a
+//! policy statement rather than a placeholder: writing one for another host should not quietly turn an
+//! unattested handover into a permitted one.
+
 use std::{
     env, io,
     os::fd::{AsFd, AsRawFd, RawFd},
@@ -150,13 +167,13 @@ fn granted_socket() -> io::Result<Socket> {
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn attested(socket: &Socket) -> io::Result<Peer> {
     let credentials = socket.peer_credentials()?;
-    let parent = getppid().as_raw();
-    if credentials.pid() != parent || credentials.uid() != getuid().as_raw() {
+    let parent = getppid().as_raw() as u32;
+    if credentials.pid != parent || credentials.uid != getuid().as_raw() {
         return Err(refused(
             "the peer behind the granted rendezvous is not this process's parent",
         ));
     }
-    Ok(Peer::introduced(credentials.pid() as u32))
+    Ok(Peer::introduced(credentials.pid))
 }
 
 /// No other unix variant is refused for lack of a mechanism name, but for lack of one that has been

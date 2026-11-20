@@ -1,3 +1,15 @@
+//! The unix-but-not-Linux arm of `crate::os::event`: a `UnixStream` pair standing in for a latch,
+//! where `Ring` writes a byte per kick and `Event` reads until the stream reports `WouldBlock`, so one
+//! `clear` drains every kick rather than one of them. `event` marks both halves nonblocking;
+//! `Ring::notify` treats a full buffer (`WouldBlock`) as a successful notification, and `Event::clear`
+//! treats a peer's closed end (`Ok(0)`) as `BrokenPipe` rather than as drained.
+//!
+//! The closed-end answer exists only on this arm — neither the counter nor the Windows bit can report a
+//! departed notifier, so anything the wait layer does with that error is behaviour this host can show
+//! and the others cannot. And `from_owned_fd` adopts a stream without setting it nonblocking, unlike
+//! `event`: a received blocking latch turns `clear`'s drain loop into a park, which no test here can
+//! reach because every latch in this file was made by `event`.
+
 use std::{
     io::{self, ErrorKind, Read, Write},
     os::{

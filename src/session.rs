@@ -1,3 +1,13 @@
+//! Owns no bytes of its own: it is the only type that pairs one directory with one heap under one
+//! member identity, and the only one that authorizes the dead-mark which rewrites a member's word in
+//! the region header. `create`, `create_with` and `open` join a member; `create_pool`,
+//! `create_channel`, `adopt` and `remove` drive the record writes and the heap claim; and a dead
+//! member's words move only inside `Recovery::reap_with`.
+//!
+//! `reap_with` walks the region twice before it clears a member, because the second walk is what
+//! proves the first changed nothing — a single walk returns `Ok` for a region that still names the
+//! peer it just removed. Those walks sit between `finish_recovery` and `release_dead` in that order,
+//! and nothing in the suite exercises the ordering.
 use core::{alloc::Layout, mem::MaybeUninit};
 
 use crate::channel::{self as shared, Channel, CloseError, Id, Port};
@@ -90,6 +100,18 @@ pub enum ChannelCreateError {
     Exhausted,
 }
 
+impl core::fmt::Display for ChannelCreateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::InvalidCapacity => "the capacity is not usable for a duplex queue",
+            Self::Exhausted => "the region has no room left for another channel record",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ChannelCreateError {}
+
 pub enum AdmitError<H: Repr> {
     WrongRegion(Port<H>),
     Stale(Port<H>),
@@ -111,6 +133,22 @@ impl<H: Repr> core::fmt::Debug for AdmitError<H> {
         })
     }
 }
+
+impl<H: Repr> core::fmt::Display for AdmitError<H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::WrongRegion(_) => "the port names another region than this session's mapping",
+            Self::Stale(_) => "the port names a channel generation the role word no longer holds",
+            Self::Occupied(_) => "another member already holds the role the port grants",
+            Self::Terminal(_) => "the channel is closed, so its role can no longer be taken",
+            Self::Orphaned(_) => "the peer's role is gone, so the channel could not be completed",
+            Self::Open(_) => "the channel behind the port is not open to that role",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<H: Repr> std::error::Error for AdmitError<H> {}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionOptions {
@@ -162,10 +200,152 @@ impl<E> SessionError<E> {
     }
 }
 
+impl<E: core::fmt::Debug> core::fmt::Display for SessionError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Source(error) => write!(f, "the provider refused the mapping: {error:?}"),
+            Self::PermissionDenied { requested } => {
+                write!(f, "the mapping does not permit {requested:?}")
+            }
+            Self::InsufficientSpace {
+                requested,
+                allocated,
+            } => write!(
+                f,
+                "{requested} bytes were asked of a region holding {allocated}"
+            ),
+            Self::Busy => f.write_str("another member held the transaction word; retry"),
+            Self::Closed => f.write_str("this region is closed"),
+            Self::DuplicateAttachment => f.write_str("this member is already attached"),
+            Self::InvalidHeader => f.write_str("no readable header sits at the recorded place"),
+            Self::LayoutMismatch(field) => {
+                write!(f, "the shared words disagree with the layout at {field:?}")
+            }
+            Self::Poisoned => f.write_str("this composition was refused as poisoned"),
+            Self::Overflow => f.write_str("the requested size or offset overflowed"),
+            Self::ParticipantExhausted => f.write_str("the region holds no free member slot"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: core::fmt::Debug> std::error::Error for SessionError<E> {}
+
+/// Why a Pool could not be opened from an id another process published.
+///
+/// The refusal is named at the point that made it, because the families of cause ask different
+/// things of the caller. `Busy` is worth retrying. `Absent` and `WrongRegion` say the id was never
+/// this region's to answer for, and retrying cannot change that. `Geometry`, `InvalidHeader`,
+/// `OutOfBounds`, `Misaligned` and `LayoutMismatch` say the region's own words disagree with each
+/// other, which is what death evidence and `Recovery` settle rather than a retry loop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum OpenPoolError {
-    Unavailable(crate::PoolId),
+    /// The id names another region than this session's mapping.
+    WrongRegion(crate::PoolId),
+    /// No published directory entry carries this id and generation.
+    Absent(crate::PoolId),
+    /// The record's offset or extent does not fit inside this mapping.
+    OutOfBounds(crate::PoolId),
+    /// The recorded offset is not aligned for the header a Pool needs to find there.
+    Misaligned(crate::PoolId),
+    /// This mapping cannot be written, so no member can be admitted to the shared header.
+    ReadOnly(crate::PoolId),
+    /// Nothing that reads as a header sits at the recorded offset.
+    InvalidHeader(crate::PoolId),
+    /// A header is there, and this field of it disagrees with the layout a Pool of this id needs.
+    LayoutMismatch(crate::PoolId, crate::header::LayoutField),
+    /// The header is a Pool header, but its class words do not rebuild the extent it records.
+    Geometry(crate::PoolId),
+    /// The Pool is closed.
+    Closed(crate::PoolId),
+    /// This member is already admitted to the Pool's header.
+    DuplicateMember(crate::PoolId),
+    /// Another member held the header's transaction word; the open may be retried.
+    Busy(crate::PoolId),
 }
+
+impl OpenPoolError {
+    pub(crate) fn of(id: crate::PoolId, cause: crate::dir::OpenCause) -> Self {
+        use crate::dir::OpenCause as Cause;
+        match cause {
+            Cause::WrongRegion => Self::WrongRegion(id),
+            Cause::Absent => Self::Absent(id),
+            Cause::OutOfBounds => Self::OutOfBounds(id),
+            Cause::Misaligned => Self::Misaligned(id),
+            Cause::ReadOnly => Self::ReadOnly(id),
+            Cause::InvalidHeader => Self::InvalidHeader(id),
+            Cause::Mismatch(field) => Self::LayoutMismatch(id, field),
+            Cause::Undiscoverable => Self::Geometry(id),
+            Cause::Closed => Self::Closed(id),
+            Cause::DuplicateMember => Self::DuplicateMember(id),
+            Cause::Busy => Self::Busy(id),
+        }
+    }
+
+    /// The id this refusal is about, whichever cause named itself.
+    pub const fn id(&self) -> crate::PoolId {
+        match self {
+            Self::WrongRegion(id)
+            | Self::Absent(id)
+            | Self::OutOfBounds(id)
+            | Self::Misaligned(id)
+            | Self::ReadOnly(id)
+            | Self::InvalidHeader(id)
+            | Self::LayoutMismatch(id, _)
+            | Self::Geometry(id)
+            | Self::Closed(id)
+            | Self::DuplicateMember(id)
+            | Self::Busy(id) => *id,
+        }
+    }
+
+    /// Whether asking again could change the answer, as opposed to the region needing adjudication.
+    pub const fn is_retryable(&self) -> bool {
+        matches!(self, Self::Busy(_))
+    }
+}
+
+impl core::fmt::Display for OpenPoolError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let id = self.id();
+        match self {
+            Self::WrongRegion(_) => write!(f, "pool {id:?} names another region than this mapping"),
+            Self::Absent(_) => write!(f, "no published record names pool {id:?}"),
+            Self::OutOfBounds(_) => {
+                write!(f, "pool {id:?}'s recorded place does not fit this mapping")
+            }
+            Self::Misaligned(_) => write!(f, "pool {id:?}'s recorded place is misaligned"),
+            Self::ReadOnly(_) => write!(
+                f,
+                "this mapping is read-only, so no member can join pool {id:?}"
+            ),
+            Self::InvalidHeader(_) => {
+                write!(
+                    f,
+                    "nothing readable as a header sits at pool {id:?}'s place"
+                )
+            }
+            Self::LayoutMismatch(_, field) => {
+                write!(
+                    f,
+                    "pool {id:?}'s header disagrees with its layout at {field:?}"
+                )
+            }
+            Self::Geometry(_) => write!(
+                f,
+                "pool {id:?}'s class words do not rebuild the extent its header records"
+            ),
+            Self::Closed(_) => write!(f, "pool {id:?} is closed"),
+            Self::DuplicateMember(_) => {
+                write!(f, "this member already holds a place in pool {id:?}")
+            }
+            Self::Busy(_) => write!(f, "another member was changing pool {id:?}'s header; retry"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for OpenPoolError {}
 
 pub enum RemoveError<H: Repr> {
     Busy(Channel<H>),
@@ -180,6 +360,22 @@ impl<H: Repr> core::fmt::Debug for RemoveError<H> {
         })
     }
 }
+
+impl<H: Repr> core::fmt::Display for RemoveError<H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Busy(_) => {
+                "the channel is still held: another handle, the peer's role, or a queued token"
+            }
+            Self::Evidence(_) => {
+                "a queued token can only be released once its owner's death is attested"
+            }
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<H: Repr> std::error::Error for RemoveError<H> {}
 
 pub struct Session {
     dir: dir::MapDirectory,
@@ -344,6 +540,15 @@ impl Session {
         let alloc = talc::MapTalc::from_handle(alloc);
         Ok(Session { dir, alloc })
     }
+
+    /// The address this process's mapping of the region starts at.
+    ///
+    /// This is a fact about the local mapping, not about the region: every member maps the same
+    /// bytes wherever it chooses, so the number identifies nothing across a boundary — `RegionId`
+    /// does that, and `Session::open` takes it. Where a mapping lands is asked of the backend
+    /// before it maps (`os::unix::FdMap::at`; Windows leaves the choice to the kernel), never
+    /// derived from a peer's answer. A test that wants to prove a region works under two different
+    /// bases uses this only as raw arithmetic, to place the second mapping away from the first.
     pub fn base_addr(&self) -> usize {
         self.alloc.base_ptr().addr()
     }
@@ -367,7 +572,7 @@ impl Session {
     }
 
     pub fn open_pool(&self, id: crate::PoolId) -> Result<crate::Pool, OpenPoolError> {
-        pool::open(&self.dir, id).ok_or(OpenPoolError::Unavailable(id))
+        pool::open(&self.dir, id)
     }
 
     #[cfg(test)]

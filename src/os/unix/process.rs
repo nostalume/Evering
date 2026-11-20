@@ -1,3 +1,19 @@
+//! One local endpoint of a Unix descriptor-transfer channel, and the framing of a single all-or-nothing
+//! offer: `HEADER` bytes of magic, bootstrap length and resource count, the bootstrap itself, then the
+//! descriptors as `SCM_RIGHTS` ancillary data. `send` writes that shape and `recv` refuses anything that
+//! does not answer it — truncated control, a short or long datagram, a declared count that differs from
+//! the expected one or from what the kernel actually delivered — and `granted` adopts a descriptor
+//! another process announced only after classifying it through a borrow. Nothing mutates shared state:
+//! each `Offer` is owned by whoever received it.
+//!
+//! The header layout and the positional resource order are the handover wire format, matched on the far
+//! side by `super::handoff` and frozen by the magic in `crate::process`, so widening a length field or
+//! reordering what a count means is a format event here, not a local edit. Two more obligations have no
+//! test in this file to catch them: every adopted descriptor is marked close-on-exec because a handover
+//! that survives an `exec` leaks a peer's object into a third process, and `Credentials` has to keep
+//! `pid`, because the attestation in `super::handoff` is a comparison of that field against `getppid()`
+//! and a pair of `uid`/`gid` cannot carry the check.
+
 use std::{
     io::{self, IoSlice, IoSliceMut},
     os::{
@@ -16,15 +32,25 @@ use nix::{
     },
 };
 
-#[cfg(any(target_os = "linux", target_os = "android"))]
-pub use nix::sys::socket::UnixCredentials;
-
 use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
 
 const HEADER: usize = 8;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
+}
+
+/// What the kernel recorded about the process that owns the peer end of a socket.
+///
+/// The identifiers are the kernel's own, captured when the two ends were connected, so neither side
+/// of the pair can assert or revoke them. `pid` is the kernel's signed process number widened to the
+/// unsigned form every other identity in this crate uses.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Credentials {
+    pub pid: u32,
+    pub uid: u32,
+    pub gid: u32,
 }
 
 /// One local endpoint of a Unix descriptor-transfer channel.
@@ -90,8 +116,13 @@ impl Socket {
     /// On a unix socketpair this is the creator of the pair, captured when the kernel connected
     /// the two ends: neither side can assert it, and neither can revoke it.
     #[cfg(any(target_os = "linux", target_os = "android"))]
-    pub fn peer_credentials(&self) -> io::Result<UnixCredentials> {
-        getsockopt(&self.0, sockopt::PeerCredentials).map_err(io::Error::from)
+    pub fn peer_credentials(&self) -> io::Result<Credentials> {
+        let peer = getsockopt(&self.0, sockopt::PeerCredentials).map_err(io::Error::from)?;
+        Ok(Credentials {
+            pid: peer.pid() as u32,
+            uid: peer.uid(),
+            gid: peer.gid(),
+        })
     }
 
     pub fn send(&self, bootstrap: &Bootstrap, resources: &[BorrowedFd<'_>]) -> io::Result<()> {

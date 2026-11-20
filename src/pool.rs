@@ -1,3 +1,12 @@
+//! Owns one authority word per block slot — generation, allocated bit, owning member — with the
+//! payload bytes it hands out and the class geometry it records in its own header. Only `claim`'s
+//! compare-exchange attaches a slot to a member, `detach` and `takeover` move it, and `release` hands
+//! it back; the directory word that says what a block *is* belongs to `dir`, which this module reads
+//! and never writes.
+//!
+//! A reserve answer rests on the control word alone, so a word naming a state no participant writes
+//! has to return as `Corrupted` rather than `Unavailable`: read as exhaustion, one scribbled word
+//! makes a healthy region look permanently full, and every retry after it is then correct.
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     alloc::Layout as AllocLayout,
@@ -101,12 +110,52 @@ impl BlockRange {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct RangeError;
 
+impl core::fmt::Display for RangeError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str("no run of power-of-two block classes fits between these bounds")
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for RangeError {}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PoolCreateError {
     InvalidExtent,
-    RequiredExtent { required: usize, available: usize },
+    RequiredExtent {
+        required: usize,
+        available: usize,
+    },
+    /// The widest class needs more alignment than every mapping of a region is guaranteed to have,
+    /// so a peer could not reproduce the block addresses this Pool hands out.
+    ClassTooWide(usize),
     Storage,
 }
+
+impl core::fmt::Display for PoolCreateError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::InvalidExtent => {
+                f.write_str("the block range cannot be built into a pool layout")
+            }
+            Self::RequiredExtent {
+                required,
+                available,
+            } => write!(
+                f,
+                "the classes reserve {required} bytes before any payload arrives; {available} were offered"
+            ),
+            Self::ClassTooWide(bytes) => write!(
+                f,
+                "a {bytes}-byte class needs an alignment a peer's mapping is not guaranteed to reproduce"
+            ),
+            Self::Storage => f.write_str("the shared heap refused the pool's own record"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for PoolCreateError {}
 
 /// Why a Pool declined to hand out a block, with the value that could not be stored.
 ///
@@ -115,7 +164,7 @@ pub enum PoolCreateError {
 /// `BlockTooLarge` is a geometry fact, and only a smaller request changes the answer. `Corrupted`
 /// is neither of those: a slot's authority word names a state no participant writes, so no release
 /// changes it and the region needs adjudication before any Pool answer can be trusted.
-#[derive(Debug, PartialEq, Eq)]
+#[derive(PartialEq, Eq)]
 pub enum ReserveError<T> {
     /// The request needs a block larger than the Pool's largest class.
     BlockTooLarge(T),
@@ -125,6 +174,41 @@ pub enum ReserveError<T> {
     /// nothing else was claimable, so one damaged word cannot hide a free slot behind it.
     Corrupted(T),
 }
+
+// `T` is the caller's value coming back, not part of why the Pool said no, so the reporting layer
+// stays free of it: a derived `Debug` would make the refusal printable and boxable only for payloads
+// that happen to implement `Debug`, which is a condition on the value rather than on the answer.
+// `PutError` omits its value field for the same reason; naming the payload's type keeps this one
+// readable without borrowing the payload's rendering.
+impl<T> core::fmt::Debug for ReserveError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let arm = match self {
+            Self::BlockTooLarge(_) => "BlockTooLarge",
+            Self::Unavailable(_) => "Unavailable",
+            Self::Corrupted(_) => "Corrupted",
+        };
+        write!(f, "{arm}({})", core::any::type_name::<T>())
+    }
+}
+
+impl<T> core::fmt::Display for ReserveError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::BlockTooLarge(_) => {
+                "the request needs a block wider than the pool's largest class"
+            }
+            Self::Unavailable(_) => {
+                "every block that could hold the request is claimed, so a release elsewhere frees one"
+            }
+            Self::Corrupted(_) => {
+                "a slot's authority word names a state no participant writes, so the region needs adjudication"
+            }
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> std::error::Error for ReserveError<T> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdoptError {
@@ -270,8 +354,15 @@ impl Geometry {
                 payload,
             });
         }
+        let layout = layout.pad_to_align();
+        // The refusal belongs here rather than at the first peer's open: a class wider than the
+        // alignment every mapping of a region is placed on cannot be reproduced at the far end, so
+        // the geometry is inadmissible even when this process can use it.
+        if layout.align() > crate::mem::REGION_ALIGN {
+            return Err(PoolCreateError::ClassTooWide(layout.align()));
+        }
         Ok(Self {
-            layout: layout.pad_to_align(),
+            layout,
             classes: classes.into_boxed_slice(),
         })
     }
@@ -937,11 +1028,16 @@ pub(crate) fn create(
         .map_err(|_| PoolCreateError::Storage)
 }
 
-pub(crate) fn open(directory: &dir::MapDirectory, id: PoolId) -> Option<Pool> {
-    let (mapped, geometry) = directory.open_recorded(id.0, |info, extent| {
-        Geometry::recorded(info, extent).map(|geometry| (geometry.config(), geometry))
-    })?;
-    Some(Pool::new(id, mapped, geometry))
+pub(crate) fn open(
+    directory: &dir::MapDirectory,
+    id: PoolId,
+) -> Result<Pool, crate::OpenPoolError> {
+    let (mapped, geometry) = directory
+        .open_recorded(id.0, |info, extent| {
+            Geometry::recorded(info, extent).map(|geometry| (geometry.config(), geometry))
+        })
+        .map_err(|cause| crate::OpenPoolError::of(id, cause))?;
+    Ok(Pool::new(id, mapped, geometry))
 }
 
 pub(crate) fn release_token<H: Repr>(

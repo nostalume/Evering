@@ -1,3 +1,13 @@
+//! Owns no state at all: it authors the commit-then-ring ordering a transfer has to follow, and the
+//! withheld-doorbell debt a batch carries when a ring was written before its item was committed. The
+//! debt moves only inside `Deferred`'s publish, adopt, admit, deliver and discard and inside
+//! `Permit`'s send, publish and cancel, and it is paid — or rung — when the guard drops; retries happen
+//! only through `Patience::step` under `reserve_with` and `claim_with`.
+//!
+//! The default ladder is a `const` here that only `Adaptive::new` reads, while this file's own tests
+//! use a separate budget and drive the counter directly: so nothing in this module pins what the
+//! default policy costs, or that dropping a guard still rings. Both are settled only by the suites
+//! outside it.
 use core::{convert::Infallible, future::Future};
 
 use crate::{
@@ -211,6 +221,19 @@ pub enum ProgressError<E> {
     /// The waiting policy reported its own progress source as failed.
     Wait(E),
 }
+
+impl<E: core::fmt::Debug> core::fmt::Display for ProgressError<E> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Busy => f.write_str("the waiting policy gave up before the operation committed"),
+            Self::Closed => f.write_str("the queue is closed"),
+            Self::Wait(error) => write!(f, "waiting on the progress source failed: {error:?}"),
+        }
+    }
+}
+
+#[cfg(feature = "std")]
+impl<E: core::fmt::Debug> std::error::Error for ProgressError<E> {}
 
 /// Borrowed process-local progress capabilities for concrete Channel endpoints.
 pub struct Signals<'a, N: ?Sized, W: ?Sized> {

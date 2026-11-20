@@ -1,3 +1,20 @@
+//! The crash-window fixtures: recovery driven by a death that really happened. Each case re-executes this
+//! test binary as a child (`ROLE`), hands it the region and the entry to touch through the environment, and
+//! kills it at a numbered transaction cut with `crash_after_for_test`; the parent's only move afterwards is
+//! the same evidence-gated `assume_dead` + `reap_with` a caller would use, which is what the assertions on
+//! the far side measure. The region is a named `shm` object rather than the memfd the rest of this arm uses
+//! because a second process has to reach it by name, and `ShmGuard` is what keeps the host clean. Which cut
+//! is which state is owned by `crate::dir`, `crate::talc` and `crate::queue` — the constants and the order of
+//! the checkpoints live there, and the exit code the parent compares against is that number offset — so
+//! adding a step to a transaction and adding a case here are one change, not two.
+//!
+//! Two things this shape cannot show. A doomed child is only reapable because it announces its own `Peer` on
+//! stdout before the cut: the fixtures never test a process that dies while joining, and the question of who
+//! can name a member that was claimed but never announced is the open `identity-bridge` decision, not
+//! something these cases adjudicate. And every child here is opened at `BASE`, which is the parent's own
+//! address passed as a placement hint — if the mapping seam stopped arranging the alignment the pool depends
+//! on, these cases would fail for that reason while appearing to be about crash windows.
+
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::thread;

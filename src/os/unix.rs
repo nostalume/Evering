@@ -1,3 +1,18 @@
+//! The file-descriptor side of a region on Unix: `UnixFd` holds the bytes — a memfd, a `/dev/shm` file,
+//! or an fd adopted from elsewhere — and `FdMap` decides where they enter this address space.
+//! `memfd`/`shm_create`/`shm_open`/`from_fd` make or take the object, `mapping`/`at`/`with_flags` state
+//! the placement, and `Source::map` is the only path that calls `mmap`: it grows the file if the request
+//! is longer than it, reserves an anonymous window, places the file at the aligned address inside that
+//! window with `MAP_FIXED`, and hands back the two remainders as unmapped.
+//!
+//! The reserve-then-place order is what makes an aligned block address reproducible rather than lucky,
+//! and it is the reason `mapping`'s residue and `mem::REGION_ALIGN` agree for every mapper: address and
+//! file offset are one decision, and trimming an existing file mapping moves the surviving pages'
+//! offsets along with them. A caller that reaches the platform a different way — `with_flags` replacing
+//! `MAP_SHARED` with a private mapping, or an `mmap` of its own at the same fd — silently opts out of
+//! that agreement, and the directory's compare-exchanges then change one process's copy while the record
+//! claims otherwise. Nothing here can see that happen; only `header` and `pool` read the addresses back.
+
 use core::ptr::NonNull;
 pub use nix::{
     libc::off_t,
@@ -202,13 +217,59 @@ impl<F: AsFd> FdMap<F> {
             unistd::ftruncate(fd, rsize)?;
         }
 
-        let start = self.start.and_then(NonZeroUsize::new);
-        let size = NonZeroUsize::new(request.len).ok_or(nix::Error::EINVAL)?;
         let access = request.access;
+        let want = NonZeroUsize::new(request.len).ok_or(nix::Error::EINVAL)?;
+        let page = nix::unistd::sysconf(nix::unistd::SysconfVar::PAGE_SIZE)?
+            .map(|bytes| bytes as usize)
+            .unwrap_or(4096);
+        let bound = crate::mem::REGION_ALIGN;
+        debug_assert!(
+            bound.is_multiple_of(page),
+            "a bound the kernel cannot address"
+        );
+        // Two processes mapping one region have to agree on which byte of the file each address names,
+        // and `mmap` alone gives neither: it promises only page alignment and treats a hint as
+        // advisory. Trimming an existing file mapping is not the way out either, because splitting the
+        // mapping moves the surviving pages' file offsets along with them. So the window is reserved
+        // first, and the file is then placed at the reserved address that satisfies the bound.
+        let slack = bound - 1;
+        let hint = self
+            .start
+            .map(|address| address & !slack)
+            .and_then(NonZeroUsize::new);
+        let keep = request.len.next_multiple_of(page);
+        let span = NonZeroUsize::new(keep + bound + page).ok_or(nix::Error::EINVAL)?;
 
         unsafe {
-            let ptr = mman::mmap(start, size, access.into(), self.flags, fd, 0)?;
-            Ok(Map::from_raw_parts(ptr.cast(), size.get(), access, release))
+            let room =
+                mman::mmap_anonymous(hint, span, ProtFlags::PROT_NONE, MapFlags::MAP_PRIVATE)?;
+            let room_start = room.cast::<u8>().addr().get();
+            let aligned = room_start.wrapping_add(slack) & !slack;
+            mman::mmap(
+                NonZeroUsize::new(aligned),
+                want,
+                access.into(),
+                self.flags.union(MapFlags::MAP_FIXED),
+                fd,
+                0,
+            )?;
+            if aligned > room_start {
+                mman::munmap(room, aligned - room_start)?;
+            }
+            let tail = aligned + keep;
+            let end = room_start + span.get();
+            if tail < end {
+                mman::munmap(
+                    NonNull::new_unchecked(tail as *mut core::ffi::c_void),
+                    end - tail,
+                )?;
+            }
+            Ok(Map::from_raw_parts(
+                NonNull::new_unchecked(aligned as *mut u8),
+                want.get(),
+                access,
+                release,
+            ))
         }
     }
 }

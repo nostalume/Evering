@@ -1,13 +1,13 @@
 use std::{
     collections::HashMap,
-    fmt::Debug,
+    fmt::Display,
     process::Command,
     time::{Duration, Instant},
 };
 
 use evering::{
     BlockRange, Channel, Pool, PoolCreateError, PoolId, Port, RemoveError, Session,
-    layout::{self, RegionId, Repr, SchemaId, SchemaKey},
+    layout::{self, RegionId, Repr, SchemaKey, compose_schema, schema_id},
     mapping::{Access, Peer, Request},
     notify::{Signals, Wait as _},
     os::{Handoff, Shared, event},
@@ -35,6 +35,10 @@ const SEEDS: [u64; 3] = [7, 11, 7];
 /// The first pass pays whatever the region and the socket buffers cost to arrive at; the passes
 /// after it are the steady state an integration actually lives in.
 const PASSES: usize = 3;
+/// Both halves of the round trip are one protocol, so their keys come from one domain name and
+/// differ only by the part they describe. Derived rather than typed in, because an integer a caller
+/// chose cannot show that it does not collide with another crate's.
+const PROTOCOL: SchemaKey = SchemaKey::new(schema_id("evering.example.compile-cache"), 1);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,7 +48,7 @@ struct Job {
 }
 
 unsafe impl Repr for Job {
-    const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x4341_43485f4a4f42), 1);
+    const SCHEMA: SchemaKey = compose_schema(PROTOCOL, SchemaKey::new(schema_id("job"), 1));
 }
 
 #[repr(C)]
@@ -56,15 +60,15 @@ struct Verdict {
 }
 
 unsafe impl Repr for Verdict {
-    const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x4341_43485f565244), 1);
+    const SCHEMA: SchemaKey = compose_schema(PROTOCOL, SchemaKey::new(schema_id("verdict"), 1));
 }
 
 fn access() -> Access {
     Access::READ | Access::WRITE
 }
 
-fn text(error: impl Debug) -> String {
-    format!("{error:?}")
+fn text(error: impl Display) -> String {
+    error.to_string()
 }
 
 fn object(seed: u64, len: usize) -> Vec<u8> {

@@ -1,3 +1,21 @@
+//! The Windows transport under a handover: a message-mode named pipe that carries one offer, plus the
+//! handles that offer names. `bind` creates the pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE` and one
+//! instance, so a name already taken is the listener's failure rather than something to delete;
+//! `accept` waits to the deadline, switches the instance to blocking message mode and then refuses
+//! anything whose client pid is not the retained child; `send` duplicates every resource *into the
+//! child's handle table* and writes those remote numbers into the message, and `rollback` closes the
+//! remote copies if any later step fails. `connect` and `server_pid` are the client's mirror of the same
+//! two checks.
+//!
+//! The remote numbers are the obligation this file cannot test: a handle value means something only in
+//! the process that will read it, so a sender that wrote its own number instead of a duplicated one
+//! would hand the child a valid handle to the wrong object, and `recv` — which turns each number
+//! straight into an `OwnedHandle` — has nothing left to compare. Its partner is the framing, shared with
+//! the Unix leg through `crate::process`'s magic and the same eight-byte header, and the message must
+//! stay inside `MAX_MESSAGE` or `WriteFile` reports a short write; the header's size also bounds what a
+//! `Listener` can admit at all, since one instance serves one child. None of this has been executed on
+//! the host writing it.
+
 use std::{
     ffi::c_void,
     io,

@@ -1,3 +1,15 @@
+//! The platform's object names and one attested identity: which primitive backs `Event`, `Ring` and
+//! `Shared` on each target, and the `Peer` a completed handover reports. `Peer` exists only through
+//! `introduced`, which `Handoff::receive` reaches once the kernel's answer and the introduction agree
+//! — an impostor is an `Err`, never a value of the type.
+//!
+//! Resources travel positionally: the order a sender puts the mapping, the event and the ring into a
+//! handover is matched by index on the receiving side, and `ReceivedResources` carries no tag saying
+//! which is which, so a sender and a reader disagreeing about that order receive each other's objects
+//! with nothing to complain. The whole map is also gated on `std`, so it simply is not there under
+//! `--no-default-features`. Each backend keeps its own obligations — the unix leg reserves a window
+//! before placing the file, the Windows leg goes through a section and a view — and only the paths a
+//! suite actually reaches on a given host have been executed.
 #![cfg(feature = "std")]
 
 #[cfg(all(feature = "map", unix))]

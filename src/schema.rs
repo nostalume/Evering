@@ -1,3 +1,12 @@
+//! Authors the identity every layout claims: the 128-bit `RegionId`, the `SchemaId` and revision a
+//! record carries, and the mixing rule `compose_schema` uses to join a domain with a part. A type
+//! states its own key through `SharedSchema`, `Repr` or `Layout`; only `Session`'s `create` and `open`
+//! choose a `RegionAdmission`, which is what says whether a region may initialise anything at all.
+//!
+//! The FNV parameters and the rotate constants are wire identity, not local detail: change one and
+//! every key recorded in an existing region stops matching, while the only test in this file asserts
+//! that two different names hash differently. No expected value is pinned, so a constant can drift
+//! with the suite green.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct RegionId {

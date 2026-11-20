@@ -1,3 +1,20 @@
+//! The caller-facing vocabulary tested on the mock region: channels and their ports, pool classes and the
+//! geometry that bounds them, transfers that move an authority word rather than a payload, session admission,
+//! and the allocator's reuse behaviour — the last of it by handing the platform-neutral stress bodies in
+//! `crate::tests` a `MapTalc` over one array. A second participant is another `Session` composed over the same
+//! bytes with `RegionAdmission::Expect`, which is as far as "the other side" can be simulated here: the two
+//! sides share an address space, so every assertion about a peer is really about the words in the region. State
+//! changes through the public surface, except for `Large` and `Small`, which share a `SchemaId` and so
+//! deliberately break the `Repr` schema-identity law to show that exact-extent admission still refuses to
+//! reconstruct the wrong pointer from a colliding schema.
+//!
+//! Two obligations this file carries past its own assertions. Its class widths are chosen to sit under the
+//! platform's geometry cap, so the over-wide case is refused here and never reaches a real mapping — that
+//! split is what `tests::unix::talc` depends on, and a cap that moved would silently hand the Unix arm work it
+//! does not currently do. And the `SchemaId(91)` collision is sound only while nothing else claims 91: an
+//! unrelated layout that took it would make the admission argument false in a place no test here looks, without
+//! any case in this file failing.
+
 use crate::Session;
 use crate::msg::Repr;
 use crate::tests;
@@ -241,6 +258,37 @@ fn explicit_pool_range_never_silently_shrinks() {
     assert!(session.create_pool(64 * 1024, None).is_ok());
 }
 
+/// The alignment contract is answered before the space one, so an over-wide class is refused even in a
+/// region too small to hold it: a peer that cannot reproduce a block address is the earlier and
+/// stronger reason, and the mock region's 128 KiB would otherwise hide which question was answered.
+#[test]
+fn a_class_wider_than_the_region_contract_is_refused_where_it_is_chosen() {
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    let contract = crate::mem::REGION_ALIGN;
+    let error = match session.create_pool(
+        32 * 1024,
+        Some(crate::BlockRange::new(64, 2 * contract).unwrap()),
+    ) {
+        Err(error) => error,
+        Ok(_) => panic!("a class no peer mapping can reproduce was accepted"),
+    };
+    assert_eq!(error, crate::PoolCreateError::ClassTooWide(2 * contract));
+    assert!(format!("{error}").contains("alignment"), "{error}");
+
+    let boundary = session
+        .create_pool(
+            32 * 1024,
+            Some(crate::BlockRange::new(64, contract).unwrap()),
+        )
+        .err()
+        .expect("a class at the contract cannot fit the mock region");
+    assert!(
+        matches!(boundary, crate::PoolCreateError::RequiredExtent { .. }),
+        "a class exactly at the contract is admissible geometry: {boundary:?}"
+    );
+}
+
 #[test]
 fn pool_reclaims_only_the_dead_participant_owner() {
     let mut pt = [0; MAX_ADDR];
@@ -454,6 +502,52 @@ fn a_damaged_authority_word_is_not_reported_as_a_full_pool() {
     );
 }
 
+/// An open used to answer one collapsed `Unavailable` for every refusal point in the directory, so
+/// a caller could not tell a retry from a dead end. These are the two refusals the directory can
+/// make on its own, without a second process: an id nothing here published, and an id that belongs
+/// to another mapping.
+#[test]
+fn a_refused_open_names_the_refusal_that_stopped_it() {
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    let pool = session.create_pool(32 * 1024, None).unwrap();
+    let id = pool.id();
+
+    // The same id over memory that never held it: nothing is published there, and waiting for a
+    // release cannot publish it.
+    let mut blank = [0; MAX_ADDR];
+    let stranger = mock_session(&mut blank, 0, MAX_ADDR);
+    let absent = match stranger.open_pool(id) {
+        Ok(_) => panic!("an id from other memory cannot be openable here"),
+        Err(error) => error,
+    };
+    assert_eq!(absent, crate::OpenPoolError::Absent(id));
+    assert!(
+        !absent.is_retryable(),
+        "an unpublished id does not arrive by waiting"
+    );
+
+    // The same id against a mapping of another region: the refusal says which half of the pair is
+    // the mismatch, which is what `Unavailable` could not separate from damage.
+    let mut other = [0; MAX_ADDR];
+    let foreign = mock_session(&mut other, 0x4000, MAX_ADDR - 0x4000);
+    let wrong = match foreign.open_pool(id) {
+        Ok(_) => panic!("an id from another region cannot be openable here"),
+        Err(error) => error,
+    };
+    assert_eq!(wrong, crate::OpenPoolError::WrongRegion(id));
+    assert_ne!(
+        wrong, absent,
+        "the two refusals ask different things of the caller"
+    );
+    assert_eq!(
+        wrong.id(),
+        id,
+        "the id an integrator logs is the id that was refused"
+    );
+    assert!(format!("{wrong}").contains("region"), "{wrong}");
+}
+
 #[test]
 fn pool_geometry_is_queryable_aligned_and_nonoverlapping() {
     let mut pt = [0; MAX_ADDR];
@@ -621,6 +715,10 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
         Err(failed) => failed,
         Ok(_) => panic!("another Pool admitted the transfer"),
     };
+    assert!(
+        failed.to_string().contains("pool"),
+        "the wrong-pool refusal said {failed}"
+    );
     let received = match failed {
         crate::AdoptError::Pool(received) => received,
         _ => panic!("wrong Pool rejection"),
@@ -629,6 +727,10 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
         Err(failed) => failed,
         Ok(_) => panic!("wrong runtime type admitted the transfer"),
     };
+    assert!(
+        failed.to_string().contains("type"),
+        "the wrong-type refusal said {failed}"
+    );
     let received = match failed {
         crate::AdoptError::Type(received) => received,
         _ => panic!("wrong type rejection"),
@@ -644,6 +746,10 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
         Ok(_) => panic!("stale participant generation admitted the transfer"),
     };
     assert!(matches!(failed, crate::AdoptError::Owned(_)));
+    assert!(
+        failed.to_string().contains("detached"),
+        "the still-held refusal said {failed}"
+    );
     drop(failed);
     assert!(matches!(
         send.try_send(pool.as_ref().put(23_u64).unwrap().transfer(())),

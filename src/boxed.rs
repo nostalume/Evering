@@ -1,3 +1,14 @@
+//! Owns no shared bytes of its own: `PBox<'a, T>` is a live value borrowed from the shared heap,
+//! holding the pointer, the `Meta` that names its span in whichever mapping reads it, and the
+//! allocator reference it came from — which is why the allocator stays out of the public type. Writes
+//! go through `DerefMut` and `write`; the block leaves only by `Drop` or `release`, each of which
+//! hands pointer, `Meta` and layout to the heap's release, and that needs this member's claim on the
+//! mutation word.
+//!
+//! `into_raw` moves all three parts out, so a raw tuple nobody rebuilds leaks the block instead of
+//! waiting for it; `Drop` replaces the `Meta` with a null one to stop a double release, and `release`
+//! is what passes the original back. For a slice box the length in the fat pointer comes from the
+//! caller of `from_meta_slice`, not from the span, and nothing reconciles the two.
 use core::{
     alloc::Layout,
     mem::{self, ManuallyDrop, MaybeUninit},

@@ -14,7 +14,7 @@ concurrency:
 jobs:
   linux:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
@@ -26,6 +26,9 @@ jobs:
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
       - run: cargo test --features os,tokio,tracing
+      # The row above never compiles `benches/ipc/*` or an example, so a target gated on a feature
+      # it does not ask for goes unnoticed until someone builds the whole matrix by hand.
+      - run: cargo test --all-features --all-targets
       - run: cargo check --no-default-features
       - run: cargo check --no-default-features --target i686-unknown-linux-gnu
       - run: cargo package --list

@@ -1,3 +1,15 @@
+//! The allocator on real bytes: `talc` driven over a memfd mapping rather than the heap, which is where
+//! a block address stops being whatever the allocator returned and becomes a number a peer has to reach.
+//! `mock_alloc`, `fd.dup()` and `fd.mapping().at(hint)` are the only makers, and the assertions ask
+//! `crate::mem::REGION_ALIGN` instead of assuming a residue, so a mapping that stops arranging the
+//! alignment it is asked for fails here rather than in the field.
+//!
+//! Two things these cases cannot show. Both mappings of one file live in this process, so the ordering
+//! that only a second process exposes — a peer mapping while the creator is still publishing its
+//! header — is claimed by `tests/ipc_process.rs` and `src/tests/unix/recovery.rs`, not by this file. And
+//! the class widths used here sit under the platform's geometry cap, so an over-wide class is refused by
+//! the mock suite's `ClassTooWide` case and never arrives on a real mapping.
+
 use crate::os::unix::UnixFd;
 
 use crate::mem::{Access, Request, Source};
@@ -17,6 +29,53 @@ fn mock_alloc(name: &str, size: usize) -> UnixAlloc {
     .unwrap()
     .try_into()
     .unwrap()
+}
+
+/// A Pool aligns its class payloads against the absolute address its creator's mapping happened to
+/// receive, while the directory records them as offsets from that base. `mmap` promises only page
+/// alignment and treats a hint as advisory, so a second mapping of the same file used to land on a
+/// different residue and read every block off its own alignment.
+#[test]
+fn a_pool_opens_in_a_second_mapping_of_the_same_region() {
+    const SIZE: usize = 1 << 24;
+    const REGION: RegionId = RegionId::new(0x0052_4553, 3);
+    let fd = UnixFd::memfd("second-mapping", SIZE, false).expect("create shared memory");
+    let parent = crate::Session::create(
+        fd.dup().expect("duplicate shared-memory handle"),
+        Request::new(SIZE, Access::WRITE | Access::READ),
+        REGION,
+    )
+    .expect("create session");
+
+    // Deliberately one page off the residue the parent landed on: an address a peer may be handed
+    // without asking, which the mapping has to make usable rather than merely check afterwards.
+    let hint = parent.base_addr() + (1 << 30) + 4096;
+    let child = crate::Session::open(
+        fd.mapping().at(hint),
+        Request::new(SIZE, Access::WRITE | Access::READ),
+        REGION,
+    )
+    .expect("join the same region");
+    assert_eq!(
+        child.base_addr() % crate::mem::REGION_ALIGN,
+        parent.base_addr() % crate::mem::REGION_ALIGN,
+        "a peer can only reproduce a block address whose alignment it reaches from its own base"
+    );
+
+    let pool = parent
+        .create_pool(
+            4 * 1024 * 1024,
+            Some(crate::BlockRange::new(64, 8 * 1024).unwrap()),
+        )
+        .expect("a pool whose widest class is above page alignment");
+    let opened = child
+        .open_pool(pool.id())
+        .expect("the second mapping opens the same pool");
+    let wide = opened
+        .as_ref()
+        .copy(&[7_u8; 8 * 1024])
+        .expect("the widest class is usable from the second mapping");
+    assert_eq!(wide[8 * 1024 - 1], 7);
 }
 
 #[test]

@@ -1,3 +1,13 @@
+//! Authors the index: the transaction word, the pending slab/entry/kind fields and the plain `Meta`
+//! cell beside them, plus each record's state (generation and phase) and offset. Nothing here reaches a
+//! caller — `pool`, `channel`, `session` and `header` are its whole audience — and only the winner of a
+//! `claim` writes, through `persist`, `clear_pending`, `commit` and `restore` inside `create_in`,
+//! `remove_in` and `grow`, or through `transfer` during recovery. `scan`, `offset` and `open_recorded`
+//! read without claiming anything.
+//!
+//! The pending cell is plain memory, so the reads that decide an outcome have to follow the
+//! transaction claim, and only atomic words may be inspected before it. The reason, the exceptions and
+//! what a refusal hands back are spelled out in the doc on `recover` rather than repeated here.
 use core::cell::UnsafeCell;
 use core::marker::PhantomData;
 use core::mem::MaybeUninit;
@@ -244,6 +254,49 @@ pub(crate) enum Error {
     Close(crate::header::CloseError),
 }
 
+/// Which refusal stopped an open, named at the point that refused.
+///
+/// Opening a recorded layout reads the directory entry, then the record's own header word, then the
+/// header's admission of this member. Those fail for different reasons and a caller handles them
+/// differently: `Busy` is worth retrying, `OutOfBounds` and `InvalidHeader` mean the region is
+/// telling us something it should not be, and `Absent` means it is telling the truth.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OpenCause {
+    WrongRegion,
+    Absent,
+    OutOfBounds,
+    Misaligned,
+    ReadOnly,
+    InvalidHeader,
+    Mismatch(crate::header::LayoutField),
+    Undiscoverable,
+    Closed,
+    DuplicateMember,
+    Busy,
+}
+
+impl OpenCause {
+    fn projection(error: crate::mem::ProjectionError) -> Self {
+        match error {
+            crate::mem::ProjectionError::ReadOnly => Self::ReadOnly,
+            crate::mem::ProjectionError::ArithmeticOverflow
+            | crate::mem::ProjectionError::OutOfBounds => Self::OutOfBounds,
+            crate::mem::ProjectionError::Misaligned => Self::Misaligned,
+            crate::mem::ProjectionError::Admission(error) => Self::admission(error),
+        }
+    }
+
+    fn admission(error: crate::header::AdmitError) -> Self {
+        match error {
+            crate::header::AdmitError::Contention => Self::Busy,
+            crate::header::AdmitError::Closed => Self::Closed,
+            crate::header::AdmitError::DuplicateMember => Self::DuplicateMember,
+            crate::header::AdmitError::InvalidHeader => Self::InvalidHeader,
+            crate::header::AdmitError::Mismatch(field) => Self::Mismatch(field),
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Recovered {
     RolledBack,
@@ -397,13 +450,22 @@ impl MapDirectory {
         &self,
         id: Id<L>,
         discover: impl FnOnce(L::Info, usize) -> Option<(L::Config, U)>,
-    ) -> Option<(crate::mem::Mapped<header::RcHeader<L>>, U)> {
-        let offset = self.offset(id).ok()?;
-        let record = unsafe { self.ref_at::<header::Record>(offset) }.ok()?;
-        let recorded = unsafe { header::recorded_at(core::ptr::from_ref(record).cast()) }.ok()?;
+    ) -> Result<(crate::mem::Mapped<header::RcHeader<L>>, U), OpenCause> {
+        let offset = self.offset(id).map_err(|_| {
+            if id.region != self.region_id() {
+                OpenCause::WrongRegion
+            } else {
+                OpenCause::Absent
+            }
+        })?;
+        let record =
+            unsafe { self.ref_at::<header::Record>(offset) }.map_err(OpenCause::projection)?;
+        let recorded = unsafe { header::recorded_at(core::ptr::from_ref(record).cast()) }
+            .map_err(OpenCause::admission)?;
         self.offset_of(core::ptr::NonNull::from(record).cast(), recorded.extent)
-            .ok()?;
-        let header = unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.ok()?;
+            .map_err(OpenCause::projection)?;
+        let header =
+            unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.map_err(OpenCause::projection)?;
         let info = unsafe {
             header::RcHeader::<L>::inspect_at(
                 header,
@@ -414,11 +476,12 @@ impl MapDirectory {
                 },
             )
         }
-        .ok()?;
-        let (conf, value) = discover(info, recorded.extent)?;
-        self.admit_at::<header::RcHeader<L>>(offset, conf, false)
-            .ok()
-            .map(|mapped| (mapped, value))
+        .map_err(OpenCause::admission)?;
+        let (conf, value) = discover(info, recorded.extent).ok_or(OpenCause::Undiscoverable)?;
+        let mapped = self
+            .admit_at::<header::RcHeader<L>>(offset, conf, false)
+            .map_err(OpenCause::projection)?;
+        Ok((mapped, value))
     }
 
     #[cfg(test)]

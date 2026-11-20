@@ -1,3 +1,43 @@
+//! A bounded, typed shared-memory substrate: a pool hands out blocks, a directory records what a
+//! block is, a channel moves one between members of a session, and a notification object says when
+//! to look again. The region is the only transport, so every type above it is a promise about the
+//! bytes in somebody else's mapping.
+//!
+//! # Where a name lives
+//!
+//! There are two maps, and a name belongs to exactly one of them.
+//!
+//! * **The crate root is what a caller holds across an exchange**: `Session`, `Pool`, `Channel`,
+//!   `Port`, `Tx`/`Rx`, `Block`, `Transfer`, `PBox`, and the refusals of that same exchange —
+//!   `PoolReserveError`, `BlockRangeError`, `ReceiveError`, `RemoveError`, `OpenPoolError`. These
+//!   come out of implementation modules that are private (`pool`, `channel`, `session`, `queue`,
+//!   `boxed`), so the root is their only address, and where two modules use the same noun the root's
+//!   alias settles it: `pool::RangeError` becomes `BlockRangeError`, `talc::Geometry` becomes
+//!   `HeapGeometry`. Rustc enforces the private half — a type from a private module cannot appear in
+//!   a public signature without being re-exported.
+//! * **A `pub mod` is the map of one layer**, named by path and deliberately not duplicated at the
+//!   root: `layout` for the identity a type claims (`SchemaKey`, `Repr`, `RegionId`,
+//!   `recovery_handler`), `mapping` for how a region gets mapped (`Access`, `Request`, `Map`),
+//!   `notify` for when to look again (`Signals`, `Wait`, `Patience`, `ProgressError`), `os` for the
+//!   platform's objects, `process` and `runtime` for spawning and for driving a wait.
+//!
+//! So `evering::Pool` and `evering::notify::Signals` are not two styles of the same thing: the first
+//! is a noun of the exchange, the second is a member of the waiting layer. A layer's own refusals
+//! travel with it for the same reason — `notify::ProgressError` and `process::TooLarge` have no root
+//! name. `layout` and `mapping` are re-export shims over private modules; they are public so a
+//! vocabulary has one address, not because their implementation is reachable.
+//!
+//! Two nouns still mean more than one thing, and the rule names them rather than fixing them:
+//! `Geometry` is both the pool's block-class layout and the heap's capacity (`HeapGeometry`), and
+//! `Peer` is both `mapping::Peer` (a mapped peer region) and `os::Peer` (a process). The second is
+//! open work, not a documentation choice.
+//!
+//! # What a module header says
+//!
+//! Three sentences, in this order: what fact or state the module owns, who may change it and under
+//! which protocol, and the one obligation a change here could break that no test would catch. The
+//! layer narrative lives in `docs/architecture.md`; a header does not retell it.
+
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
 #![feature(const_trait_impl, const_convert, const_cmp)]
 #![feature(slice_ptr_get)]

@@ -1,3 +1,19 @@
+//! The Windows half of a handover: a named-pipe listener is the meeting, and the grant is the pipe's
+//! address plus this process's own pid, both installed in the admitted child's environment by `admit`,
+//! which consumes the grant. `send` accepts the client and refuses anything that is not the `child` it
+//! was given, bounded by `deadline` because the pipe instance exists long before the child runs;
+//! `receive` connects, asks the kernel whose pipe this is and refuses unless that answer matches the
+//! announced introducer, and only then reads the offer. `shared` is where a section's protection is
+//! fixed, since that is the earliest point a Windows object can be restricted.
+//!
+//! Both legs are load-bearing in a way the Unix arm's are not: the address is discoverable by any
+//! process on the host while the pipe exists, so nothing but `accept`'s check and `server_pid`'s
+//! protects the offer from a claimant that merely read it — drop either and the impostor test that
+//! covers the other direction would still pass. What the two arms must keep agreeing on is not here:
+//! `recv(3)`'s count and the order the three handles are removed in are the same positional contract the
+//! Unix leg implements, and `Grant` staying single-use is what stops one address admitting two
+//! children. Nothing in this file has been executed on the host writing it.
+
 use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 
 use crate::{

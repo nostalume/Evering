@@ -1,5 +1,24 @@
+//! The suite on a region that is only a buffer: `MockBackend` turns any `[u8; MAX_ADDR]` into a `Map` whose
+//! release zeroes the extent, so a whole region — root, directory, allocator header — exists with no kernel
+//! object anywhere. That is what makes these the cases that need to interleave rather than to share: two
+//! threads racing one rolled-back create, a reap that must stand down while a live mutation is still landing,
+//! poison and quarantine decided by which word a dead owner left behind, an admit that refuses a member still
+//! mapped, and the release accounting below. Only the cases change state, and `MockBackend::map` bounds every
+//! extent it hands out, so no fixture can write past the array. Several drive the directory through states the
+//! real vocabulary cannot reach by defining a fixture `Layout` inline (`evering.test.*` schemas), so a change
+//! to `init`/`attach`/`Status` lands here before it lands anywhere else.
+//!
+//! Two things the shape cannot carry. Nothing here constrains placement: the array is as aligned as whatever
+//! allocated it and `mock_view` accepts any `start`, so an assertion about an address or a residue in this file
+//! proves the host and not the library — the peer-visible version of that claim belongs to `tests::unix`. And
+//! `RELEASES` is one process-global counter that a single case installs through `count_release`: the "released
+//! exactly once" assertion is sound only because nothing else routes through it, so a second user — or a `Build`
+//! that counted releases generally — would leave an assertion that still passes `--test-threads=1` and fails in
+//! a normal run.
+
 #![cfg(test)]
 
+mod refusals;
 mod talc;
 
 use core::ptr::NonNull;

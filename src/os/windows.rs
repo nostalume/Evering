@@ -1,3 +1,21 @@
+//! The Windows object that stands for a region's bytes and the view of it this process reads: `Section`
+//! is a page-file file mapping whose protection is fixed for the whole object at `anonymous`, and
+//! `Source::map` opens a view of it, narrowing — never widening — with the request's own `Access`.
+//! `from_owned_handle` adopts a section handed over from another process and `borrow` relabels one
+//! without a second handle; nothing here mutates shared state. A view is released by `release`, which
+//! unmaps it, while `Section`'s own drop only closes this process's handle — the object stays alive for
+//! as long as another process holds one, so a caller cannot make a peer's bytes disappear by dropping.
+//!
+//! Two things this path does not do, both of which the layers above assume of the backend generally.
+//! Placement is not asked of the kernel — `MapViewOfFile` takes no address, so where a view lands is the
+//! allocator's choice, and `mem::REGION_ALIGN`'s non-unix value of `1 << 16` is the section allocation
+//! granularity rather than something arranged here; a pool whose blocks have to sit at the same residue
+//! in two processes is therefore relying on the kernel, not on this file. And the access a section is
+//! created with is enforced for every mapper, which is the opposite of the Unix arm, where a memfd
+//! carries none and each mapping decides: a caller that reads one arm's `Access` behaviour into the
+//! other gets a refusal on one host and silent over-permission on the other. None of this has been
+//! executed on the host writing it.
+
 #[cfg(feature = "process")]
 pub mod process;
 

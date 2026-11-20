@@ -1,3 +1,11 @@
+//! Owns the frozen ceilings a handoff is measured against — `MAX_BOOTSTRAP`, `MAX_RESOURCES` and the
+//! magic a rendezvous carries — and the linear ownership of exactly one child. Bytes enter only through
+//! `Bootstrap::new`; a child's terminal state is reached only through `try_wait`, `wait` or `kill_wait`,
+//! and the status is then memoized, which is what makes an `Exit` a proof rather than another poll.
+//!
+//! `Drop` has to reap a child nobody waited on. The suite covers waiting, killing and a spawn that
+//! failed, but nothing drops an un-waited supervisor, so taking that arm out leaks a live child with no
+//! failing test. `MAX_RESOURCES` is enforced on the receiving side, not here.
 use core::marker::PhantomData;
 use std::{
     io,

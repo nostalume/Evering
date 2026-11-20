@@ -1,3 +1,14 @@
+//! Authors each record's words — status, format and profile, magic, schema key and revision, extent
+//! and the alignment that extent was made at — plus the member bitset and the root's per-slot member
+//! word. A record is written once, by the winner of `admit`, which stores the fields and then
+//! publishes; later joiners only set or clear their own bit through `claim` and `leave`, and moving a
+//! member word is confined to `mark_dead`, `release_dead` and `leave`.
+//!
+//! The non-atomic fields are readable only because that publishing store says they are: `recorded_at`
+//! acquire-loads the status and reads the rest plainly, and `dir::scan` hands it a relaxed-loaded
+//! offset. Writing a field after the store, or reading it without the status load, fails no test
+//! inside one process. A record caught `Initializing` is `Contention` for every joiner afterwards and
+//! re-initialising it is refused, so a claim that died mid-flight has to be adjudicated, not retried.
 use core::{
     mem,
     ops::Deref,

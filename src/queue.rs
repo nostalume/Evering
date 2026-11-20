@@ -1,3 +1,13 @@
+//! Owns the encoding of a slot's control word — base state, `COMPLETE`, source, reaper and reserved
+//! bits — plus the turn field and the head/tail cursors a `Header` adds. The atoms belong to whoever
+//! implements `Queue`, and outside tests only a channel's endpoint does; mutation runs through
+//! `reserve`, `stage`, `publish` and `cancel`, `claim`, `recycle` and `take`, while
+//! `repair_slot_with` is the path a recovery walk uses on a slot another member left mid-flight.
+//!
+//! A `Full` or `Empty` answer is preceded by a sequenced-consistent fence, because the cursors and the
+//! control word are two separate reads: remove it and a caller can be told a queue is empty in the
+//! same instant somebody commits an item into it. That lost wakeup is a two-thread fact, so no
+//! single-threaded test notices it.
 use core::cell::UnsafeCell;
 use core::mem::MaybeUninit;
 use core::sync::atomic::{self, AtomicU8, AtomicU16, AtomicUsize, Ordering};
@@ -526,7 +536,6 @@ pub(crate) fn repair_slot_with<T>(
     Repair::Recovered
 }
 
-#[derive(Debug)]
 pub enum TrySendError<T> {
     /// Shared capacity is exhausted; receiver progress is required.
     Full(T),
@@ -537,6 +546,35 @@ pub enum TrySendError<T> {
     /// the value cannot be returned because its block now belongs to another participant.
     Authority,
 }
+
+// The value is the caller's own, returned rather than diagnosed, so `Debug` is written by hand: a
+// derived one would tie the refusal's report to whether the payload happens to be printable.
+impl<T> core::fmt::Debug for TrySendError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            Self::Full(_) => write!(f, "Full({})", core::any::type_name::<T>()),
+            Self::Busy(_) => write!(f, "Busy({})", core::any::type_name::<T>()),
+            Self::Disconnected(_) => write!(f, "Disconnected({})", core::any::type_name::<T>()),
+            Self::Authority => f.write_str("Authority"),
+        }
+    }
+}
+
+impl<T> core::fmt::Display for TrySendError<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Full(_) => "the queue is full, so a receiver has to claim before this value fits",
+            Self::Busy(_) => "another send is mid-flight, so a local retry may take it",
+            Self::Disconnected(_) => "the receiving end is closed, so the value came back unsent",
+            Self::Authority => {
+                "the transfer lost its block before publication, and nothing was sent"
+            }
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<T> std::error::Error for TrySendError<T> {}
 
 #[derive(Debug)]
 #[cfg(test)]

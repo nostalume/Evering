@@ -1,3 +1,13 @@
+//! Publishes exactly one thing, `Wait`, and owns only a process-local registration: it turns an
+//! `os::Event` into something a Tokio task can park on, so that a caller never has to spend a thread
+//! per region. Nothing here touches shared bytes, and the whole file exists only under the `tokio`
+//! feature. Readiness is consumed inside `wait` and nowhere else — on unix by clearing the event
+//! before the registration is cleared, on Windows by a wait registered once and unregistered blocking.
+//!
+//! The Windows leg hands one allocation between two owners: the wake callback reclaims the pointer it
+//! was passed, and `Drop` reclaims it only after reading, with acquire ordering, that no callback ever
+//! started. That store/load pair is the whole ownership argument, and nothing counts the allocation to
+//! confirm it.
 #[cfg(unix)]
 mod imp {
     use std::io;

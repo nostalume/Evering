@@ -1,3 +1,14 @@
+//! Authors the transfer locator's bytes — pool identity, class and slot, generation, metadata tag,
+//! type id — and the mechanical size rule the value behind them follows. `Block::transfer_with` is the
+//! only thing that mints one; `map` and `update` rewrite the header half; `adopt_id` and `takeover`
+//! read it back. `Shape` is sealed, so a caller satisfies it through the blanket impls here rather than
+//! by declaring one.
+//!
+//! The tag encoding sits outside the composed schema key, so reshaping these fields keeps every schema
+//! valid while an unrecognised tag simply decodes as no metadata and is refused as a type mismatch —
+//! no size or offset assertion catches the reorder. That is tolerable only because the locator is not a
+//! reconstruction capability: `Token` is deliberately unpublished and `layout::Shape` is the half a
+//! caller ever holds.
 use core::{alloc::Layout, mem, ptr};
 
 use crate::{

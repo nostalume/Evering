@@ -1,3 +1,14 @@
+//! Owns the linear account of one process-local mapping: the cursor that turns a sequence of composed
+//! layouts into addresses, and the arithmetic that reserves a span inside it. `Build`'s `push` and
+//! `reserve`, committed through `Reservation::commit`, extend the composition; `Map`'s `reserve` and
+//! `commit` do the address arithmetic and the compare-exchange that keeps it honest; `Map::close`
+//! hands the account back once.
+//!
+//! The cursor advances by `size_of`, never by the extent a configuration says a type needs, so a
+//! record whose extent grows with its contents has to be composed last. Nothing asserts that, and a
+//! region composed the other way round still opens. The residue a composition records is likewise a
+//! promise about the mapping underneath it, and a `Source` written outside this crate can hand back a
+//! `Map` that does not keep it.
 use alloc::sync::Arc;
 use core::ptr::NonNull;
 use core::{marker::PhantomData, ops::Deref};
@@ -158,6 +169,24 @@ impl AddrSpan<usize> {
         unsafe { NonNull::new_unchecked(base.add(self.start_offset).cast_mut()) }
     }
 }
+
+/// Alignment every mapping of a region is guaranteed to have in every process that maps it.
+///
+/// A pool's class blocks are `bytes`-aligned against the absolute address the allocator happened to
+/// get, and a peer reading the same record offset only reproduces that alignment if its own base has
+/// the same residue — which is what `header::recorded_at` refuses. `os::unix` arranges the residue by
+/// placing the file at an address on this bound instead of hoping `mmap` chose one, and
+/// `pool::Geometry::build` refuses a wider class than the bound, so the promise is never one a peer
+/// cannot keep. Because the bound names what the host's mapping can promise, it is the platform's own
+/// property: a caller that wants one geometry everywhere keeps its classes inside the smallest of
+/// them. Windows takes the granularity its view placement is documented to round addresses to, which
+/// is coarser than any class the Unix-side tests here lay out, and has not been executed. A test
+/// backend that hands every session a slice of one buffer cannot vary its residue, so it exercises
+/// neither the arrangement nor the refusal.
+#[cfg(unix)]
+pub(crate) const REGION_ALIGN: usize = 1 << 21;
+#[cfg(not(unix))]
+pub(crate) const REGION_ALIGN: usize = 1 << 16;
 
 /// Linear owner of one process-local mapping.
 pub struct Map {

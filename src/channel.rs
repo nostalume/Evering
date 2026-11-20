@@ -1,3 +1,14 @@
+//! Owns a channel's two role words — generation, which endpoint holds it, terminal bit — its
+//! lifecycle byte, its capacity, and the header magic that says the bytes between the endpoints are
+//! one channel. `creator` writes both role words outright, `adopt` claims the one it will use,
+//! `invite` advances the peer's to a fresh generation, and `close_with` is the only way to the
+//! terminal state; an endpoint's `Drop` returns its word only while the generation and owner still
+//! match what it recorded.
+//!
+//! `adopt` has to win its own compare-exchange before it reads the issuer's word, and give its word
+//! back if the issuer turns out to be gone. Reverse those two steps and the region keeps an owned role
+//! that nobody holds — a state no in-process test can see, because only a later recovery walk reads
+//! it back.
 use core::alloc::Layout as AllocLayout;
 use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
@@ -1001,6 +1012,19 @@ pub enum ReceiveError {
     Closed,
 }
 
+impl core::fmt::Display for ReceiveError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Empty => "no item has been committed, so a sender has to publish one",
+            Self::Busy => "another claim is mid-flight, so a local retry may take this one",
+            Self::Closed => "every sender is gone and nothing was left to claim",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl std::error::Error for ReceiveError {}
+
 pub enum AdoptError<'a, H: Repr> {
     Pool(Received<'a, H>),
     Span(Received<'a, H>),
@@ -1018,6 +1042,22 @@ impl<H: Repr> core::fmt::Debug for AdoptError<'_, H> {
         })
     }
 }
+
+// Every arm carries the claim back, so the sentence only has to say which promise the token broke;
+// `into_received` is what a caller uses to recover from that.
+impl<H: Repr> core::fmt::Display for AdoptError<'_, H> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(match self {
+            Self::Pool(_) => "the claim names a pool this one is not",
+            Self::Span(_) => "the claim names a block this pool's classes do not have",
+            Self::Type(_) => "the block holds another type than the one being adopted",
+            Self::Owned(_) => "the block is not detached, so another member still holds it",
+        })
+    }
+}
+
+#[cfg(feature = "std")]
+impl<H: Repr> std::error::Error for AdoptError<'_, H> {}
 
 impl<'a, H: Repr> AdoptError<'a, H> {
     pub fn into_received(self) -> Received<'a, H> {

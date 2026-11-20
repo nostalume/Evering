@@ -1,3 +1,13 @@
+//! The Unix arm of the in-crate suite: `mock_view` hands the platform-neutral bodies in `crate::tests` a
+//! real memfd mapping instead of the heap one, and `recovery` and `talc` below are the cases that only
+//! mean something once the bytes are shared-memory. Nothing here owns state a test may not rebuild, and
+//! no fixture reaches a second process — cross-process cases live in `tests/`.
+//!
+//! Because the mapping is made through `Source::map`, every byte these tests see has been through the
+//! backend's reserve-then-place path, so an assertion that hard-codes an address or a residue instead of
+//! asking `crate::mem::REGION_ALIGN` proves the host, not the library. The whole file is also gated on
+//! `map`, so a change to a shared body can be green on the mock allocator and never once run here.
+
 #![cfg(feature = "map")]
 #![cfg(test)]
 

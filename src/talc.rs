@@ -1,3 +1,14 @@
+//! Authors the heap's allocator words: the mutation claim word, the summary, availability and bin
+//! arrays that describe free space, each block's boundary tags, and the geometry recorded in the heap
+//! header. Only a claim holder writes them — `allocate`, `begin_mutation` and the paired
+//! `allocate_during`/`deallocate_during` all run under `Mutation::claim`, and `commit` alone releases
+//! it, so a claim dropped uncommitted leaves the heap poisoned; a dead owner's word moves only during
+//! recovery.
+//!
+//! The three free-space arrays have to move as one unit inside the claim, and the only check that
+//! would notice otherwise, `scan_errors`, compiles to nothing in a release build — a release run can
+//! therefore pass on an availability bit that disagrees with the bin naming it. A reader also has to
+//! verify a peer-chosen tag's alignment before `deallocate` trusts it.
 use core::alloc;
 use core::cell::UnsafeCell;
 use core::ops::Deref;
