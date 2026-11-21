@@ -289,6 +289,44 @@ fn a_class_wider_than_the_region_contract_is_refused_where_it_is_chosen() {
     );
 }
 
+/// The floor an exact range costs has two readers and one computation: the query an integrator asks
+/// before choosing an extent, and the refusal that names the extent they should have offered. The query
+/// is pinned to the refusal rather than to arithmetic, because a re-derived formula agrees with nothing.
+#[test]
+fn a_range_reports_the_extent_it_costs_before_any_region_exists() {
+    let mut pt = [0; MAX_ADDR];
+    let session = mock_session(&mut pt, 0, MAX_ADDR);
+    for (min, max) in [(64, 64), (64, 128), (64, 256)] {
+        let range = crate::BlockRange::new(min, max).unwrap();
+        let refused = match session.create_pool(1, Some(range)) {
+            Err(crate::PoolCreateError::RequiredExtent { required, .. }) => required,
+            Err(other) => panic!("a one-byte extent refused something else: {other}"),
+            Ok(_) => panic!("a one-byte extent was accepted"),
+        };
+        assert_eq!(range.required_extent().unwrap(), refused, "{min}..{max}");
+    }
+
+    let narrow = crate::BlockRange::new(64, 64).unwrap();
+    let floor = narrow.required_extent().unwrap();
+    assert!(session.create_pool(floor, Some(narrow)).is_ok());
+    let short = match session.create_pool(floor - 1, Some(narrow)) {
+        Err(error) => error,
+        Ok(_) => panic!("an extent below the floor was accepted"),
+    };
+    assert!(
+        matches!(short, crate::PoolCreateError::RequiredExtent { .. }),
+        "the floor moved: {short:?}"
+    );
+
+    let contract = crate::mem::REGION_ALIGN;
+    let too_wide = crate::BlockRange::new(64, 2 * contract).unwrap();
+    assert_eq!(
+        too_wide.required_extent().err(),
+        Some(crate::PoolCreateError::ClassTooWide(2 * contract)),
+        "a range no peer can map is refused as geometry, not as size"
+    );
+}
+
 #[test]
 fn pool_reclaims_only_the_dead_participant_owner() {
     let mut pt = [0; MAX_ADDR];
@@ -402,6 +440,78 @@ fn reclaimed_authority_reports_publish_failure_without_committing() {
     );
     core::mem::forget(sender_channel);
     core::mem::forget(pool);
+    core::mem::forget(sender);
+    core::mem::forget(channel);
+}
+
+/// The lines a reap wrote, kept instead of printed: a trace nobody reads back is the same silence as
+/// a trace nobody wrote.
+#[cfg(feature = "tracing")]
+#[derive(Clone)]
+struct TraceLines(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+#[cfg(feature = "tracing")]
+impl std::io::Write for TraceLines {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// A schema no handler answers and a schema two handlers answer end the reap the same way, so the
+/// trace is the only place they part. The single handler that succeeds afterwards is what shows the
+/// duplicate stopped the second reap rather than some earlier exit.
+#[cfg(feature = "tracing")]
+#[test]
+fn an_unanswered_schema_and_a_duplicated_one_trace_different_refusals() {
+    let mut pt = [0; MAX_ADDR];
+    let issuer = mock_session(&mut pt, 0, MAX_ADDR);
+    let (channel, port) = issuer.create_channel::<TestProtocol>(1).unwrap();
+    let sender = peer_session(&mut pt);
+    let sender_channel = sender.adopt(port).unwrap();
+    let dead = sender.peer();
+
+    let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = {
+        let lines = lines.clone();
+        move || TraceLines(lines.clone())
+    };
+    let handler = crate::layout::recovery_handler::<TestProtocol>();
+    let recovery = tracing::subscriber::with_default(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .with_writer(sink)
+            .finish(),
+        || {
+            let recovery = unsafe { issuer.assume_dead(dead) }
+                .expect("the dead peer still owes its member to a reap");
+            let recovery = recovery
+                .reap()
+                .expect_err("a channel member is not the Pool storage the built-in handler knows");
+            recovery
+                .reap_with(&[handler, handler])
+                .expect_err("two handlers for one member leaves it as undecided as none")
+        },
+    );
+    assert!(
+        recovery.reap_with(&[handler]).is_ok(),
+        "one handler for the member is what both refusals were asking for"
+    );
+
+    let written = String::from_utf8(lines.lock().unwrap().clone()).unwrap();
+    assert!(
+        written.contains("no handler answers"),
+        "the missing handler was not named: {written}"
+    );
+    assert!(
+        written.contains("two handlers answer"),
+        "the duplicate handler was not named: {written}"
+    );
+    core::mem::forget(sender_channel);
     core::mem::forget(sender);
     core::mem::forget(channel);
 }

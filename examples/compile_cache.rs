@@ -16,8 +16,6 @@ use evering::{
 };
 
 const REGION: RegionId = RegionId::new(0x4556_4552_4341_4348, 1);
-const PROBE: RegionId = RegionId::new(0x4556_4552_4341_4348, 2);
-const PROBE_BYTES: usize = 2 * 1024 * 1024;
 /// A `BlockRange` is exact, and an exact range reserves its floor before any payload arrives: 64
 /// slots of every power-of-two class up to `LARGEST`, which is 256 MiB of Pool for a 1 MiB class.
 /// `compile_cache --geometry` prints the floor each range demands instead of trusting this number.
@@ -483,9 +481,6 @@ async fn liveness(session: &Session, pool: &Pool, shared: &Shared) -> Result<(),
 }
 
 fn geometry() -> Result<(), String> {
-    let shared = evering::os::shared("evering-geometry", PROBE_BYTES, access()).map_err(text)?;
-    let session = Session::create(shared.borrow(), Request::new(PROBE_BYTES, access()), PROBE)
-        .map_err(text)?;
     for (min, max) in [
         (64, 1 << 20),
         (64, 1 << 15),
@@ -494,11 +489,10 @@ fn geometry() -> Result<(), String> {
         (4 << 10, 1 << 20),
     ] {
         let range = BlockRange::new(min, max).map_err(text)?;
-        let floor = match session.create_pool(1, Some(range)) {
-            Err(PoolCreateError::RequiredExtent { required, .. }) => format!("{required}"),
+        let floor = match range.required_extent() {
+            Ok(required) => format!("{required}"),
             Err(PoolCreateError::ClassTooWide(bytes)) => format!("refused-class-too-wide-{bytes}"),
             Err(other) => return Err(text(other)),
-            Ok(_) => "1".to_owned(),
         };
         println!("GEOMETRY\t{min}\t{max}\t{floor}");
     }

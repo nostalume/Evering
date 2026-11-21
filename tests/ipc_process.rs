@@ -4,6 +4,23 @@
     reason = "uncommitted transfers stay inline so retry retains exact ownership"
 )]
 
+//! What a second process can ask of the layout and recovery layers: that a mapping joined at a
+//! different base still reads the same directory, that a region whose root names another region is
+//! refused at the root, that a read-only attachment is refused, and that session attachment is not
+//! secretly coupled to how a queue is counted, typed or revised — each of those answered by a peer
+//! that read the numbers out of its own environment rather than by a caller who could have arranged
+//! them. It also asks that geometry and schema information from a different build be refused rather
+//! than trusted, that a member which died mid-queue is reaped only by a handler naming its schema, and
+//! that after a complete reap its slot is reusable, its generation is not, and its stale identity
+//! targets nothing.
+//!
+//! The two recovery cases have a Windows leg, in `tests/recovery_dispatch_windows.rs`; that file says
+//! which faces of the dispatch were already executed there and what the transport looks like without a
+//! POSIX shared-memory name. The rest of this file is a unix-only claim and is not ported: several of
+//! these cases assert where a mapping landed, and the Windows backend does not ask the kernel for an
+//! address at all, so there is no alternate base to join at and nothing for such an assertion to
+//! answer to.
+
 use std::{
     io::Write,
     process::{Child, Command, ExitStatus},
@@ -384,6 +401,9 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
     let recovery = unsafe { session.assume_dead(peer) }.expect("mark exact dead generation");
     #[cfg(not(feature = "process"))]
     let recovery = unsafe { session.assume_dead(peer) }.expect("mark exact dead generation");
+    // Naming no handler repairs nothing, although every member of this region is of the unit schema:
+    // the refusal is the absence of a handler, and the claim comes back rather than being spent.
+    let recovery = recovery.reap().unwrap_err();
     assert!(
         recovery
             .reap_with(&[layout::recovery_handler::<()>()])
@@ -610,6 +630,11 @@ fn recovery_dispatch_requires_the_exact_layout_handler() {
     let recovery = unsafe { session.assume_dead(peer) }.unwrap();
     let recovery = recovery.reap().unwrap_err();
     let handler = layout::recovery_handler::<AlternateEnvelope>();
+    // A handler naming a schema this member does not carry is refused the same way naming none is, so
+    // what completes the reap is the match, not the mere fact that a handler was supplied.
+    let recovery = recovery
+        .reap_with(&[layout::recovery_handler::<()>()])
+        .unwrap_err();
     let recovery = recovery.reap_with(&[handler, handler]).unwrap_err();
     assert!(recovery.reap_with(&[handler]).is_ok());
 }

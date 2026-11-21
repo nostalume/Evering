@@ -1,10 +1,10 @@
-#![cfg(all(feature = "os", unix))]
+#![cfg(all(feature = "os", any(unix, windows)))]
 
 //! What the promise looks like across a process boundary: one process reserves a member slot, admits
 //! a child with it, and the child — a second mapping of a region it only ever received as a descriptor
-//! — arrives in exactly the slot it was told about. `src/tests/unix/talc.rs` covers the same
-//! transitions between two mappings of one region inside one process; nothing there can show what a
-//! child reads out of its own environment, which is the half these four cases are about.
+//! or a handle — arrives in exactly the slot it was told about. `src/tests/unix/talc.rs` covers the
+//! same transitions between two mappings of one region inside one process; nothing there can show what
+//! a child reads out of its own environment, which is the half these four cases are about.
 //!
 //! The identity each child checks against arrives out of band, as `slot:generation` in a second key.
 //! A child that compared an announcement against nothing would also pass if the transport swapped the
@@ -13,8 +13,12 @@
 //! member of its own, and the roster refuses a displaced member, not an eavesdropper; and what a
 //! promise does while its member is still standing, since a child on its way out releases the slot it
 //! arrived in before the parent gives the promise back, which is the case
-//! `src/tests/unix/talc.rs` holds open instead. Nothing on the Windows leg has been run on that host
-//! either; it writes the same key in the same order.
+//! `src/tests/unix/talc.rs` holds open instead. All four cases run on both legs — over a descriptor on
+//! Unix, over a duplicated handle on Windows — and running them on the second leg is what pinned where
+//! this file's promise is checked: the child reads its announcement only after the offer has arrived, so
+//! a scribbled one is refused by the process it was scribbled into rather than reaching its parent as a
+//! failed handover. The companions named below are Unix-only files, so on Windows these four are the
+//! whole of what executes.
 //!
 //! The fourth case is the one where the death machinery has nothing to do, and that is as far as it
 //! goes: a promised child that met and then died before arriving leaves the roster holding a promise

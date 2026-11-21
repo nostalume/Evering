@@ -105,6 +105,16 @@ impl BlockRange {
     pub const fn max(self) -> usize {
         self.max
     }
+
+    /// The smallest extent that can hold a pool whose classes are exactly this range.
+    ///
+    /// Only a named range has a floor: the `None` a caller may instead hand to
+    /// [`Session::create_pool`](crate::Session::create_pool) shrinks its class count until the extent it
+    /// was given covers it, and would report a number its own call never refuses at.
+    pub fn required_extent(self) -> Result<usize, PoolCreateError> {
+        let count = self.max.ilog2() - self.min.ilog2() + 1;
+        Geometry::for_count(self, count).map(|geometry| geometry.layout.size())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -264,6 +274,20 @@ struct Geometry {
 }
 
 impl Geometry {
+    /// The geometry of `range` spread over `count` classes, each keeping the slots an exact range
+    /// reserves before any payload arrives.
+    ///
+    /// This is the one computation behind both answers a caller can get: the number
+    /// [`BlockRange::required_extent`] reports and the one `RequiredExtent` refuses with, so neither can
+    /// drift from the other. `create` asks again with fewer classes only when the caller left the range
+    /// unspecified.
+    fn for_count(range: BlockRange, count: u32) -> Result<Self, PoolCreateError> {
+        let minimum = 64usize
+            .checked_shl((count as usize - 1) as u32 / 2)
+            .ok_or(PoolCreateError::InvalidExtent)?;
+        Self::build(range.min, count, minimum)
+    }
+
     fn create(bound: usize, range: Option<BlockRange>) -> Result<Self, PoolCreateError> {
         let exact = range.is_some();
         let range = range.unwrap_or(BlockRange {
@@ -275,12 +299,9 @@ impl Geometry {
         // is what keeps this subtraction and the one in `claim` from underflowing.
         let mut count = range.max.ilog2() - range.min.ilog2() + 1;
         loop {
-            let minimum = 64usize
-                .checked_shl((count as usize - 1) as u32 / 2)
-                .ok_or(PoolCreateError::InvalidExtent)?;
-            let required = Self::build(range.min, count, minimum)?;
+            let required = Self::for_count(range, count)?;
             if required.layout.size() <= bound {
-                let mut low = minimum;
+                let mut low = required.classes[0].slots;
                 let mut high = bound / (MIN_BLOCK + 1) + 1;
                 while low + 1 < high {
                     let middle = low + (high - low) / 2;

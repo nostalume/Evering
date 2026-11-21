@@ -460,39 +460,88 @@ impl Recovery<'_> {
     /// this participant or one holding the handle later — continues from what is left rather than
     /// starting over. A reap that keeps failing with the same cause is a region holding a layout no
     /// caller has supplied a handler for.
+    ///
+    /// Which of those decisions was not yours is written to the trace, not returned: build with the
+    /// `tracing` feature and subscribe at `DEBUG` to see the exit each failed reap stopped at.
     pub fn reap_with(self, handlers: &[RecoveryHandler]) -> Result<(), Self> {
         let session = self.session;
-        if self.peer() == session.dir.peer() {
+        let peer = self.peer();
+        if peer == session.dir.peer() {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Recovery]: this handle names the caller itself (slot {}, generation {}), so its state is not a leftover to repair",
+                peer.slot(),
+                peer.generation()
+            );
             return Err(self);
         }
         let dead = self.member.slot;
         let live = session.dir.peer().slot();
-        match session.dir.transaction_owner() {
-            None => {}
-            Some(owner) if owner == dead => {
-                // The cause is discarded deliberately. Every answer `recover` gives from here ends
-                // the reap the same way — hand the authority back so a participant that can name the
-                // handler tries again — and `reap_with` returns the session rather than an error, so
-                // there is no place to put a cause a caller could act on. A typed recovery failure
-                // reopens when one caller's branch actually differs by cause, not before.
-                if session.dir.recover(&session.alloc, dead).is_err() {
-                    return Err(self);
-                }
+        let holder = session.dir.transaction_owner();
+        if let Some(owner) = holder {
+            if owner != dead {
+                #[cfg(feature = "tracing")]
+                tracing::debug!(
+                    "[Recovery]: the transaction is held by live peer {}, not by the dead {}: only its holder can settle it",
+                    owner,
+                    dead
+                );
+                return Err(self);
             }
-            Some(_) => return Err(self),
+            // The cause stays out of the return value on purpose. `reap_with` hands the session back
+            // rather than an error, so every answer here ends the reap the same way and there is no
+            // caller to branch on one. The trace tells them apart anyway: `Busy` and `Stale` mean the
+            // state moved under this reaper and the next one reads what it observed, while `Admission`
+            // means the record itself is unreadable and no retry with the same handlers settles it.
+            let repaired = session.dir.recover(&session.alloc, dead);
+            #[cfg(feature = "tracing")]
+            if let Err(cause) = &repaired {
+                tracing::debug!(
+                    "[Recovery]: the dead peer's transaction was not repaired: {:?}",
+                    cause
+                );
+            }
+            if repaired.is_err() {
+                return Err(self);
+            }
         }
-        if !session.alloc.finish_recovery(dead)
-            || !session.scan_recovery(dead, live, handlers)
-            || !session.scan_recovery(dead, live, handlers)
-        {
+        if !session.alloc.finish_recovery(dead) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Recovery]: the dead peer's in-flight allocator mutation could not be closed"
+            );
+            return Err(self);
+        }
+        if !session.scan_recovery(dead, live, handlers) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Recovery]: a published member was not settled by the handlers on hand"
+            );
+            return Err(self);
+        }
+        if !session.scan_recovery(dead, live, handlers) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!("[Recovery]: the first pass unsettled a member the second pass found");
             return Err(self);
         }
         session.dir.recover_member(dead);
-        if session.dir.has_member(dead) || !session.dir.release_dead(self.member) {
-            Err(self)
-        } else {
-            Ok(())
+        if session.dir.has_member(dead) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Recovery]: a header still names member {} after every repair this call ran",
+                dead
+            );
+            return Err(self);
         }
+        if !session.dir.release_dead(self.member) {
+            #[cfg(feature = "tracing")]
+            tracing::debug!(
+                "[Recovery]: member {} was repaired, but its directory slot was not released",
+                dead
+            );
+            return Err(self);
+        }
+        Ok(())
     }
 }
 
@@ -871,13 +920,35 @@ impl Session {
                     item.schema == recorded.schema && item.profile == recorded.profile
                 };
                 let mut selected = builtins.iter().chain(handlers).filter(matches);
-                let Some(handler) = selected.next() else {
+                let first = selected.next();
+                let Some(handler) = first else {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        "[Recovery]: no handler answers {:?}, so the member at {:?} is left for one that does",
+                        recorded.schema,
+                        id
+                    );
                     return false;
                 };
                 if selected.next().is_some() {
+                    #[cfg(feature = "tracing")]
+                    tracing::debug!(
+                        "[Recovery]: two handlers answer {:?}, so which one owns the member at {:?} is undecided",
+                        recorded.schema,
+                        id
+                    );
                     return false;
                 }
-                unsafe { (handler.run)(&self.dir, id, recorded, dead, live) }
+                let settled = unsafe { (handler.run)(&self.dir, id, recorded, dead, live) };
+                #[cfg(feature = "tracing")]
+                if !settled {
+                    tracing::debug!(
+                        "[Recovery]: the handler for {:?} refused the member at {:?}",
+                        recorded.schema,
+                        id
+                    );
+                }
+                settled
             })
             .is_ok_and(|complete| complete)
     }

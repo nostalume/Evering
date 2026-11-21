@@ -13,9 +13,12 @@
 //! covers the other direction would still pass. What the two arms must keep agreeing on is not here:
 //! `recv(3)`'s count and the order the three handles are removed in are the same positional contract the
 //! Unix leg implements, and so are the promised slot's text and the fact that both legs read it only
-//! after the kernel has answered, which is what keeps one arm's child able to meet the other arm's
-//! parent. And `Grant` staying single-use is what stops one address admitting two children. Nothing in
-//! this file has been executed on the host writing it.
+//! after the kernel has answered and the offer has been taken, which is what keeps one arm's child able
+//! to meet the other arm's parent. And `Grant` staying single-use is what stops one address admitting
+//! two children. The offer leg has since been executed on this host, by `tests/seat_announcement.rs`:
+//! bind, admit, send, the introducer check in `receive`, and the promised slot read both ways. So has the
+//! return leg the next paragraph is about, by `tests/arrival_receipt_windows.rs`: the report, the client
+//! named again at the read, and the comparison against the promise.
 //!
 //! The return leg is the receipt, and it is where the two arms' mechanisms differ most even though their
 //! answers are the same shape. Here the credit is the instance: `accept` proved whose client connected,
@@ -23,8 +26,10 @@
 //! the process the caller is about to reap rather than to the pipe. On Unix the credit is a field the
 //! kernel writes beside the message. An arrival that means one thing means the other only if this leg's
 //! `nMaxInstances` stays `1` — widened, the report would come from whichever client connected, and the
-//! pid here would name a process that never held the promise. Which is another way of saying none of the
-//! three checks below has been run on a Windows host.
+//! pid here would name a process that never held the promise. Widening it is an obligation no case here
+//! touches, and what the leg has now shown on this host is the half the paragraph rests on: after the
+//! client has been reaped the instance still names it, and what it wrote is still queued, so a caller that
+//! takes the exit first and reads the arrival second is answering for one process either way.
 
 use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 
@@ -119,6 +124,10 @@ impl Handoff {
     ///
     /// The client end is kept, because it is the way back: the [`Receipt`] this returns is how the
     /// admitted process tells its parent which member it became.
+    ///
+    /// The announced slot is read after the offer for the same reason the Unix leg reads it there: a
+    /// message-mode pipe write has no queue to outlive its reader, so a child that declined before
+    /// taking the handover would report itself to its parent as a broken pipe.
     pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
         let address = env::var(RENDEZVOUS)
             .map_err(|_| refused("no evering rendezvous was granted to this process"))?;
@@ -135,9 +144,9 @@ impl Handoff {
                 "the peer behind the granted rendezvous is not the process that granted it",
             ));
         }
-        let promised = announced_seat()?;
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
+        let promised = announced_seat()?;
         Ok((
             Peer::introduced(server),
             ReceivedResources {
@@ -210,9 +219,10 @@ impl Receipt {
 
 /// The member slot this process was told to arrive at, if its parent announced one.
 ///
-/// Read after the introducer check, like the Unix leg reads it after its attestation: the environment
-/// is this process's own, so nothing here can be forged into a handover, and a slot announced in a
-/// shape no slot has is refused as the malformed text it is rather than arrived at.
+/// Read after the introducer check and after the offer, like the Unix leg reads it after its
+/// attestation: the environment is this process's own, so nothing here can be forged into a handover,
+/// and a slot announced in a shape no slot has is refused as the malformed text it is rather than
+/// arrived at.
 fn announced_seat() -> io::Result<Option<Introduction>> {
     let announced = match env::var(SEAT) {
         Ok(announced) => announced,

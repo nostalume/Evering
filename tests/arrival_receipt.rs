@@ -25,9 +25,11 @@
 //! on a rendezvous lets go of the command as soon as it has spawned it. What dropping it does not buy is what
 //! the third case measures: on a datagram rendezvous the host reports a peer's departure as nothing at all, so
 //! a child that met, said nothing and exited is answered by the caller's own deadline — the same answer a slow
-//! child gets — and it is the reap, not the socket, that tells a parent its child is gone. Nothing on the
-//! Windows leg has been run on that host; its credit is the pipe instance rather than a field beside the
-//! message, and it reads the same three answers in the same order.
+//! child gets — and it is the reap, not the socket, that tells a parent its child is gone. The Windows leg
+//! is `tests/arrival_receipt_windows.rs`: the same three answers, in the same order, off the pipe instance
+//! rather than a field beside the message, and with the difference this paragraph is about — a departed
+//! child is something that instance can report, so the bound is left to the silence of a client that has
+//! not gone anywhere.
 
 use std::{
     env,

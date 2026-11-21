@@ -13,8 +13,12 @@
 //! straight into an `OwnedHandle` — has nothing left to compare. Its partner is the framing, shared with
 //! the Unix leg through `crate::process`'s magic and the same eight-byte header, and the message must
 //! stay inside `MAX_MESSAGE` or `WriteFile` reports a short write; the header's size also bounds what a
-//! `Listener` can admit at all, since one instance serves one child. None of this has been executed on
-//! the host writing it.
+//! `Listener` can admit at all, since one instance serves one child. The two messages and the two pid
+//! questions have since been crossed by real processes on this host — the offer by
+//! `tests/seat_announcement.rs`, whose child reads a session out of numbers written into its own handle
+//! table, and the receipt by `tests/arrival_receipt_windows.rs`. What has not is `rollback`, which runs
+//! only after a duplication or a write that failed, and the `MAX_MESSAGE` ceiling that turns a longer
+//! offer into a short write.
 //!
 //! The receipt crosses the same instance in the other direction, one message with the arrival tag and no
 //! handles in it, and what it asks for is the read `accept` already does under a deadline — with a sleep
@@ -295,14 +299,16 @@ impl Socket {
     /// `CreateFileW` while this one waits for a process that has a session to join first, and a caller's
     /// budget of seconds should not cost a core.
     ///
-    /// The two faces of a peer that will not report are not as clean as they look, and no run here has shown
-    /// them: `ERROR_BROKEN_PIPE` says the client is gone, while a client that closes without writing leaves
-    /// the peek reporting an empty pipe, so that one is reached through `TimedOut` instead. The Unix leg was
-    /// measured and answers the same way for the rendezvous this crate actually makes — a datagram pair
-    /// reports a peer's departure as nothing at all, so a caller waiting on a silent child is stopped by its
-    /// own bound there too, and `UnexpectedEof` on that leg belongs to a seqpacket endpoint. Both faces here
-    /// mean nobody is going to report, and a caller that has to tell them apart has to bound the wait for its
-    /// own reasons anyway.
+    /// The two faces of a peer that will not report answer apart, and `tests/arrival_receipt_windows.rs`
+    /// runs both on this host. A client that met, wrote nothing and exited fails the peek with
+    /// `ERROR_BROKEN_PIPE`, which is the instance itself saying nobody is left to report; a client that
+    /// connected and has not gone leaves the peek reporting an empty pipe, and only the caller's bound ends
+    /// that read. A message written before the client left is *not* lost with it — the peek reports it and
+    /// the read takes it — so this leg's `UnexpectedEof` means nobody reported rather than nobody could
+    /// still be reached. The Unix leg has no equivalent of the first face: a datagram pair reports a
+    /// peer's departure as nothing at all, so both of its silences end at the deadline, and
+    /// `UnexpectedEof` on that leg belongs to a seqpacket endpoint. Both faces here mean nobody is going to
+    /// report, and a caller that gives up for its own reasons is stopped by the bound only in the second.
     pub fn arrival(&self, deadline: Instant) -> io::Result<Introduction> {
         loop {
             let mut queued = 0;

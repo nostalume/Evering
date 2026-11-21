@@ -149,12 +149,18 @@ impl Handoff {
     /// The granted end is kept rather than closed, because it is the one channel back to the process
     /// that admitted this one: the [`Receipt`] it returns is how this process says which member it
     /// became.
+    ///
+    /// The announced slot is read after the offer, not before it. A child that finds its announcement
+    /// unreadable still declines a meeting it was admitted to, and the handover its parent is already
+    /// writing has to reach somebody: a reader that left first makes the parent's
+    /// [`Handoff::send`](Handoff::send) answer with whatever the host reports for a vanished peer, which
+    /// is the one outcome the two arms cannot be allowed to disagree about.
     pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
         let socket = granted_socket()?;
         let peer = attested(&socket)?;
-        let promised = announced_seat()?;
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
+        let promised = announced_seat()?;
         Ok((
             peer,
             ReceivedResources {
@@ -297,10 +303,10 @@ fn granted_socket() -> io::Result<Socket> {
 
 /// The member slot this process was told to arrive at, if its parent announced one.
 ///
-/// Read after the attestation, not before it: the environment is this process's own, so the kernel has
-/// nothing to say about it and nothing here can be forged into a handover. A slot that is announced in
-/// a shape no slot has is refused as the malformed text it is rather than arriving at whatever the
-/// readable half of it names.
+/// Read after the attestation and after the offer, never before either: the environment is this
+/// process's own, so the kernel has nothing to say about it and nothing here can be forged into a
+/// handover. A slot that is announced in a shape no slot has is refused as the malformed text it is
+/// rather than arriving at whatever the readable half of it names.
 fn announced_seat() -> io::Result<Option<Introduction>> {
     let announced = match env::var(SEAT) {
         Ok(announced) => announced,

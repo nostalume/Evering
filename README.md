@@ -47,7 +47,10 @@ also checks with default features disabled.
 
 The core declares `const` traits and `const` impls, so it needs a nightly
 toolchain. `rust-toolchain.toml` pins the version the checks below were run on
-(`nightly-2026-11-17`); `rustup` installs it on first use.
+(`nightly-2026-11-17`); `rustup` installs it on first use. The pin is a
+`minimal` profile, so rustfmt and Clippy come with a second command
+(`rustup component add rustfmt clippy`), and a check run through `+nightly` or
+`+stable` instead of the pin compares a different compiler build than CI does.
 
 ## Practical example
 
