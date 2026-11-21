@@ -338,7 +338,7 @@ impl<T: Layout + core::fmt::Debug> core::fmt::Debug for RcHeader<T> {
     }
 }
 
-const impl<T: Layout> Deref for RcHeader<T> {
+impl<T: Layout> Deref for RcHeader<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

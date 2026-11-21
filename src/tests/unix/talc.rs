@@ -126,7 +126,8 @@ fn alloc_content() {
     const NUM: usize = 500;
 
     const NAME: &str = "alloc";
-    const SIZE: usize = (BYTES_SIZE * ALLOC_NUM).max(10000).next_power_of_two();
+    const SIZE: usize =
+        crate::numeric::max_usize(BYTES_SIZE * ALLOC_NUM, 10000).next_power_of_two();
 
     let a = mock_alloc(NAME, SIZE);
 

@@ -45,12 +45,12 @@ The default feature is `std`. `map`, `notify`, and `process` are composable;
 `os` selects all native adapters. `tokio` adds process-local waiting. The core
 also checks with default features disabled.
 
-The core declares `const` traits and `const` impls, so it needs a nightly
-toolchain. `rust-toolchain.toml` pins the version the checks below were run on
-(`nightly-2026-11-17`); `rustup` installs it on first use. The pin is a
-`minimal` profile, so rustfmt and Clippy come with a second command
-(`rustup component add rustfmt clippy`), and a check run through `+nightly` or
-`+stable` instead of the pin compares a different compiler build than CI does.
+The crate builds on stable Rust; nothing in it needs a nightly compiler.
+`rust-toolchain.toml` pins the version the checks below were run on
+(`1.100.0`, with rustfmt and Clippy) and `rustup` installs it on first use. A
+check run through `+nightly` or another stable version compares a different
+compiler build than CI does. That pin is not a minimum supported version: no
+lower bound has been measured, so `Cargo.toml` states none.
 
 ## Practical example
 

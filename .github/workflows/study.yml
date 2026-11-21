@@ -25,7 +25,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-11-17
+          toolchain: 1.100.0
       - run: cargo test --features benchmark --test ipc-study
 
   smoke:
@@ -36,7 +36,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-11-17
+          toolchain: 1.100.0
       - run: mkdir -p artifacts
       - run: cargo bench --bench ipc --features benchmark -- smoke "${{ inputs.family }}" "artifacts/${{ inputs.family }}.jsonl"
       - run: cargo bench --bench ipc --features benchmark -- analyze "artifacts/${{ inputs.family }}.jsonl" > "artifacts/${{ inputs.family }}.md"

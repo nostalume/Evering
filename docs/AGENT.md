@@ -19,13 +19,15 @@ conceptually separable.
 
 ## Technology
 
-- Rust 2024 edition on nightly Rust.
+- Rust 2024 edition on stable Rust, pinned to `1.100.0` in `rust-toolchain.toml`.
 - One root `evering` crate with default standard-library support and a verified
   `no_std + alloc` configuration when default features are disabled.
 - Additive `map`, `notify`, and `process` adapter capabilities, with `os` as
   their native-platform sugar; Tokio and tracing remain orthogonal features.
-- Const generics and nightly const-trait features for statically specialized
-  layouts and policies.
+- Const generics and const-evaluated schema-key arithmetic for statically
+  specialized layouts and policies. No `const` traits: the type-level identity is
+  a `const fn` over values, and the shape rule takes a pointer's metadata, so it
+  is evaluated where the metadata exists.
 - Atomic bounded queues and a generational Directory for shared coordination.
 - A synchronized Talc GeneralHeap isolated to Directory layouts and explicit
   PBox values; it is not recoverable transfer storage.

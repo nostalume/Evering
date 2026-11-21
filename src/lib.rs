@@ -39,8 +39,6 @@
 //! layer narrative lives in `docs/architecture.md`; a header does not retell it.
 
 #![cfg_attr(not(any(test, feature = "std")), no_std)]
-#![feature(const_trait_impl, const_convert, const_cmp)]
-#![feature(slice_ptr_get)]
 
 extern crate alloc;
 
@@ -128,7 +126,17 @@ mod numeric {
         }
     }
 
-    pub const trait Alignable {
+    // `usize::min` and `usize::max` are only conditionally const, so a `const fn` cannot reach them
+    // without a feature gate; these do the same thing and are const on their own.
+    pub const fn min_usize(a: usize, b: usize) -> usize {
+        if a < b { a } else { b }
+    }
+
+    pub const fn max_usize(a: usize, b: usize) -> usize {
+        if a > b { a } else { b }
+    }
+
+    pub trait Alignable {
         fn align_down(self, align: Self) -> Self;
         fn align_down_of<T>(self) -> Self;
         fn align_up(self, align: Self) -> Self;
@@ -137,7 +145,7 @@ mod numeric {
 
     macro_rules! align {
         ($ty:ty) => {
-            const impl Alignable for $ty {
+            impl Alignable for $ty {
                 #[inline(always)]
                 fn align_down(self, align: Self) -> Self {
                     debug_assert!(align.is_power_of_two());

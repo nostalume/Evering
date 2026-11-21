@@ -20,6 +20,7 @@ use crate::numeric::bit::{bit_check, bit_flip};
 use crate::numeric::{
     AlignPtr, Alignable,
     bit::{WORD_ALIGN, WORD_BITS, Word},
+    max_usize, min_usize,
 };
 use crate::schema::{LayoutContext, LayoutInfo, SchemaKey, SharedSchema, schema_id};
 use crate::{header, mem};
@@ -549,7 +550,7 @@ impl Chunk {
     }
 
     #[inline]
-    const fn chunk_size(size: usize) -> usize {
+    fn chunk_size(size: usize) -> usize {
         if size <= FreeNode::SIZE {
             Chunk::MIN_CHUNK_SIZE
         } else {
@@ -669,12 +670,16 @@ impl Geometry {
             return Err(GeometryError::TooSmall);
         }
         let max_log = extent.ilog2() as usize;
-        let exponential_log = max_log.min(Self::DEFAULT_EXPONENTIAL_LOG);
-        let max_bins = (Self::budget(extent) * 8 / Self::CANONICAL_BIN_BITS)
-            .min(WORD_BITS * WORD_BITS)
-            .min(u16::MAX as usize);
+        let exponential_log = min_usize(max_log, Self::DEFAULT_EXPONENTIAL_LOG);
+        let max_bins = min_usize(
+            min_usize(
+                Self::budget(extent) * 8 / Self::CANONICAL_BIN_BITS,
+                WORD_BITS * WORD_BITS,
+            ),
+            u16::MAX as usize,
+        );
 
-        let mut linear_shift = Self::MIN_LINEAR_SHIFT.min(exponential_log);
+        let mut linear_shift = min_usize(Self::MIN_LINEAR_SHIFT, exponential_log);
         while linear_shift <= exponential_log {
             let linear = 1usize << (exponential_log - linear_shift);
             let mut divisions_log = Self::MAX_DIVISIONS_LOG;
@@ -752,7 +757,7 @@ impl Geometry {
 
     #[inline(always)]
     pub const fn bin(self, size: usize) -> usize {
-        let size = size.max(1);
+        let size = max_usize(size, 1);
         let exponential_start = 1usize << self.exponential_log;
         let index = if size < exponential_start {
             (size - 1) >> self.linear_shift
@@ -764,7 +769,7 @@ impl Geometry {
                 + (octave - self.exponential_log as usize) * self.divisions()
                 + division
         };
-        index.min(self.bin_count() - 1)
+        min_usize(index, self.bin_count() - 1)
     }
 
     #[inline(always)]
@@ -933,7 +938,7 @@ impl TalcMeta {
 
         let (word_idx, bit_idx) = Self::word_bit_idx(idx);
 
-        let avails = self.avails(geometry).as_mut_ptr().cast::<Word>();
+        let avails = self.avails(geometry).as_ptr().cast::<Word>();
         let word = unsafe { &mut *avails.add(word_idx) };
         let was_empty = *word == 0;
         debug_assert!(bit_check(*word, bit_idx) != should_be);
@@ -962,7 +967,7 @@ impl TalcMeta {
     #[inline]
     const fn bin_by_idx(&self, idx: usize, geometry: Geometry) -> *mut FreeNodeLink {
         debug_assert!(idx < geometry.bin_count());
-        unsafe { self.bins(geometry).as_mut_ptr().add(idx) }
+        unsafe { self.bins(geometry).as_ptr().cast::<FreeNodeLink>().add(idx) }
     }
 
     #[inline]
@@ -1262,14 +1267,14 @@ impl TalckMeta {
 pub type Header = header::RcHeader<TalckMeta>;
 pub type MapHeader = mem::Mapped<Header>;
 
-pub struct Talc<H: const Deref<Target = Header>> {
+pub struct Talc<H: Deref<Target = Header>> {
     pub header: H,
     owner: u8,
     geometry: Geometry,
 }
 
-unsafe impl<H: const Deref<Target = Header> + Send> Send for Talc<H> {}
-unsafe impl<H: const Deref<Target = Header> + Sync> Sync for Talc<H> {}
+unsafe impl<H: Deref<Target = Header> + Send> Send for Talc<H> {}
+unsafe impl<H: Deref<Target = Header> + Sync> Sync for Talc<H> {}
 
 pub type RefTalc<'a> = Talc<&'a Header>;
 pub type MapTalc = Talc<MapHeader>;
@@ -1301,7 +1306,7 @@ fn crash_after(point: usize) {
     }
 }
 
-impl<H: const Deref<Target = Header>> Talc<H> {
+impl<H: Deref<Target = Header>> Talc<H> {
     #[inline]
     pub(crate) fn base_ptr(&self) -> *const u8 {
         self.header.talc_ref().base_ptr()
@@ -1648,7 +1653,7 @@ impl Config {
             "[Talc]: [forward][size] where must [forward] < [bound]"
         );
         Self {
-            size: self.size.min(bound) - self.forward,
+            size: min_usize(self.size, bound) - self.forward,
             ..self
         }
     }
@@ -1690,9 +1695,9 @@ unsafe impl header::Layout for TalckMeta {
     }
 }
 
-impl<H: const Deref<Target = Header>> Talc<H> {
+impl<H: Deref<Target = Header>> Talc<H> {
     #[inline]
-    pub const fn header(&self) -> &Header {
+    pub fn header(&self) -> &Header {
         &self.header
     }
 }

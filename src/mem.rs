@@ -767,7 +767,7 @@ impl<T: AdmitLayout> Drop for Mapped<T> {
     }
 }
 
-const impl<T: AdmitLayout> Deref for Mapped<T> {
+impl<T: AdmitLayout> Deref for Mapped<T> {
     type Target = T;
 
     fn deref(&self) -> &Self::Target {

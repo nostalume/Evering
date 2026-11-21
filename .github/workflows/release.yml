@@ -20,7 +20,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@master
         with:
-          toolchain: nightly-2026-11-17
+          toolchain: 1.100.0
           components: rustfmt, clippy, rust-docs
       - name: Match candidate metadata
         shell: bash

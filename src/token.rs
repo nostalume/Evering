@@ -104,7 +104,7 @@ impl<H: Repr> Token<H> {
 }
 
 /// Mechanical metadata for sized values and slices.
-pub const trait Shape: crate::seal::Sealed {
+pub trait Shape: crate::seal::Sealed {
     fn metadata(ptr: *const Self) -> Metadata;
     fn layout(metadata: Metadata) -> Result<Layout, MetadataError>;
 }

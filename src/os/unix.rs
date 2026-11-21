@@ -192,7 +192,7 @@ impl<F: AsFd> UnixFd<F> {
     }
 }
 
-const impl From<Access> for ProtFlags {
+impl From<Access> for ProtFlags {
     fn from(value: Access) -> Self {
         let mut prot = ProtFlags::empty();
         if value.contains(Access::READ) {
