@@ -11,8 +11,9 @@
 use core::{convert::Infallible, future::Future};
 
 use crate::{
-    AdoptError, Block, PoolRef, ReceiveError, Received, Rx, Transfer, TransferStaged, TrySendError,
-    Tx, channel::PublishError, channel::TransferReserved, layout::Repr, token::Shape,
+    AdoptError, Block, Decline, DeclineCause, PoolRef, ReceiveError, Received, Rx, Transfer,
+    TransferStaged, Tx, channel::PublishError, channel::TransferReserved, layout::Repr,
+    token::Shape,
 };
 
 const LOCAL_RETRY_LIMIT: usize = 32;
@@ -403,7 +404,7 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
         &self,
         tx: &Tx<H>,
         value: Transfer<'p, H>,
-    ) -> Result<Committed<(), N::Error>, TrySendError<Transfer<'p, H>>> {
+    ) -> Result<Committed<(), N::Error>, Decline<Transfer<'p, H>>> {
         tx.try_send(value).map(|()| committed(self.notify, ()))
     }
 
@@ -422,16 +423,14 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
         tx: &Tx<H>,
         value: Transfer<'p, H>,
         deferred: &mut Deferred<'_, N>,
-    ) -> Result<(), TrySendError<Transfer<'p, H>>> {
+    ) -> Result<(), Decline<Transfer<'p, H>>> {
         match tx.reserve() {
+            // The block authority moved to another member before publication, so the transfer is gone
+            // with it: a decline with nothing to hand back.
             Ok(reserved) => deferred
                 .publish(reserved.stage(value))
-                .map_err(|_| TrySendError::Authority)?,
-            Err(crate::SendReserveError::Full) => return Err(TrySendError::Full(value)),
-            Err(crate::SendReserveError::Busy) => return Err(TrySendError::Busy(value)),
-            Err(crate::SendReserveError::Closed) => {
-                return Err(TrySendError::Disconnected(value));
-            }
+                .map_err(|_| DeclineCause::Contested { member: None }.declined())?,
+            Err(cause) => return Err(cause.decline(value)),
         }
         Ok(())
     }
@@ -475,9 +474,12 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
                         notify: self.notify,
                     });
                 }
-                Err(crate::SendReserveError::Closed) => return Err(ProgressError::Closed),
-                Err(crate::SendReserveError::Busy) => Contention::Busy,
-                Err(crate::SendReserveError::Full) => Contention::Full,
+                Err(cause) => match cause {
+                    DeclineCause::Sealed => return Err(ProgressError::Closed),
+                    DeclineCause::NoRoom { .. } => Contention::Full,
+                    DeclineCause::Contested { .. } => Contention::Busy,
+                    cause => unreachable!("a channel reservation never answers {cause:?}"),
+                },
             };
             let further = patience.step(reason).await.map_err(ProgressError::Wait)?;
             if !further {

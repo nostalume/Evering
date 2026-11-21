@@ -9,7 +9,7 @@ use std::{
 };
 
 use evering::{
-    BlockRange, PoolId, PoolReserveError, Session,
+    BlockRange, DeclineCause, PoolId, RoomWait, Session,
     layout::RegionId,
     mapping::{Access, Peer, Request},
     notify::Notify,
@@ -249,11 +249,14 @@ fn exited_process_pool_ownership_is_reclaimed() {
         let pool = session.open_pool(id).unwrap();
         let pool_ref = pool.as_ref();
         let mut blocks = Vec::new();
+        let shortage = DeclineCause::NoRoom {
+            waits: RoomWait::Release,
+        };
         loop {
             match pool_ref.put(7_u64) {
                 Ok(block) => blocks.push(block),
-                Err(PoolReserveError::Unavailable(7)) => break,
-                Err(error) => panic!("unexpected Pool error: {error:?}"),
+                Err(decline) if decline.cause == shortage => break,
+                Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
             }
         }
         std::fs::write(
@@ -310,10 +313,19 @@ fn exited_process_pool_ownership_is_reclaimed() {
     );
     assert!(fields.next().unwrap().parse::<usize>().unwrap() >= 64);
     assert_eq!(pool.id(), PoolId::new(REGION, slab, entry, generation));
-    assert!(matches!(
-        pool.as_ref().put(9_u64),
-        Err(PoolReserveError::Unavailable(9))
-    ));
+    let decline = pool
+        .as_ref()
+        .put(9_u64)
+        .err()
+        .expect("a dead member's claims still occupy the pool");
+    assert_eq!(
+        decline.cause,
+        DeclineCause::NoRoom {
+            waits: RoomWait::Release
+        },
+        "the pool is full of one member's claims, so what frees room is a release"
+    );
+    assert_eq!(decline.value, Some(9_u64), "the declined block comes back");
     let recovery = unsafe { session.assume_dead(peer) }.unwrap();
     assert!(recovery.reap().is_ok());
     assert_eq!(*pool.as_ref().put(11_u64).unwrap(), 11);

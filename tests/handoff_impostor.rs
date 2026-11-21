@@ -4,7 +4,9 @@
 //! falsify it, as a prediction read from the code. The red run of that prediction is recorded in the
 //! plan; these are the two assertions P0 is accepted on: a process that holds the announcement but
 //! not the descriptor is refused before it is handed anything, and the process the grant was admitted
-//! to can name the peer it met.
+//! to can name the peer it met. Both now also hold the introducer's policy word — one written by the
+//! claimant for itself, one written by the grant that admitted the other child — because a value that
+//! can complete an unattested handover has to be shown to open no door and to close none.
 
 use std::{
     env,
@@ -18,12 +20,15 @@ use std::{
 
 use evering::{
     mapping::Access,
-    os::{Handoff, shared},
+    os::{Handoff, Provenance, shared},
     process::{Bootstrap, Supervisor},
 };
 
 /// The environment key a grant announces its rendezvous under, as frozen in `src/process.rs`.
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
+/// The introducer's policy key, which the claimant below writes for itself and the honest grant below
+/// writes through `Grant::trusting_introduction`.
+const TRUST: &str = "EVERING_TRUST";
 const ROLE: &str = "EVERING_IMPOSTOR_ROLE";
 const ATTACKER: &str = "attacker";
 const CHILD: &str = "child";
@@ -87,10 +92,18 @@ fn child() -> i32 {
         .expect("a numeric peer id");
     match Handoff::receive() {
         Ok((peer, resources, _report)) => {
-            if peer.pid() != expected {
+            if peer.pid() != Some(expected) {
                 eprintln!(
-                    "attested peer {} is not the expected {expected}",
+                    "attested peer {:?} is not the expected {expected}",
                     peer.pid()
+                );
+                return FAILED;
+            }
+            if peer.provenance() != Provenance::Attested {
+                eprintln!(
+                    "a rendezvous that answered is reported as {:?}, and the grant's policy cannot \
+                     make a kernel's silence out of an answer",
+                    peer.provenance()
                 );
                 return FAILED;
             }
@@ -149,12 +162,12 @@ fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
     let bootstrap = Bootstrap::new(b"selected-protocol-id").unwrap();
 
     let mut command = Command::new(env::current_exe().unwrap());
-    command.env(RENDEZVOUS, ANNOUNCED);
+    command.env(RENDEZVOUS, ANNOUNCED).env(TRUST, "1");
     let mut attacker = spawn(&mut command, ATTACKER);
 
     let mut command = Command::new(env::current_exe().unwrap());
     command.env(EXPECT_PEER, std::process::id().to_string());
-    grant.admit(&mut command).unwrap();
+    grant.trusting_introduction().admit(&mut command).unwrap();
     let mut granted = spawn(&mut command, CHILD);
 
     handoff
@@ -171,12 +184,14 @@ fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
     assert_eq!(
         wait_for(&mut attacker, "the claimant", Duration::from_secs(10)),
         REFUSED,
-        "holding the announcement is not holding the rendezvous, so nothing was due to be handed over"
+        "holding the announcement is not holding the rendezvous, and a policy word written by the \
+         claimant itself releases a handover no introducer ever announced"
     );
     assert_eq!(
         wait_for(&mut granted, "the granted child", Duration::from_secs(10)),
         ATTESTED,
-        "the process the grant was admitted to meets and names its introducer"
+        "the process the grant was admitted to meets and names its introducer, and the policy that \
+         grant carried leaves an answer the kernel gave exactly as it was"
     );
 }
 

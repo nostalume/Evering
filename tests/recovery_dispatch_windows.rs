@@ -48,7 +48,7 @@ use std::{
 };
 
 use evering::{
-    Block, ChannelId as Id, PoolId, PoolRef, Port, Rx, Session, TrySendError,
+    Block, ChannelId as Id, Decline, DeclineCause, PoolId, PoolRef, Port, Rx, Session,
     layout::{self, RegionId, Repr, SchemaId, SchemaKey, Shape, SharedSchema},
     mapping::{Access, Peer, Request},
     os::windows::{
@@ -153,17 +153,21 @@ fn parse_channel(bytes: &[u8]) -> Port<AlternateEnvelope> {
 
 fn send_bounded<T>(
     mut value: T,
-    mut send: impl FnMut(T) -> Result<(), TrySendError<T>>,
+    mut send: impl FnMut(T) -> Result<(), Decline<T>>,
     deadline: Instant,
 ) {
     loop {
-        match send(value) {
+        let Decline { cause, value: sent } = match send(value) {
             Ok(()) => return,
-            Err(TrySendError::Full(returned) | TrySendError::Busy(returned)) => value = returned,
-            Err(TrySendError::Disconnected(_returned)) => {
-                panic!("peer disconnected while sending")
+            Err(decline) => decline,
+        };
+        match (cause, sent) {
+            (DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. }, Some(returned)) => {
+                value = returned
             }
-            Err(TrySendError::Authority) => panic!("block lost its Pool authority"),
+            (DeclineCause::Sealed, _) => panic!("peer disconnected while sending"),
+            (_, None) => panic!("block lost its Pool authority: {cause:?}"),
+            (cause, Some(_)) => panic!("send refused for {cause:?}"),
         }
         assert!(Instant::now() < deadline, "queue remained full");
         thread::yield_now();

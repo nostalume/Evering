@@ -248,10 +248,47 @@ pub(crate) enum Error {
     Full,
     Stale,
     Admission(crate::mem::ProjectionError),
-    Heap(crate::talc::MutationError),
+    Heap(crate::mem::DeclineCause),
     RolledBack,
     InUse,
     Close(crate::header::CloseError),
+}
+
+impl Error {
+    /// This refusal in the words the crate declines with, when it is one, plus what it needs to say.
+    ///
+    /// A create or an adopt answers in this vocabulary at the drop of a hat — room that another
+    /// member's act frees, a transaction word somebody holds, a region that has to grow. Two of those
+    /// need help crossing: a heap refusal is already a cause and only moves, while a mapping that
+    /// cannot be written has to be told as `ReadOnly { region }`, because which region's mapping turned
+    /// the admission's write away is the part a projection loses.
+    ///
+    /// What is left is the directory's own answer about a record — a stale id, a transaction recovery
+    /// rolled back, words in the region that disagree with each other. Those are not shortages or races
+    /// anybody here waits out, so they stay in this type and the caller keeps its own arm for them.
+    pub(crate) fn declined(&self, region: RegionId) -> Option<crate::mem::DeclineCause> {
+        use crate::mem::{DeclineCause, ProjectionError, RoomWait};
+        match self {
+            Self::Admission(ProjectionError::ReadOnly) => Some(DeclineCause::ReadOnly { region }),
+            Self::Admission(ProjectionError::ArithmeticOverflow) => Some(DeclineCause::Overflow),
+            Self::Admission(ProjectionError::Admission(error)) => match error {
+                crate::header::AdmitError::Contention => {
+                    Some(DeclineCause::Contested { member: None })
+                }
+                crate::header::AdmitError::Closed => Some(DeclineCause::Sealed),
+                _ => None,
+            },
+            Self::Busy(member) => Some(DeclineCause::Contested {
+                member: Some(*member),
+            }),
+            Self::Full => Some(DeclineCause::NoRoom {
+                waits: RoomWait::Grow,
+            }),
+            Self::Heap(cause) => Some(*cause),
+            Self::Stale | Self::RolledBack | Self::InUse | Self::Close(_) => None,
+            Self::Admission(ProjectionError::OutOfBounds | ProjectionError::Misaligned) => None,
+        }
+    }
 }
 
 /// Which refusal stopped an open, named at the point that refused.

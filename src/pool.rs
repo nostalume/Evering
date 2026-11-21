@@ -5,8 +5,9 @@
 //! and never writes.
 //!
 //! A reserve answer rests on the control word alone, so a word naming a state no participant writes
-//! has to return as `Corrupted` rather than `Unavailable`: read as exhaustion, one scribbled word
-//! makes a healthy region look permanently full, and every retry after it is then correct.
+//! has to return as `Corrupted` rather than `NoRoom { waits: Release }`: read as a shortage, one
+//! scribbled word makes a healthy region look permanently full, and every retry after it is then
+//! correct.
 use alloc::{boxed::Box, vec::Vec};
 use core::{
     alloc::Layout as AllocLayout,
@@ -20,7 +21,7 @@ use core::{
 use crate::{
     dir,
     header::{self, RcHeader, RecoveryContext},
-    mem::Mapped,
+    mem::{Decline, DeclineCause, Mapped, RoomWait},
     msg::Repr,
     schema::{LayoutContext, LayoutInfo, SchemaKey, SharedSchema, schema_id},
     talc::MapTalc,
@@ -139,7 +140,12 @@ pub enum PoolCreateError {
     /// The widest class needs more alignment than every mapping of a region is guaranteed to have,
     /// so a peer could not reproduce the block addresses this Pool hands out.
     ClassTooWide(usize),
-    Storage,
+    /// The shared heap, this mapping, or a member's transaction refused the pool's own record, in the
+    /// cause that refusal gave.
+    Declined(crate::mem::DeclineCause),
+    /// The directory refused the record for its own reason — a stale id, a publish recovery undid, words
+    /// in the region that disagree — which no release, retry or wider region answers.
+    Record,
 }
 
 impl core::fmt::Display for PoolCreateError {
@@ -159,66 +165,25 @@ impl core::fmt::Display for PoolCreateError {
                 f,
                 "a {bytes}-byte class needs an alignment a peer's mapping is not guaranteed to reproduce"
             ),
-            Self::Storage => f.write_str("the shared heap refused the pool's own record"),
+            Self::Declined(cause) => {
+                write!(f, "the pool's own record was refused: {cause}")
+            }
+            Self::Record => f.write_str(
+                "the directory refused the pool's own record for a reason no retry answers",
+            ),
         }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for PoolCreateError {}
-
-/// Why a Pool declined to hand out a block, with the value that could not be stored.
-///
-/// The arm says whether waiting would help. `Unavailable` is a capacity fact: every slot that could
-/// hold the request is claimed, so a release somewhere else can make the next attempt succeed.
-/// `BlockTooLarge` is a geometry fact, and only a smaller request changes the answer. `Corrupted`
-/// is neither of those: a slot's authority word names a state no participant writes, so no release
-/// changes it and the region needs adjudication before any Pool answer can be trusted.
-#[derive(PartialEq, Eq)]
-pub enum ReserveError<T> {
-    /// The request needs a block larger than the Pool's largest class.
-    BlockTooLarge(T),
-    /// Every slot that could hold the request is claimed.
-    Unavailable(T),
-    /// A slot's authority word is not one any participant could have written. Reported only when
-    /// nothing else was claimable, so one damaged word cannot hide a free slot behind it.
-    Corrupted(T),
-}
-
-// `T` is the caller's value coming back, not part of why the Pool said no, so the reporting layer
-// stays free of it: a derived `Debug` would make the refusal printable and boxable only for payloads
-// that happen to implement `Debug`, which is a condition on the value rather than on the answer.
-// `PutError` omits its value field for the same reason; naming the payload's type keeps this one
-// readable without borrowing the payload's rendering.
-impl<T> core::fmt::Debug for ReserveError<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let arm = match self {
-            Self::BlockTooLarge(_) => "BlockTooLarge",
-            Self::Unavailable(_) => "Unavailable",
-            Self::Corrupted(_) => "Corrupted",
-        };
-        write!(f, "{arm}({})", core::any::type_name::<T>())
+impl std::error::Error for PoolCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Declined(cause) => Some(cause),
+            _ => None,
+        }
     }
 }
-
-impl<T> core::fmt::Display for ReserveError<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::BlockTooLarge(_) => {
-                "the request needs a block wider than the pool's largest class"
-            }
-            Self::Unavailable(_) => {
-                "every block that could hold the request is claimed, so a release elsewhere frees one"
-            }
-            Self::Corrupted(_) => {
-                "a slot's authority word names a state no participant writes, so the region needs adjudication"
-            }
-        })
-    }
-}
-
-#[cfg(feature = "std")]
-impl<T> std::error::Error for ReserveError<T> {}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AdoptError {
@@ -591,7 +556,7 @@ unsafe impl Send for PoolRef<'_> {}
 unsafe impl Sync for PoolRef<'_> {}
 
 impl<'p> PoolRef<'p> {
-    pub fn reserve<T: Repr>(&self) -> Result<Vacant<'p, T>, ReserveError<()>> {
+    pub fn reserve<T: Repr>(&self) -> Result<Vacant<'p, T>, DeclineCause> {
         let () = T::VALID;
         self.claim(AllocLayout::new::<T>())
             .map(|(allocation, pointer)| Vacant {
@@ -601,16 +566,14 @@ impl<'p> PoolRef<'p> {
             })
     }
 
-    pub fn put<T: Repr>(&self, value: T) -> Result<Block<'p, T>, ReserveError<T>> {
+    pub fn put<T: Repr>(&self, value: T) -> Result<Block<'p, T>, Decline<T>> {
         match self.reserve() {
             Ok(vacant) => Ok(vacant.write(value)),
-            Err(ReserveError::BlockTooLarge(())) => Err(ReserveError::BlockTooLarge(value)),
-            Err(ReserveError::Unavailable(())) => Err(ReserveError::Unavailable(value)),
-            Err(ReserveError::Corrupted(())) => Err(ReserveError::Corrupted(value)),
+            Err(cause) => Err(cause.decline(value)),
         }
     }
 
-    pub fn copy<T: Repr + Copy>(&self, values: &[T]) -> Result<Block<'p, [T]>, ReserveError<()>> {
+    pub fn copy<T: Repr + Copy>(&self, values: &[T]) -> Result<Block<'p, [T]>, DeclineCause> {
         self.init(values.len(), |index| values[index])
     }
 
@@ -618,7 +581,7 @@ impl<'p> PoolRef<'p> {
         &self,
         len: usize,
         mut make: impl FnMut(usize) -> T,
-    ) -> Result<Block<'p, [T]>, ReserveError<()>> {
+    ) -> Result<Block<'p, [T]>, DeclineCause> {
         let mut vacant = self.reserve_slice::<T>(len)?;
         for (index, value) in vacant.as_uninit().iter_mut().enumerate() {
             value.write(make(index));
@@ -626,19 +589,16 @@ impl<'p> PoolRef<'p> {
         Ok(unsafe { vacant.assume_all_init() })
     }
 
-    pub fn reserve_bytes(
-        &self,
-        len: usize,
-    ) -> Result<Vacant<'p, [MaybeUninit<u8>]>, ReserveError<()>> {
+    pub fn reserve_bytes(&self, len: usize) -> Result<Vacant<'p, [MaybeUninit<u8>]>, DeclineCause> {
         self.reserve_slice(len)
     }
 
     fn reserve_slice<T: Repr>(
         &self,
         len: usize,
-    ) -> Result<Vacant<'p, [MaybeUninit<T>]>, ReserveError<()>> {
+    ) -> Result<Vacant<'p, [MaybeUninit<T>]>, DeclineCause> {
         let () = T::VALID;
-        let layout = AllocLayout::array::<T>(len).map_err(|_| ReserveError::BlockTooLarge(()))?;
+        let layout = AllocLayout::array::<T>(len).map_err(|_| DeclineCause::Overflow)?;
         self.claim(layout).map(|(allocation, pointer)| Vacant {
             allocation,
             pointer: NonNull::slice_from_raw_parts(pointer.cast(), len),
@@ -646,10 +606,7 @@ impl<'p> PoolRef<'p> {
         })
     }
 
-    fn claim(
-        &self,
-        layout: AllocLayout,
-    ) -> Result<(Allocation<'p>, NonNull<u8>), ReserveError<()>> {
+    fn claim(&self, layout: AllocLayout) -> Result<(Allocation<'p>, NonNull<u8>), DeclineCause> {
         if layout.size() == 0 {
             return Ok((
                 Allocation::empty(*self),
@@ -661,7 +618,7 @@ impl<'p> PoolRef<'p> {
             .max(layout.align())
             .checked_next_power_of_two()
         else {
-            return Err(ReserveError::BlockTooLarge(()));
+            return Err(DeclineCause::TooWide);
         };
         let first = self.geometry.classes[0].bytes;
         // The class index is a difference of logarithms, which is exact only because `build` requires
@@ -669,7 +626,7 @@ impl<'p> PoolRef<'p> {
         // `bytes`-aligned.
         let preferred = needed.max(first).ilog2() - first.ilog2();
         if preferred as usize >= self.geometry.classes.len() {
-            return Err(ReserveError::BlockTooLarge(()));
+            return Err(DeclineCause::TooWide);
         }
         let mut corrupted = false;
         for (index, class) in self
@@ -720,10 +677,12 @@ impl<'p> PoolRef<'p> {
         }
         if corrupted {
             // A damaged word is not a shortage, and the difference is the whole point: a caller that
-            // hears `Unavailable` retries forever, and the region stays damaged either way.
-            return Err(ReserveError::Corrupted(()));
+            // hears `NoRoom` retries forever, and the region stays damaged either way.
+            return Err(DeclineCause::Corrupted);
         }
-        Err(ReserveError::Unavailable(()))
+        Err(DeclineCause::NoRoom {
+            waits: RoomWait::Release,
+        })
     }
 
     /// Writes an authority word naming a state no participant writes into one slot of `class`.
@@ -1043,10 +1002,14 @@ pub(crate) fn create(
 ) -> Result<Pool, PoolCreateError> {
     let geometry = Geometry::create(bound, range)?;
     let config = geometry.config();
+    let region = heap.region_id();
     directory
         .create_in::<Storage>(heap, config, config.layout)
         .map(|(id, mapped)| Pool::new(PoolId(id), mapped, geometry))
-        .map_err(|_| PoolCreateError::Storage)
+        .map_err(|error| match error.declined(region) {
+            Some(cause) => PoolCreateError::Declined(cause),
+            None => PoolCreateError::Record,
+        })
 }
 
 pub(crate) fn open(

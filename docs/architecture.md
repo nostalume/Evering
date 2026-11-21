@@ -71,9 +71,13 @@ types and errors do not survive admission.
 
 The root has a caller-chosen region identity. Creation may initialize an empty
 root. Expected-identity and discovery modes only attach, so a peer cannot turn
-missing shared state into a new region by accident. Admission currently needs
-writable access because attachment updates participant state; read-only
-observation would require a separate lifetime model.
+missing shared state into a new region by accident. Joining a region needs
+writable access, because attachment updates participant state. Reading one does
+not: `Observer::discover` maps the same extent under the same access
+declaration, reports which region the published root claims, and answers what a
+published record says it is. It holds no member slot and takes no part in the
+roster, so what it can name is the shape of what is published rather than a
+position in the exchange, and it is not a consumer of anybody's queue.
 
 Every layout begins with a fixed record followed by layout-owned information
 and body bytes. The record binds state, magic, recursive schema, region,
@@ -280,7 +284,8 @@ are additive capabilities. Bare-metal or restricted systems may supply their
 own mapping and polling environment without a fake signal implementation.
 
 Evering remains experimental. It does not promise cross-build ABI stability,
-read-only participation, automatic replay of application work, universal
+membership that cannot write, automatic replay of application work, universal
 allocator recovery, or performance superiority outside a registered and
-matched study condition. These limits are protocol boundaries, not hidden
-fallback behavior.
+matched study condition. Read-only observation is offered, and it is offered as
+a standpoint outside the roster rather than as a kind of membership. These
+limits are protocol boundaries, not hidden fallback behavior.

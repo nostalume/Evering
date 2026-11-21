@@ -7,7 +7,7 @@ use std::{
 };
 
 use evering::{
-    Encoded, ReceiveError, Session, TrySendError,
+    DeclineCause, Encoded, ReceiveError, RoomWait, Session,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
     mapping::{Access, Request},
     notify::{
@@ -465,7 +465,17 @@ async fn a_refused_publish_keeps_the_transfer_and_owes_nothing() {
             &mut batch,
         )
         .expect_err("a full Queue must not consume the batch");
-    assert!(matches!(rejected, TrySendError::Full(_)));
+    assert_eq!(
+        rejected.cause,
+        DeclineCause::NoRoom {
+            waits: RoomWait::Drain
+        },
+        "a full Queue must say a receiver has to claim before the transfer fits"
+    );
+    assert!(
+        rejected.value.is_some(),
+        "the refused transfer must come back to the sender"
+    );
 
     batch.deliver().unwrap();
     assert_eq!(bell.0.get(), 1, "only the committed publish is owed a ring");

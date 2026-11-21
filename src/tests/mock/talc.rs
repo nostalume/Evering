@@ -46,11 +46,11 @@ fn mock_alloc(bk: &mut [u8], start: usize, size: usize) -> MockAlloc {
     bk.shared(start, size).try_into().unwrap()
 }
 
-fn mock_session(bk: &mut [u8], start: usize, size: usize) -> MockSession {
+pub(super) fn mock_session(bk: &mut [u8], start: usize, size: usize) -> MockSession {
     Session::from(MockBackend(bk).shared(start, size)).unwrap()
 }
 
-fn peer_session(bk: &mut [u8]) -> MockSession {
+pub(super) fn peer_session(bk: &mut [u8]) -> MockSession {
     Session::from(MockBackend(bk).map(
         0,
         MAX_ADDR,
@@ -350,11 +350,16 @@ fn pool_reclaims_only_the_dead_participant_owner() {
     first.abandon_heap_for_test(peer.slot());
     let recovery = unsafe { first.assume_dead(peer) }.unwrap();
     assert!(recovery.reap().is_ok());
-    let error = match first.heap().put(1_u8) {
-        Err(error) => error.error,
+    let decline = match first.heap().put(1_u8) {
+        Err(decline) => decline,
         Ok(_) => panic!("poison admitted heap mutation"),
     };
-    assert_eq!(error, crate::talc::MutationError::Poisoned);
+    assert_eq!(decline.cause, crate::mem::DeclineCause::Poisoned);
+    assert_eq!(
+        decline.value,
+        Some(1_u8),
+        "a poisoned heap never took the value"
+    );
     assert_eq!(*first_pool.as_ref().put(19_u64).unwrap(), 19);
 }
 
@@ -532,14 +537,12 @@ fn pool_errors_keep_values_and_concurrent_claims_unique() {
     let range = crate::BlockRange::new(64, 64).unwrap();
     let pool = session.create_pool(32 * 1024, Some(range)).unwrap();
     let pool = pool.as_ref();
-    let error = match pool.put(OverAligned(7)) {
-        Err(error) => error,
+    let decline = match pool.put(OverAligned(7)) {
+        Err(decline) => decline,
         Ok(_) => panic!("over-aligned value entered a 64-byte class"),
     };
-    assert_eq!(
-        error,
-        crate::PoolReserveError::BlockTooLarge(OverAligned(7))
-    );
+    assert_eq!(decline.cause, crate::mem::DeclineCause::TooWide);
+    assert_eq!(decline.value, Some(OverAligned(7)));
 
     std::thread::scope(|scope| {
         let block = pool.put(5_u64).unwrap();
@@ -554,11 +557,15 @@ fn pool_errors_keep_values_and_concurrent_claims_unique() {
     });
 
     let mut blocks = Vec::new();
+    let shortage = crate::mem::DeclineCause::NoRoom {
+        waits: crate::mem::RoomWait::Release,
+    };
     loop {
         match pool.put(99_u64) {
             Ok(block) => blocks.push(block),
-            Err(error) => {
-                assert_eq!(error, crate::PoolReserveError::Unavailable(99));
+            Err(decline) => {
+                assert_eq!(decline.cause, shortage);
+                assert_eq!(decline.value, Some(99_u64));
                 break;
             }
         }
@@ -569,9 +576,9 @@ fn pool_errors_keep_values_and_concurrent_claims_unique() {
     assert_eq!(*pool.put(101_u64).unwrap(), 101);
 }
 
-/// A free-list word naming a state nobody writes is damage, not capacity. Reported as
-/// `Unavailable` it becomes a shortage that never clears: the caller's only remedy, waiting for a
-/// release, cannot change the word.
+/// A free-list word naming a state nobody writes is damage, not capacity. Reported as a shortage it
+/// becomes a wait that never clears: the caller's only remedy, waiting for a release, cannot change
+/// the word.
 #[test]
 fn a_damaged_authority_word_is_not_reported_as_a_full_pool() {
     let mut pt = [0; MAX_ADDR];
@@ -588,12 +595,13 @@ fn a_damaged_authority_word_is_not_reported_as_a_full_pool() {
     loop {
         match pool.put(1_u64) {
             Ok(block) => held.push(block),
-            Err(error) => {
+            Err(decline) => {
                 assert_eq!(
-                    error,
-                    crate::PoolReserveError::Corrupted(1),
+                    decline.cause,
+                    crate::mem::DeclineCause::Corrupted,
                     "an unusable slot is not a shortage, and waiting for a release cannot fix it"
                 );
+                assert_eq!(decline.value, Some(1_u64));
                 break;
             }
         }
@@ -861,10 +869,16 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
         "the still-held refusal said {failed}"
     );
     drop(failed);
-    assert!(matches!(
-        send.try_send(pool.as_ref().put(23_u64).unwrap().transfer(())),
-        Err(crate::TrySendError::Full(_) | crate::TrySendError::Busy(_))
-    ));
+    let refused = send
+        .try_send(pool.as_ref().put(23_u64).unwrap().transfer(()))
+        .expect_err("the stale send still occupies its slot");
+    assert!(
+        matches!(
+            refused.cause,
+            crate::DeclineCause::NoRoom { .. } | crate::DeclineCause::Contested { .. }
+        ),
+        "the queue refused for room or contention, not {refused:?}"
+    );
 }
 
 #[test]
@@ -1004,17 +1018,23 @@ fn heap_preserves_exact_allocation_failures() {
     let session = mock_session(&mut pt, 0, MAX_ADDR);
     let heap = session.heap();
     let overflow = match heap.init::<u64>(usize::MAX, |_| 0) {
-        Err(error) => error,
+        Err(cause) => cause,
         Ok(_) => panic!("overflow was admitted"),
     };
-    assert_eq!(overflow, crate::talc::MutationError::LayoutOverflow);
+    assert_eq!(overflow, crate::mem::DeclineCause::Overflow);
 
     let mut records = Vec::new();
+    let grown = crate::mem::DeclineCause::NoRoom {
+        waits: crate::mem::RoomWait::Grow,
+    };
     loop {
         match heap.copy(&[0_u8; 1024]) {
             Ok(record) => records.push(record),
-            Err(error) => {
-                assert_eq!(error, crate::talc::MutationError::Exhausted);
+            Err(cause) => {
+                assert_eq!(
+                    cause, grown,
+                    "the heap is out of extent, not out of arithmetic"
+                );
                 break;
             }
         }

@@ -15,7 +15,7 @@ use core::ops::Deref;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use core::{marker::PhantomData, ptr::NonNull};
 
-use crate::mem::Build;
+use crate::mem::{Build, DeclineCause, RoomWait};
 use crate::numeric::bit::{bit_check, bit_flip};
 use crate::numeric::{
     AlignPtr, Alignable,
@@ -1312,7 +1312,7 @@ impl<H: Deref<Target = Header>> Talc<H> {
         self.header.talc_ref().base_ptr()
     }
 
-    pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, MutationError> {
+    pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, DeclineCause> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
         crash_after(ALLOC_CLAIMED);
@@ -1330,7 +1330,7 @@ impl<H: Deref<Target = Header>> Talc<H> {
         &self,
         ptr: NonNull<u8>,
         layout: alloc::Layout,
-    ) -> Result<(), MutationError> {
+    ) -> Result<(), DeclineCause> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
         crash_after(FREE_CLAIMED);
@@ -1371,7 +1371,7 @@ impl<H: Deref<Target = Header>> Talc<H> {
         Ok(())
     }
 
-    pub(crate) fn begin_mutation(&self) -> Result<Mutation<'_>, MutationError> {
+    pub(crate) fn begin_mutation(&self) -> Result<Mutation<'_>, DeclineCause> {
         Mutation::claim(&self.header.mutation, self.owner)
     }
 
@@ -1379,13 +1379,16 @@ impl<H: Deref<Target = Header>> Talc<H> {
         &self,
         mutation: &Mutation<'_>,
         layout: alloc::Layout,
-    ) -> Result<Meta, MutationError> {
+    ) -> Result<Meta, DeclineCause> {
         debug_assert!(mutation.owns(&self.header.mutation, self.owner));
         unsafe {
             (&mut *self.header.talc_ptr())
                 .allocate(layout, self.geometry)
                 .map(|ptr| Meta::from_ptr(ptr.as_ptr(), self.base_ptr(), layout.size()))
-                .map_err(|_| MutationError::Exhausted)
+                // Nothing in the region can hold the request until the region itself grows.
+                .map_err(|_| DeclineCause::NoRoom {
+                    waits: RoomWait::Grow,
+                })
         }
     }
 
@@ -1431,7 +1434,7 @@ fn poison_mutation(state: &AtomicUsize, owner: u8) -> bool {
 }
 
 impl<'a> Mutation<'a> {
-    fn claim(state: &'a AtomicUsize, owner: u8) -> Result<Self, MutationError> {
+    fn claim(state: &'a AtomicUsize, owner: u8) -> Result<Self, DeclineCause> {
         match state.compare_exchange(
             MUTATION_CLEAN,
             owner_word(owner),
@@ -1443,8 +1446,14 @@ impl<'a> Mutation<'a> {
                 owner,
                 committed: false,
             }),
-            Err(MUTATION_POISONED) => Err(MutationError::Poisoned),
-            Err(owner) => Err(MutationError::Busy((owner - 1) as u8)),
+            // A poisoned word is what a writer that died mid-change leaves, and recovery, not the next
+            // attempt, is what settles it.
+            Err(MUTATION_POISONED) => Err(DeclineCause::Poisoned),
+            // The word this claim lost still names its holder, so the contention is attributable: a
+            // peer worth waiting for is a different diagnosis from a race that leaves no name behind.
+            Err(holder) => Err(DeclineCause::Contested {
+                member: Some((holder - 1) as u8),
+            }),
         }
     }
 }
@@ -1454,14 +1463,6 @@ const MUTATION_POISONED: usize = usize::MAX;
 
 const fn owner_word(slot: u8) -> usize {
     slot as usize + 1
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum MutationError {
-    Busy(u8),
-    Poisoned,
-    Exhausted,
-    LayoutOverflow,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1498,19 +1499,19 @@ impl Drop for Mutation<'_> {
 
 #[cfg(test)]
 mod mutation_tests {
-    use super::{
-        MUTATION_CLEAN, MUTATION_POISONED, Mutation, MutationError, owner_word, poison_mutation,
-    };
+    use super::{MUTATION_CLEAN, MUTATION_POISONED, Mutation, owner_word, poison_mutation};
+    use crate::mem::DeclineCause;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
     fn live_contention_is_one_bounded_attempt_and_reports_owner() {
         let state = AtomicUsize::new(MUTATION_CLEAN);
         let held = Mutation::claim(&state, 2).unwrap();
-        assert!(matches!(
-            Mutation::claim(&state, 1),
-            Err(MutationError::Busy(2))
-        ));
+        assert_eq!(
+            Mutation::claim(&state, 1).err(),
+            Some(DeclineCause::Contested { member: Some(2) }),
+            "the word is claimed, so this claim is declined"
+        );
         held.commit();
         assert_eq!(state.load(Ordering::Acquire), MUTATION_CLEAN);
     }
@@ -1521,10 +1522,11 @@ mod mutation_tests {
         assert!(!poison_mutation(&state, 2));
         assert!(poison_mutation(&state, 3));
         assert_eq!(state.load(Ordering::Acquire), MUTATION_POISONED);
-        assert!(matches!(
-            Mutation::claim(&state, 0),
-            Err(MutationError::Poisoned)
-        ));
+        assert_eq!(
+            Mutation::claim(&state, 0).err(),
+            Some(DeclineCause::Poisoned),
+            "a poisoned word names a state no owner holds"
+        );
     }
 }
 

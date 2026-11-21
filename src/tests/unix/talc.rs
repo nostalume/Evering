@@ -224,15 +224,19 @@ fn a_roster_full_of_promises_refuses_a_join_differently_than_a_roster_full_of_me
     );
     assert!(matches!(
         parent.reserve_seat(),
-        Err(crate::SeatError::Promised)
+        Err(crate::SeatError::NoRoom {
+            waits: crate::RoomWait::Promise
+        })
     ));
 
     // Nothing has arrived in any of them, so the region holds no member for anybody to reap: the
-    // refusal is one a caller can wait out, which is the answer `ParticipantExhausted` does not give.
+    // refusal is one a caller can wait out, which is the answer `RoomWait::Grow` does not give.
     let refused = crate::Session::open(peer(), request(), REGION);
     assert!(matches!(
         refused,
-        Err(crate::SessionError::ParticipantReserved)
+        Err(crate::SessionError::NoRoom {
+            waits: crate::RoomWait::Promise
+        })
     ));
 
     let freed = seats.pop().expect("a promise to give back");

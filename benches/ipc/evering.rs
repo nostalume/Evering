@@ -6,7 +6,8 @@ use std::{
 };
 
 use evering::{
-    BlockRange, Channel, ChannelId as Id, Pool, PoolId, Port, Rx, Session, TrySendError, Tx,
+    BlockRange, Channel, ChannelId as Id, Decline, DeclineCause, Pool, PoolId, Port, Rx, Session,
+    Tx,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
     mapping::{Access, Request, Source},
     notify::{Contention, Patience, ProgressError, Signals, Wait as _},
@@ -178,7 +179,7 @@ impl Local<'_> {
         self,
         endpoint: &Tx<H>,
         value: evering::Transfer<'p, H>,
-    ) -> Result<Result<(), String>, TrySendError<evering::Transfer<'p, H>>> {
+    ) -> Result<Result<(), String>, Decline<evering::Transfer<'p, H>>> {
         if WAIT {
             Signals::new(self.ring, self.wait)
                 .try_send(endpoint, value)
@@ -445,22 +446,28 @@ where
                 self.send_spins = SPINS;
                 Ok(Step::Committed(notified))
             }
-            Err(TrySendError::Full(value)) => {
-                self.staged = Some(value);
-                path.send_full().map_err(|_| "path count overflow")?;
-                Ok(Step::Pending)
-            }
-            Err(TrySendError::Busy(value)) => {
-                self.staged = Some(value);
-                self.contended = true;
-                path.send_busy().map_err(|_| "path count overflow")?;
-                Ok(Step::Pending)
-            }
-            Err(TrySendError::Disconnected(value)) => {
-                self.staged = Some(value);
-                Err("disconnected".into())
-            }
-            Err(TrySendError::Authority) => Err("lost block authority".into()),
+            Err(Decline { cause, value }) => match (cause, value) {
+                (DeclineCause::NoRoom { .. }, Some(value)) => {
+                    self.staged = Some(value);
+                    path.send_full().map_err(|_| "path count overflow")?;
+                    Ok(Step::Pending)
+                }
+                (DeclineCause::Contested { .. }, Some(value)) => {
+                    self.staged = Some(value);
+                    self.contended = true;
+                    path.send_busy().map_err(|_| "path count overflow")?;
+                    Ok(Step::Pending)
+                }
+                (DeclineCause::Sealed, Some(value)) => {
+                    self.staged = Some(value);
+                    Err("disconnected".into())
+                }
+                (_, None) => Err("lost block authority".into()),
+                (cause, Some(value)) => {
+                    self.staged = Some(value);
+                    Err(format!("send refused for {cause:?}"))
+                }
+            },
         }
     }
 

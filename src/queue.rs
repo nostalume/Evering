@@ -14,6 +14,8 @@ use core::sync::atomic::{self, AtomicU8, AtomicU16, AtomicUsize, Ordering};
 
 use crossbeam_utils::CachePadded;
 
+use crate::mem::{DeclineCause, RoomWait};
+
 /// One shared queue position. Control owns bytes before either cursor moves.
 #[repr(C)]
 pub struct Slot<T> {
@@ -87,17 +89,41 @@ const fn canonical(control: u16) -> bool {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum ReserveError {
-    Full,
-    Busy,
-    Closed,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ClaimError {
     Empty,
     Busy,
     Closed,
+}
+
+/// The participant whose owner bits a lost compare-exchange met, when the word still names one.
+///
+/// Only the two in-flight bases name a holder: `PRODUCER` and `CONSUMER` are written with the winner's
+/// slot, while `AVAILABLE` answers "an item is waiting to be claimed" and `EMPTY` answers nothing.
+const fn holder(control: u16) -> Option<u8> {
+    if !matches!(base(control), PRODUCER | CONSUMER) {
+        return None;
+    }
+    let source = (control & SOURCE_MASK) >> SOURCE_SHIFT;
+    if source == 0 {
+        None
+    } else {
+        Some(source as u8 - 1)
+    }
+}
+
+/// The three ways a reservation says no, in the words the whole crate declines with. A reservation is
+/// where a send still holds its value, so the answer carries a cause and the caller adds the value.
+const SEALED: DeclineCause = DeclineCause::Sealed;
+const FULL: DeclineCause = DeclineCause::NoRoom {
+    waits: RoomWait::Drain,
+};
+const BUSY: DeclineCause = DeclineCause::Contested { member: None };
+
+/// A lost claim over a slot's control word, attributed to whoever's word won it if the word says.
+const fn contested(control: u16) -> DeclineCause {
+    DeclineCause::Contested {
+        member: holder(control),
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -243,13 +269,13 @@ pub trait Queue {
     fn owner(&self) -> u8;
     fn one_lap(&self) -> usize;
 
-    fn reserve(&self) -> Result<Reserved<'_, Self::Item>, ReserveError>
+    fn reserve(&self) -> Result<Reserved<'_, Self::Item>, DeclineCause>
     where
         Self: Sized,
     {
         let header = self.header();
         if self.state() != 0 {
-            return Err(ReserveError::Closed);
+            return Err(SEALED);
         }
         let tail = header.tail.load(Ordering::Relaxed);
         let one_lap = self.one_lap();
@@ -261,31 +287,27 @@ pub trait Queue {
             lap.wrapping_add(one_lap)
         };
         let slot = &self.buf()[index];
-        if slot
-            .control
-            .compare_exchange(
-                EMPTY,
-                owned(PRODUCER, false, self.owner()),
-                Ordering::AcqRel,
-                Ordering::Acquire,
-            )
-            .is_err()
-        {
+        if let Err(control) = slot.control.compare_exchange(
+            EMPTY,
+            owned(PRODUCER, false, self.owner()),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
             atomic::fence(Ordering::SeqCst);
             return if header.head.load(Ordering::Relaxed).wrapping_add(one_lap) == tail {
-                Err(ReserveError::Full)
+                Err(FULL)
             } else {
-                Err(ReserveError::Busy)
+                Err(contested(control))
             };
         }
         if slot.turn.load(Ordering::Acquire) != tail || header.tail.load(Ordering::Relaxed) != tail
         {
             slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Busy);
+            return Err(BUSY);
         }
         if self.state() != 0 {
             slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Closed);
+            return Err(SEALED);
         }
         if header
             .tail
@@ -293,7 +315,7 @@ pub trait Queue {
             .is_err()
         {
             slot.control.store(EMPTY, Ordering::Release);
-            return Err(ReserveError::Busy);
+            return Err(BUSY);
         }
         Ok(Reserved { slot, done: false })
     }
@@ -536,46 +558,6 @@ pub(crate) fn repair_slot_with<T>(
     Repair::Recovered
 }
 
-pub enum TrySendError<T> {
-    /// Shared capacity is exhausted; receiver progress is required.
-    Full(T),
-    /// Local retry may progress without receiver action.
-    Busy(T),
-    Disconnected(T),
-    /// A Pool-backed transfer lost its block authority before publication. Nothing was sent, and
-    /// the value cannot be returned because its block now belongs to another participant.
-    Authority,
-}
-
-// The value is the caller's own, returned rather than diagnosed, so `Debug` is written by hand: a
-// derived one would tie the refusal's report to whether the payload happens to be printable.
-impl<T> core::fmt::Debug for TrySendError<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        match self {
-            Self::Full(_) => write!(f, "Full({})", core::any::type_name::<T>()),
-            Self::Busy(_) => write!(f, "Busy({})", core::any::type_name::<T>()),
-            Self::Disconnected(_) => write!(f, "Disconnected({})", core::any::type_name::<T>()),
-            Self::Authority => f.write_str("Authority"),
-        }
-    }
-}
-
-impl<T> core::fmt::Display for TrySendError<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::Full(_) => "the queue is full, so a receiver has to claim before this value fits",
-            Self::Busy(_) => "another send is mid-flight, so a local retry may take it",
-            Self::Disconnected(_) => "the receiving end is closed, so the value came back unsent",
-            Self::Authority => {
-                "the transfer lost its block before publication, and nothing was sent"
-            }
-        })
-    }
-}
-
-#[cfg(feature = "std")]
-impl<T> std::error::Error for TrySendError<T> {}
-
 #[derive(Debug)]
 #[cfg(test)]
 pub enum TryRecvError {
@@ -602,20 +584,18 @@ pub struct QueueRx<T: Queue> {
 
 #[cfg(test)]
 impl<T: Queue> QueueTx<T> {
-    pub fn reserve(&self) -> Result<Reserved<'_, T::Item>, ReserveError> {
+    pub fn reserve(&self) -> Result<Reserved<'_, T::Item>, DeclineCause> {
         self.tx.reserve()
     }
 
     #[inline(always)]
-    pub fn try_send(&self, value: T::Item) -> Result<(), TrySendError<T::Item>> {
+    pub fn try_send(&self, value: T::Item) -> Result<(), crate::mem::Decline<T::Item>> {
         match self.reserve() {
             Ok(reserved) => {
                 reserved.stage(value).publish();
                 Ok(())
             }
-            Err(ReserveError::Closed) => Err(TrySendError::Disconnected(value)),
-            Err(ReserveError::Full) => Err(TrySendError::Full(value)),
-            Err(ReserveError::Busy) => Err(TrySendError::Busy(value)),
+            Err(cause) => Err(cause.decline(value)),
         }
     }
 }
@@ -641,8 +621,9 @@ impl<T: Queue> QueueRx<T> {
 #[cfg(test)]
 mod ownership_tests {
     use super::{
-        AVAILABLE, BASE_MASK, COMPLETE, CONSUMER, EMPTY, Header, PRODUCER, Queue, QueueRx, QueueTx,
-        REAPER_MASK, RESERVED_MASK, SOURCE_MASK, Slot, TryRecvError, TrySendError, canonical,
+        AVAILABLE, BASE_MASK, COMPLETE, CONSUMER, DeclineCause, EMPTY, Header, PRODUCER, Queue,
+        QueueRx, QueueTx, REAPER_MASK, RESERVED_MASK, RoomWait, SOURCE_MASK, Slot, TryRecvError,
+        canonical,
     };
     use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 
@@ -696,10 +677,11 @@ mod ownership_tests {
         let queue = TestQueue::new(1);
         (&queue).close_send();
         let sender = QueueTx { tx: &queue };
-        match sender.try_send(41) {
-            Err(TrySendError::Disconnected(value)) => assert_eq!(value, 41),
-            _ => panic!("closed queue must return the submitted item"),
-        }
+        let decline = sender
+            .try_send(41)
+            .expect_err("a closed queue refuses the item it was handed");
+        assert_eq!(decline.cause, DeclineCause::Sealed);
+        assert_eq!(decline.value, Some(41));
         let receiver = QueueRx { rx: &queue };
         assert!(matches!(
             receiver.try_recv(),
@@ -715,10 +697,13 @@ mod ownership_tests {
             .store(super::owned(PRODUCER, false, 0), Ordering::Release);
         let sender = QueueTx { tx: &queue };
 
-        match sender.try_send(43) {
-            Err(TrySendError::Busy(value)) => assert_eq!(value, 43),
-            other => panic!("local producer contention must stay Busy: {other:?}"),
-        }
+        // The word this send lost to names member 0, and the answer says so: contention that can be
+        // attributed is a different diagnosis from a race that cannot.
+        let decline = sender
+            .try_send(43)
+            .expect_err("local producer contention is declined, not accepted");
+        assert_eq!(decline.cause, DeclineCause::Contested { member: Some(0) });
+        assert_eq!(decline.value, Some(43));
     }
 
     #[test]
@@ -772,10 +757,16 @@ mod ownership_tests {
             for index in 0..3 {
                 sender.try_send(lap * 3 + index).unwrap();
             }
-            assert!(matches!(
-                sender.try_send(u64::MAX),
-                Err(TrySendError::Full(u64::MAX))
-            ));
+            let full = sender
+                .try_send(u64::MAX)
+                .expect_err("a queue with a lap of unclaimed items is full");
+            assert_eq!(
+                full.cause,
+                DeclineCause::NoRoom {
+                    waits: RoomWait::Drain
+                }
+            );
+            assert_eq!(full.value, Some(u64::MAX));
             for index in 0..3 {
                 assert_eq!(receiver.try_recv().unwrap(), lap * 3 + index);
             }
@@ -808,19 +799,23 @@ mod ownership_tests {
                                 accepted.fetch_add(1, Ordering::Relaxed);
                                 break;
                             }
-                            Err(TrySendError::Busy(returned)) => {
-                                pending = returned;
-                                std::thread::yield_now();
-                            }
-                            Err(TrySendError::Disconnected(returned))
-                            | Err(TrySendError::Full(returned)) => {
-                                assert_eq!(returned, value);
-                                rejected.fetch_add(1, Ordering::Relaxed);
-                                break;
-                            }
-                            Err(TrySendError::Authority) => {
-                                unreachable!("a queue of values carries no Pool authority")
-                            }
+                            Err(decline) => match (decline.cause, decline.value) {
+                                (DeclineCause::Contested { .. }, Some(returned)) => {
+                                    pending = returned;
+                                    std::thread::yield_now();
+                                }
+                                (
+                                    DeclineCause::Sealed | DeclineCause::NoRoom { .. },
+                                    Some(returned),
+                                ) => {
+                                    assert_eq!(returned, value);
+                                    rejected.fetch_add(1, Ordering::Relaxed);
+                                    break;
+                                }
+                                (cause, _) => {
+                                    unreachable!("a queue of values never answers {cause:?}")
+                                }
+                            },
                         }
                     }
                 });

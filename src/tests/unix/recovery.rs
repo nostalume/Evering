@@ -454,11 +454,12 @@ fn standalone_talc_crash_windows_poison_mutation_without_blocking_reap() {
             ALLOC_CLAIMED | ALLOC_MUTATED | FREE_CLAIMED | FREE_MUTATED
         ) {
             assert!(result.is_ok(), "poisoned heap must not block reap");
-            let error = match session.heap().put(8_u64) {
-                Err(error) => error,
+            let decline = match session.heap().put(8_u64) {
+                Err(decline) => decline,
                 Ok(_) => panic!("poison admitted a new mutation"),
             };
-            assert_eq!(error.error, crate::talc::MutationError::Poisoned);
+            assert_eq!(decline.cause, crate::mem::DeclineCause::Poisoned);
+            assert_eq!(decline.value, Some(8_u64), "poison took nothing");
             assert_eq!(*record, 7, "pre-existing data remains readable");
             continue;
         }

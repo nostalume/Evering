@@ -3,6 +3,10 @@
 //! The Windows half of P0. The parent already refused a client that was not the child it retained
 //! (`Listener::accept`), so what was missing was the other direction: a process that reaches a pipe
 //! it does not own is now told so by the kernel before it is allowed to read the offer.
+//!
+//! The two runs also carry the introducer's policy word, one forged by the claimant and one written by
+//! the grant that admitted the other child: `Provenance` makes an unattested peer a value, and these are
+//! the assertions that it did not become a value a claimant could ask for.
 
 use std::{
     env,
@@ -13,12 +17,15 @@ use std::{
 
 use evering::{
     mapping::Access,
-    os::{Handoff, Shared, event, windows::process::Listener},
+    os::{Handoff, Provenance, Shared, event, windows::process::Listener},
     process::{Bootstrap, Supervisor},
 };
 
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
 const INTRODUCER: &str = "EVERING_INTRODUCER";
+/// The introducer's policy key: the claimant writes it for itself, and the honest grant below writes it
+/// through `Grant::trusting_introduction`.
+const TRUST: &str = "EVERING_TRUST";
 const ROLE: &str = "EVERING_IMPOSTOR_ROLE";
 const ATTACKER: &str = "attacker";
 const CHILD: &str = "child";
@@ -32,12 +39,14 @@ const FAILED: i32 = 1;
 
 /// Connects to a real listener the test process owns, and claims to have been introduced by someone
 /// else. The kernel's answer for the pipe server is what refuses the claim, so the attacker asks for
-/// that refusal by its reason: any other error would mean it never reached a pipe at all.
+/// that refusal by its reason: any other error would mean it never reached a pipe at all. It writes the
+/// introducer's policy key for itself on the way, which is the word that must not answer for a pipe the
+/// introducer never opened.
 fn attacker() -> i32 {
     match Handoff::receive() {
         Ok((peer, _, _report)) => {
             eprintln!(
-                "attacker was handed the meeting by a peer at {}",
+                "attacker was handed the meeting by a peer at {:?}",
                 peer.pid()
             );
             HIJACKED
@@ -64,10 +73,18 @@ fn child() -> i32 {
         .expect("a numeric peer id");
     match Handoff::receive() {
         Ok((peer, resources, _report)) => {
-            if peer.pid() != expected {
+            if peer.pid() != Some(expected) {
                 eprintln!(
-                    "attested peer {} is not the expected {expected}",
+                    "attested peer {:?} is not the expected {expected}",
                     peer.pid()
+                );
+                return FAILED;
+            }
+            if peer.provenance() != Provenance::Attested {
+                eprintln!(
+                    "a rendezvous that answered is reported as {:?}, and the grant's policy cannot \
+                     make a kernel's silence out of an answer",
+                    peer.provenance()
                 );
                 return FAILED;
             }
@@ -119,7 +136,7 @@ fn a_granted_process_names_the_peer_it_met() {
 
     let mut command = Command::new(env::current_exe().unwrap());
     command.env(EXPECT_PEER, std::process::id().to_string());
-    grant.admit(&mut command).unwrap();
+    grant.trusting_introduction().admit(&mut command).unwrap();
     let mut granted = spawn(&mut command, CHILD, TEST);
 
     handoff
@@ -136,7 +153,8 @@ fn a_granted_process_names_the_peer_it_met() {
     assert_eq!(
         wait_for(&mut granted, "the granted child", Duration::from_secs(20)),
         ATTESTED,
-        "the process the grant was admitted to meets and names its introducer"
+        "the process the grant was admitted to meets and names its introducer, and the policy that \
+         grant carried leaves an answer the kernel gave exactly as it was"
     );
 }
 
@@ -151,12 +169,14 @@ fn a_process_that_claims_another_introducer_is_refused_before_it_reads() {
     let mut command = Command::new(env::current_exe().unwrap());
     command
         .env(RENDEZVOUS, listener.name())
-        .env(INTRODUCER, "1");
+        .env(INTRODUCER, "1")
+        .env(TRUST, "1");
     let mut attacker = spawn(&mut command, ATTACKER, TEST);
 
     assert_eq!(
         wait_for(&mut attacker, "the claimant", Duration::from_secs(20)),
         REFUSED,
-        "a pipe owned by this process is not the introducer the claimant named"
+        "a pipe owned by this process is not the introducer the claimant named, and a policy the \
+         claimant wrote for itself cannot vouch for a pipe no introducer opened"
     );
 }

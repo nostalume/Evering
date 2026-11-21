@@ -24,15 +24,12 @@ use crate::{
     boxed::PBox,
     dir,
     header::{Claim, Member, RecoveryHandler},
-    mem::{self, Build, MemOps, Peer, Request, Source},
+    mem::{self, Build, Decline, DeclineCause, MemOps, Peer, Request, Source},
     msg::Repr,
     pool, talc,
 };
 
-use crate::{
-    schema::RegionId,
-    talc::{Geometry, MutationError},
-};
+use crate::{schema::RegionId, talc::Geometry};
 
 #[derive(Clone)]
 pub struct GeneralHeap<'a> {
@@ -40,7 +37,7 @@ pub struct GeneralHeap<'a> {
 }
 
 impl<'a> GeneralHeap<'a> {
-    fn uninit<T>(&self) -> Result<PBox<'a, MaybeUninit<T>>, MutationError> {
+    fn uninit<T>(&self) -> Result<PBox<'a, MaybeUninit<T>>, DeclineCause> {
         let alloc = self.alloc.clone();
         if size_of::<T>() == 0 {
             Ok(PBox::null(alloc))
@@ -51,10 +48,10 @@ impl<'a> GeneralHeap<'a> {
         }
     }
 
-    fn uninit_slice<T>(&self, len: usize) -> Result<PBox<'a, [MaybeUninit<T>]>, MutationError> {
+    fn uninit_slice<T>(&self, len: usize) -> Result<PBox<'a, [MaybeUninit<T>]>, DeclineCause> {
         let alloc = self.alloc.clone();
-        let layout =
-            Layout::array::<MaybeUninit<T>>(len).map_err(|_| MutationError::LayoutOverflow)?;
+        // The request's own arithmetic overflowed, which no room in the region changes.
+        let layout = Layout::array::<MaybeUninit<T>>(len).map_err(|_| DeclineCause::Overflow)?;
         let meta = if layout.size() == 0 {
             talc::Meta::null()
         } else {
@@ -63,16 +60,16 @@ impl<'a> GeneralHeap<'a> {
         Ok(PBox::from_meta_slice(meta, alloc, len))
     }
 
-    pub fn put<T: Repr>(&self, value: T) -> Result<PBox<'a, T>, PutError<T>> {
+    pub fn put<T: Repr>(&self, value: T) -> Result<PBox<'a, T>, Decline<T>> {
         let () = T::VALID;
         let slot = match self.uninit() {
             Ok(slot) => slot,
-            Err(error) => return Err(PutError { error, value }),
+            Err(cause) => return Err(cause.decline(value)),
         };
         Ok(slot.write(value))
     }
 
-    pub fn copy<T: Repr + Copy>(&self, value: &[T]) -> Result<PBox<'a, [T]>, MutationError> {
+    pub fn copy<T: Repr + Copy>(&self, value: &[T]) -> Result<PBox<'a, [T]>, DeclineCause> {
         self.init(value.len(), |index| value[index])
     }
 
@@ -80,7 +77,7 @@ impl<'a> GeneralHeap<'a> {
         &self,
         len: usize,
         mut make: impl FnMut(usize) -> T,
-    ) -> Result<PBox<'a, [T]>, MutationError> {
+    ) -> Result<PBox<'a, [T]>, DeclineCause> {
         let () = T::VALID;
         let mut values = self.uninit_slice(len)?;
         for (index, value) in values.iter_mut().enumerate() {
@@ -90,36 +87,38 @@ impl<'a> GeneralHeap<'a> {
     }
 }
 
-pub struct PutError<T> {
-    pub error: MutationError,
-    pub value: T,
-}
-
-impl<T> core::fmt::Debug for PutError<T> {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.debug_struct("PutError")
-            .field("error", &self.error)
-            .finish_non_exhaustive()
-    }
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ChannelCreateError {
     InvalidCapacity,
-    Exhausted,
+    /// The region had no room for the channel's record, or the write that would have made room was
+    /// refused, in the cause the directory or the heap gave.
+    Declined(DeclineCause),
+    /// The directory refused the record for its own reason — a stale id, a publish recovery undid,
+    /// words in the region that disagree — which neither a retry nor a wider region answers.
+    Record,
 }
 
 impl core::fmt::Display for ChannelCreateError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::InvalidCapacity => "the capacity is not usable for a duplex queue",
-            Self::Exhausted => "the region has no room left for another channel record",
-        })
+        match self {
+            Self::InvalidCapacity => f.write_str("the capacity is not usable for a duplex queue"),
+            Self::Declined(cause) => write!(f, "the channel's record was refused: {cause}"),
+            Self::Record => f.write_str(
+                "the directory refused the channel's record for a reason no retry answers",
+            ),
+        }
     }
 }
 
 #[cfg(feature = "std")]
-impl std::error::Error for ChannelCreateError {}
+impl std::error::Error for ChannelCreateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Declined(cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 
 pub enum AdmitError<H: Repr> {
     WrongRegion(Port<H>),
@@ -128,36 +127,62 @@ pub enum AdmitError<H: Repr> {
     Terminal(Port<H>),
     Orphaned(Port<H>),
     Open(Port<H>),
+    /// The port's channel exists, but opening this session's way into it was declined.
+    Declined(Port<H>, DeclineCause),
 }
 
 impl<H: Repr> core::fmt::Debug for AdmitError<H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::WrongRegion(_) => "WrongRegion(..)",
-            Self::Stale(_) => "Stale(..)",
-            Self::Occupied(_) => "Occupied(..)",
-            Self::Terminal(_) => "Terminal(..)",
-            Self::Orphaned(_) => "Orphaned(..)",
-            Self::Open(_) => "Open(..)",
-        })
+        match self {
+            Self::WrongRegion(_) => f.write_str("WrongRegion(..)"),
+            Self::Stale(_) => f.write_str("Stale(..)"),
+            Self::Occupied(_) => f.write_str("Occupied(..)"),
+            Self::Terminal(_) => f.write_str("Terminal(..)"),
+            Self::Orphaned(_) => f.write_str("Orphaned(..)"),
+            Self::Open(_) => f.write_str("Open(..)"),
+            Self::Declined(_, cause) => write!(f, "Declined(.., {cause:?})"),
+        }
     }
 }
 
 impl<H: Repr> core::fmt::Display for AdmitError<H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            Self::WrongRegion(_) => "the port names another region than this session's mapping",
-            Self::Stale(_) => "the port names a channel generation the role word no longer holds",
-            Self::Occupied(_) => "another member already holds the role the port grants",
-            Self::Terminal(_) => "the channel is closed, so its role can no longer be taken",
-            Self::Orphaned(_) => "the peer's role is gone, so the channel could not be completed",
-            Self::Open(_) => "the channel behind the port is not open to that role",
-        })
+        match self {
+            Self::WrongRegion(_) => {
+                f.write_str("the port names another region than this session's mapping")
+            }
+            Self::Stale(_) => {
+                f.write_str("the port names a channel generation the role word no longer holds")
+            }
+            Self::Occupied(_) => {
+                f.write_str("another member already holds the role the port grants")
+            }
+            Self::Terminal(_) => {
+                f.write_str("the channel is closed, so its role can no longer be taken")
+            }
+            Self::Orphaned(_) => {
+                f.write_str("the peer's role is gone, so the channel could not be completed")
+            }
+            Self::Open(_) => f.write_str("the channel behind the port is not open to that role"),
+            Self::Declined(_, cause) => {
+                write!(
+                    f,
+                    "this session was declined the channel behind the port: {cause}"
+                )
+            }
+        }
     }
 }
 
 #[cfg(feature = "std")]
-impl<H: Repr> std::error::Error for AdmitError<H> {}
+impl<H: Repr> std::error::Error for AdmitError<H> {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Declined(_, cause) => Some(cause),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct SessionOptions {
@@ -174,8 +199,13 @@ impl SessionOptions {
 #[derive(Debug)]
 pub enum SessionError<E> {
     Source(E),
-    PermissionDenied { requested: mem::Access },
-    InsufficientSpace { requested: usize, allocated: usize },
+    PermissionDenied {
+        requested: mem::Access,
+    },
+    InsufficientSpace {
+        requested: usize,
+        allocated: usize,
+    },
     Busy,
     Closed,
     DuplicateAttachment,
@@ -183,8 +213,10 @@ pub enum SessionError<E> {
     LayoutMismatch(crate::header::LayoutField),
     Poisoned,
     Overflow,
-    ParticipantExhausted,
-    ParticipantReserved,
+    /// No member slot could be given, and `waits` says whose act would free one.
+    NoRoom {
+        waits: mem::RoomWait,
+    },
     ArrivalRefused,
 }
 
@@ -206,8 +238,7 @@ impl<E> SessionError<E> {
             mem::Error::LayoutMismatch(field) => Self::LayoutMismatch(field),
             mem::Error::PoisonedComposition => Self::Poisoned,
             mem::Error::ArithmeticOverflow => Self::Overflow,
-            mem::Error::ParticipantExhausted => Self::ParticipantExhausted,
-            mem::Error::ParticipantReserved => Self::ParticipantReserved,
+            mem::Error::NoRoom { waits } => Self::NoRoom { waits },
             mem::Error::ArrivalRefused => Self::ArrivalRefused,
         }
     }
@@ -236,9 +267,8 @@ impl<E> core::fmt::Display for SessionError<E> {
             }
             Self::Poisoned => f.write_str("this composition was refused as poisoned"),
             Self::Overflow => f.write_str("the requested size or offset overflowed"),
-            Self::ParticipantExhausted => f.write_str("the region holds no free member slot"),
-            Self::ParticipantReserved => {
-                f.write_str("every member slot is held, or promised to a process not yet arrived")
+            Self::NoRoom { waits } => {
+                write!(f, "the region holds no member slot to give, so {waits}")
             }
             Self::ArrivalRefused => {
                 f.write_str("the member slot named for arrival was not promised to it")
@@ -596,19 +626,16 @@ impl Drop for Seat<'_> {
 /// Why no member slot could be promised.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SeatError {
-    /// Every slot is free or held, and nothing more can be promised until the region grows.
-    Exhausted,
-    /// Every slot is taken, but some stand promised to a process that has not arrived: dropping that
-    /// seat, or waiting for its arrival, is what can make room.
-    Promised,
+    /// No slot could be promised, and `waits` says whose act would free one: the region growing, or
+    /// the seat already held being dropped and its member arriving.
+    NoRoom { waits: mem::RoomWait },
 }
 
 impl core::fmt::Display for SeatError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
-            Self::Exhausted => f.write_str("the region holds no member slot left to promise"),
-            Self::Promised => {
-                f.write_str("every member slot is held or promised to a process not yet arrived")
+            Self::NoRoom { waits } => {
+                write!(f, "no member slot could be promised, so {waits}")
             }
         }
     }
@@ -636,6 +663,7 @@ impl Session {
             source,
             request,
             crate::schema::RegionAdmission::Create(region),
+            None,
             options.heap,
         )
     }
@@ -649,6 +677,7 @@ impl Session {
             source,
             request,
             crate::schema::RegionAdmission::Expect(region),
+            None,
             None,
         )
     }
@@ -666,8 +695,12 @@ impl Session {
                 session: self,
                 member,
             }),
-            Claim::Promised => Err(SeatError::Promised),
-            Claim::Full => Err(SeatError::Exhausted),
+            Claim::Promised => Err(SeatError::NoRoom {
+                waits: mem::RoomWait::Promise,
+            }),
+            Claim::Full => Err(SeatError::NoRoom {
+                waits: mem::RoomWait::Grow,
+            }),
         }
     }
 
@@ -684,20 +717,33 @@ impl Session {
         region: RegionId,
         peer: Peer,
     ) -> Result<Self, SessionError<S::Error>> {
-        let map = source.map(request).map_err(SessionError::Source)?;
-        let area = Build::arriving_as(map, crate::schema::RegionAdmission::Expect(region), peer)
-            .map_err(SessionError::admission)?;
-        Self::from(area).map_err(SessionError::admission)
+        Self::admit(
+            source,
+            request,
+            crate::schema::RegionAdmission::Expect(region),
+            Some(peer),
+            None,
+        )
     }
 
+    /// The one internal entrance every public constructor reaches the region through.
+    ///
+    /// Keeping it the only path is what makes the promise in [`Session::open_as`] mean what the other
+    /// three say: a second route would be a second place where the access declaration, the layout
+    /// verification, and the arrival's slot claim are decided.
     fn admit<S: Source>(
         source: S,
         request: Request,
         admission: crate::schema::RegionAdmission,
+        promised: Option<Peer>,
         geometry: Option<Geometry>,
     ) -> Result<Self, SessionError<S::Error>> {
         let map = source.map(request).map_err(SessionError::Source)?;
-        let area = Build::new(map, admission).map_err(SessionError::admission)?;
+        let area = match promised {
+            Some(peer) => Build::arriving_as(map, admission, peer),
+            None => Build::new(map, admission),
+        }
+        .map_err(SessionError::admission)?;
         match geometry {
             Some(geometry) => Self::from_geometry(area, geometry),
             None => Self::from(area),
@@ -779,10 +825,14 @@ impl Session {
     ) -> Result<(Channel<H>, Port<H>), ChannelCreateError> {
         let geometry = shared::Duplex::<H>::geometry(capacity)
             .map_err(|_| ChannelCreateError::InvalidCapacity)?;
+        let region = self.dir.region_id();
         let (inner, mapped) = self
             .dir
             .create_in::<shared::Duplex<H>>(&self.alloc, capacity, geometry.layout)
-            .map_err(|_| ChannelCreateError::Exhausted)?;
+            .map_err(|error| match error.declined(region) {
+                Some(cause) => ChannelCreateError::Declined(cause),
+                None => ChannelCreateError::Record,
+            })?;
         let id = Id { inner, capacity };
         let (channel, generation) = shared::Channel::creator(mapped, geometry, id);
         Ok((channel, Port::new(id, 1, generation)))
@@ -797,8 +847,16 @@ impl Session {
             .open::<shared::Duplex<H>>(port.id.inner, port.id.capacity)
         {
             Ok(mapped) => mapped,
-            Err(_) => {
-                return Err(AdmitError::Open(port));
+            Err(error) => {
+                // Adopting admits this member to the channel's header, which writes. A read-only
+                // mapping therefore refuses the adopt before any role word is read, and naming the
+                // region is the only way the caller learns that the port is fine and this entrance
+                // is not.
+                let cause = error.declined(self.dir.region_id());
+                return Err(match cause {
+                    Some(cause) => AdmitError::Declined(port, cause),
+                    None => AdmitError::Open(port),
+                });
             }
         };
         match shared::Channel::adopt(mapped, &port) {

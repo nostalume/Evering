@@ -36,13 +36,16 @@ use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 use crate::{
     layout::RegionId,
     os::{
-        Event, Peer, ReceivedResources, Ring,
+        Event, Peer, Provenance, ReceivedResources, Ring,
         windows::{
             Section,
             process::{Listener, Socket},
         },
     },
-    process::{Arrival, Bootstrap, INTRODUCER, Introduction, RENDEZVOUS, SEAT, Supervisor},
+    process::{
+        Arrival, Bootstrap, INTRODUCER, Introduction, RENDEZVOUS, SEAT, Supervisor, TRUST,
+        announced_trust,
+    },
 };
 
 pub type Shared = Section<std::os::windows::io::OwnedHandle>;
@@ -67,10 +70,14 @@ pub struct Handoff {
 /// installs it in the admitted process's environment. What the API no longer offers is the name as a
 /// `&str` a caller can pass around: the peer check in `send` and the one in `receive` are what decide
 /// who the meeting is with, and both of them read the kernel's answer rather than a claim.
+///
+/// The `trusts` half is a policy and this is the only place one can be written, for the same reason the
+/// promised slot rides along: what the introducer did not say, the receiver is not allowed to decide.
 pub struct Grant {
     address: String,
     introducer: u32,
     promised: Option<Introduction>,
+    trusts: bool,
 }
 
 fn refused(reason: &'static str) -> io::Error {
@@ -88,6 +95,7 @@ impl Handoff {
                 address,
                 introducer: std::process::id(),
                 promised: None,
+                trusts: false,
             },
         ))
     }
@@ -122,6 +130,14 @@ impl Handoff {
     /// Takes the handover this process was granted, and attests the peer before any of it is
     /// released to the caller.
     ///
+    /// The two ways the kernel's answer can fail to arrive are not the same failure, and the grant's
+    /// policy speaks to only one of them. An answer that names somebody other than the announced
+    /// introducer is the impostor that read the pipe address off a parent's environment, and it is
+    /// refused under every policy: the introducer cannot vouch for a server it did not open. No answer
+    /// at all is a meeting whose other end exists — the connect succeeded, so the rendezvous is
+    /// established as one this process was given — and which was not asked, and that is the one a
+    /// trusting introduction carries, as `Provenance::Unavailable`.
+    ///
     /// The client end is kept, because it is the way back: the [`Receipt`] this returns is how the
     /// admitted process tells its parent which member it became.
     ///
@@ -135,20 +151,22 @@ impl Handoff {
             .map_err(|_| refused("the granted rendezvous names no introducer"))?
             .parse()
             .map_err(|_| refused("the announced introducer is not a process id"))?;
+        let trusts = announced_trust()?;
         let socket = Socket::connect(&address)?;
-        let server = socket
-            .server_pid()
-            .map_err(|_| refused("the granted rendezvous reports no server"))?;
-        if server != introducer {
-            return Err(refused(
-                "the peer behind the granted rendezvous is not the process that granted it",
-            ));
-        }
+        let peer = match socket.server_pid() {
+            Ok(server) if server == introducer => Peer::introduced(server),
+            Ok(_) => {
+                return Err(refused(
+                    "the peer behind the granted rendezvous is not the process that granted it",
+                ));
+            }
+            Err(_) => Peer::unattested(Provenance::Unavailable, true, trusts)?,
+        };
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
         let promised = announced_seat()?;
         Ok((
-            Peer::introduced(server),
+            peer,
             ReceivedResources {
                 bootstrap,
                 mapping: Section::from_owned_handle(resources.remove(0)),
@@ -246,17 +264,37 @@ impl Grant {
         self
     }
 
+    /// Say to the process this grant admits that a peer it cannot attest may complete the handover.
+    ///
+    /// The word reaches one failure and not the other, on this platform: a server that answers and names
+    /// somebody else is refused whatever the grant said, because that is the claimant that read the pipe
+    /// address out of a parent's environment, and the introducer has no authority to vouch for a pipe it
+    /// did not open. A server that was not asked at all is the handover this releases, and it arrives
+    /// named `Provenance::Unavailable` rather than with a process id nobody confirmed.
+    pub fn trusting_introduction(mut self) -> Self {
+        self.trusts = true;
+        self
+    }
+
     /// Installs this rendezvous in `command`, so the process it spawns is the one meeting.
     ///
     /// Consuming `self` is what makes the grant single-use: a second `admit` cannot be written, and
     /// the address never becomes something a caller threads through arguments, where every process
     /// on the host could read it. It also means a promised slot is announced to exactly one child,
     /// because the second child would have to be admitted by a grant that no longer exists.
+    ///
+    /// Everything the introducer meant goes out here — the address, its own process id, the promised
+    /// slot, and the policy word if [`trusting_introduction`](Grant::trusting_introduction) was called —
+    /// so the receiver has four announcements to read and no decision of its own to make about any of
+    /// them.
     pub fn admit(self, command: &mut Command) -> io::Result<()> {
         command.env(RENDEZVOUS, self.address.as_str());
         command.env(INTRODUCER, self.introducer.to_string());
         if let Some(promised) = &self.promised {
             command.env(SEAT, promised.announcement());
+        }
+        if self.trusts {
+            command.env(TRUST, "1");
         }
         Ok(())
     }

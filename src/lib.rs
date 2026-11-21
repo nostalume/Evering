@@ -7,14 +7,16 @@
 //!
 //! There are two maps, and a name belongs to exactly one of them.
 //!
-//! * **The crate root is what a caller holds across an exchange**: `Session`, `Pool`, `Channel`,
-//!   `Port`, `Tx`/`Rx`, `Block`, `Transfer`, `PBox`, and the refusals of that same exchange —
-//!   `PoolReserveError`, `BlockRangeError`, `ReceiveError`, `RemoveError`, `OpenPoolError`. These
-//!   come out of implementation modules that are private (`pool`, `channel`, `session`, `queue`,
-//!   `boxed`), so the root is their only address, and where two modules use the same noun the root's
-//!   alias settles it: `pool::RangeError` becomes `BlockRangeError`, `talc::Geometry` becomes
-//!   `HeapGeometry`. Rustc enforces the private half — a type from a private module cannot appear in
-//!   a public signature without being re-exported.
+//! * **The crate root is what a caller holds across an exchange**: `Session`, `Observer`, `Pool`,
+//!   `Channel`, `Port`, `Tx`/`Rx`, `Block`, `Transfer`, `PBox`, and the refusals of that same
+//!   exchange — `BlockRangeError`, `ReceiveError`, `RemoveError`, `OpenPoolError`, `ObserverError`.
+//!   A refusal that hands something of the caller's back answers with one shared vocabulary instead of
+//!   a shape per module: `Decline`, `DeclineCause`, `RoomWait`. These come out of implementation
+//!   modules that are private (`pool`, `channel`, `session`, `queue`, `boxed`), so the root is their
+//!   only address, and where two modules use the same noun the root's alias settles it:
+//!   `pool::RangeError` becomes `BlockRangeError`, `talc::Geometry` becomes `HeapGeometry`. Rustc
+//!   enforces the private half — a type from a private module cannot appear in a public signature
+//!   without being re-exported.
 //! * **A `pub mod` is the map of one layer**, named by path and deliberately not duplicated at the
 //!   root: `layout` for the identity a type claims (`SchemaKey`, `Repr`, `RegionId`,
 //!   `recovery_handler`), `mapping` for how a region gets mapped (`Access`, `Request`, `Map`),
@@ -89,20 +91,39 @@ mod token;
 pub use boxed::PBox;
 pub use channel::{
     AdoptError, Channel, Id as ChannelId, Port, PublishError, ReceiveError, Received, Rx,
-    SendReserveError, TransferReserved, TransferStaged, TrySendError, Tx,
+    TransferReserved, TransferStaged, Tx,
 };
+/// Why a request was declined, and the two tables that say what would change the answer.
+///
+/// One shape covers every authority that answers no while still holding something of the caller's — a
+/// block request, a queue reservation, a heap mutation — because the reporting layer must not depend
+/// on what the payload can render.
+pub use mem::{Decline, DeclineCause, RoomWait};
+/// A standpoint on a region, held by a process that reads it and never joined it.
+///
+/// Neither the mapping it reads through nor a member's authority is reachable from it, which is why a
+/// reader cannot commit anything by accident — the refusal is a missing method, not a runtime error.
+///
+/// ```compile_fail
+/// # use evering::Observer;
+/// # fn cannot_hand_out_the_mapping(observer: &Observer) { let _map = observer.map(); }
+/// ```
+///
+/// ```compile_fail
+/// # use evering::Observer;
+/// # fn cannot_speak_for_a_member(observer: &Observer) { let _peer = observer.peer(); }
+/// ```
+pub use mem::{Observer, ObserverError};
 pub use msg::Encoded;
 pub use pool::{
     Block, BlockRange, ClassInfo, Pool, PoolCreateError, PoolId, PoolRef,
-    RangeError as BlockRangeError, ReserveError as PoolReserveError, Transfer, Vacant,
+    RangeError as BlockRangeError, Transfer, Vacant,
 };
 pub use session::{
-    AdmitError, ChannelCreateError, GeneralHeap, OpenPoolError, PutError, Recovery, RemoveError,
-    Seat, SeatError, Session, SessionError, SessionOptions,
+    AdmitError, ChannelCreateError, GeneralHeap, OpenPoolError, Recovery, RemoveError, Seat,
+    SeatError, Session, SessionError, SessionOptions,
 };
-pub use talc::{
-    Geometry as HeapGeometry, GeometryError as HeapGeometryError, MutationError as GeneralHeapError,
-};
+pub use talc::{Geometry as HeapGeometry, GeometryError as HeapGeometryError};
 
 mod seal {
     pub trait Sealed {}

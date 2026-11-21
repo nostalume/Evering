@@ -24,7 +24,7 @@ mod talc;
 use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
-use crate::mem::{Access, Build, Map};
+use crate::mem::{Access, Build, Map, Request, Source};
 
 const MAX_ADDR: usize = 0x20000;
 
@@ -70,6 +70,38 @@ impl MockBackend<'_> {
 fn mock_view(bk: &mut [u8], start: usize, size: usize) -> Build {
     let bk = MockBackend(bk);
     bk.shared(start, size)
+}
+
+/// One buffer offered as a `Source`, so an entrance can be asked for the declaration it will be held to.
+///
+/// `MockBackend` hands out writable maps and unwraps its own admission, which is the right shape for a
+/// member and the wrong one for a reader: the cases below need the same extent under a narrower
+/// declaration, and they need to see the refusal rather than panic past it.
+#[derive(Clone, Copy)]
+struct Borrowed {
+    start: *mut u8,
+    len: usize,
+}
+
+unsafe impl Source for Borrowed {
+    type Error = core::convert::Infallible;
+
+    fn map(self, request: Request) -> Result<Map, Self::Error> {
+        assert!(
+            request.len <= self.len,
+            "the fixture extent is shorter than the request"
+        );
+        // SAFETY: the buffer outlives every view a case makes of it, the request says what the bytes
+        // were granted for, and there is nothing to give back — which is what `from_static` declares
+        // rather than what `from_raw_parts` would be lied about.
+        Ok(unsafe {
+            Map::from_static(
+                NonNull::new_unchecked(self.start),
+                request.len,
+                request.access,
+            )
+        })
+    }
 }
 
 #[test]
@@ -213,7 +245,7 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
     assert!(heap.finish_recovery(dead));
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::talc::MutationError::Poisoned)
+        Err(crate::mem::DeclineCause::Poisoned)
     );
 }
 
@@ -433,7 +465,7 @@ fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
     assert!(!heap.finish_recovery(dead.wrapping_add(1)));
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::talc::MutationError::Busy(dead))
+        Err(crate::mem::DeclineCause::Contested { member: Some(dead) })
     );
 
     assert_eq!(
@@ -442,7 +474,7 @@ fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
     );
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::talc::MutationError::Poisoned)
+        Err(crate::mem::DeclineCause::Poisoned)
     );
     assert!(heap.finish_recovery(dead));
     assert!(heap.finish_recovery(dead));
@@ -788,7 +820,7 @@ fn directory_growth_with_an_ambiguous_dead_heap_owner_is_leaked_and_poisoned() {
     assert_eq!(directory.slab_count_for_test(), 1);
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::talc::MutationError::Poisoned)
+        Err(crate::mem::DeclineCause::Poisoned)
     );
 }
 
@@ -809,7 +841,7 @@ fn dead_heap_owner_before_growth_evidence_poison_is_not_mistaken_for_rollback() 
     );
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::talc::MutationError::Poisoned)
+        Err(crate::mem::DeclineCause::Poisoned)
     );
 }
 
@@ -837,6 +869,233 @@ fn failed_root_admission_releases_the_map() {
         Err(crate::mem::Error::UnenoughSpace { .. })
     ));
     assert_eq!(bytes, [0]);
+}
+
+#[test]
+fn a_read_only_view_answers_the_two_questions_the_entrance_asks_first() {
+    use crate::mem::{MemOps, read_root};
+    use crate::schema::RegionAdmission;
+
+    #[repr(align(64))]
+    struct Storage([u8; 0x2000]);
+
+    let mut storage = Storage([0; 0x2000]);
+    let writer = mock_view(&mut storage.0, 0, 0x2000);
+    // The reader borrows the extent rather than owning it, so it declares nothing to give back; the
+    // same base address and residue the writer's map was handed is what this backend gives everyone.
+    let reader = unsafe {
+        Map::from_static(
+            NonNull::new(writer.start_ptr().cast_mut()).unwrap(),
+            writer.size(),
+            Access::READ,
+        )
+    };
+
+    match read_root(&reader) {
+        Ok(region) => assert_eq!(
+            region,
+            writer.region_id(),
+            "a mapping that may not write still learns which region this root claims"
+        ),
+        Err(error) => panic!("the read-only view was refused: {error:?}"),
+    }
+
+    let refused = Build::new(reader, RegionAdmission::Discover)
+        .err()
+        .expect("a read-only mapping is admitted nowhere");
+    assert!(
+        matches!(refused, crate::mem::Error::PermissionDenied { requested }
+            if requested == Access::WRITE),
+        "the entrance refused for a different reason: {refused:?}"
+    );
+
+    // The answer above is read, not assumed: nothing is published in a page nobody wrote to.
+    let mut blank = [0u8; 0x2000];
+    let unpublished = unsafe {
+        Map::from_static(
+            NonNull::new(core::ptr::addr_of_mut!(blank))
+                .unwrap()
+                .cast::<u8>(),
+            blank.len(),
+            Access::READ,
+        )
+    };
+    let unwritten = read_root(&unpublished).err();
+    assert!(
+        matches!(unwritten, Some(crate::mem::Error::InvalidHeader)),
+        "a root that published nothing was read as one: {unwritten:?}"
+    );
+}
+
+#[test]
+fn a_reader_with_no_slot_answers_what_a_published_record_claims_and_writes_nothing() {
+    use crate::header::{Layout, RootHeader, Status};
+    use crate::mem::{MemOps, Observer};
+    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    struct Claimed(u32);
+
+    impl SharedSchema for Claimed {
+        const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.test.claimed"), 1);
+    }
+
+    unsafe impl crate::schema::LayoutInfo for Claimed {}
+
+    #[repr(C)]
+    struct Counted(u32);
+
+    impl SharedSchema for Counted {
+        const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.test.counted"), 1);
+    }
+
+    unsafe impl Layout for Counted {
+        type Config = u32;
+        type Info = Claimed;
+
+        const MAGIC: crate::header::Magic = 0xC04;
+
+        fn info(conf: &Self::Config, _: LayoutContext) -> Claimed {
+            Claimed(*conf)
+        }
+
+        unsafe fn init(destination: *mut Self, value: Self::Config) -> Status {
+            unsafe { destination.write(Self(value)) };
+            Status::Initialized
+        }
+
+        fn attach(&self, value: &Self::Config) -> Status {
+            if self.0 == *value {
+                Status::Initialized
+            } else {
+                Status::Corrupted
+            }
+        }
+    }
+
+    #[repr(align(64))]
+    struct Storage([u8; 0x2000]);
+    const HEAD: usize = core::mem::size_of::<RootHeader>();
+
+    let mut storage = Storage([0; 0x2000]);
+    let mut writer = mock_view(&mut storage.0, 0, 0x2000);
+    let record = writer
+        .push::<crate::header::RcHeader<Counted>>(7)
+        .expect("a counted record fits the fixture extent");
+    let at = record.layout_id().offset as usize;
+    let before = {
+        let mut bytes = [0u8; HEAD];
+        bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(writer.start_ptr(), HEAD) });
+        bytes
+    };
+
+    let observer = Observer::discover(
+        Borrowed {
+            start: storage.0.as_mut_ptr(),
+            len: 0x2000,
+        },
+        Request::new(0x2000, Access::READ),
+    )
+    .expect("a reader that claims no slot was refused");
+
+    assert_eq!(
+        observer.region(),
+        writer.region_id(),
+        "the standpoint names a different region than the root it read claims"
+    );
+    assert_eq!(
+        observer.access(),
+        Access::READ,
+        "the standpoint reports an access it was not granted"
+    );
+    let read = observer.read::<Counted>(at);
+    assert!(
+        matches!(read, Ok(Claimed(7))),
+        "the reader was answered with something other than what the record published: {read:?}"
+    );
+    let elsewhere = observer.read::<Counted>(at + 0x800);
+    assert!(
+        matches!(
+            elsewhere,
+            Err(crate::mem::Error::LayoutMismatch(
+                crate::header::LayoutField::State
+            ))
+        ),
+        "bytes that publish no record were read as one: {elsewhere:?}"
+    );
+
+    // The promise of the entrance is checked where it could have been broken: the root header is the
+    // one place a member writes on its way in, and a reader that reached it would show here.
+    let after = {
+        let mut bytes = [0u8; HEAD];
+        bytes.copy_from_slice(unsafe { core::slice::from_raw_parts(writer.start_ptr(), HEAD) });
+        bytes
+    };
+    assert_eq!(
+        before, after,
+        "the read-only entrance left the root header's bytes changed"
+    );
+}
+
+#[test]
+fn a_full_roster_turns_a_member_away_and_answers_a_reader() {
+    use crate::header::PARTICIPANT_CAPACITY;
+    use crate::mem::Observer;
+    use crate::schema::{RegionAdmission, RegionId};
+
+    #[repr(align(64))]
+    struct Storage([u8; 0x2000]);
+
+    let mut storage = Storage([0; 0x2000]);
+    let extent = Borrowed {
+        start: storage.0.as_mut_ptr(),
+        len: 0x2000,
+    };
+    let request = Request::new(0x2000, Access::READ | Access::WRITE);
+    let region = RegionId::new(9, 9);
+    let mut members = Vec::new();
+    for slot in 0..PARTICIPANT_CAPACITY {
+        let admission = if slot == 0 {
+            RegionAdmission::Create(region)
+        } else {
+            RegionAdmission::Expect(region)
+        };
+        let map = extent.map(request).unwrap();
+        members
+            .push(Build::new(map, admission).expect("a slot is free while the roster is not full"));
+    }
+    assert_eq!(members.len(), PARTICIPANT_CAPACITY);
+
+    let exhausted = Build::new(
+        extent.map(request).unwrap(),
+        RegionAdmission::Expect(region),
+    )
+    .err();
+    assert!(
+        matches!(
+            exhausted,
+            Some(crate::mem::Error::NoRoom {
+                waits: crate::RoomWait::Grow
+            })
+        ),
+        "the roster filled without exhausting: {exhausted:?}"
+    );
+
+    // The same extent, the same declaration of what may be done with it, and no seat: reading a region
+    // is not a request to be a member of it, and this is the refusal that used to be the only answer.
+    let observer = Observer::discover(extent, Request::new(0x2000, Access::READ))
+        .expect("a full roster refused a reader as well as a member");
+    assert_eq!(
+        observer.region(),
+        region,
+        "the reader named a region the exhausted roster does not claim"
+    );
+    let published = observer.read::<crate::header::Root>(0);
+    assert!(
+        matches!(published, Ok(())),
+        "the root that turned a member away was not readable: {published:?}"
+    );
 }
 
 #[test]

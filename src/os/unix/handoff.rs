@@ -17,9 +17,9 @@
 //! move a descriptor by one place — and it is a claim this file neither makes nor vouches for, which
 //! leaves the roster, not the reader, to decide whether it was ever promised. The adoption rule that
 //! makes the attestation testable — classify by borrow, own only on the accepting path — lives in
-//! `Socket::granted`, not here. And the non-Linux arm refuses for lack of a mechanism, which is a
-//! policy statement rather than a placeholder: writing one for another host should not quietly turn an
-//! unattested handover into a permitted one.
+//! `Socket::granted`, not here. And the non-Linux arm answers nothing about its peer end, so it completes
+//! only on a word the introducer said beside the grant: the permission for an unattested handover is
+//! announced, which keeps writing a mechanism for a new host from quietly permitting one by `cfg`.
 //!
 //! The return leg is the receipt, and it changes what a meeting *ends* when: the granted descriptor is
 //! now the child's way back, so `Attendance::arrival` is what reconciles the child's own word about the
@@ -47,10 +47,12 @@ use nix::unistd::{getppid, getuid};
 use crate::{
     layout::RegionId,
     os::{
-        Event, Peer, ReceivedResources, Ring,
+        Event, Peer, Provenance, ReceivedResources, Ring,
         unix::{UnixFd, process::Socket},
     },
-    process::{Arrival, Bootstrap, Introduction, RENDEZVOUS, SEAT, Supervisor},
+    process::{
+        Arrival, Bootstrap, Introduction, RENDEZVOUS, SEAT, Supervisor, TRUST, announced_trust,
+    },
 };
 
 pub type Shared = UnixFd<std::os::fd::OwnedFd>;
@@ -93,9 +95,15 @@ pub struct Handoff {
 /// the holder of a [`Seat`](crate::Seat) decided this process should arrive at. Carrying it here
 /// means admitting a process and telling it who it is cannot be done in the wrong order or to the
 /// wrong child, because both go out through the one `admit` that consumes the grant.
+///
+/// The `trusts` half is a policy, and this is the only place one can be written: it says that a peer
+/// the admitted process cannot attest may complete the handover anyway. A receiver cannot decide that
+/// for itself, and on this platform the word changes nothing that answers back — see
+/// [`trusting_introduction`](Grant::trusting_introduction).
 pub struct Grant {
     socket: Socket,
     promised: Option<Introduction>,
+    trusts: bool,
 }
 
 impl Handoff {
@@ -108,6 +116,7 @@ impl Handoff {
             Grant {
                 socket: there,
                 promised: None,
+                trusts: false,
             },
         ))
     }
@@ -146,6 +155,10 @@ impl Handoff {
     /// made itself, is refused without ever blocking on a message it was never sent — and without any
     /// descriptor being installed in its table first.
     ///
+    /// The introducer's policy about a peer that cannot be attested is read beside that answer and
+    /// never instead of it: it can complete a handover on a target whose rendezvous answers nothing, and
+    /// it cannot turn this platform's silence about a descriptor into a granted one.
+    ///
     /// The granted end is kept rather than closed, because it is the one channel back to the process
     /// that admitted this one: the [`Receipt`] it returns is how this process says which member it
     /// became.
@@ -157,7 +170,7 @@ impl Handoff {
     /// is the one outcome the two arms cannot be allowed to disagree about.
     pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
         let socket = granted_socket()?;
-        let peer = attested(&socket)?;
+        let peer = attested(&socket, announced_trust()?)?;
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
         let promised = announced_seat()?;
@@ -246,6 +259,19 @@ impl Grant {
         self
     }
 
+    /// Say to the process this grant admits that a peer it cannot attest may complete the handover.
+    ///
+    /// This is where the policy lives, and nowhere else: the receiver reads the word out of the
+    /// announcement and decides nothing about it. On this platform the answer is already available for
+    /// every rendezvous that was truly granted, so the word changes nothing about a peer that answered —
+    /// it can neither downgrade a name the kernel wrote nor stand in for a descriptor nobody inherited.
+    /// It is written for the unix arms that answer nothing at all, where it is the only thing that makes
+    /// such a handover complete rather than refuse.
+    pub fn trusting_introduction(mut self) -> Self {
+        self.trusts = true;
+        self
+    }
+
     /// Installs this rendezvous in `command`, so that the process it spawns holds the granted end.
     ///
     /// `dup2` is the whole mechanism and one of its details is load-bearing: both ends of the pair this
@@ -258,10 +284,17 @@ impl Grant {
     /// point a second child at the same meeting, and no name left for anyone else to claim first. It
     /// also means a promised slot is announced to exactly one child, because the second child would
     /// have to be admitted by a grant that no longer exists.
+    ///
+    /// Whatever the grant was told to carry goes out here and nowhere else — the promised slot, and the
+    /// policy word if [`trusting_introduction`](Grant::trusting_introduction) was called — which is what
+    /// keeps a receiver from having to decide either of them about itself.
     pub fn admit(self, command: &mut Command) -> io::Result<()> {
         command.env(RENDEZVOUS, INHERITED.to_string());
         if let Some(promised) = &self.promised {
             command.env(SEAT, promised.announcement());
+        }
+        if self.trusts {
+            command.env(TRUST, "1");
         }
         let granted = self.socket;
         // SAFETY: the hook runs between fork and exec in the child, and calls only `dup2`, which is
@@ -319,9 +352,21 @@ fn announced_seat() -> io::Result<Option<Introduction>> {
 }
 
 /// The kernel's own answer about the process that owns the peer end, checked against this process's parent.
+///
+/// A granted pair answers this question because the kernel wrote the name when it connected the two ends,
+/// so an answer that does not match the introduction is an impostor under any policy, and no answer at all
+/// says more about the descriptor than about the target: the handover was never established as a granted
+/// one, which is the fact a policy has to bear on. So the silence goes to `Peer::unattested` as
+/// unestablished, and the decision it cannot release is that arm's to make and say. The host's own error is
+/// kept for a receiver that was never given a policy to fail by, because for that caller the missing thing
+/// is an introduction and the kernel's sentence is the truer report.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn attested(socket: &Socket) -> io::Result<Peer> {
-    let credentials = socket.peer_credentials()?;
+fn attested(socket: &Socket, trusts: bool) -> io::Result<Peer> {
+    let credentials = match socket.peer_credentials() {
+        Ok(credentials) => credentials,
+        Err(_) if trusts => return Peer::unattested(Provenance::Unavailable, false, trusts),
+        Err(error) => return Err(error),
+    };
     let parent = getppid().as_raw() as u32;
     if credentials.pid != parent || credentials.uid != getuid().as_raw() {
         return Err(refused(
@@ -332,13 +377,15 @@ fn attested(socket: &Socket) -> io::Result<Peer> {
 }
 
 /// No other unix variant is refused for lack of a mechanism name, but for lack of one that has been
-/// written and run here: an unattested handover completes nowhere unless a policy says so out loud,
-/// which is card 3.4's `Agreement` clause and is not implemented by this file.
+/// written and run here. That is the case a trusting introduction is for: with the introducer's word
+/// the handover completes and says `Provenance::Delegated`, because the rendezvous is one this process
+/// holds by inheritance and every authority for who the peer is came from the step that admitted it;
+/// without that word the handover is refused, since a receiver is not the one allowed to decide how
+/// little proof is enough. Writing a mechanism for another host therefore cannot quietly permit an
+/// unattested handover — the permission is announced, not compiled.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn attested(_socket: &Socket) -> io::Result<Peer> {
-    Err(refused(
-        "this platform has no peer attestation implemented, and an unattested handover is refused",
-    ))
+fn attested(_socket: &Socket, trusts: bool) -> io::Result<Peer> {
+    Peer::unattested(Provenance::Delegated, true, trusts)
 }
 
 /// The receipt this rendezvous carries, credited to the admitted process and reconciled with the promise.

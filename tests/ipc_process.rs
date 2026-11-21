@@ -31,8 +31,8 @@ use std::{
 #[cfg(feature = "process")]
 use evering::process::Supervisor;
 use evering::{
-    Block, BlockRange, ChannelId as Id, PoolId, PoolRef, PoolReserveError, Port, Rx, Session,
-    SessionError, TrySendError,
+    Block, BlockRange, ChannelId as Id, Decline, DeclineCause, PoolId, PoolRef, Port, RoomWait, Rx,
+    Session, SessionError,
     layout::{self, RegionId, Repr, SchemaId, SchemaKey, Shape, SharedSchema},
     mapping::{Access, LayoutField, Peer, Request},
     os::unix::UnixFd,
@@ -135,17 +135,21 @@ fn joiner_session(name: &str, parent_base: usize) -> UnixSession {
 
 fn send_bounded<T>(
     mut value: T,
-    mut send: impl FnMut(T) -> Result<(), TrySendError<T>>,
+    mut send: impl FnMut(T) -> Result<(), Decline<T>>,
     deadline: Instant,
 ) {
     loop {
-        match send(value) {
+        let Decline { cause, value: sent } = match send(value) {
             Ok(()) => return,
-            Err(TrySendError::Full(returned) | TrySendError::Busy(returned)) => value = returned,
-            Err(TrySendError::Disconnected(_returned)) => {
-                panic!("peer disconnected while sending")
+            Err(decline) => decline,
+        };
+        match (cause, sent) {
+            (DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. }, Some(returned)) => {
+                value = returned
             }
-            Err(TrySendError::Authority) => panic!("block lost its Pool authority"),
+            (DeclineCause::Sealed, _) => panic!("peer disconnected while sending"),
+            (_, None) => panic!("block lost its Pool authority: {cause:?}"),
+            (cause, Some(_)) => panic!("send refused for {cause:?}"),
         }
         assert!(Instant::now() < deadline, "queue remained full");
         thread::yield_now();
@@ -655,11 +659,14 @@ fn pool_blocks_owned_by_an_exited_process_are_reclaimed() {
         let pool = session.open_pool(id).unwrap();
         let pool_ref = pool.as_ref();
         let mut blocks = Vec::new();
+        let shortage = DeclineCause::NoRoom {
+            waits: RoomWait::Release,
+        };
         loop {
             match pool_ref.put(7_u64) {
                 Ok(block) => blocks.push(block),
-                Err(PoolReserveError::Unavailable(7)) => break,
-                Err(error) => panic!("unexpected Pool error: {error:?}"),
+                Err(decline) if decline.cause == shortage => break,
+                Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
             }
         }
         println!(
@@ -709,10 +716,19 @@ fn pool_blocks_owned_by_an_exited_process_are_reclaimed() {
         fields.next().unwrap().parse().unwrap(),
     );
     assert!(fields.next().unwrap().parse::<usize>().unwrap() >= 64);
-    assert!(matches!(
-        pool.as_ref().put(9_u64),
-        Err(PoolReserveError::Unavailable(9))
-    ));
+    let decline = pool
+        .as_ref()
+        .put(9_u64)
+        .err()
+        .expect("a dead member's claims still occupy the pool");
+    assert_eq!(
+        decline.cause,
+        DeclineCause::NoRoom {
+            waits: RoomWait::Release
+        },
+        "the pool is full of one member's claims, so what frees room is a release"
+    );
+    assert_eq!(decline.value, Some(9_u64), "the declined block comes back");
     let recovery = unsafe { session.assume_dead(peer) }.unwrap();
     assert!(recovery.reap().is_ok());
     assert_eq!(*pool.as_ref().put(11_u64).unwrap(), 11);

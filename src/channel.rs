@@ -19,18 +19,15 @@ use core::sync::atomic::{AtomicU8, AtomicUsize, Ordering};
 use alloc::sync::Arc;
 
 use crate::header::{self, RcHeader, RecoveryContext};
-use crate::mem::Mapped;
+use crate::mem::{Decline, DeclineCause, Mapped};
 use crate::msg::Repr;
 use crate::queue::{
-    Claim, ClaimError, Header, Queue, Repair, ReserveError, Reserved, Slot, Staged,
-    repair_slot_with,
+    Claim, ClaimError, Header, Queue, Repair, Reserved, Slot, Staged, repair_slot_with,
 };
 use crate::schema::{
     LayoutContext, LayoutInfo, SchemaKey, SharedSchema, compose_schema, schema_id,
 };
 use crate::token::Token;
-
-pub use crate::queue::{ReserveError as SendReserveError, TrySendError};
 
 type Item<H> = Token<H>;
 type ClosedMap<H> = (Mapped<RcHeader<Duplex<H>>>, usize, usize, u8);
@@ -871,7 +868,7 @@ pub struct TransferStaged<'a, 'p, H: Repr> {
 }
 
 impl<H: Repr> Tx<H> {
-    pub fn reserve(&self) -> Result<TransferReserved<'_, H>, ReserveError> {
+    pub fn reserve(&self) -> Result<TransferReserved<'_, H>, DeclineCause> {
         Queue::reserve(&self.0).map(|reserved| TransferReserved { reserved })
     }
 
@@ -882,15 +879,15 @@ impl<H: Repr> Tx<H> {
     pub fn try_send<'p>(
         &self,
         value: crate::Transfer<'p, H>,
-    ) -> Result<(), TrySendError<crate::Transfer<'p, H>>> {
+    ) -> Result<(), Decline<crate::Transfer<'p, H>>> {
         match self.reserve() {
+            // Another member took the block's authority word between reserving and publishing, so
+            // nothing was sent and the transfer cannot come back with the refusal.
             Ok(reserved) => reserved
                 .stage(value)
                 .publish()
-                .map_err(|_| TrySendError::Authority),
-            Err(ReserveError::Closed) => Err(TrySendError::Disconnected(value)),
-            Err(ReserveError::Full) => Err(TrySendError::Full(value)),
-            Err(ReserveError::Busy) => Err(TrySendError::Busy(value)),
+                .map_err(|_| DeclineCause::Contested { member: None }.declined()),
+            Err(cause) => Err(cause.decline(value)),
         }
     }
 

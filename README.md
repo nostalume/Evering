@@ -16,6 +16,7 @@ ownership transitions. Native resources and asynchronous waiting are adapters.
 | Concept | What you use it for |
 | --- | --- |
 | `Session` | Create or open one typed view of a shared-memory region. |
+| `Observer` | Read what a region publishes without joining it or holding a slot. |
 | `Pool` | Store transferable payloads in bounded, recoverable blocks. |
 | `Channel<H>` | Exchange fixed-representation headers through a bounded duplex queue. |
 | `Port<H>` | Hand one channel role to another process as stable bytes. |
@@ -107,9 +108,11 @@ analysis, and extension rules; plots are generated on demand.
 
 Evering currently assumes peers agree on build, target architecture, protocol
 representations, and session composition. It does not promise cross-build Rust
-ABI compatibility, read-only participation, automatic application replay, or
+ABI compatibility, membership that cannot write, automatic application replay, or
 recovery of ambiguous general-heap mutation. Exact participant-death evidence
-is required before shared ownership recovery.
+is required before shared ownership recovery. Reading a region without joining
+it is supported by `Observer`, which is a standpoint outside the roster rather
+than a kind of membership.
 
 ## Documentation
 

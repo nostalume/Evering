@@ -19,7 +19,7 @@
 use std::{cell::Cell, rc::Rc, time::Duration};
 
 use evering::{
-    Encoded, PoolRef, ReceiveError, Rx, Session, Transfer, TrySendError, Tx,
+    Decline, DeclineCause, Encoded, PoolRef, ReceiveError, Rx, Session, Transfer, Tx,
     layout::{RegionId, SchemaId, SchemaKey},
     mapping::{Access, Request},
     notify::{Signals, Wait},
@@ -129,9 +129,15 @@ async fn alternate(
                     committed.into_parts();
                     tally.published.set(tally.published.get() + 1);
                 }
-                Err(TrySendError::Busy(value) | TrySendError::Full(value)) => staged.push(value),
-                Err(TrySendError::Disconnected(_)) => panic!("the peer closed early"),
-                Err(TrySendError::Authority) => panic!("the block lost its authority"),
+                Err(Decline { cause, value }) => match (cause, value) {
+                    (
+                        DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. },
+                        Some(returned),
+                    ) => staged.push(returned),
+                    (DeclineCause::Sealed, _) => panic!("the peer closed early"),
+                    (_, None) => panic!("the block lost its authority: {cause:?}"),
+                    (cause, Some(_)) => panic!("the peer refused for {cause:?}"),
+                },
             }
         }
         match rx.claim() {

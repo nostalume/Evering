@@ -28,6 +28,9 @@ use std::{
     process::{Child, Command, ExitStatus},
 };
 
+#[cfg(all(feature = "process", any(unix, windows)))]
+use std::env;
+
 #[cfg(target_os = "linux")]
 use std::{
     os::fd::{FromRawFd, OwnedFd},
@@ -75,6 +78,18 @@ pub(crate) const INTRODUCER: &str = "EVERING_INTRODUCER";
 /// the same reason — this adds a claim beside the frame, not a version of it.
 #[cfg(all(feature = "process", any(unix, windows)))]
 pub(crate) const SEAT: &str = "EVERING_SEAT";
+
+/// The key the introducer's own policy about an unattestable peer is announced through, absent when the
+/// introducer said nothing — which is the default of no.
+///
+/// A fourth key rather than a fifth field of `EVERING_SEAT`, because the seat text is frozen at the
+/// four numbers a receiver already refuses at, and this carries no identity to widen that grammar over.
+/// It is a policy statement and not a claim about the peer: whoever admits a process says with this key
+/// whether a rendezvous that answers nothing about its other end may still complete. The receiver reads
+/// the word and never writes one, which is the only reason a handover can complete on a target that has
+/// no way to attest anything.
+#[cfg(all(feature = "process", any(unix, windows)))]
+pub(crate) const TRUST: &str = "EVERING_TRUST";
 
 /// The member slot a parent promised before the process holding it existed, announced to that process.
 ///
@@ -145,6 +160,43 @@ impl Introduction {
             member: Peer::from_parts(slot, generation),
         })
     }
+}
+
+/// Whether the grant that admitted this process said a peer it cannot attest may complete the handover.
+///
+/// The answer comes from [`TRUST`], which only [`Grant::admit`](crate::os::Grant::admit) writes: a
+/// receiver that decided this question for itself would be granting itself the authority the policy
+/// exists to withhold, and the environment is the receiver's own. Absent is the default of no.
+#[cfg(all(feature = "process", any(unix, windows)))]
+pub(crate) fn announced_trust() -> io::Result<bool> {
+    let announced = match env::var(TRUST) {
+        Ok(announced) => Some(announced),
+        Err(env::VarError::NotPresent) => None,
+        Err(_) => return Err(refused("the announced introduction policy is not text")),
+    };
+    policy_of(announced.as_deref())
+}
+
+/// The two words a grant announces, and the refusal of anything else.
+///
+/// `0` is the negative written out rather than left out, so a host that exports the key for every
+/// process still admits the children it means to. Any other text is refused instead of read as the
+/// default: a reader that guessed at a policy word could guess it open, and the whole point of the key
+/// is that guessing is not how this answer gets decided.
+#[cfg(all(feature = "process", any(unix, windows)))]
+fn policy_of(announced: Option<&str>) -> io::Result<bool> {
+    match announced {
+        None | Some("0") => Ok(false),
+        Some("1") => Ok(true),
+        _ => Err(refused(
+            "the announced introduction policy names no policy this grant writes",
+        )),
+    }
+}
+
+#[cfg(all(feature = "process", any(unix, windows)))]
+fn refused(reason: &'static str) -> io::Error {
+    io::Error::new(io::ErrorKind::PermissionDenied, reason)
 }
 
 /// One process's own report of the member it became, credited by the host to the process that reported.
@@ -255,6 +307,30 @@ fn a_granted_rendezvous_is_announced_by_one_frozen_key() {
 #[test]
 fn a_promised_seat_is_announced_by_a_key_nobody_else_writes() {
     assert_eq!(SEAT, "EVERING_SEAT");
+}
+
+#[cfg(all(test, feature = "process", any(unix, windows)))]
+#[test]
+fn an_introducers_policy_is_announced_by_a_key_of_its_own() {
+    assert_eq!(TRUST, "EVERING_TRUST");
+    assert_ne!(
+        TRUST, SEAT,
+        "the seat text names a member slot, and a key that overwrote it would trade a policy for an identity"
+    );
+}
+
+#[cfg(all(test, feature = "process", any(unix, windows)))]
+#[test]
+fn only_the_two_words_a_grant_announces_are_read_as_its_policy() {
+    assert!(!policy_of(None).unwrap(), "said nothing is the default no");
+    assert!(!policy_of(Some("0")).unwrap());
+    assert!(policy_of(Some("1")).unwrap());
+    for scribbled in ["", "yes", "1 ", "true", "01"] {
+        let error = policy_of(Some(scribbled))
+            .err()
+            .unwrap_or_else(|| panic!("read {scribbled:?} as a policy nobody wrote"));
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    }
 }
 
 #[cfg(test)]

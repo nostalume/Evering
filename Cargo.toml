@@ -84,6 +84,11 @@ name = "compile_cache"
 path = "examples/compile_cache.rs"
 required-features = ["os", "tokio"]
 
+[[example]]
+name = "second_introduction"
+path = "examples/second_introduction.rs"
+required-features = ["os"]
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
