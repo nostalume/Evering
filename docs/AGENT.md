@@ -45,6 +45,12 @@ conceptually separable.
   before proposing a replacement API.
 - Treat shared bytes as a protocol. Identify which values are persistent,
   transferable, process-local, and reconstructable.
+- Name a shared word where it is declared. No shared field carries visibility
+  outside its module, so a reader elsewhere reaches it through something the
+  declaring module publishes: a value accessor, or, for a layout computed from a
+  base address the way pools and queue records are, an accessor that names the
+  location. A new hand-out of raw shared bytes is that second shape and owes a
+  reason at its declaration.
 - Treat `Repr` and `Layout` implementations as unsafe portability proofs;
   reject process-local representation and ownership at that boundary.
 - Keep the mapping root responsible only for region identity and mapping
@@ -88,8 +94,20 @@ At minimum, select evidence from:
 - wrong-allocator, invalid-identity, duplicate-completion, and quarantine tests;
 - release-mode benchmarks only after correctness checks pass.
 
+A claim that needs no kernel object is written once, in `src/tests.rs`, and each
+backend tree hands it a view. A copy in `src/tests/mock` or `src/tests/unix`
+keeps passing while the two readings drift apart, so
+`tests/backend_adapters.rs` fails the day a name both trees spell stops
+delegating.
+
 Do not describe an unexecuted platform path, benchmark, or process boundary as
 verified.
+
+An example is a process, so it is gated as one: a CI row runs it and asserts on
+the lines its legs print and on its exit code. No test target can take that place,
+because a leg that hands over is a leg that spawns, and a spawning leg names its
+child's role as an option on `current_exe()` — which the test harness refuses
+before any role body could answer for it.
 
 ## Reduction and delivery discipline
 

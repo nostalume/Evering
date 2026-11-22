@@ -63,7 +63,9 @@ cargo run --example index --features os,tokio -- README.md Cargo.toml
 ```
 
 It prints bytes, lines, and a checksum for each file. Worker failure is reported
-and supervised, but abrupt in-flight application work is not replayed.
+and supervised, but abrupt in-flight application work is not replayed. A worker
+that dies without answering ends the run at its budget rather than leaving the
+coordinator parked on a doorbell nobody will ring.
 
 A second example sends the same three compile jobs twice — once through a
 daemon in another process, once through a matched framed-TCP server — then
@@ -78,6 +80,11 @@ dominates a debug build. `--geometry` first prints the reservation each exact
 block range asks for, which is a floor set by the largest class rather than by
 traffic. The comparison favours TCP on purpose: its server is a thread inside
 the parent, while the Evering peer crosses `exec` and owns the other process.
+
+The workflow runs every example as a process on both arms — the same commands, in
+the profile CI already builds, asserting on the lines each leg prints and on the
+exit code — so an example that stops working fails a build instead of ageing
+quietly. The timings those lines carry are measurements and are not asserted.
 
 ## Benchmark evidence
 

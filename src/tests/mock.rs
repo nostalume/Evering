@@ -25,6 +25,7 @@ use core::ptr::NonNull;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::mem::{Access, Build, Map, Request, Source};
+use crate::tests;
 
 const MAX_ADDR: usize = 0x20000;
 
@@ -109,8 +110,7 @@ fn area_init() {
     const STEP: usize = 0x2000;
     let mut pt = [0; MAX_ADDR];
     for start in (0..MAX_ADDR).step_by(STEP) {
-        let a = mock_view(&mut pt, start, STEP);
-        tracing::debug!("{:?}", a.header());
+        tests::area_init(mock_view(&mut pt, start, STEP));
     }
 }
 

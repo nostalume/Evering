@@ -464,17 +464,20 @@ async fn liveness(session: &Session, pool: &Pool, shared: &Shared) -> Result<(),
         announced.len as usize,
     );
     let recovery = unsafe { session.assume_dead(dead) }.ok_or("no such member generation")?;
-    let repaired = recovery
-        .reap_with(&[
-            layout::recovery_handler::<Job>(),
-            layout::recovery_handler::<Verdict>(),
-        ])
-        .is_ok();
-
+    let reclaimed = recovery.reap_with(&[
+        layout::recovery_handler::<Job>(),
+        layout::recovery_handler::<Verdict>(),
+    ]);
     println!(
-        "LIVENESS\tpid={pid}\texit={code}\tdetect_ns={}\twakes={woken}\treap={repaired}",
-        detected.as_nanos()
+        "LIVENESS\tpid={pid}\texit={code}\tdetect_ns={}\twakes={woken}\treap={}",
+        detected.as_nanos(),
+        reclaimed.is_ok()
     );
+    // The line above is the measurement; this one is the leg. A daemon died and its storage is the whole
+    // claim, so a reclaim that did not settle has to end the run rather than be reported beside a success.
+    if reclaimed.is_err() {
+        return Err("the dead peer's storage was never reclaimed".into());
+    }
     drop((jobs_rx, jobs_port, verdicts_port));
     retire(session, jobs)?;
     retire(session, verdicts)

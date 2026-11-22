@@ -6,6 +6,12 @@
 //! The mock writes raw bytes straight through a mapping, past every protocol owner, and the bound on
 //! that is a `debug_assert`: only the permission check panics. So a green run here is evidence about
 //! behaviour, not about extents, and the suites outside `src` are what measure the difference.
+//!
+//! A claim that does not depend on a kernel object belongs to a body here, not to a platform directory.
+//! `mock` and `unix` differ only in where the bytes come from, so a body that asks nothing of the host
+//! reserves is written once and handed a view by both trees; a second copy of it keeps passing while the
+//! two readings drift apart. The bodies below take that view as their parameter for exactly that reason,
+//! and `tests/backend_adapters.rs` is what stops a platform directory from re-implementing one.
 #![cfg(test)]
 #![allow(dead_code)]
 

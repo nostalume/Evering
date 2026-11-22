@@ -91,8 +91,13 @@ Schema composition includes every type, constant, and nested revision that
 changes shared interpretation. A nested incompatible change therefore changes
 the enclosing identity. Compatibility is behavioral across native word widths:
 each architecture may use its natural representation, but both obey the same
-state transitions and reject values that cannot be represented locally. The
-project does not promise a byte-identical Rust ABI across builds or targets.
+state transitions and reject values that cannot be represented locally. Within
+that promise, a new or touched shared word is written fixed-width little-endian
+with an explicit atomic-width class, the shape `Id<L>::to_bytes` in `src/dir.rs`
+already sets, so a field stops inheriting its width from the host the day it is
+written; the natural-width fields that predate this are left as they are until a
+32-bit participant makes the difference observable. The project does not promise
+a byte-identical Rust ABI across builds or targets.
 
 ## Storage and ownership
 
@@ -183,7 +188,8 @@ not observable through a wait, so an adapter's further properties are proved
 against the primitive itself in its own module. An extension that reports a cause
 would be admissible only where a provider can both carry it and be checked
 carrying it, and only to skip work a re-examination could have found. The clauses
-a new provider is checked against are recorded in `tests/latch_conformance.rs`.
+a new provider is checked against are recorded in
+`tests/notification_latch/latch_clauses.rs`.
 
 A park can also be asked of a whole set of latches, which reports the one that
 answered and consumes that one alone. It multiplexes latches rather than causes, so
@@ -202,7 +208,8 @@ holding both sides of a duplex channel stops reading while it does that. If the
 peer is written the same way, each waits on the ring the other would free by
 reading, and nothing inside either loop can notice, so an agent with both roles
 bounds its budget or attempts a read between publishes.
-`tests/duplex_patience.rs` demonstrates both shapes against one geometry.
+`tests/publish_and_kick/ring_limit.rs` demonstrates both shapes against one
+geometry.
 
 Native latches may coalesce signals or wake spuriously. Concurrent waiters are
 allowed, cancellation unregisters only local interest, and a later notification
@@ -275,7 +282,9 @@ and bounded worker recovery. Two arms are exercised natively,
 executed only on the first, because its tests name Unix, so that leg of the
 handover seam is compiled but untested on Windows. The practical
 indexer demonstrates public construction, process handoff, runtime waiting,
-typed payload admission, close, and removal.
+typed payload admission, close, and removal. Each example is executed as a
+process by ordinary CI on both arms and asserts on the lines its legs print, so
+what it demonstrates is gate-run rather than only compiled.
 
 The crate defaults to standard-library support; its core also compiles with
 default features disabled. Native mapping, notification, process exchange,

@@ -123,7 +123,7 @@ fn all_files() -> Vec<String> {
 }
 
 /// The `#[path = "…"]` values in a file, resolved against `tests/` so that a root reaching above the tree —
-/// the way `examples_run.rs` compiles an example — lands in the same coordinates as its leg files.
+/// the way `example_wire.rs` compiles an example — lands in the same coordinates as its leg files.
 fn named_paths(text: &str) -> BTreeSet<String> {
     let mut named = BTreeSet::new();
     for line in text.lines() {

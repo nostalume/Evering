@@ -80,13 +80,20 @@ test = false
 required-features = ["benchmark"]
 
 [[test]]
+name = "backend_adapters"
+path = "tests/backend_adapters.rs"
+# No `required-features`, as for `verification_layout`: this target reads `src/tests` as text and imports no
+# production code, so there is no feature that could make it fail to build — including the `map` gate that
+# keeps the unix tree from compiling here at all.
+
+[[test]]
 name = "child_supervision"
 path = "tests/child_supervision.rs"
 required-features = ["process"]
 
 [[test]]
-name = "examples_run"
-path = "tests/examples_run.rs"
+name = "example_wire"
+path = "tests/example_wire.rs"
 required-features = ["os", "tokio"]
 
 [[test]]
@@ -139,6 +146,12 @@ name = "verification_layout"
 path = "tests/verification_layout.rs"
 # No `required-features`, as for `protocol_oracles`: this target reads the manifest and the integration tree
 # as text and imports no production code, so there is no feature that could make it fail to build.
+
+[[test]]
+name = "shared_word_access"
+path = "tests/shared_word_access.rs"
+# No `required-features`, as for `verification_layout`: this target reads `src/` as text and imports no
+# production code, so there is no feature that could make it fail to build.
 
 [[test]]
 name = "ipc-study"

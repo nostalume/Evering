@@ -23,7 +23,13 @@ const OUTCOME: SchemaKey = SchemaKey::new(SchemaId(0x494e_4458_5f4f_5554), 1);
 const EXTENT: usize = 16 * 1024 * 1024;
 const WORKERS: usize = 2;
 const BOOT_MAGIC: u64 = 0x4556_494e_4458_0001;
-type Result<T> = std::result::Result<T, String>;
+/// How long the coordinator lets a job stay outstanding. A queue reports contention and closure and never
+/// silence, so a worker that died before answering leaves the peer-bound park with no cause to end on:
+/// the run has to carry the bound, which is what an integration holding both roles is told to do.
+const BUDGET: Duration = Duration::from_secs(30);
+const STUCK: &str =
+    "a job stayed outstanding past the run's budget; the workers' own lines name why";
+pub(crate) type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct Index {
@@ -71,7 +77,12 @@ fn text(error: impl Debug) -> String {
     format!("{error:?}")
 }
 
-fn encode_boot(worker: usize, pool: PoolId, job: &Port<Encoded>, out: &Port<Encoded>) -> Bootstrap {
+pub(crate) fn encode_boot(
+    worker: usize,
+    pool: PoolId,
+    job: &Port<Encoded>,
+    out: &Port<Encoded>,
+) -> Bootstrap {
     let mut bytes = Vec::with_capacity(24 + PoolId::BYTE_LEN + 2 * Port::<Encoded>::BYTE_LEN);
     for value in [BOOT_MAGIC, worker as u64, EXTENT as u64] {
         bytes.extend_from_slice(&value.to_le_bytes());
@@ -82,7 +93,7 @@ fn encode_boot(worker: usize, pool: PoolId, job: &Port<Encoded>, out: &Port<Enco
     Bootstrap::new(bytes).unwrap()
 }
 
-fn decode_boot(
+pub(crate) fn decode_boot(
     boot: &Bootstrap,
     expected: usize,
 ) -> Result<(PoolId, Port<Encoded>, Port<Encoded>)> {
@@ -105,14 +116,14 @@ fn decode_boot(
     ))
 }
 
-fn job(id: u64, path: &Path) -> Result<Vec<u8>> {
+pub(crate) fn job(id: u64, path: &Path) -> Result<Vec<u8>> {
     let path = path.to_str().ok_or("path is not UTF-8")?;
     let mut body = id.to_le_bytes().to_vec();
     body.extend_from_slice(path.as_bytes());
     Ok(body)
 }
 
-fn read_job(body: &[u8]) -> Result<(u64, PathBuf)> {
+pub(crate) fn read_job(body: &[u8]) -> Result<(u64, PathBuf)> {
     if body.len() < 8 {
         return Err("short job".into());
     }
@@ -121,7 +132,7 @@ fn read_job(body: &[u8]) -> Result<(u64, PathBuf)> {
     Ok((id, PathBuf::from(path)))
 }
 
-fn encode_outcome(id: u64, index: &Index) -> Vec<u8> {
+pub(crate) fn encode_outcome(id: u64, index: &Index) -> Vec<u8> {
     let mut body = Vec::with_capacity(33 + index.error.as_ref().map_or(0, String::len));
     for value in [id, index.bytes, index.lines, index.checksum] {
         body.extend_from_slice(&value.to_le_bytes());
@@ -133,7 +144,7 @@ fn encode_outcome(id: u64, index: &Index) -> Vec<u8> {
     body
 }
 
-fn read_outcome(body: &[u8]) -> Result<(usize, Index)> {
+pub(crate) fn read_outcome(body: &[u8]) -> Result<(usize, Index)> {
     if body.len() < 33 {
         return Err("short outcome".into());
     }
@@ -238,10 +249,19 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
     let mut output: Vec<Option<Index>> = (0..paths.len()).map(|_| None).collect();
     let mut sent = 0;
     let mut received = 0;
+    let started = Instant::now();
+    let remaining = || {
+        BUDGET
+            .checked_sub(started.elapsed())
+            .ok_or_else(|| STUCK.to_owned())
+    };
     while sent < paths.len() || received < sent {
         if sent < paths.len() && sent - received < window {
             let peer = &peers[sent % peers.len()];
-            let permit = signals.reserve(&peer.jobs).await.map_err(text)?;
+            let permit = tokio::time::timeout(remaining()?, signals.reserve(&peer.jobs))
+                .await
+                .map_err(|_| STUCK.to_owned())?
+                .map_err(text)?;
             let body = job(sent as u64, &paths[sent])?;
             let block = pool.as_ref().copy(&body).map_err(text)?;
             permit
@@ -270,7 +290,10 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
             }
         }
         if !progress {
-            wait.wait().await.map_err(text)?;
+            tokio::time::timeout(remaining()?, wait.wait())
+                .await
+                .map_err(|_| STUCK.to_owned())?
+                .map_err(text)?;
         }
     }
     for peer in &peers {
