@@ -43,15 +43,22 @@ evering = { version = "0.1.0", features = ["os", "tokio"] }
 ```
 
 The default feature is `std`. `map`, `notify`, and `process` are composable;
-`os` selects all native adapters. `tokio` adds process-local waiting. The core
-also checks with default features disabled.
+`os` selects all native adapters. `tokio` adds process-local waiting. Each of the
+three is also built and run at its own width on both hosts, because a layer that
+quietly needs a dependency feature some wider layer turns on composes only in
+name. The core also checks with default features disabled.
 
 The crate builds on stable Rust; nothing in it needs a nightly compiler.
 `rust-toolchain.toml` pins the version the checks below were run on
 (`1.100.0`, with rustfmt and Clippy) and `rustup` installs it on first use. A
 check run through `+nightly` or another stable version compares a different
-compiler build than CI does. That pin is not a minimum supported version: no
-lower bound has been measured, so `Cargo.toml` states none.
+compiler build than CI does. That pin is also the minimum supported version, and
+`Cargo.toml` now states it: older compilers were run rather than reasoned about,
+and `1.99.0` fails on the three standard-library faces this crate leans on —
+`allocator_api`, `unsafe_cell_access`, and a `const` `UnsafeCell::as_ref_unchecked`
+— all stable at `1.100.0`. The floor is where the library became sufficient, not
+a bound we agreed to maintain, so raising it is a one-line decision and lowering
+it is a code change.
 
 ## Practical example
 

@@ -21,7 +21,7 @@ jobs:
         with:
           toolchain: 1.100.0
           components: rustfmt, clippy, rust-docs
-          targets: i686-unknown-linux-gnu
+          targets: i686-unknown-linux-gnu,riscv32imac-unknown-none-elf,aarch64-unknown-none
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
@@ -76,8 +76,23 @@ jobs:
       # the same reason. `tokio` belongs in the row because four rows ask it — without it `cargo check` reports
       # those four skipped and reports nothing else.
       - run: cargo check --tests --features os,tokio
+      # The mapping layer at the width it names. `src/os/unix.rs` asks `nix` for `sysconf`, which sits in
+      # nix's own `feature` sub-layer, and `map` declared only `fs` and `mman`: the library built because
+      # `notify` and `process` reach `nix/poll`, which turns `feature` on for them. No row asked for `map`
+      # alone, so that was true for as long as nobody looked.
+      - run: cargo test -q --features map --lib
       - run: cargo check --no-default-features
       - run: cargo check --no-default-features --target i686-unknown-linux-gnu
+      # `categories` names `no-std`, and the two rows above check that tree where `std` is merely switched
+      # off: `cfg(unix)` is still true there, so anything the portable layers reach for that only a libc
+      # supplies builds anyway. A target with neither `unix` nor `windows` is the arm where that cannot
+      # happen, and so the only arm that compiles the replacement rule `src/os.rs` documents — a caller's
+      # `Source` over bytes in its own image, a caller's `Notify`/`Wait` over its own doorbell — instead of
+      # asserting it. `tests/portable_contracts/static_source.rs` writes exactly that `Source`, but as a
+      # process that still has a libc under it. One width each, because the `REGION_ALIGN` arrangement and
+      # every bound derived from `usize` answer differently at 32 bits.
+      - run: cargo check --no-default-features --target riscv32imac-unknown-none-elf
+      - run: cargo check --no-default-features --target aarch64-unknown-none
       - run: cargo package --list
 
   windows:
@@ -125,4 +140,9 @@ jobs:
           esac
       # The same narrow compile as the linux job: the legs this host owns are the ones a wide row hides.
       - run: cargo check --tests --features os,tokio
+      # And the same width the linux job asks for the mapping layer. Nothing on this arm was broken by that
+      # nix gate, and removing one of the three `windows-sys` subfeatures `map` declares does not fire this
+      # row either, so it is the symmetric guard rather than a scar: the only row that asks this host's
+      # mapping source to build and run with nothing above it.
+      - run: cargo test -q --features map --lib
       - run: cargo check --all-targets --all-features

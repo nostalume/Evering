@@ -4,6 +4,7 @@ version = "0.1.0"
 authors = ["Nostalgia <Nostalume@outlook.com>"]
 license = "MIT OR Apache-2.0"
 edition = "2024"
+rust-version = "1.100.0"
 description = "Typed shared-memory communication across processes"
 repository = "https://github.com/nostalume/evering"
 readme = "README.md"
@@ -28,7 +29,10 @@ autotests = false
 [features]
 default = ["std"]
 std = []
-map = ["std", "dep:nix", "nix/fs", "nix/mman", "dep:windows-sys",
+# `nix/feature` names no capability of this crate's own: `src/os/unix.rs` asks the host for its page size
+# through `nix::unistd::sysconf`, and nix keeps that call behind that feature. Nothing but a `map`-only build
+# notices it missing, which is why the workflow has one on each arm.
+map = ["std", "dep:nix", "nix/feature", "nix/fs", "nix/mman", "dep:windows-sys",
     "windows-sys/Win32_Foundation", "windows-sys/Win32_Security", "windows-sys/Win32_System_Memory"]
 notify = ["std", "dep:nix", "nix/event", "nix/poll", "dep:windows-sys",
     "windows-sys/Win32_Foundation", "windows-sys/Win32_Security",

@@ -19,7 +19,10 @@ conceptually separable.
 
 ## Technology
 
-- Rust 2024 edition on stable Rust, pinned to `1.100.0` in `rust-toolchain.toml`.
+- Rust 2024 edition on stable Rust, pinned to `1.100.0` in `rust-toolchain.toml`,
+  which is also the stated `rust-version`: the compilers below it were run and
+  fail on `allocator_api`, `unsafe_cell_access`, and a `const`
+  `UnsafeCell::as_ref_unchecked`.
 - One root `evering` crate with default standard-library support and a verified
   `no_std + alloc` configuration when default features are disabled.
 - Additive `map`, `notify`, and `process` adapter capabilities, with `os` as
