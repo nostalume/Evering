@@ -1,20 +1,18 @@
-#![cfg(all(feature = "map", feature = "tokio"))]
-
-// One agent, both roles. `Channel::split` gives a holder a `Tx` on its own route and an
-// `Rx` on the peer's, so a request/response side owns both directions in one task, and the
-// waiting loops in `Signals` run one direction until it commits. That combination is what
-// this file tests: an agent blocked in a send never looks at its receive, and a peer built
-// the same way is blocked in its own send for want of exactly that draining.
-//
-// Both arms use the same region, capacity, window, and wait source, and the arms differ
-// only in whether a receive is attempted between publishes. The wait source yields to the
-// scheduler instead of sleeping, which is the most generous assumption available here: both
-// agents run whenever the other is not, so a stall cannot be blamed on a notification that
-// was lost. `Adaptive`, the library's own ladder, has no deadline, so each exchange is
-// bounded from outside — which is what a caller has to invent to notice it is stuck.
-//
-// The completing arm is what makes the stalling arm mean anything: it shows this geometry
-// moves data at all, so the other result is about loop shape rather than a broken fixture.
+//! One agent, both roles. `Channel::split` gives a holder a `Tx` on its own route and an
+//! `Rx` on the peer's, so a request/response side owns both directions in one task, and the
+//! waiting loops in `Signals` run one direction until it commits. That combination is what
+//! this leg pins: an agent blocked in a send never looks at its receive, and a peer built
+//! the same way is blocked in its own send for want of exactly that draining.
+//!
+//! Both arms use the same region, capacity, window, and wait source, and the arms differ
+//! only in whether a receive is attempted between publishes. The wait source yields to the
+//! scheduler instead of sleeping, which is the most generous assumption available here: both
+//! agents run whenever the other is not, so a stall cannot be blamed on a notification that
+//! was lost. `Adaptive`, the library's own ladder, has no deadline, so each exchange is
+//! bounded from outside — which is what a caller has to invent to notice it is stuck.
+//!
+//! The completing arm is what makes the stalling arm mean anything: it shows this geometry
+//! moves data at all, so the other result is about loop shape rather than a broken fixture.
 
 use std::{cell::Cell, rc::Rc, time::Duration};
 
@@ -24,7 +22,6 @@ use evering::{
     notify::{Signals, Wait},
 };
 
-mod support;
 use crate::support::region;
 
 const REGION: RegionId = RegionId::new(0x6576_6475_706c_6578, 1);

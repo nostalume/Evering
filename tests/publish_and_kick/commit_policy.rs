@@ -1,4 +1,10 @@
-#![cfg(all(feature = "map", feature = "tokio"))]
+//! The ordering half of the claim: making a value visible and ringing the doorbell that announces it are
+//! two decisions, and this is where they are held apart — what a borrowed signal commits before it
+//! notifies, what a rollback and a full reserve owe the notification behind them, why a failed
+//! notification never demotes the commit it followed, and how many rings a group of commits owes (one,
+//! including when its guard dies mid-batch, and nothing at all when the batch is empty). The `Patience`
+//! arms ask the other question: a contention a policy is allowed to stop on has to be reported rather
+//! than waited through on the peer's behalf.
 
 use std::{
     cell::{Cell, RefCell},
@@ -14,7 +20,6 @@ use evering::{
     },
 };
 
-mod support;
 use crate::support::region;
 
 const REGION: RegionId = RegionId::new(0x6539_7375_7266_6163, 1);

@@ -1,5 +1,3 @@
-#![cfg(all(feature = "os", any(unix, windows)))]
-
 //! What the promise looks like across a process boundary: one process reserves a member slot, admits
 //! a child with it, and the child — a second mapping of a region it only ever received as a descriptor
 //! or a handle — arrives in exactly the slot it was told about. `src/tests/unix/talc.rs` covers the
@@ -26,7 +24,7 @@
 //! cannot yet say is which member a death *did* reach: an announced identity is the parent's word
 //! about a slot, not a record of who stood in it, so binding a reaped child to the member it became is
 //! a decision of its own and no part of this file can make it. Reaping an identity a caller can name
-//! for itself is what `src/tests/unix/recovery.rs` and `tests/ipc_process.rs` show.
+//! for itself is what `src/tests/unix/recovery.rs` and `tests/recovery_conserves.rs` show.
 
 use std::{
     env,
@@ -41,7 +39,6 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-mod support;
 use crate::support::{introduce, region, role};
 
 const SIZE: usize = 1 << 20;
@@ -59,16 +56,15 @@ const UNANNOUNCED: i32 = 4;
 const SCRIBBLE_REFUSED: i32 = 5;
 /// Exited by a promised child that met and then died without arriving in the slot it was told of.
 const VANISHED: i32 = 6;
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[
-        ("announced", announced),
-        ("unannounced", unannounced),
-        ("scribbled", scribbled),
-        ("vanished", vanished),
-    ]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` dispatches over
+/// this table and the platform leg's, because the harness re-enters a child by exact item name and only
+/// one item in a target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    ("announced", announced),
+    ("unannounced", unannounced),
+    ("scribbled", scribbled),
+    ("vanished", vanished),
+];
 
 fn expected() -> Peer {
     let named = env::var(EXPECT).expect("the child is told out of band which member to expect");

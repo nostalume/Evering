@@ -16,9 +16,9 @@
 //!   until a narrower row is added — and narrower rows cannot be added freely while `--features map` alone
 //!   fails inside `src/os/unix.rs`, which asks `nix` for a `sysconf` the `map` feature never declares.
 //!
-//! The manifest side of this layout is `[package] autotests` and the `[[test]]` rows. Until every target is
-//! named there, this file is also discovered as a target of its own; it holds no test items, so that binary
-//! reports zero tests.
+//! The manifest side of this layout is `[package] autotests = false` and the `[[test]]` rows: nothing under
+//! `tests/` is discovered any more, and `tests/verification_layout.rs` fails the suite when a file and a row
+//! stop agreeing. That check exists because a dropped row is not an error but a green run over one claim less.
 
 // An attribute on this module, so a claim file's own dead code is still reported: the harness may hold a
 // helper no claim calls yet, and that is not a licence for a claim to hold dead code.

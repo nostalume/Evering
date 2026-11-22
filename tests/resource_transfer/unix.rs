@@ -1,4 +1,19 @@
-#![cfg(all(feature = "process", unix))]
+//! What the control pipe carries besides bytes: an offer's opaque prefix and its descriptors arrive together
+//! or not at all, and a refusal closes whatever it already received. Two of the refusals here are arranged
+//! by hand rather than asked for politely — one receives with a count the datagram does not carry, the other
+//! writes its frame straight with `sendmsg` so that rights arrive beside bytes no parser in this crate
+//! claims — and both end with the peer's own end of a stream reporting EOF, which is the only way to see a
+//! descriptor the kernel dup'd *into* this process again leave it.
+//!
+//! One seam differs from the Windows leg, and it is the reason the two stay separate files rather than one
+//! file with two arms: here the child binds the rendezvous and the parent connects back to a name in the
+//! filesystem, while there the parent owns a named pipe instance and the child dials it. The bounds case
+//! stays inside this process on both hosts, because a local limit that rejected nothing would otherwise
+//! look like a transport failure.
+//!
+//! Two questions this pipe does not answer, named so their absence is not read as coverage: which member a
+//! handover named, which `handover_admission` answers, and what a death left behind, which
+//! `recovery_conserves` counts.
 
 use std::{
     env,
@@ -8,46 +23,31 @@ use std::{
         fd::{AsFd, AsRawFd},
         unix::net::UnixStream,
     },
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 use evering::{
-    os::{Handoff, unix::process::Socket},
+    os::unix::process::Socket,
     process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES},
 };
 
-mod support;
-use crate::support::role;
-
-/// The rendezvous a role is told to bind, which is the same name the parent connects back to.
-const RENDEZVOUS: &str = "EVERING_EXCHANGE_RENDEZVOUS";
-/// The region the handover claim exchanges, and the size both legs check it at.
-#[cfg(feature = "notify")]
-const SIZE: usize = 4096;
-
-#[test]
-fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
-    let (handoff, grant) = Handoff::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    grant.admit(&mut command).unwrap();
-    drop(handoff);
-    let error = Handoff::receive()
-        .err()
-        .expect("a process holding no grant meets no one");
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-}
-
-#[cfg(feature = "notify")]
-#[test]
-fn received_event_constructor_is_safe() {
-    let _: fn(std::os::fd::OwnedFd) -> evering::os::Event = evering::os::Event::from_owned_fd;
-}
 use nix::{
     fcntl::{FcntlArg, FdFlag, fcntl},
     sys::socket::{ControlMessage, MsgFlags, sendmsg},
 };
+
+use crate::support::role;
+
+/// The rendezvous a role is told to bind, which is the same name the parent connects back to.
+const RENDEZVOUS: &str = "EVERING_EXCHANGE_RENDEZVOUS";
+/// The size of the mapping the `taker` role is handed, and the size it checks that file against.
+const SIZE: usize = 4096;
+
+#[test]
+fn received_event_constructor_is_safe() {
+    let _: fn(std::os::fd::OwnedFd) -> evering::os::Event = evering::os::Event::from_owned_fd;
+}
 
 fn assert_peer_closed(observer: &mut UnixStream) {
     let deadline = Instant::now() + Duration::from_secs(1);
@@ -142,7 +142,6 @@ fn local_bounds_reject_without_transport() {
 }
 
 /// The role the handover spawns: take the region and the two bells the parent sends, and ring back.
-#[cfg(feature = "notify")]
 fn taker() -> i32 {
     use evering::os::unix::UnixFd;
     use nix::{sys::stat::fstat, unistd};
@@ -169,14 +168,11 @@ fn taker() -> i32 {
     0
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    #[cfg(feature = "notify")]
-    role::dispatch(&[("taker", taker)]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root holds the target's only
+/// `role_entry`, because the harness re-enters a child by exact item name and only one item in a target may
+/// answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[("taker", taker)];
 
-#[cfg(feature = "notify")]
 #[test]
 fn child_accepts_mapping_and_directional_bells() {
     use evering::{

@@ -1,35 +1,33 @@
-#![cfg(all(feature = "tokio", feature = "notify", any(unix, windows)))]
-
-// The latch contract, in the four clauses every notification backend has to meet for
-// `Signals` to park on it. A backend is conformant when all four hold for the pair
-// `os::event()` hands out, whichever primitive it wraps, so this file is what a new
-// adapter — including a kernel-side provider — is checked against.
-//
-// Which claims are portable and which are a convenience of the primitives here:
-//
-// - Stickiness, coalescing without counting, and cancellation that takes nothing are
-//   the contract. seL4's notification object documents the same shape: a signalled word
-//   stays until `receiveSignal` returns it to Idle, the same badge twice is
-//   indistinguishable from once, and a thread that stops waiting consumes nothing.
-// - That a park left the latch empty is not observable here: a park that stays asleep
-//   cannot tell an empty latch from a readiness the driver never re-reported, so each
-//   clause below keeps a live waiter as a positive control and the consumption claim
-//   lives with the primitive it is about, in each backend's own test.
-// - Releasing *every* registered waiter is not. `seL4_Signal` dequeues only the head
-//   TCB while the others wait for the next signal, so a kernel peer cannot satisfy this
-//   clause. Nothing in the library may depend on it: a woken waiter re-examines its own
-//   state and re-parks, which is what `Contention` and `Patience` are for. It is tested
-//   here because these backends really do release the whole set, and an accidental
-//   change to a one-waiter-per-kick latch must not look like an improvement.
-// - What keeps a head-only latch harmless is structural rather than disciplinary:
-//   `os::event()` hands out one pair per condition — one ring, one direction — so no
-//   two conditions are ever parked on one primitive. An adapter that multiplexed
-//   causes onto a single latch would need the wake to name its cause, which is the
-//   badge a bounded notification word carries and a byte queue or a bit does not.
-// - The synchronous park over a *set* of latches, `Event::wait_any`, is none of these
-//   clauses: it multiplexes latches rather than causes, so each condition still owns
-//   one pair. Its own claims — one latch reported per park, the rest of the set kept
-//   ready — are checked in `src/os/mux.rs`, beside the leg that makes them.
+//! The latch contract, in the four clauses every notification backend has to meet for
+//! `Signals` to park on it. A backend is conformant when all four hold for the pair
+//! `os::event()` hands out, whichever primitive it wraps, so this leg is what a new
+//! adapter — including a kernel-side provider — is checked against.
+//!
+//! Which claims are portable and which are a convenience of the primitives here:
+//!
+//! - Stickiness, coalescing without counting, and cancellation that takes nothing are
+//!   the contract. seL4's notification object documents the same shape: a signalled word
+//!   stays until `receiveSignal` returns it to Idle, the same badge twice is
+//!   indistinguishable from once, and a thread that stops waiting consumes nothing.
+//! - That a park left the latch empty is not observable here: a park that stays asleep
+//!   cannot tell an empty latch from a readiness the driver never re-reported, so each
+//!   clause below keeps a live waiter as a positive control and the consumption claim
+//!   lives with the primitive it is about, in each backend's own test.
+//! - Releasing *every* registered waiter is not. `seL4_Signal` dequeues only the head
+//!   TCB while the others wait for the next signal, so a kernel peer cannot satisfy this
+//!   clause. Nothing in the library may depend on it: a woken waiter re-examines its own
+//!   state and re-parks, which is what `Contention` and `Patience` are for. It is tested
+//!   here because these backends really do release the whole set, and an accidental
+//!   change to a one-waiter-per-kick latch must not look like an improvement.
+//! - What keeps a head-only latch harmless is structural rather than disciplinary:
+//!   `os::event()` hands out one pair per condition — one ring, one direction — so no
+//!   two conditions are ever parked on one primitive. An adapter that multiplexed
+//!   causes onto a single latch would need the wake to name its cause, which is the
+//!   badge a bounded notification word carries and a byte queue or a bit does not.
+//! - The synchronous park over a *set* of latches, `Event::wait_any`, is none of these
+//!   clauses: it multiplexes latches rather than causes, so each condition still owns
+//!   one pair. Its own claims — one latch reported per park, the rest of the set kept
+//!   ready — are checked in `src/os/mux.rs`, beside the leg that makes them.
 
 use std::time::Duration;
 

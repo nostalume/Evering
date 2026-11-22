@@ -1,4 +1,3 @@
-#![cfg(all(unix, feature = "map"))]
 #![expect(
     clippy::result_large_err,
     reason = "uncommitted transfers stay inline so retry retains exact ownership"
@@ -14,7 +13,7 @@
 //! that after a complete reap its slot is reusable, its generation is not, and its stale identity
 //! targets nothing.
 //!
-//! The two recovery cases have a Windows leg, in `tests/recovery_dispatch_windows.rs`; that file says
+//! The reap and pool cases have a Windows leg, in the `windows` module beside this one; that file says
 //! which faces of the dispatch were already executed there and what the transport looks like without a
 //! POSIX shared-memory name. The rest of this file is a unix-only claim and is not ported: several of
 //! these cases assert where a mapping landed, and the Windows backend does not ask the kernel for an
@@ -39,7 +38,6 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(feature = "process")]
 use evering::process::Supervisor;
 use evering::{
     BlockRange, ChannelId as Id, DeclineCause, PoolId, Port, RoomWait, Session, SessionError,
@@ -48,7 +46,6 @@ use evering::{
     os::unix::UnixFd,
 };
 
-mod support;
 use crate::support::{cuts, introduce, region, role};
 
 const NAME: &str = "EVERING_PROCESS_SHM";
@@ -208,18 +205,17 @@ fn pool_id_from_env() -> PoolId {
     )
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[
-        ("server", server),
-        ("announce-peer-and-exit", announce_peer_and_exit),
-        ("wrong-region", wrong_region),
-        ("talc-geometry", talc_geometry),
-        ("alternate-layout-owner", alternate_layout_owner),
-        ("pool-owner", pool_owner),
-    ]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` dispatches over
+/// this table and the other legs', because the harness re-enters a child by exact item name and only one item
+/// in a target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    ("server", server),
+    ("announce-peer-and-exit", announce_peer_and_exit),
+    ("wrong-region", wrong_region),
+    ("talc-geometry", talc_geometry),
+    ("alternate-layout-owner", alternate_layout_owner),
+    ("pool-owner", pool_owner),
+];
 
 /// The answering peer of the round trip: join at a base it was handed, serve one request, and report
 /// where its own allocator landed.
@@ -399,17 +395,9 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
     declare_port(&mut command, &port);
     declare_pool(&mut command, pool.id());
     cuts::hand(&mut command, DOOMED);
-    #[cfg(feature = "process")]
     let mut child = Supervisor::spawn(&mut command).expect("spawn doomed peer");
-    #[cfg(not(feature = "process"))]
-    let mut child = ChildGuard(command.spawn().expect("spawn doomed peer"));
-
-    #[cfg(feature = "process")]
     let exit = child.wait().expect("wait for child");
-    #[cfg(feature = "process")]
     let status = exit.status();
-    #[cfg(not(feature = "process"))]
-    let status = child.wait();
     assert_eq!(
         status.code(),
         Some(DOOMED),

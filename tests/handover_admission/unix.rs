@@ -1,5 +1,6 @@
-#![cfg(all(feature = "process", unix))]
-
+//! Which process a handoff will meet: one that only claims an introduction is refused, one that holds a
+//! grant it never spent is refused, and the one the grant was admitted into names the peer it met.
+//!
 //! Delta 31 recorded the Unix handshake's missing peer attestation, and the impostor run that would
 //! falsify it, as a prediction read from the code. The red run of that prediction is recorded in the
 //! plan; these are the two assertions P0 is accepted on: a process that holds the announcement but
@@ -7,6 +8,13 @@
 //! to can name the peer it met. Both now also hold the introducer's policy word — one written by the
 //! claimant for itself, one written by the grant that admitted the other child — because a value that
 //! can complete an unattested handover has to be shown to open no door and to close none.
+//!
+//! The refusals of a process that was never admitted are kept apart rather than merged because they differ in
+//! what that process still holds: one spent its grant into a command that never spawned, so the granted
+//! descriptor is still open in this process's own table, and the other let the command go too. Both are
+//! answered at the first line of `granted_socket`, which is what the pair is for — a descriptor you were
+//! handed is not an announcement made to you. They came from the file that borrowed a handoff to move a
+//! region, which is not where a claim about who may meet belongs.
 
 use std::{
     env,
@@ -23,7 +31,6 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-mod support;
 use crate::support::{introduce, role};
 
 /// The environment key a grant announces its rendezvous under, as frozen in `src/process.rs`.
@@ -125,11 +132,10 @@ fn child() -> i32 {
     }
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[(ATTACKER, attacker), (CHILD, child)]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` runs whichever
+/// platform leg was compiled, because the harness re-enters a child by exact item name and only one item in a
+/// target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[(ATTACKER, attacker), (CHILD, child)];
 
 #[test]
 fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
@@ -171,6 +177,18 @@ fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
         "the process the grant was admitted to meets and names its introducer, and the policy that \
          grant carried leaves an answer the kernel gave exactly as it was"
     );
+}
+
+#[test]
+fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
+    let (handoff, grant) = Handoff::bind().unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    grant.admit(&mut command).unwrap();
+    drop(handoff);
+    let error = Handoff::receive()
+        .err()
+        .expect("a process holding no grant meets no one");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
 #[test]

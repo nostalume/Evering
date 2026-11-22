@@ -29,6 +29,12 @@ jobs:
       # The row above never compiles `benches/ipc/*` or an example, so a target gated on a feature
       # it does not ask for goes unnoticed until someone builds the whole matrix by hand.
       - run: cargo test --all-features --all-targets
+      # What each row says it needs, compiled at that width. `--all-features` hides this class twice over: a
+      # library feature that calls a dependency feature it never declares builds because another feature turns
+      # that dependency on, and a target whose `required-features` stop short of the code it holds builds for
+      # the same reason. `tokio` belongs in the row because four rows ask it — without it `cargo check` reports
+      # those four skipped and reports nothing else.
+      - run: cargo check --tests --features os,tokio
       - run: cargo check --no-default-features
       - run: cargo check --no-default-features --target i686-unknown-linux-gnu
       - run: cargo package --list
@@ -43,4 +49,6 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - run: cargo test --features os,tokio,tracing
+      # The same narrow compile as the linux job: the legs this host owns are the ones a wide row hides.
+      - run: cargo check --tests --features os,tokio
       - run: cargo check --all-targets --all-features

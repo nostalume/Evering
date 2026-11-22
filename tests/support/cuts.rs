@@ -6,11 +6,11 @@
 //! number — one to die with, one to assert — so the pair stayed honest only while somebody remembered to
 //! edit both. The parent passes it now and the child leaves with whatever it was handed.
 //!
-//! What deliberately stays per claim is the table the parent reads. `recovery_process` names four cuts at
-//! 81 to 84, `recovery_dispatch_windows` distinguishes a doomed member (77) from a foreign owner (73), and
-//! `src/tests/unix/recovery.rs` — a library unit test, unreachable from this subtree — keeps deriving
-//! `80 + cut`. Merging those would assert more than any claim does: that two files' crash numbers may
-//! never collide.
+//! What deliberately stays per claim is the table the parent reads. `recovery_conserves`'s `at_every_cut` leg
+//! names four cuts at 81 to 84, its `unix` and `windows` legs distinguish a doomed member (77) from a foreign
+//! owner (73) and a pool filler (74), and `src/tests/unix/recovery.rs` — a library unit test, unreachable from
+//! this subtree — keeps deriving `80 + cut`. Merging those would assert more than any claim does: that two
+//! files' crash numbers may never collide.
 
 use std::{env, process::Command};
 

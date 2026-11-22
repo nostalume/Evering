@@ -21,7 +21,7 @@ include = [
 #
 # A claim whose legs are separate files lives in a directory named after its root, and the root reaches
 # those legs with `#[path]`: a crate root looks for its children beside itself, so a bare `mod unix;` in
-# `tests/foo.rs` would resolve to `tests/unix.rs` and land in the flat list the rows above are checked
+# `tests/foo.rs` would resolve to `tests/unix.rs` and land in the flat list the rows below are checked
 # against.
 autotests = false
 
@@ -29,12 +29,12 @@ autotests = false
 default = ["std"]
 std = []
 map = ["std", "dep:nix", "nix/fs", "nix/mman", "dep:windows-sys",
-    "windows-sys/Win32_Foundation", "windows-sys/Win32_System_Memory"]
+    "windows-sys/Win32_Foundation", "windows-sys/Win32_Security", "windows-sys/Win32_System_Memory"]
 notify = ["std", "dep:nix", "nix/event", "nix/poll", "dep:windows-sys",
     "windows-sys/Win32_Foundation", "windows-sys/Win32_Security",
     "windows-sys/Win32_System_Threading"]
 process = [
-    "map", "nix/process", "nix/signal", "nix/socket", "nix/uio", "nix/user", "nix/poll",
+    "map", "notify", "nix/process", "nix/signal", "nix/socket", "nix/uio", "nix/user", "nix/poll",
     "windows-sys/Win32_Security", "windows-sys/Win32_System_IO",
     "windows-sys/Win32_Storage_FileSystem", "windows-sys/Win32_System_Pipes",
     "windows-sys/Win32_System_Threading",
@@ -80,21 +80,9 @@ test = false
 required-features = ["benchmark"]
 
 [[test]]
-name = "arrival_receipt"
-path = "tests/arrival_receipt.rs"
-
-[[test]]
-name = "arrival_receipt_windows"
-path = "tests/arrival_receipt_windows.rs"
-
-[[test]]
 name = "child_supervision"
 path = "tests/child_supervision.rs"
 required-features = ["process"]
-
-[[test]]
-name = "duplex_patience"
-path = "tests/duplex_patience.rs"
 
 [[test]]
 name = "examples_run"
@@ -102,41 +90,24 @@ path = "tests/examples_run.rs"
 required-features = ["os", "tokio"]
 
 [[test]]
-name = "handoff_impostor"
-path = "tests/handoff_impostor.rs"
+name = "handover_admission"
+path = "tests/handover_admission.rs"
+required-features = ["process"]
 
 [[test]]
-name = "handoff_impostor_windows"
-path = "tests/handoff_impostor_windows.rs"
+name = "handover_attestation"
+path = "tests/handover_attestation.rs"
+required-features = ["os"]
 
 [[test]]
-name = "ipc_process"
-path = "tests/ipc_process.rs"
-
-[[test]]
-name = "latch_conformance"
-path = "tests/latch_conformance.rs"
-
-[[test]]
-name = "notify_commit_policy"
-path = "tests/notify_commit_policy.rs"
-
-[[test]]
-name = "notify_process"
-path = "tests/notify_process.rs"
+name = "notification_latch"
+path = "tests/notification_latch.rs"
+required-features = ["notify", "tokio"]
 
 [[test]]
 name = "portable_contracts"
 path = "tests/portable_contracts.rs"
 required-features = ["map"]
-
-[[test]]
-name = "process_exchange"
-path = "tests/process_exchange.rs"
-
-[[test]]
-name = "process_exchange_windows"
-path = "tests/process_exchange_windows.rs"
 
 [[test]]
 name = "protocol_oracles"
@@ -145,16 +116,29 @@ path = "tests/protocol_oracles.rs"
 # make them fail to build, and a gate here would only hide them from a narrower command.
 
 [[test]]
-name = "recovery_dispatch_windows"
-path = "tests/recovery_dispatch_windows.rs"
+name = "publish_and_kick"
+path = "tests/publish_and_kick.rs"
+required-features = ["map", "tokio"]
 
 [[test]]
-name = "recovery_process"
-path = "tests/recovery_process.rs"
+name = "resource_transfer"
+path = "tests/resource_transfer.rs"
+# Both legs' old `notify` and `map` terms were vacuous: `process` already pulls in the mapping and
+# notification layers, so this is everything the two files actually reach for.
+required-features = ["process"]
 
 [[test]]
-name = "seat_announcement"
-path = "tests/seat_announcement.rs"
+name = "recovery_conserves"
+path = "tests/recovery_conserves.rs"
+# `process` already pulls in the mapping and notification layers, so this is the narrowest pair on which
+# every leg builds: the arithmetic leg additionally waits on a runtime doorbell.
+required-features = ["process", "tokio"]
+
+[[test]]
+name = "verification_layout"
+path = "tests/verification_layout.rs"
+# No `required-features`, as for `protocol_oracles`: this target reads the manifest and the integration tree
+# as text and imports no production code, so there is no feature that could make it fail to build.
 
 [[test]]
 name = "ipc-study"

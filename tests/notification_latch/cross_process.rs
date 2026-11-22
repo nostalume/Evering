@@ -1,4 +1,6 @@
-#![cfg(all(feature = "tokio", feature = "notify", any(unix, windows)))]
+//! The same latch seen from two processes: a doorbell whose descriptor number is handed to a second
+//! process rebuilds there into a wait that a kick from the first releases, and a peer that exits instead
+//! of waiting cancels that wait without ever making readiness appear.
 
 use std::{env, time::Duration};
 
@@ -7,14 +9,13 @@ use evering::{
     os, runtime,
 };
 
-mod support;
 use crate::support::role;
 
 /// The doorbell the parent names to its child, spelled as the number a second process can rebuild.
 const HANDLE: &str = "EVERING_NOTIFY_HANDLE";
 
 /// The role the cross-process wait spawns: park on the handle the parent named, and leave when it rings.
-fn parks() -> i32 {
+pub(crate) fn parks() -> i32 {
     let raw: usize = env::var(HANDLE).unwrap().parse().unwrap();
 
     #[cfg(unix)]
@@ -40,15 +41,13 @@ fn parks() -> i32 {
 }
 
 /// The role the peer-exit claim spawns: leave at once, so a death is the only answer the wait can get.
-fn leaves() -> i32 {
+pub(crate) fn leaves() -> i32 {
     0
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[("parks", parks), ("leaves", leaves)]);
-}
+// Both roles are dispatched from the claim root's single `role_entry`. The harness re-enters a child by
+// exact item name, so a `role_entry` living in this module would be reachable as
+// `cross_process::role_entry` and would answer to nothing.
 
 #[test]
 fn wait_cross_process() {

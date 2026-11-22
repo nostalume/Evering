@@ -6,7 +6,7 @@
 //!
 //! Two things these cases cannot show. Both mappings of one file live in this process, so the ordering
 //! that only a second process exposes — a peer mapping while the creator is still publishing its
-//! header, or still holding a promise over a slot — is claimed by `tests/ipc_process.rs` and
+//! header, or still holding a promise over a slot — is claimed by `tests/recovery_conserves.rs` and
 //! `src/tests/unix/recovery.rs`, not by this file. And
 //! the class widths used here sit under the platform's geometry cap, so an over-wide class is refused by
 //! the mock suite's `ClassTooWide` case and never arrives on a real mapping.

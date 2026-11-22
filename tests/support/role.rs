@@ -41,12 +41,23 @@ pub type Body = fn() -> i32;
 /// named that the table does not hold is the claim's own mistake and is reported as one, rather than
 /// falling through into whichever driver shares the binary.
 pub fn dispatch(table: &[(&'static str, Body)]) {
+    dispatch_all(&[table]);
+}
+
+/// [`dispatch`] over several tables at once, which is what a claim whose legs sit in separate files needs:
+/// each leg keeps its roles beside its own bodies, and the root's entry says which legs this host compiles.
+/// A role named by two of them is settled by order rather than ambiguity — the first table to match has the
+/// child leave before the second is read — so a duplicate is a claim's own drafting mistake, visible in its
+/// `--list`, and not something this function can detect.
+pub fn dispatch_all(tables: &[&[(&'static str, Body)]]) {
     let Ok(role) = env::var(ROLE) else {
         return;
     };
-    for (name, body) in table {
-        if *name == role {
-            leave(body());
+    for table in tables {
+        for (name, body) in *table {
+            if *name == role {
+                leave(body());
+            }
         }
     }
     panic!("{role:?} is not a role this target defines");

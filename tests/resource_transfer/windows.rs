@@ -1,20 +1,28 @@
-#![cfg(all(feature = "process", feature = "notify", windows))]
+//! The Windows control pipe, asked from both ends. A `Listener` owns one pipe instance and hands its name to
+//! one command, then refuses a client that is not the child it was told about — `PermissionDenied` against a
+//! retained child that is somebody else's — and owes a timeout to a child that never dials at all. Neither
+//! face has a unix counterpart in this claim: a `Socket::pair` is already the connection, so there is no
+//! instance to compare a client against and no `accept` left to run out.
+//!
+//! What arrives with an offer is counted rather than trusted. The child reads its own handle table before
+//! and after a receive that asked for more handles than the frame carries, so the refusal is shown to close
+//! what it received instead of parking a duplicate. The handover case keeps the unix leg's shape — a section
+//! handle plus one event each way — with the dial reversed: here the parent binds and the child connects.
 
 use std::{
     env,
     os::windows::io::{AsHandle, AsRawHandle},
-    process::Command,
     thread,
     time::{Duration, Instant},
 };
 
 use evering::{
-    BlockRange, DeclineCause, PoolId, RoomWait, Session,
+    Session,
     layout::RegionId,
-    mapping::{Access, Peer, Request},
+    mapping::{Access, Request},
     notify::Notify,
     os::{
-        Handoff, event,
+        event,
         windows::{
             Section,
             process::{Listener, Socket},
@@ -23,33 +31,20 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-mod support;
-use crate::support::role;
-
-#[test]
-fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
-    let (handoff, grant) = Handoff::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    grant.admit(&mut command).unwrap();
-    drop(handoff);
-    let error = Handoff::receive()
-        .err()
-        .expect("a process holding no grant meets no one");
-    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
-}
-
-#[cfg(feature = "notify")]
-#[test]
-fn received_event_constructor_is_safe() {
-    let _: fn(std::os::windows::io::OwnedHandle) -> evering::os::Event =
-        evering::os::Event::from_owned_handle;
-}
 use windows_sys::Win32::{
     Foundation::WAIT_OBJECT_0,
     System::Threading::{
         GetCurrentProcess, GetProcessHandleCount, INFINITE, SetEvent, WaitForSingleObject,
     },
 };
+
+use crate::support::role;
+
+#[test]
+fn received_event_constructor_is_safe() {
+    let _: fn(std::os::windows::io::OwnedHandle) -> evering::os::Event =
+        evering::os::Event::from_owned_handle;
+}
 
 const SIZE: usize = 4 * 1024 * 1024;
 const REGION: RegionId = RegionId::new(0x5749_4e44_4f57_534d, 2);
@@ -64,18 +59,16 @@ fn rendezvous() -> String {
     env::var(RENDEZVOUS).expect("a role that meets is told which pipe to connect to")
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[
-        ("sleeping", sleeping),
-        ("taker", taker),
-        ("connecting", connecting),
-        ("unrelated", unrelated),
-        ("counter", counter),
-        ("filler", filler),
-    ]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root holds the target's only
+/// `role_entry`, because the harness re-enters a child by exact item name and only one item in a target may
+/// answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    ("sleeping", sleeping),
+    ("taker", taker),
+    ("connecting", connecting),
+    ("unrelated", unrelated),
+    ("counter", counter),
+];
 
 /// The role the deadline claim spawns: stay alive without ever connecting, so an `accept` that is owed a
 /// timeout is given one.
@@ -238,111 +231,4 @@ fn count_mismatch_closes_every_remote_handle() {
         .unwrap();
     assert!(child.wait().unwrap().success());
     std::fs::remove_file(ready).unwrap();
-}
-
-/// The role the reap claim spawns: fill the pool with blocks this process never releases, then leave
-/// without unwinding any of them.
-fn filler() -> i32 {
-    let socket = Socket::connect(&rendezvous()).unwrap();
-    let offer = socket.recv(1).unwrap();
-    let id = std::str::from_utf8(offer.bootstrap().as_ref()).unwrap();
-    let mut fields = id.split(',');
-    let id = PoolId::new(
-        REGION,
-        fields.next().unwrap().parse().unwrap(),
-        fields.next().unwrap().parse().unwrap(),
-        fields.next().unwrap().parse().unwrap(),
-    );
-    let (_, resources) = offer.into_parts();
-    let mut resources = resources.into_vec();
-    let section = Section::from_owned_handle(resources.remove(0));
-    let session = Session::open(
-        section,
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-    )
-    .unwrap();
-    let peer = session.peer();
-    let pool = session.open_pool(id).unwrap();
-    let pool_ref = pool.as_ref();
-    let mut blocks = Vec::new();
-    let shortage = DeclineCause::NoRoom {
-        waits: RoomWait::Release,
-    };
-    loop {
-        match pool_ref.put(7_u64) {
-            Ok(block) => blocks.push(block),
-            Err(decline) if decline.cause == shortage => break,
-            Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
-        }
-    }
-    std::fs::write(
-        env::var(READY).unwrap(),
-        format!("{},{},{}", peer.slot(), peer.generation(), blocks.len()),
-    )
-    .unwrap();
-    core::mem::forget(blocks);
-    core::mem::forget(pool);
-    core::mem::forget(session);
-    0
-}
-
-#[test]
-fn exited_process_pool_ownership_is_reclaimed() {
-    let ready = env::temp_dir().join(format!("evering-pool-ready-{}", std::process::id()));
-    let _ = std::fs::remove_file(&ready);
-    let listener = Listener::bind().unwrap();
-    let mut command = role::child("filler");
-    command.env(RENDEZVOUS, listener.name()).env(READY, &ready);
-    let mut child = Supervisor::spawn(&mut command).unwrap();
-    let socket = listener
-        .accept(&child, Instant::now() + Duration::from_secs(5))
-        .unwrap();
-    let section = Section::anonymous(SIZE, Access::READ | Access::WRITE).unwrap();
-    let session = Session::create(
-        section.borrow(),
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-    )
-    .unwrap();
-    let pool = session
-        .create_pool(64 * 1024, Some(BlockRange::new(64, 64).unwrap()))
-        .unwrap();
-    let id = pool.id();
-    let (_, slab, entry, generation) = id.parts();
-    let id = format!("{slab},{entry},{generation}");
-    socket
-        .send(
-            &child,
-            &Bootstrap::new(id.as_bytes()).unwrap(),
-            &[section.as_handle()],
-        )
-        .unwrap();
-    let exit = child.wait().unwrap();
-    assert!(exit.success());
-    let identity = std::fs::read_to_string(&ready).unwrap();
-    std::fs::remove_file(&ready).unwrap();
-    let mut fields = identity.split(',');
-    let peer = Peer::from_parts(
-        fields.next().unwrap().parse().unwrap(),
-        fields.next().unwrap().parse().unwrap(),
-    );
-    assert!(fields.next().unwrap().parse::<usize>().unwrap() >= 64);
-    assert_eq!(pool.id(), PoolId::new(REGION, slab, entry, generation));
-    let decline = pool
-        .as_ref()
-        .put(9_u64)
-        .err()
-        .expect("a dead member's claims still occupy the pool");
-    assert_eq!(
-        decline.cause,
-        DeclineCause::NoRoom {
-            waits: RoomWait::Release
-        },
-        "the pool is full of one member's claims, so what frees room is a release"
-    );
-    assert_eq!(decline.value, Some(9_u64), "the declined block comes back");
-    let recovery = unsafe { session.assume_dead(peer) }.unwrap();
-    assert!(recovery.reap().is_ok());
-    assert_eq!(*pool.as_ref().put(11_u64).unwrap(), 11);
 }

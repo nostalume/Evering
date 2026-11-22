@@ -1,21 +1,23 @@
-#![cfg(all(feature = "os", windows))]
 #![expect(
     clippy::result_large_err,
     reason = "uncommitted transfers stay inline so retry retains exact ownership"
 )]
 
-//! The Windows leg of the two recovery cases in `tests/ipc_process.rs` that only a second process can
+//! The Windows leg of the recovery cases in the `unix` leg beside this one that only a second process can
 //! ask of: a member that died mid-queue has to be reaped by a handler naming the schema its channel
-//! carries, and a completely reaped slot has to come back around. `tests/recovery_process.rs` is
-//! platform-neutral and already drives `Recovery::reap_with` with the exact handler for the unit schema
-//! to `Ok` here, against four real peers cut at four different points — so the accepted face of that
-//! dispatch is not new evidence on this host. What these two cases add is the way round it: a reap that
+//! carries, a completely reaped slot has to come back around, and the pool blocks a doomed member died
+//! holding have to come back with it. The `at_every_cut` leg is platform-neutral and already drives
+//! `Recovery::reap_with` with the exact handler for the unit schema to `Ok` here, against four real peers
+//! cut at four different points — so the accepted face of that dispatch is not new evidence on this host.
+//! What these two dispatch cases add is the way round it: a reap that
 //! names no handler is refused, once where every member carries the unit schema and once where one
 //! member carries a foreign one, so the refusal is the absence of a handler and not a mismatch; a
 //! handler naming the wrong schema is refused, and so is the right handler named twice, where naming it
 //! once completes; and each refusal hands the caller back the same bounded recovery rather than
 //! spending it. Then the aftermath of a complete reap, where the slot is reusable again, its generation
-//! is not reproducible, and the stale identity can no longer be pointed at.
+//! is not reproducible, and the stale identity can no longer be pointed at. The pool case adds the one
+//! face a scan cannot show: a full pool whose room only a reap frees, refused first with the declined
+//! block handed back, and writable again once the member that filled it is reaped.
 //!
 //! Two seams differ from the unix leg, both because this host names no shared region across processes.
 //! The region reaches the child as a duplicated section handle over the control pipe, so no POSIX shm
@@ -46,7 +48,7 @@ use std::{
 };
 
 use evering::{
-    ChannelId as Id, PoolId, Port, Session,
+    BlockRange, ChannelId as Id, DeclineCause, PoolId, Port, RoomWait, Session,
     layout::{self, RegionId, Repr, SchemaId, SchemaKey, SharedSchema},
     mapping::{Access, Peer, Request},
     os::windows::{
@@ -56,7 +58,6 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-mod support;
 use crate::support::{cuts, introduce, role};
 
 const ADDRESS: &str = "EVERING_RECOVERY_ADDRESS";
@@ -70,6 +71,8 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 const DOOMED: i32 = 77;
 /// The doomed owner of the second case: it adopts a channel of the foreign schema and leaves.
 const FOREIGN: i32 = 73;
+/// The pool filler: it exhausts the pool with claims it never releases, and leaves.
+const FILLED: i32 = 74;
 
 /// A schema no recovery handler in this suite is ever handed by default, so its members can only be
 /// reaped by a caller who names it.
@@ -98,6 +101,12 @@ fn channel_only(port: &Port<AlternateEnvelope>) -> Bootstrap {
     .unwrap()
 }
 
+/// The third case's doomed member holds a pool and no channel, so only a pool's three numbers travel.
+fn pool_only(pool: PoolId) -> Bootstrap {
+    let (_, slab, entry, generation) = pool.parts();
+    Bootstrap::new(format!("{slab},{entry},{generation}")).unwrap()
+}
+
 /// The six numbers identifying one channel endpoint, read off the handover's bytes.
 fn parse_port<T: Repr>(parts: &mut impl Iterator<Item = usize>) -> Port<T> {
     let id = Id::new(
@@ -110,18 +119,23 @@ fn parse_port<T: Repr>(parts: &mut impl Iterator<Item = usize>) -> Port<T> {
     Port::from_parts(id, parts.next().unwrap() as u8, parts.next().unwrap()).unwrap()
 }
 
+/// The three numbers identifying one pool, read off the handover's bytes.
+fn parse_pool(parts: &mut impl Iterator<Item = usize>) -> PoolId {
+    PoolId::new(
+        REGION,
+        parts.next().unwrap() as u32,
+        parts.next().unwrap() as u32,
+        parts.next().unwrap(),
+    )
+}
+
 fn parse_channel_and_pool(bytes: &[u8]) -> (Port<()>, PoolId) {
     let mut parts = std::str::from_utf8(bytes)
         .unwrap()
         .split(',')
         .map(|part| part.parse::<usize>().unwrap());
     let port = parse_port(&mut parts);
-    let pool = PoolId::new(
-        REGION,
-        parts.next().unwrap() as u32,
-        parts.next().unwrap() as u32,
-        parts.next().unwrap(),
-    );
+    let pool = parse_pool(&mut parts);
     (port, pool)
 }
 
@@ -149,14 +163,14 @@ fn meet() -> (Session, Bootstrap) {
     (session, bytes)
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[
-        ("doomed-member", doomed_member),
-        ("foreign-owner", foreign_owner),
-    ]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` dispatches
+/// over this table and the other legs', because the harness re-enters a child by exact item name and only
+/// one item in a target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    ("doomed-member", doomed_member),
+    ("foreign-owner", foreign_owner),
+    ("pool-filler", pool_filler),
+];
 
 /// The first case's role: publish its own identity twice, then leave with the number the parent handed so
 /// no destructor runs.
@@ -191,6 +205,38 @@ fn foreign_owner() -> i32 {
     fs::write(
         env::var_os(READY).expect("ready path"),
         format!("{},{}", peer.slot(), peer.generation()),
+    )
+    .expect("report the member this process became");
+    role::leave(cuts::code())
+}
+
+/// The third case's role: fill the pool with blocks this process never releases, report what it holds, and
+/// leave the same way.
+fn pool_filler() -> i32 {
+    let (session, bytes) = meet();
+    let mut parts = std::str::from_utf8(bytes.as_ref())
+        .unwrap()
+        .split(',')
+        .map(|part| part.parse::<usize>().unwrap());
+    let pool = session
+        .open_pool(parse_pool(&mut parts))
+        .expect("open the pool the parent left unfilled");
+    let peer = session.peer();
+    let pool_ref = pool.as_ref();
+    let mut blocks = Vec::new();
+    let shortage = DeclineCause::NoRoom {
+        waits: RoomWait::Release,
+    };
+    loop {
+        match pool_ref.put(7_u64) {
+            Ok(block) => blocks.push(block),
+            Err(decline) if decline.cause == shortage => break,
+            Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
+        }
+    }
+    fs::write(
+        env::var_os(READY).expect("ready path"),
+        format!("{},{},{}", peer.slot(), peer.generation(), blocks.len()),
     )
     .expect("report the member this process became");
     role::leave(cuts::code())
@@ -332,4 +378,49 @@ fn a_foreign_schema_reap_refuses_every_handler_short_of_the_exact_one() {
         recovery.reap_with(&[handler]).is_ok(),
         "the exact handler completes the reap"
     );
+}
+
+#[test]
+fn exited_process_pool_ownership_is_reclaimed() {
+    let ready = env::temp_dir().join(format!("evering-pool-filler-{}.txt", std::process::id()));
+    let _ = fs::remove_file(&ready);
+    let (mut child, listener) = admit("pool-filler", FILLED, Some(&ready));
+    let (source, session) = region();
+    let pool = session
+        .create_pool(64 * 1024, Some(BlockRange::new(64, 64).unwrap()))
+        .expect("the pool the doomed member fills");
+    let socket = listener
+        .accept(&child, Instant::now() + TIMEOUT)
+        .expect("the pool filler connects");
+    socket
+        .send(&child, &pool_only(pool.id()), &[source.as_handle()])
+        .expect("hand the region over");
+
+    let exit = child.wait().expect("wait for the pool filler");
+    assert_eq!(exit.status().code(), Some(FILLED), "no Rust destructor ran");
+    let report = fs::read_to_string(&ready).expect("the filler's report");
+    fs::remove_file(&ready).expect("remove the report");
+    let mut parts = report.split(',').map(|part| part.parse::<usize>().unwrap());
+    let peer = Peer::from_parts(parts.next().unwrap() as u8, parts.next().unwrap());
+    assert!(parts.next().unwrap() >= 64, "the filler held the pool full");
+
+    let decline = pool
+        .as_ref()
+        .put(9_u64)
+        .err()
+        .expect("a dead member's claims still occupy the pool");
+    assert_eq!(
+        decline.cause,
+        DeclineCause::NoRoom {
+            waits: RoomWait::Release
+        },
+        "the pool is full of one member's claims, so what frees room is a release"
+    );
+    assert_eq!(decline.value, Some(9_u64), "the declined block comes back");
+    let recovery = unsafe { session.assume_dead(peer) }.expect("mark the exact dead generation");
+    assert!(
+        recovery.reap().is_ok(),
+        "the reap releases what the dead member held"
+    );
+    assert_eq!(*pool.as_ref().put(11_u64).unwrap(), 11);
 }

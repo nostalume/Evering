@@ -1,4 +1,13 @@
-#![cfg(all(feature = "process", feature = "notify", feature = "tokio"))]
+//! The conservation arithmetic: a second process adopts a channel, carries one record as far as one of the four
+//! cuts a transfer can stop at, and leaves through `process::exit` so that none of its destructors runs. What
+//! its parent then owes is a number rather than a feeling — accepted equals validated plus recovered loss, with
+//! no duplicate and nothing fabricated — and the roster has to come out clean enough for a fresh member to
+//! attach and for the channel to be removed.
+//!
+//! The cut is the child's own last act and the code it leaves by is handed to it rather than fixed in the arm
+//! that dies, so the parent reports a death it witnessed instead of one it arranged. Both hosts run this leg,
+//! one arm each for `setup` and `crashed_at`: what differs between them is how a doomed child is handed the
+//! region and the doorbell, not what the recovery table says the parent owes afterwards.
 
 use std::{
     env, fs,
@@ -16,7 +25,6 @@ use evering::{
     process::Supervisor,
 };
 
-mod support;
 use crate::support::{cuts, introduce, role};
 
 const READY: &str = "EVERING_RECOVERY_READY";
@@ -141,16 +149,15 @@ fn command(cut: Cut, ready: &PathBuf, address: &str) -> Command {
     command
 }
 
-/// The child's whole program: one role per crash cut, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[
-        ("reserved", || crashed_at(Cut::Reserved)),
-        ("staged", || crashed_at(Cut::Staged)),
-        ("published", || crashed_at(Cut::Published)),
-        ("claimed", || crashed_at(Cut::Claimed)),
-    ]);
-}
+/// The roles this leg defines: one per crash cut, and nothing else. The claim root's single `role_entry` runs
+/// them beside the platform leg's, because the harness re-enters a child by exact item name and only one item
+/// in a target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    ("reserved", || crashed_at(Cut::Reserved)),
+    ("staged", || crashed_at(Cut::Staged)),
+    ("published", || crashed_at(Cut::Published)),
+    ("claimed", || crashed_at(Cut::Claimed)),
+];
 
 #[cfg(unix)]
 fn crashed_at(cut: Cut) -> i32 {

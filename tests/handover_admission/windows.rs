@@ -1,15 +1,24 @@
-#![cfg(all(feature = "process", windows))]
-
-//! The Windows half of P0. The parent already refused a client that was not the child it retained
+//! Which process a handoff will meet, off the mechanism this host has: a pipe answers for its own client,
+//! so a process that reaches a rendezvous it does not hold is told so before it may read the offer, and a
+//! process that was never admitted has no rendezvous to reach at all.
+//!
+//! The parent already refused a client that was not the child it retained
 //! (`Listener::accept`), so what was missing was the other direction: a process that reaches a pipe
 //! it does not own is now told so by the kernel before it is allowed to read the offer.
 //!
 //! The two runs also carry the introducer's policy word, one forged by the claimant and one written by
 //! the grant that admitted the other child: `Provenance` makes an unattested peer a value, and these are
 //! the assertions that it did not become a value a claimant could ask for.
+//!
+//! The refusal of a process that was never granted anything is here rather than in the file that borrowed a
+//! handoff to move a region, because a claim about who may meet belongs with the machinery being attacked. It
+//! has no near neighbour on this host: the claimant above is refused by the peer check one step into `receive`,
+//! and this one never reaches a pipe, because a grant announces its address to the command it was spent into
+//! and to nobody else.
 
 use std::{
     env,
+    process::Command,
     time::{Duration, Instant},
 };
 
@@ -19,7 +28,6 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-mod support;
 use crate::support::{introduce, role};
 
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
@@ -101,11 +109,10 @@ fn child() -> i32 {
     }
 }
 
-/// The child's whole program: the roles this claim defines, and nothing else.
-#[test]
-fn role_entry() {
-    role::dispatch(&[(ATTACKER, attacker), (CHILD, child)]);
-}
+/// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` runs whichever
+/// platform leg was compiled, because the harness re-enters a child by exact item name and only one item in a
+/// target may answer to it.
+pub(crate) const ROLES: &[(&str, role::Body)] = &[(ATTACKER, attacker), (CHILD, child)];
 
 #[test]
 fn a_granted_process_names_the_peer_it_met() {
@@ -156,4 +163,16 @@ fn a_process_that_claims_another_introducer_is_refused_before_it_reads() {
         "a pipe owned by this process is not the introducer the claimant named, and a policy the \
          claimant wrote for itself cannot vouch for a pipe no introducer opened"
     );
+}
+
+#[test]
+fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
+    let (handoff, grant) = Handoff::bind().unwrap();
+    let mut command = Command::new(env::current_exe().unwrap());
+    grant.admit(&mut command).unwrap();
+    drop(handoff);
+    let error = Handoff::receive()
+        .err()
+        .expect("a process holding no grant meets no one");
+    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
 }
