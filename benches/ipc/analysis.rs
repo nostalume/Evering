@@ -1,4 +1,5 @@
 use super::{
+    boundary,
     family::Family,
     fixture,
     mechanism::{self, FixtureSchema},
@@ -22,6 +23,29 @@ pub enum Decision {
     Inconclusive,
 }
 
+/// The second estimand, paired with the throughput contrast that shares its blocks.
+/// Every figure is per operation, taken over the coordinator's own timed window, and
+/// medians are of the per-block values exactly as the ratio's are. It carries no
+/// decision: the registered band belongs to the ratio alone, a run time of zero is a
+/// legal reading of a phase that never blocked, and the worker's witness is a second
+/// subject measured over a different interval, so it is paired with these figures and
+/// never added to them. Absent means no block-level pairing survived, which is not the
+/// statement that the boundary cost nothing.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct BoundaryEstimate {
+    pub source: boundary::Source,
+    pub blocks: usize,
+    pub candidate_runtime_us: f64,
+    pub baseline_runtime_us: f64,
+    pub runtime_delta_us: f64,
+    pub candidate_voluntary: f64,
+    pub baseline_voluntary: f64,
+    pub candidate_involuntary: f64,
+    pub baseline_involuntary: f64,
+    pub candidate_wall_us: f64,
+    pub baseline_wall_us: f64,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Estimate {
     pub condition: Condition,
@@ -35,6 +59,7 @@ pub struct Estimate {
     pub delta: f64,
     pub candidate_rate: f64,
     pub baseline_rate: f64,
+    pub boundary: Option<BoundaryEstimate>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -78,6 +103,83 @@ fn median(values: &mut [f64]) -> f64 {
     }
 }
 
+/// One arm's boundary figures for one block, each already divided by that trial's
+/// operation count. Wall time is carried along because it is the denominator a reader
+/// would otherwise have to take from the other table to make sense of the run time.
+#[derive(Clone, Copy)]
+struct PhaseCost {
+    runtime_us: f64,
+    voluntary: f64,
+    involuntary: f64,
+    wall_us: f64,
+}
+
+fn cost_per_op(measure: &system::Measure) -> Option<(PhaseCost, boundary::Source)> {
+    let cost = measure.boundary?;
+    let per_op = |value: u64| value as f64 / measure.requested as f64;
+    Some((
+        PhaseCost {
+            runtime_us: per_op(cost.runtime_us),
+            voluntary: per_op(cost.voluntary_switches),
+            involuntary: per_op(cost.involuntary_switches),
+            wall_us: measure.elapsed_ns as f64 / 1_000.0 / measure.requested as f64,
+        },
+        cost.source,
+    ))
+}
+
+/// The paired cost of one block, or nothing. A block where either arm carries no
+/// figure, or where the two figures came from differently resolved sources, says
+/// nothing about the boundary, so it is dropped whole instead of half-counted; that is
+/// why a contrast reports no figures rather than a subset of its blocks when a host
+/// could not observe the crossing.
+fn paired_cost(
+    candidate: &system::Measure,
+    baseline: &system::Measure,
+) -> Option<(PhaseCost, PhaseCost, boundary::Source)> {
+    let (candidate, left) = cost_per_op(candidate)?;
+    let (baseline, right) = cost_per_op(baseline)?;
+    (left == right).then_some((candidate, baseline, left))
+}
+
+fn boundary_estimate(
+    costs: &[Option<(PhaseCost, PhaseCost, boundary::Source)>],
+) -> Option<BoundaryEstimate> {
+    let pairs = costs.iter().copied().collect::<Option<Vec<_>>>()?;
+    let source = pairs.first()?.2;
+    if pairs.iter().any(|(_, _, other)| *other != source) {
+        return None;
+    }
+    let median_of = |candidate: bool, pick: fn(&PhaseCost) -> f64| {
+        let mut values = pairs
+            .iter()
+            .map(|(left, right, _)| pick(if candidate { left } else { right }))
+            .collect::<Vec<_>>();
+        median(&mut values)
+    };
+    let runtime = |cost: &PhaseCost| cost.runtime_us;
+    let voluntary = |cost: &PhaseCost| cost.voluntary;
+    let involuntary = |cost: &PhaseCost| cost.involuntary;
+    let wall = |cost: &PhaseCost| cost.wall_us;
+    let mut difference = pairs
+        .iter()
+        .map(|(candidate, baseline, _)| candidate.runtime_us - baseline.runtime_us)
+        .collect::<Vec<_>>();
+    Some(BoundaryEstimate {
+        source,
+        blocks: pairs.len(),
+        candidate_runtime_us: median_of(true, runtime),
+        baseline_runtime_us: median_of(false, runtime),
+        runtime_delta_us: median(&mut difference),
+        candidate_voluntary: median_of(true, voluntary),
+        baseline_voluntary: median_of(false, voluntary),
+        candidate_involuntary: median_of(true, involuntary),
+        baseline_involuntary: median_of(false, involuntary),
+        candidate_wall_us: median_of(true, wall),
+        baseline_wall_us: median_of(false, wall),
+    })
+}
+
 fn interval(
     values: &[f64],
     seed: u64,
@@ -101,30 +203,52 @@ fn interval(
     }
 }
 
+/// One block of a contrast: the two arms' rates, the log ratio the point estimate is
+/// taken from, and the paired boundary figures that block may or may not carry. They
+/// travel together because both estimands are the same pairing over the same blocks.
+#[derive(Clone, Copy)]
+struct Block {
+    log_ratio: f64,
+    candidate_rate: f64,
+    baseline_rate: f64,
+    cost: Option<(PhaseCost, PhaseCost, boundary::Source)>,
+}
+
 fn estimate(
     condition: Condition,
     candidate: String,
     contrast: &system::Contrast,
-    logs: &[f64],
-    rates: (&[f64], &[f64]),
+    blocks: &[Block],
     seed: u64,
     tail: f64,
 ) -> Estimate {
-    let interval = interval(logs, seed, tail, f64::exp);
-    let mut candidate_rate = rates.0.to_vec();
-    let mut baseline_rate = rates.1.to_vec();
+    let logs = blocks
+        .iter()
+        .map(|block| block.log_ratio)
+        .collect::<Vec<_>>();
+    let interval = interval(&logs, seed, tail, f64::exp);
+    let mut candidate_rate = blocks
+        .iter()
+        .map(|block| block.candidate_rate)
+        .collect::<Vec<_>>();
+    let mut baseline_rate = blocks
+        .iter()
+        .map(|block| block.baseline_rate)
+        .collect::<Vec<_>>();
+    let costs = blocks.iter().map(|block| block.cost).collect::<Vec<_>>();
     Estimate {
         condition,
         candidate,
         case: contrast.candidate.clone(),
         role: contrast.role,
-        blocks: logs.len(),
+        blocks: blocks.len(),
         effect: interval.point,
         low: interval.low,
         high: interval.high,
         delta: contrast.delta,
         candidate_rate: median(&mut candidate_rate),
         baseline_rate: median(&mut baseline_rate),
+        boundary: boundary_estimate(&costs),
     }
 }
 
@@ -401,9 +525,7 @@ fn decision(estimate: &Estimate) -> Decision {
 fn admit(evidence: &Evidence) -> Result<(&'static Family, bool), Error> {
     let header = &evidence.header;
     let spec = &header.specification;
-    let family = super::family::find(&spec.family)
-        .filter(|family| family.revision == spec.family_revision)
-        .ok_or(Error::Family)?;
+    let family = super::family::find_at(&spec.family, spec.family_revision).ok_or(Error::Family)?;
     let focused = match spec.mode.as_str() {
         "smoke" | "screening" => false,
         "focused" => true,
@@ -458,9 +580,7 @@ pub fn analyze(evidence: &Evidence) -> Result<Analysis, Error> {
         if header.cases[baseline as usize].workload.condition() != condition {
             return Err(Error::Pair);
         }
-        let mut logs = Vec::with_capacity(header.specification.blocks as usize);
-        let mut candidate_rates = Vec::with_capacity(header.specification.blocks as usize);
-        let mut baseline_rates = Vec::with_capacity(header.specification.blocks as usize);
+        let mut blocks = Vec::with_capacity(header.specification.blocks as usize);
         for block in 0..header.specification.blocks {
             let find = |case| {
                 evidence
@@ -476,16 +596,18 @@ pub fn analyze(evidence: &Evidence) -> Result<Analysis, Error> {
                 row.measure.validated as f64 * 1e9 / row.measure.elapsed_ns as f64
             };
             let (candidate_rate, baseline_rate) = (rate(candidate), rate(baseline));
-            logs.push((candidate_rate / baseline_rate).ln());
-            candidate_rates.push(candidate_rate);
-            baseline_rates.push(baseline_rate);
+            blocks.push(Block {
+                log_ratio: (candidate_rate / baseline_rate).ln(),
+                candidate_rate,
+                baseline_rate,
+                cost: paired_cost(&candidate.measure, &baseline.measure),
+            });
         }
         estimates.push(estimate(
             condition,
             header.cases[candidate as usize].workload.arm.clone(),
             contrast,
-            &logs,
-            (&candidate_rates, &baseline_rates),
+            &blocks,
             header.run.seed,
             tail,
         ));
@@ -564,6 +686,55 @@ impl Analysis {
                 write!(output, " {:?} |", self.decisions[index])
                     .expect("String writes cannot fail");
             }
+        }
+        if self
+            .estimates
+            .iter()
+            .any(|estimate| estimate.boundary.is_some())
+        {
+            output.push_str(
+                "\nBoundary cost per operation, paired over the same blocks as the ratio above. It \
+                 carries no decision: the registered band belongs to the ratio alone. The resolution \
+                 column names the counter that produced the run time, which is either nanoseconds or \
+                 whole ten-millisecond ticks, and a zero there is a phase that never blocked rather \
+                 than an idle one. Run time is coordinator-process CPU inside the timed window, the \
+                 delta is the median of the per-block differences, the switch columns are \
+                 block-initiated and preempted context switches per operation, and the wall column is \
+                 the timed window itself, which is what bounds the run time. Figures appear only for \
+                 a contrast whose every block carried a figure on both arms at the same resolution, \
+                 so an absent contrast is not one that cost nothing. The worker process keeps its own \
+                 accounting over its own bracket, which is paired with these figures and never added \
+                 to them.\n\n| arm | payload | capacity | in-flight | blocks | resolution | candidate \
+                 µs/op | baseline µs/op | Δ µs/op | candidate voluntary/op | baseline voluntary/op | \
+                 candidate preempted/op | baseline preempted/op | candidate wall µs/op | baseline wall \
+                 µs/op |\n|---|---:|---:|---:|---:|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+            );
+            for estimate in &self.estimates {
+                let Some(cost) = estimate.boundary else {
+                    continue;
+                };
+                write!(
+                    output,
+                    "\n| {} | {} | {} | {} | {} | {:?} | {:.4} | {:.4} | {:+.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} | {:.4} |",
+                    estimate.candidate,
+                    size(estimate.condition.payload),
+                    estimate.condition.capacity,
+                    estimate.condition.in_flight,
+                    cost.blocks,
+                    cost.source,
+                    cost.candidate_runtime_us,
+                    cost.baseline_runtime_us,
+                    cost.runtime_delta_us,
+                    cost.candidate_voluntary,
+                    cost.baseline_voluntary,
+                    cost.candidate_involuntary,
+                    cost.baseline_involuntary,
+                    cost.candidate_wall_us,
+                    cost.baseline_wall_us,
+                )
+                .expect("String writes cannot fail");
+            }
+            output.push('\n');
         }
         output.push_str("\n\n");
         output

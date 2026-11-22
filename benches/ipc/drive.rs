@@ -159,6 +159,10 @@ pub struct Measured {
     pub boundary: Option<boundary::Accounting>,
 }
 
+/// A trial that did not complete. `timed` separates the two failures a study reads
+/// differently: a setup that errored (`false`) and a measurement whose deadline ran out
+/// after setup handed over (`true`).
+#[derive(Debug)]
 pub struct MeasureError<E> {
     pub timed: bool,
     pub error: Error<E>,
@@ -397,6 +401,7 @@ pub fn measure<E: Endpoint>(
     path = PathCounts::default();
     let started = Instant::now();
     let before = boundary::sample();
+    boundary::mark(boundary::Marker::MeasuredOpen);
     match transfer_inner::<true, _>(
         endpoint,
         work,
@@ -405,13 +410,19 @@ pub fn measure<E: Endpoint>(
         deadline,
         &mut path,
     ) {
-        Ok(counts) => Ok(Measured {
-            counts,
-            path,
-            setup_ns,
-            boundary: bounded(before, boundary::sample()),
-            elapsed_ns: started.elapsed().as_nanos().max(1) as u64,
-        }),
+        Ok(counts) => {
+            // Mark before the closing reads so they stay out of the window; take elapsed after
+            // them, because the span the schema checks has to cover the CPU those reads cost.
+            boundary::mark(boundary::Marker::MeasuredClose);
+            let boundary = bounded(before, boundary::sample());
+            Ok(Measured {
+                counts,
+                path,
+                setup_ns,
+                boundary,
+                elapsed_ns: started.elapsed().as_nanos().max(1) as u64,
+            })
+        }
         Err(error) => Err(MeasureError {
             timed: true,
             error,

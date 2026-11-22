@@ -4,7 +4,7 @@ use std::time::{Duration, Instant};
 use super::local;
 use super::{
     drive::Deadline,
-    evering,
+    evering_arm,
     model::{self, Cell, Condition},
     stream,
     system::Resources,
@@ -44,9 +44,17 @@ const fn evering(key: &'static str, label: &'static str, run: Runner) -> Arm {
     }
 }
 
-pub static BUSY: Arm = evering("evering/busy", "Evering busy", evering::busy);
-pub static ADAPTIVE: Arm = evering("evering/adaptive", "Evering adaptive", evering::adaptive);
-pub static NOTIFIED: Arm = evering("evering/notified", "Evering notified", evering::notified);
+pub static BUSY: Arm = evering("evering/busy", "Evering busy", evering_arm::busy);
+pub static ADAPTIVE: Arm = evering(
+    "evering/adaptive",
+    "Evering adaptive",
+    evering_arm::adaptive,
+);
+pub static NOTIFIED: Arm = evering(
+    "evering/notified",
+    "Evering notified",
+    evering_arm::notified,
+);
 pub static STREAM: Arm = Arm {
     key: "tcp/readiness",
     label: "TCP readiness",
@@ -143,6 +151,20 @@ pub static CORE: Family = Family {
     modes: &CORE_MODES,
     members: core,
 };
+/// The `core-ipc` generation that evidence written before `9e4b356` records. That commit
+/// raised the revision without touching this family's members or mode table, so the
+/// retired definition is the current one under its old number, and an old artifact's
+/// schedule stays reproducible from a compiled definition instead of being trusted.
+/// A generation is retained only while an artifact needs it: the fixture named by
+/// `evidence_generations` is a `core-ipc` one, and no retained `local-ipc-unix` evidence
+/// predates the revision that cut its case matrix.
+static CORE_RETIRED: Family = Family {
+    key: "core-ipc",
+    revision: 2,
+    baseline: &STREAM,
+    modes: &CORE_MODES,
+    members: core,
+};
 #[cfg(all(unix, feature = "local-socket"))]
 fn local(mode: &str) -> Option<Vec<(Condition, &'static Arm)>> {
     let payloads: &[_] = if mode == "smoke" {
@@ -176,4 +198,22 @@ static FAMILIES: [&Family; 1] = [&CORE];
 
 pub fn find(key: &str) -> Option<&'static Family> {
     FAMILIES.iter().copied().find(|family| family.key == key)
+}
+
+static RETIRED: [&Family; 1] = [&CORE_RETIRED];
+
+/// The definition an artifact was written against. `find` answers for the current
+/// generation only, so a retired schedule can never be run; this second lookup exists
+/// because reading evidence means checking the generation the file claims, and a
+/// revision no retained artifact needs stays absent — which is what makes `admit`
+/// refuse an unknown generation rather than reinterpret it.
+pub fn find_at(key: &str, revision: u32) -> Option<&'static Family> {
+    find(key)
+        .filter(|family| family.revision == revision)
+        .or_else(|| {
+            RETIRED
+                .iter()
+                .copied()
+                .find(|family| family.key == key && family.revision == revision)
+        })
 }

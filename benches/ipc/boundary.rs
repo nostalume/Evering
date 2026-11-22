@@ -1,16 +1,18 @@
 use std::{fs, time::Instant};
 
-/// Provenance and resolution of [`Accounting::runtime_us`].
+/// Provenance and resolution of [`Accounting::runtime_us`], read from the task's own
+/// entry under whichever of the two procfs roots [`sample`] or [`sample_here`] was
+/// asked for.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub enum Source {
-    /// `/proc/self/schedstat` run time, which the kernel reports in nanoseconds.
+    /// `schedstat` run time, which the kernel reports in nanoseconds.
     Nanoseconds,
-    /// `/proc/self/stat` user plus system ticks at the 100 Hz user clock, so a
+    /// `stat` user plus system ticks at the 100 Hz user clock, so a
     /// delta is only resolved to whole 10 ms ticks.
     Ticks,
 }
 
-/// Coordinator-process cost attributed to one timed phase.
+/// Cost attributed to one timed phase, from the counters of the task that ran it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Accounting {
     pub source: Source,
@@ -20,7 +22,7 @@ pub struct Accounting {
 }
 
 /// Worker-process cost, carried with the width of the bracket it was measured
-/// over. The bracket travels with the figure because a process-wide delta is
+/// over. The bracket travels with the figure because a task's own delta is
 /// only comparable to another window once its own width is known, and the
 /// worker's bracket necessarily runs past the coordinator's timed window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
@@ -29,8 +31,10 @@ pub struct Witness {
     pub bracket_ns: u64,
 }
 
-/// A process-wide counter reading. The fields are exposed because a reading is
-/// not evidence on its own: only [`Sample::since`] turns a pair into one.
+/// One task's counter reading: `status` for the two switch counts and `schedstat`,
+/// falling back to `stat`, for the run time. The fields are exposed because a reading
+/// is not evidence on its own: only [`Sample::since`] turns a pair into one, and a pair
+/// taken from two tasks would compare two unrelated counters.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Sample {
     pub runtime: (u64, Source),
@@ -123,14 +127,15 @@ pub mod text {
     }
 }
 
+/// One task's counters, read from the given procfs root.
 #[cfg(target_os = "linux")]
-pub fn sample() -> Option<Sample> {
-    let status = fs::read_to_string("/proc/self/status").ok()?;
+fn reading(at: &str) -> Option<Sample> {
+    let status = fs::read_to_string(format!("{at}/status")).ok()?;
     let (voluntary, involuntary) = text::switches(&status)?;
-    let schedstat = fs::read_to_string("/proc/self/schedstat").ok();
+    let schedstat = fs::read_to_string(format!("{at}/schedstat")).ok();
     let runtime = match schedstat {
         Some(schedstat) => text::schedstat(&schedstat),
-        None => text::stat(&fs::read_to_string("/proc/self/stat").ok()?),
+        None => text::stat(&fs::read_to_string(format!("{at}/stat")).ok()?),
     }?;
     Some(Sample {
         runtime,
@@ -139,8 +144,28 @@ pub fn sample() -> Option<Sample> {
     })
 }
 
+/// The thread-group leader's counters, which is what a single-threaded host owes a
+/// trial: `sample()` is the whole process whenever the timed phase ran on the thread
+/// that `/proc/self` names.
+#[cfg(target_os = "linux")]
+pub fn sample() -> Option<Sample> {
+    reading("/proc/self")
+}
+
+/// The counters of the calling task. `/proc/thread-self` is the kernel's spelling of
+/// "this task", so a bracket taken here never reports another thread's scheduling.
+#[cfg(target_os = "linux")]
+pub fn sample_here() -> Option<Sample> {
+    reading("/proc/thread-self")
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn sample() -> Option<Sample> {
+    None
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn sample_here() -> Option<Sample> {
     None
 }
 
@@ -163,7 +188,56 @@ impl Sample {
 /// The argv placeholder for a host that claimed no trailer.
 pub const ABSENT: &str = "-";
 
-/// One bracketing pair taken inside the worker process around the phase it
+/// One edge of a phase, marked so a trace of a whole run can be cut there.
+///
+/// The marker is a `stat` of a name that is never created, so it costs exactly one
+/// kernel entry and that entry carries the name as its own argument. A counting pass
+/// over a shared stream can therefore keep only the entries between a phase's opening
+/// and closing markers, which is what separates the timed work from the process
+/// bootstrap — the connect retry spin and the host's own shell probe — that the same
+/// stream otherwise records inside every window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Marker {
+    MeasuredOpen,
+    MeasuredClose,
+    ServedOpen,
+    ServedClose,
+}
+
+impl Marker {
+    fn name(self) -> &'static str {
+        match self {
+            Self::MeasuredOpen => "measured-open",
+            Self::MeasuredClose => "measured-close",
+            Self::ServedOpen => "served-open",
+            Self::ServedClose => "served-close",
+        }
+    }
+}
+
+// Resolved once per process: a trial that marks hundreds of phases must not re-read the
+// environment to learn that it marks none.
+static MARKER_DIRECTORY: std::sync::OnceLock<Option<std::path::PathBuf>> =
+    std::sync::OnceLock::new();
+
+/// `EVERING_MARKER_DIRECTORY` names the directory whose absent entries the markers
+/// stand for, and marking exists only while it is set: a registered or timed run
+/// leaves it unset and pays no entry for a boundary it never reports.
+///
+/// Nothing is created, so a marker leaves no trace on the filesystem and cannot collide
+/// with another process's file; the path's existence would change the entry's result but
+/// never its count, which is all the counting pass reads.
+pub fn mark(marker: Marker) {
+    let Some(directory) = MARKER_DIRECTORY
+        .get_or_init(|| std::env::var_os("EVERING_MARKER_DIRECTORY").map(std::path::PathBuf::from))
+        .as_deref()
+    else {
+        return;
+    };
+    let _ = fs::metadata(directory.join(marker.name()));
+}
+
+/// One bracketing pair taken on the task that serves the phase, around the phase it
 /// served. The start is the probe frame that closes setup, so warmup stays out
 /// of the figure and no subtraction is needed for work the coordinator timed.
 pub struct Phase {
@@ -175,14 +249,20 @@ impl Phase {
     /// `None` when no accounting was requested, so a phase that cannot be
     /// reported costs the worker no reads at all.
     pub fn begin(trailer: &str) -> Option<Self> {
-        (trailer != ABSENT).then(|| Self {
-            started: Instant::now(),
-            before: sample(),
+        (trailer != ABSENT).then(|| {
+            let started = Instant::now();
+            let before = sample_here();
+            mark(Marker::ServedOpen);
+            Self { started, before }
         })
     }
 
+    /// The close is marked before the counters are read, so a marked window holds the
+    /// phase and neither bracket's own reads: the accounting cost a witness reports is
+    /// the reading a marker deliberately keeps out of the count it accompanies.
     pub fn witness(self) -> Option<Witness> {
-        let cost = self.before?.since(sample()?)?;
+        mark(Marker::ServedClose);
+        let cost = self.before?.since(sample_here()?)?;
         Some(Witness {
             cost,
             bracket_ns: self.started.elapsed().as_nanos().max(1) as u64,
@@ -215,11 +295,13 @@ static NEXT_TRAILER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64
 
 impl Trailer {
     /// A trailer exists exactly when this host can observe the boundary at all,
-    /// which keeps the extra file off hosts that could only ever report absence.
+    /// which keeps the extra file off hosts that could only ever report absence. The
+    /// probe is the reading [`Phase`] will take, so a host that has `/proc/self` but no
+    /// `/proc/thread-self` claims nothing rather than a bracket it cannot account for.
     /// `create_new` makes a path another user pre-created a hard setup failure
     /// instead of an overwrite.
     pub fn claim() -> Result<Option<Self>, String> {
-        if sample().is_none() {
+        if sample_here().is_none() {
             return Ok(None);
         }
         let sequence = NEXT_TRAILER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);

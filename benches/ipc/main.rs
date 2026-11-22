@@ -2,7 +2,7 @@ mod analysis;
 mod boundary;
 mod drive;
 mod environment;
-mod evering;
+mod evering_arm;
 mod family;
 mod fixture;
 pub mod geometry;
@@ -155,7 +155,7 @@ fn system_header(
             family_revision: input.family.revision,
             mode: input.mode.into(),
             blocks: input.blocks,
-            spin: evering::ADAPTIVE_SPINS as u32,
+            spin: evering_arm::ADAPTIVE_SPINS as u32,
             timeout_ms: input.timeout_ms,
             alpha: 0.05,
             calibration,
@@ -336,7 +336,7 @@ fn dispatch() -> Result<(), String> {
         [command, address, policy, timeout, environment, trailer]
             if command == "worker-evering" =>
         {
-            evering::worker(
+            evering_arm::worker(
                 address,
                 policy,
                 Duration::from_millis(number(timeout, "timeout")?),

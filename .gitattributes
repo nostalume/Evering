@@ -1,1 +1,4 @@
 * text=auto
+
+# Evidence is quoted by the digest of its bytes, so it must check out unchanged.
+benches/evidence/*.jsonl -text

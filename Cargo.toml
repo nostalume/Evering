@@ -142,7 +142,7 @@ path = "tests/verification_layout.rs"
 
 [[test]]
 name = "ipc-study"
-path = "benches/ipc/test_main.rs"
+path = "benches/ipc/study_tests.rs"
 required-features = ["benchmark"]
 
 [[example]]
