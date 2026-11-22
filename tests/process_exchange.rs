@@ -18,6 +18,15 @@ use evering::{
     process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES},
 };
 
+mod support;
+use crate::support::role;
+
+/// The rendezvous a role is told to bind, which is the same name the parent connects back to.
+const RENDEZVOUS: &str = "EVERING_EXCHANGE_RENDEZVOUS";
+/// The region the handover claim exchanges, and the size both legs check it at.
+#[cfg(feature = "notify")]
+const SIZE: usize = 4096;
+
 #[test]
 fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
     let (handoff, grant) = Handoff::bind().unwrap();
@@ -132,6 +141,41 @@ fn local_bounds_reject_without_transport() {
     );
 }
 
+/// The role the handover spawns: take the region and the two bells the parent sends, and ring back.
+#[cfg(feature = "notify")]
+fn taker() -> i32 {
+    use evering::os::unix::UnixFd;
+    use nix::{sys::stat::fstat, unistd};
+
+    let socket = Socket::bind(env::var(RENDEZVOUS).unwrap()).unwrap();
+    let offer = socket.recv(3).unwrap();
+    assert_eq!(offer.bootstrap().as_ref(), b"selected-protocol-id");
+    let (_, resources) = offer.into_parts();
+    let mut resources = resources.into_vec();
+    let mapping = UnixFd::from_fd(resources.remove(0)).unwrap();
+    assert_eq!(mapping.size(), SIZE);
+    assert_eq!(fstat(mapping.as_fd()).unwrap().st_size as usize, SIZE);
+
+    let mut word = [0; 8];
+    let arrived = unistd::read(&resources[0], &mut word).unwrap();
+    assert!(
+        arrived > 0,
+        "the wait end the child received must still hold the kick queued before the handoff"
+    );
+    assert_eq!(
+        unistd::write(&resources[1], &1u64.to_ne_bytes()).unwrap(),
+        8
+    );
+    0
+}
+
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    #[cfg(feature = "notify")]
+    role::dispatch(&[("taker", taker)]);
+}
+
 #[cfg(feature = "notify")]
 #[test]
 fn child_accepts_mapping_and_directional_bells() {
@@ -140,40 +184,12 @@ fn child_accepts_mapping_and_directional_bells() {
         os::{event, unix::UnixFd},
         process::Supervisor,
     };
-    use nix::{sys::stat::fstat, unistd};
-
-    const CHILD: &str = "EVERING_EXCHANGE_CHILD";
-    const SIZE: usize = 4096;
-
-    if let Some(path) = env::var_os(CHILD) {
-        let socket = Socket::bind(path).unwrap();
-        let offer = socket.recv(3).unwrap();
-        assert_eq!(offer.bootstrap().as_ref(), b"selected-protocol-id");
-        let (_, resources) = offer.into_parts();
-        let mut resources = resources.into_vec();
-        let mapping = UnixFd::from_fd(resources.remove(0)).unwrap();
-        assert_eq!(mapping.size(), SIZE);
-        assert_eq!(fstat(mapping.as_fd()).unwrap().st_size as usize, SIZE);
-
-        let mut word = [0; 8];
-        let arrived = unistd::read(&resources[0], &mut word).unwrap();
-        assert!(
-            arrived > 0,
-            "the wait end the child received must still hold the kick queued before the handoff"
-        );
-        assert_eq!(
-            unistd::write(&resources[1], &1u64.to_ne_bytes()).unwrap(),
-            8
-        );
-        return;
-    }
+    use nix::unistd;
 
     let path = env::temp_dir().join(format!("evering-exchange-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "child_accepts_mapping_and_directional_bells"])
-        .env(CHILD, &path);
+    let mut command = role::child("taker");
+    command.env(RENDEZVOUS, &path);
     let mut child = Supervisor::spawn(&mut command).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let socket = loop {

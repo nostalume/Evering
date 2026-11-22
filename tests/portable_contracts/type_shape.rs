@@ -1,4 +1,16 @@
-use evering::{Channel, Port, Session, layout::Repr};
+//! Two claims the type system answers with nothing running: what a shared box's type records — a mapping
+//! lifetime and a value, and nothing a holder could misuse to keep it alive past the session — and that a
+//! session selects its protocol per channel, so two schemas share one region without a second session and
+//! without a key collision.
+
+use evering::{Channel, PBox, Port, Session, layout::Repr};
+
+fn accepts_heap_box(_: PBox<'_, u64>) {}
+
+#[test]
+fn shared_box_has_only_mapping_lifetime_and_value_in_its_type() {
+    let _ = accepts_heap_box;
+}
 
 #[repr(C)]
 struct Left(u32);

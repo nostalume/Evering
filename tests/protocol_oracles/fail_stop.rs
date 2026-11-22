@@ -1,8 +1,9 @@
-//! Deterministic state-model oracles for fail-stop shared-memory protocols.
-//!
-//! These tests deliberately contain no production implementation. They freeze
-//! schedules and ownership outcomes before the corresponding owners are
-//! replaced.
+//! The crash-semantics model: what a process leaves behind when the word that claims ownership and the
+//! word that publishes content are not committed together — a bounded directory transaction that
+//! excludes the ABA schedule, the packed meaning of a queue control word, which commit decides producer
+//! and consumer recovery, how a dead reaper is replaced without changing the source evidence, the heap
+//! and slab phase orders that may not be committed before their evidence is durable, and the seeded
+//! replay that shrinks a failure to the shortest prefix which still reproduces it.
 
 #[derive(Debug, PartialEq, Eq)]
 struct Directory<const N: usize> {

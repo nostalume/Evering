@@ -21,9 +21,11 @@ use std::{cell::Cell, rc::Rc, time::Duration};
 use evering::{
     Decline, DeclineCause, Encoded, PoolRef, ReceiveError, Rx, Session, Transfer, Tx,
     layout::{RegionId, SchemaId, SchemaKey},
-    mapping::{Access, Request},
     notify::{Signals, Wait},
 };
+
+mod support;
+use crate::support::region;
 
 const REGION: RegionId = RegionId::new(0x6576_6475_706c_6578, 1);
 const RUNTIME: SchemaKey = SchemaKey::new(SchemaId(0x6576_6475_706c_6531), 1);
@@ -54,25 +56,8 @@ impl Wait for Yield {
     }
 }
 
-#[cfg(unix)]
 fn sessions() -> (Session, Session) {
-    let source = evering::os::unix::UnixFd::memfd("evering-duplex", 1 << 21, false).unwrap();
-    let request = Request::new(1 << 21, Access::READ | Access::WRITE);
-    (
-        Session::create(source.borrow(), request, REGION).unwrap(),
-        Session::open(source.borrow(), request, REGION).unwrap(),
-    )
-}
-
-#[cfg(windows)]
-fn sessions() -> (Session, Session) {
-    let source =
-        evering::os::windows::Section::anonymous(1 << 21, Access::READ | Access::WRITE).unwrap();
-    let request = Request::new(1 << 21, Access::READ | Access::WRITE);
-    (
-        Session::create(source.borrow(), request, REGION).unwrap(),
-        Session::open(source.borrow(), request, REGION).unwrap(),
-    )
+    region::pair("evering-duplex", 1 << 21, REGION)
 }
 
 /// Publishes the whole window, then reads the whole window: the shape a duplex agent

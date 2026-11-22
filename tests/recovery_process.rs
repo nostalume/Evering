@@ -13,10 +13,12 @@ use evering::{
     mapping::{Access, Peer, Request},
     notify::{Notify, Wait as _},
     os::{Event, Ring, event},
-    process::{Bootstrap, Supervisor},
+    process::Supervisor,
 };
 
-const ROLE: &str = "EVERING_RECOVERY_ROLE";
+mod support;
+use crate::support::{cuts, introduce, role};
+
 const READY: &str = "EVERING_RECOVERY_READY";
 const ADDRESS: &str = "EVERING_RECOVERY_ADDRESS";
 const SIZE: usize = 4 * 1024 * 1024;
@@ -46,6 +48,8 @@ impl Cut {
         }
     }
 
+    /// What the parent reports this cut's death by. The child is handed the number rather than reading
+    /// this arm, so no second copy of the table exists to keep in step.
     const fn code(self) -> i32 {
         match self {
             Self::Reserved => 81,
@@ -54,31 +58,6 @@ impl Cut {
             Self::Claimed => 84,
         }
     }
-
-    fn parse(value: &str) -> Self {
-        Self::ALL
-            .into_iter()
-            .find(|cut| cut.name() == value)
-            .expect("known crash cut")
-    }
-}
-
-fn bootstrap(port: &Port<()>, pool: PoolId) -> Bootstrap {
-    let id = port.id();
-    let (_, pool_slab, pool_entry, pool_generation) = pool.parts();
-    Bootstrap::new(format!(
-        "{},{},{},{},{},{},{},{},{}",
-        id.slab(),
-        id.entry(),
-        id.generation(),
-        id.capacity(),
-        port.role(),
-        port.generation(),
-        pool_slab,
-        pool_entry,
-        pool_generation,
-    ))
-    .unwrap()
 }
 
 fn parse_ids(bytes: &[u8]) -> (Port<()>, PoolId) {
@@ -116,24 +95,25 @@ fn crash(session: TestSession, port: Port<()>, pool: PoolId, ring: Ring, cut: Cu
     let pool = session.open_pool(pool).expect("transfer pool");
     let (send, recv) = channel.split();
     let peer = session.peer();
+    let code = cuts::code();
     match cut {
         Cut::Reserved => {
             let _reserved = send.reserve().expect("reserve");
-            announce(peer, &ring, cut.code());
+            announce(peer, &ring, code);
         }
         Cut::Staged => {
             let record = pool.as_ref().put(VALUE).unwrap().transfer(());
             let _staged = send.reserve().unwrap().stage(record);
-            announce(peer, &ring, cut.code());
+            announce(peer, &ring, code);
         }
         Cut::Published => {
             let record = pool.as_ref().put(VALUE).unwrap().transfer(());
             send.reserve().unwrap().stage(record).publish().unwrap();
-            announce(peer, &ring, cut.code());
+            announce(peer, &ring, code);
         }
         Cut::Claimed => {
             let _claim = recv.claim().expect("claim");
-            announce(peer, &ring, cut.code());
+            announce(peer, &ring, code);
         }
     }
 }
@@ -155,21 +135,28 @@ struct Setup {
 }
 
 fn command(cut: Cut, ready: &PathBuf, address: &str) -> Command {
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "recovery_conserves_every_accepted_record"])
-        .env(ROLE, cut.name())
-        .env(READY, ready)
-        .env(ADDRESS, address);
+    let mut command = role::child(cut.name());
+    command.env(READY, ready).env(ADDRESS, address);
+    cuts::hand(&mut command, cut.code());
     command
 }
 
+/// The child's whole program: one role per crash cut, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("reserved", || crashed_at(Cut::Reserved)),
+        ("staged", || crashed_at(Cut::Staged)),
+        ("published", || crashed_at(Cut::Published)),
+        ("claimed", || crashed_at(Cut::Claimed)),
+    ]);
+}
+
 #[cfg(unix)]
-fn child() -> Option<()> {
+fn crashed_at(cut: Cut) -> i32 {
     use evering::os::unix::{UnixFd, process::Socket};
 
-    let cut = Cut::parse(&env::var(ROLE).ok()?);
-    let socket = Socket::bind(env::var_os(ADDRESS).unwrap()).unwrap();
+    let socket = Socket::bind(env::var(ADDRESS).unwrap()).unwrap();
     let (bytes, resources) = socket.recv(2).unwrap().into_parts();
     let mut resources = resources.into_vec();
     let source = UnixFd::from_fd(resources.remove(0)).unwrap();
@@ -185,10 +172,9 @@ fn child() -> Option<()> {
 }
 
 #[cfg(windows)]
-fn child() -> Option<()> {
+fn crashed_at(cut: Cut) -> i32 {
     use evering::os::windows::{Section, process::Socket};
 
-    let cut = Cut::parse(&env::var(ROLE).ok()?);
     let socket = Socket::connect(&env::var(ADDRESS).unwrap()).unwrap();
     let (bytes, resources) = socket.recv(2).unwrap().into_parts();
     let mut resources = resources.into_vec();
@@ -241,7 +227,10 @@ fn setup(cut: Cut, ready: PathBuf) -> Setup {
     };
     let (ring, event) = event().unwrap();
     socket
-        .send(&bootstrap(&port, pool_id), &[source.as_fd(), ring.as_fd()])
+        .send(
+            &introduce::bootstrap(&port, pool_id),
+            &[source.as_fd(), ring.as_fd()],
+        )
         .unwrap();
     fs::remove_file(path).unwrap();
     Setup {
@@ -280,7 +269,7 @@ fn setup(cut: Cut, ready: PathBuf) -> Setup {
     socket
         .send(
             &child,
-            &bootstrap(&port, pool_id),
+            &introduce::bootstrap(&port, pool_id),
             &[source.as_handle(), ring.as_handle()],
         )
         .unwrap();
@@ -375,7 +364,6 @@ fn clean_attach(
 
 #[test]
 fn recovery_conserves_every_accepted_record() {
-    child();
     for cut in Cut::ALL {
         let ready = env::temp_dir().join(format!(
             "evering-recovery-ready-{}-{}",

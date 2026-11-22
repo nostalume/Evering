@@ -1,4 +1,7 @@
-#![cfg(all(feature = "map", windows))]
+//! The Windows section leg, which only a Windows host can compile: a freshly made anonymous section is a
+//! session source in its own right, and the three requests that must not be honored — zero size, no read
+//! access, and a mapping wider than the section was declared with — are refused by the call they are
+//! made to, not by the first fault that reaches through the mapping.
 
 use evering::{
     Session,

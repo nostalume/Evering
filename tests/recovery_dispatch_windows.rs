@@ -42,14 +42,12 @@ use std::{
     env, fs,
     os::windows::io::AsHandle,
     path::Path,
-    process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
 use evering::{
-    Block, ChannelId as Id, Decline, DeclineCause, PoolId, PoolRef, Port, Rx, Session,
-    layout::{self, RegionId, Repr, SchemaId, SchemaKey, Shape, SharedSchema},
+    ChannelId as Id, PoolId, Port, Session,
+    layout::{self, RegionId, Repr, SchemaId, SchemaKey, SharedSchema},
     mapping::{Access, Peer, Request},
     os::windows::{
         Section,
@@ -58,7 +56,9 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
-const ROLE: &str = "EVERING_RECOVERY_ROLE";
+mod support;
+use crate::support::{cuts, introduce, role};
+
 const ADDRESS: &str = "EVERING_RECOVERY_ADDRESS";
 const READY: &str = "EVERING_RECOVERY_READY";
 const SIZE: usize = 4 * 1024 * 1024;
@@ -82,24 +82,6 @@ impl SharedSchema for AlternateEnvelope {
 
 unsafe impl Repr for AlternateEnvelope {
     const SCHEMA: SchemaKey = <Self as SharedSchema>::SCHEMA;
-}
-
-fn bootstrap(port: &Port<()>, pool: PoolId) -> Bootstrap {
-    let id = port.id();
-    let (_, pool_slab, pool_entry, pool_generation) = pool.parts();
-    Bootstrap::new(format!(
-        "{},{},{},{},{},{},{},{},{}",
-        id.slab(),
-        id.entry(),
-        id.generation(),
-        id.capacity(),
-        port.role(),
-        port.generation(),
-        pool_slab,
-        pool_entry,
-        pool_generation,
-    ))
-    .unwrap()
 }
 
 fn channel_only(port: &Port<AlternateEnvelope>) -> Bootstrap {
@@ -151,50 +133,8 @@ fn parse_channel(bytes: &[u8]) -> Port<AlternateEnvelope> {
     parse_port(&mut parts)
 }
 
-fn send_bounded<T>(
-    mut value: T,
-    mut send: impl FnMut(T) -> Result<(), Decline<T>>,
-    deadline: Instant,
-) {
-    loop {
-        let Decline { cause, value: sent } = match send(value) {
-            Ok(()) => return,
-            Err(decline) => decline,
-        };
-        match (cause, sent) {
-            (DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. }, Some(returned)) => {
-                value = returned
-            }
-            (DeclineCause::Sealed, _) => panic!("peer disconnected while sending"),
-            (_, None) => panic!("block lost its Pool authority: {cause:?}"),
-            (cause, Some(_)) => panic!("send refused for {cause:?}"),
-        }
-        assert!(Instant::now() < deadline, "queue remained full");
-        thread::yield_now();
-    }
-}
-
-fn adopt_bounded<'p, H, T>(recv: &Rx<H>, pool: PoolRef<'p>, deadline: Instant) -> (H, Block<'p, T>)
-where
-    H: Repr,
-    T: Repr + Shape + ?Sized,
-{
-    loop {
-        match recv.claim() {
-            Ok(received) => match received.adopt(pool) {
-                Ok(value) => return value,
-                Err(error) => panic!("matching Pool rejected transfer: {error:?}"),
-            },
-            Err(evering::ReceiveError::Empty | evering::ReceiveError::Busy) => {}
-            Err(evering::ReceiveError::Closed) => panic!("peer disconnected while receiving"),
-        }
-        assert!(Instant::now() < deadline, "queue remained empty");
-        thread::yield_now();
-    }
-}
-
-/// The child half of either case: one section handle over the pipe, then the role the parent named.
-fn child(role: &str) -> ! {
+/// The child half of either case: one section handle over the pipe, and the numbers sent with it.
+fn meet() -> (Session, Bootstrap) {
     let socket = Socket::connect(&env::var(ADDRESS).expect("rendezvous address"))
         .expect("child meets the parent that spawned it");
     let (bytes, resources) = socket.recv(1).expect("one section handle").into_parts();
@@ -206,49 +146,64 @@ fn child(role: &str) -> ! {
         REGION,
     )
     .expect("join the session the parent created");
-    match role {
-        "doomed-member" => {
-            let (port, pool_id) = parse_channel_and_pool(bytes.as_ref());
-            let channel = session.adopt(port).expect("adopt the current channel role");
-            let pool = session.open_pool(pool_id).expect("open the identity pool");
-            let (send, _) = channel.split();
-            let peer = session.peer();
-            let deadline = Instant::now() + TIMEOUT;
-            for value in [peer.slot() as u64, peer.generation() as u64] {
-                let record = pool.as_ref().put(value).expect("allocate identity");
-                send_bounded(
-                    record.transfer(()),
-                    |record| send.try_send(record),
-                    deadline,
-                );
-            }
-            std::process::exit(DOOMED)
-        }
-        "foreign-owner" => {
-            let port = parse_channel(bytes.as_ref());
-            let _channel = session.adopt(port).expect("adopt the foreign schema role");
-            let peer = session.peer();
-            fs::write(
-                env::var_os(READY).expect("ready path"),
-                format!("{},{}", peer.slot(), peer.generation()),
-            )
-            .expect("report the member this process became");
-            std::process::exit(FOREIGN)
-        }
-        other => panic!("unknown recovery role {other}"),
-    }
+    (session, bytes)
 }
 
-fn admit(role: &str, test: &str, report: Option<&Path>) -> (Supervisor, Listener) {
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("doomed-member", doomed_member),
+        ("foreign-owner", foreign_owner),
+    ]);
+}
+
+/// The first case's role: publish its own identity twice, then leave with the number the parent handed so
+/// no destructor runs.
+fn doomed_member() -> i32 {
+    let (session, bytes) = meet();
+    let (port, pool_id) = parse_channel_and_pool(bytes.as_ref());
+    let channel = session.adopt(port).expect("adopt the current channel role");
+    let pool = session.open_pool(pool_id).expect("open the identity pool");
+    let (send, _) = channel.split();
+    let peer = session.peer();
+    let deadline = Instant::now() + TIMEOUT;
+    for value in [peer.slot() as u64, peer.generation() as u64] {
+        let record = pool.as_ref().put(value).expect("allocate identity");
+        introduce::send_bounded(
+            record.transfer(()),
+            |record| send.try_send(record),
+            deadline,
+        );
+    }
+    // Diverges in tail position rather than returning the code: a body that returned would drop the
+    // session it just stood in, and the parent would find a politely released slot instead of a reap.
+    role::leave(cuts::code())
+}
+
+/// The second case's role: become the member of a schema no default handler names, report itself, and
+/// leave the same way.
+fn foreign_owner() -> i32 {
+    let (session, bytes) = meet();
+    let port = parse_channel(bytes.as_ref());
+    let _channel = session.adopt(port).expect("adopt the foreign schema role");
+    let peer = session.peer();
+    fs::write(
+        env::var_os(READY).expect("ready path"),
+        format!("{},{}", peer.slot(), peer.generation()),
+    )
+    .expect("report the member this process became");
+    role::leave(cuts::code())
+}
+
+fn admit(name: &str, code: i32, report: Option<&Path>) -> (Supervisor, Listener) {
     let listener = Listener::bind().expect("a rendezvous for the doomed peer");
-    let mut command = Command::new(env::current_exe().expect("test executable"));
-    command
-        .args(["--exact", test])
-        .env(ROLE, role)
-        .env(ADDRESS, listener.name());
+    let mut command = role::child(name);
+    command.env(ADDRESS, listener.name());
     if let Some(report) = report {
         command.env(READY, report);
     }
+    cuts::hand(&mut command, code);
     let child = Supervisor::spawn(&mut command).expect("spawn the doomed peer");
     (child, listener)
 }
@@ -266,15 +221,7 @@ fn region() -> (Section<std::os::windows::io::OwnedHandle>, Session) {
 
 #[test]
 fn a_dead_member_is_reaped_by_its_exact_handler_and_its_slot_comes_back() {
-    if let Ok(role) = env::var(ROLE) {
-        child(&role);
-    }
-
-    let (mut child, listener) = admit(
-        "doomed-member",
-        "a_dead_member_is_reaped_by_its_exact_handler_and_its_slot_comes_back",
-        None,
-    );
+    let (mut child, listener) = admit("doomed-member", DOOMED, None);
     let (source, session) = region();
     let pool = session.create_pool(64 * 1024, None).expect("identity pool");
     let pool_id = pool.id();
@@ -286,7 +233,11 @@ fn a_dead_member_is_reaped_by_its_exact_handler_and_its_slot_comes_back() {
         .accept(&child, Instant::now() + TIMEOUT)
         .expect("the doomed peer connects");
     socket
-        .send(&child, &bootstrap(&port, pool_id), &[source.as_handle()])
+        .send(
+            &child,
+            &introduce::bootstrap(&port, pool_id),
+            &[source.as_handle()],
+        )
         .expect("hand the region over");
 
     let exit = child.wait().expect("wait for the doomed member");
@@ -295,7 +246,7 @@ fn a_dead_member_is_reaped_by_its_exact_handler_and_its_slot_comes_back() {
     let deadline = Instant::now() + TIMEOUT;
     let mut identity = [0_u64; 2];
     for part in &mut identity {
-        let (_, value) = adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
+        let (_, value) = introduce::adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
         *part = *value;
     }
     drop(recv);
@@ -336,17 +287,9 @@ fn a_dead_member_is_reaped_by_its_exact_handler_and_its_slot_comes_back() {
 
 #[test]
 fn a_foreign_schema_reap_refuses_every_handler_short_of_the_exact_one() {
-    if let Ok(role) = env::var(ROLE) {
-        child(&role);
-    }
-
     let ready = env::temp_dir().join(format!("evering-foreign-owner-{}.txt", std::process::id()));
     let _ = fs::remove_file(&ready);
-    let (mut child, listener) = admit(
-        "foreign-owner",
-        "a_foreign_schema_reap_refuses_every_handler_short_of_the_exact_one",
-        Some(&ready),
-    );
+    let (mut child, listener) = admit("foreign-owner", FOREIGN, Some(&ready));
     let (source, session) = region();
     let alternate = Session::open(
         source.borrow(),

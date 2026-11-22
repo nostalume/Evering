@@ -1,43 +1,57 @@
 #![cfg(all(feature = "tokio", feature = "notify", any(unix, windows)))]
 
-use std::{env, process::Command, time::Duration};
+use std::{env, time::Duration};
 
 use evering::{
     notify::{Notify, Wait as _},
     os, runtime,
 };
 
-const CHILD: &str = "EVERING_NOTIFY_CHILD";
+mod support;
+use crate::support::role;
+
+/// The doorbell the parent names to its child, spelled as the number a second process can rebuild.
 const HANDLE: &str = "EVERING_NOTIFY_HANDLE";
-const EXIT_CHILD: &str = "EVERING_NOTIFY_EXIT_CHILD";
+
+/// The role the cross-process wait spawns: park on the handle the parent named, and leave when it rings.
+fn parks() -> i32 {
+    let raw: usize = env::var(HANDLE).unwrap().parse().unwrap();
+
+    #[cfg(unix)]
+    let event = {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        os::Event::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw as i32) })
+    };
+    #[cfg(windows)]
+    let event = {
+        use std::os::windows::io::{FromRawHandle, OwnedHandle};
+        os::Event::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw as *mut _) })
+    };
+
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(async move {
+            let wait = runtime::Wait::new(event).unwrap();
+            wait.wait().await.unwrap();
+        });
+    0
+}
+
+/// The role the peer-exit claim spawns: leave at once, so a death is the only answer the wait can get.
+fn leaves() -> i32 {
+    0
+}
+
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[("parks", parks), ("leaves", leaves)]);
+}
 
 #[test]
 fn wait_cross_process() {
-    if env::var_os(CHILD).is_some() {
-        let raw: usize = env::var(HANDLE).unwrap().parse().unwrap();
-
-        #[cfg(unix)]
-        let event = {
-            use std::os::fd::{FromRawFd, OwnedFd};
-            os::Event::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw as i32) })
-        };
-        #[cfg(windows)]
-        let event = {
-            use std::os::windows::io::{FromRawHandle, OwnedHandle};
-            os::Event::from_owned_handle(unsafe { OwnedHandle::from_raw_handle(raw as *mut _) })
-        };
-
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(async move {
-                let wait = runtime::Wait::new(event).unwrap();
-                wait.wait().await.unwrap();
-            });
-        return;
-    }
-
     let (ring, event) = os::event().unwrap();
 
     #[cfg(unix)]
@@ -64,11 +78,7 @@ fn wait_cross_process() {
         handle as usize
     };
 
-    let mut child = Command::new(env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("wait_cross_process")
-        .arg("--nocapture")
-        .env(CHILD, "1")
+    let mut child = role::child("parks")
         .env(HANDLE, raw.to_string())
         .spawn()
         .unwrap();
@@ -79,10 +89,6 @@ fn wait_cross_process() {
 
 #[test]
 fn peer_exit_cancels_wait_without_fabricating_readiness() {
-    if env::var_os(EXIT_CHILD).is_some() {
-        return;
-    }
-
     let (_ring, event) = os::event().unwrap();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -92,13 +98,7 @@ fn peer_exit_cancels_wait_without_fabricating_readiness() {
     let wait = runtime::Wait::new(event).unwrap();
     drop(entered);
 
-    let mut child = Command::new(env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("peer_exit_cancels_wait_without_fabricating_readiness")
-        .arg("--nocapture")
-        .env(EXIT_CHILD, "1")
-        .spawn()
-        .unwrap();
+    let mut child = role::child("leaves").spawn().unwrap();
     let (exited, status) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
         let _ = exited.send(child.wait());

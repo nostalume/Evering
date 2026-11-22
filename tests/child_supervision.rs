@@ -1,33 +1,36 @@
-#![cfg(feature = "process")]
+//! What a supervised child owes the process that spawned it: a wait that returns a terminal proof, a kill
+//! that finishes with the same status it was waited for, a failed spawn that creates no supervisor at all,
+//! and an `Exited` witness that reports a death before anybody reaps it — including once the owner that
+//! made it has given the child up, which is the only arm of `Drop` this claim reaches.
 
 use std::{env, process::Command, thread, time::Duration};
 
 use evering::process::Supervisor;
 
-const CHILD: &str = "EVERING_SUPERVISOR_CHILD";
+mod support;
+use crate::support::role;
 
-#[test]
-fn supervised_child() {
-    match env::var(CHILD).as_deref() {
-        Ok("exit") => {}
-        Ok("sleep") => loop {
-            thread::sleep(Duration::from_secs(1));
-        },
-        _ => {}
+/// The role a terminal proof is owed: it agrees by leaving, and leaves with success.
+fn agreed() -> i32 {
+    0
+}
+
+/// The role a kill is owed: it stays alive until the parent takes it off its hands.
+fn stays() -> i32 {
+    loop {
+        thread::sleep(Duration::from_secs(1));
     }
 }
 
-fn child(mode: &str) -> Command {
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "supervised_child"])
-        .env(CHILD, mode);
-    command
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[("agreed", agreed), ("stays", stays)]);
 }
 
 #[test]
 fn wait_returns_terminal_proof_for_retained_child() {
-    let mut supervisor = Supervisor::spawn(&mut child("exit")).unwrap();
+    let mut supervisor = Supervisor::spawn(&mut role::child("agreed")).unwrap();
     let exit = supervisor.wait().unwrap();
     assert!(exit.success());
     assert!(exit.status().success());
@@ -35,7 +38,7 @@ fn wait_returns_terminal_proof_for_retained_child() {
 
 #[test]
 fn kill_always_finishes_with_waited_status() {
-    let mut supervisor = Supervisor::spawn(&mut child("sleep")).unwrap();
+    let mut supervisor = Supervisor::spawn(&mut role::child("stays")).unwrap();
     assert!(supervisor.try_wait().unwrap().is_none());
     assert!(!supervisor.kill_wait().unwrap().success());
     assert!(supervisor.try_wait().unwrap().is_some());
@@ -53,7 +56,7 @@ fn failed_spawn_creates_no_supervisor() {
 /// process already waited on, and it is not stranded by the owner that made it.
 #[cfg(all(feature = "tokio", target_os = "linux"))]
 mod death_witness {
-    use super::child;
+    use super::role;
 
     use std::time::Duration;
 
@@ -77,7 +80,7 @@ mod death_witness {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_child_that_exited_but_was_never_reaped_wakes_its_witness() {
-        let mut supervisor = Supervisor::spawn(&mut child("exit")).unwrap();
+        let mut supervisor = Supervisor::spawn(&mut role::child("agreed")).unwrap();
         let witness = supervisor.exited().unwrap();
 
         // The whole point of the witness: the death is observable before any reap turns it into a
@@ -93,7 +96,7 @@ mod death_witness {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_live_child_keeps_its_witness_parked() {
-        let mut supervisor = Supervisor::spawn(&mut child("sleep")).unwrap();
+        let mut supervisor = Supervisor::spawn(&mut role::child("stays")).unwrap();
         let witness = supervisor.exited().unwrap();
 
         assert!(
@@ -107,7 +110,7 @@ mod death_witness {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_witness_stays_ready_after_the_child_was_killed_and_reaped() {
-        let mut supervisor = Supervisor::spawn(&mut child("sleep")).unwrap();
+        let mut supervisor = Supervisor::spawn(&mut role::child("stays")).unwrap();
         let witness = supervisor.exited().unwrap();
 
         supervisor.kill_wait().unwrap();
@@ -120,7 +123,7 @@ mod death_witness {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_witness_taken_after_a_wait_never_asks_the_host() {
-        let mut supervisor = Supervisor::spawn(&mut child("exit")).unwrap();
+        let mut supervisor = Supervisor::spawn(&mut role::child("agreed")).unwrap();
         supervisor.wait().unwrap();
 
         // The child is gone and already reaped, so a process number taken now could name somebody
@@ -133,7 +136,7 @@ mod death_witness {
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_witness_is_not_stranded_by_the_owner_that_gave_its_child_up() {
-        let supervisor = Supervisor::spawn(&mut child("sleep")).unwrap();
+        let supervisor = Supervisor::spawn(&mut role::child("stays")).unwrap();
         let witness = supervisor.exited().unwrap();
 
         // `Drop` kills and reaps a child nobody waited on, and a witness holds no borrow of that owner,

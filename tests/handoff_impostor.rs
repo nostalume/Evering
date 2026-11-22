@@ -14,7 +14,6 @@ use std::{
     os::unix::net::UnixDatagram,
     path::PathBuf,
     process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -24,12 +23,14 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
+mod support;
+use crate::support::{introduce, role};
+
 /// The environment key a grant announces its rendezvous under, as frozen in `src/process.rs`.
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
 /// The introducer's policy key, which the claimant below writes for itself and the honest grant below
 /// writes through `Grant::trusting_introduction`.
 const TRUST: &str = "EVERING_TRUST";
-const ROLE: &str = "EVERING_IMPOSTOR_ROLE";
 const ATTACKER: &str = "attacker";
 const CHILD: &str = "child";
 const ANNOUNCED: &str = "3";
@@ -124,51 +125,28 @@ fn child() -> i32 {
     }
 }
 
-fn wait_for(child: &mut Supervisor, label: &str, budget: Duration) -> i32 {
-    let until = Instant::now() + budget;
-    loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            return exit.status().code().unwrap_or(-1);
-        }
-        if Instant::now() >= until {
-            let _ = child.kill_wait();
-            panic!("{label} never finished");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[(ATTACKER, attacker), (CHILD, child)]);
 }
-
-fn spawn(command: &mut Command, role: &str) -> Supervisor {
-    command.args(["--exact", TEST]).env(ROLE, role);
-    Supervisor::spawn(command).expect("a role process spawns")
-}
-
-const TEST: &str = "a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets";
 
 #[test]
 fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
-    let role = env::var(ROLE).ok();
-    if role.as_deref() == Some(ATTACKER) {
-        std::process::exit(attacker());
-    }
-    if role.as_deref() == Some(CHILD) {
-        std::process::exit(child());
-    }
-
     let (handoff, grant) = Handoff::bind().unwrap();
     let mapping = shared("attestation", SIZE, Access::READ | Access::WRITE).unwrap();
     let (_notify, child_wait) = evering::os::event().unwrap();
     let (child_ring, _event) = evering::os::event().unwrap();
     let bootstrap = Bootstrap::new(b"selected-protocol-id").unwrap();
 
-    let mut command = Command::new(env::current_exe().unwrap());
+    let mut command = role::child(ATTACKER);
     command.env(RENDEZVOUS, ANNOUNCED).env(TRUST, "1");
-    let mut attacker = spawn(&mut command, ATTACKER);
+    let mut attacker = Supervisor::spawn(&mut command).expect("a role process spawns");
 
-    let mut command = Command::new(env::current_exe().unwrap());
+    let mut command = role::child(CHILD);
     command.env(EXPECT_PEER, std::process::id().to_string());
     grant.trusting_introduction().admit(&mut command).unwrap();
-    let mut granted = spawn(&mut command, CHILD);
+    let mut granted = Supervisor::spawn(&mut command).expect("a role process spawns");
 
     handoff
         .send(
@@ -182,13 +160,13 @@ fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
         .unwrap();
 
     assert_eq!(
-        wait_for(&mut attacker, "the claimant", Duration::from_secs(10)),
+        introduce::exit_code(&mut attacker, "the claimant", Duration::from_secs(10)),
         REFUSED,
         "holding the announcement is not holding the rendezvous, and a policy word written by the \
          claimant itself releases a handover no introducer ever announced"
     );
     assert_eq!(
-        wait_for(&mut granted, "the granted child", Duration::from_secs(10)),
+        introduce::exit_code(&mut granted, "the granted child", Duration::from_secs(10)),
         ATTESTED,
         "the process the grant was admitted to meets and names its introducer, and the policy that \
          grant carried leaves an answer the kernel gave exactly as it was"

@@ -1,3 +1,7 @@
+//! The identity bytes a port may not reinterpret: the exact words a `PoolId` and a `Port` occupy on the
+//! wire, the round trip that reads those bytes back into the same parts, and the malformed buffers that
+//! are refused rather than repaired.
+
 use evering::{
     Encoded, PoolId, Port,
     layout::{RegionId, Repr},

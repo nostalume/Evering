@@ -10,8 +10,6 @@
 
 use std::{
     env,
-    process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
@@ -21,12 +19,14 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
+mod support;
+use crate::support::{introduce, role};
+
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
 const INTRODUCER: &str = "EVERING_INTRODUCER";
 /// The introducer's policy key: the claimant writes it for itself, and the honest grant below writes it
 /// through `Grant::trusting_introduction`.
 const TRUST: &str = "EVERING_TRUST";
-const ROLE: &str = "EVERING_IMPOSTOR_ROLE";
 const ATTACKER: &str = "attacker";
 const CHILD: &str = "child";
 const EXPECT_PEER: &str = "EVERING_EXPECT_PEER";
@@ -101,32 +101,14 @@ fn child() -> i32 {
     }
 }
 
-fn wait_for(child: &mut Supervisor, label: &str, budget: Duration) -> i32 {
-    let until = Instant::now() + budget;
-    loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            return exit.status().code().unwrap_or(-1);
-        }
-        if Instant::now() >= until {
-            let _ = child.kill_wait();
-            panic!("{label} never finished");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-fn spawn(command: &mut Command, role: &str, test: &str) -> Supervisor {
-    command.args(["--exact", test]).env(ROLE, role);
-    Supervisor::spawn(command).expect("a role process spawns")
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[(ATTACKER, attacker), (CHILD, child)]);
 }
 
 #[test]
 fn a_granted_process_names_the_peer_it_met() {
-    const TEST: &str = "a_granted_process_names_the_peer_it_met";
-    if env::var(ROLE).ok().as_deref() == Some(CHILD) {
-        std::process::exit(child());
-    }
-
     let (handoff, grant) = Handoff::bind().unwrap();
     let mapping: Shared =
         evering::os::shared("attestation", SIZE, Access::READ | Access::WRITE).unwrap();
@@ -134,10 +116,10 @@ fn a_granted_process_names_the_peer_it_met() {
     let (child_ring, _event) = event().unwrap();
     let bootstrap = Bootstrap::new(b"selected-protocol-id").unwrap();
 
-    let mut command = Command::new(env::current_exe().unwrap());
+    let mut command = role::child(CHILD);
     command.env(EXPECT_PEER, std::process::id().to_string());
     grant.trusting_introduction().admit(&mut command).unwrap();
-    let mut granted = spawn(&mut command, CHILD, TEST);
+    let mut granted = Supervisor::spawn(&mut command).expect("a role process spawns");
 
     handoff
         .send(
@@ -151,7 +133,7 @@ fn a_granted_process_names_the_peer_it_met() {
         .unwrap();
 
     assert_eq!(
-        wait_for(&mut granted, "the granted child", Duration::from_secs(20)),
+        introduce::exit_code(&mut granted, "the granted child", Duration::from_secs(20)),
         ATTESTED,
         "the process the grant was admitted to meets and names its introducer, and the policy that \
          grant carried leaves an answer the kernel gave exactly as it was"
@@ -160,21 +142,16 @@ fn a_granted_process_names_the_peer_it_met() {
 
 #[test]
 fn a_process_that_claims_another_introducer_is_refused_before_it_reads() {
-    const TEST: &str = "a_process_that_claims_another_introducer_is_refused_before_it_reads";
-    if env::var(ROLE).ok().as_deref() == Some(ATTACKER) {
-        std::process::exit(attacker());
-    }
-
     let listener = Listener::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
+    let mut command = role::child(ATTACKER);
     command
         .env(RENDEZVOUS, listener.name())
         .env(INTRODUCER, "1")
         .env(TRUST, "1");
-    let mut attacker = spawn(&mut command, ATTACKER, TEST);
+    let mut attacker = Supervisor::spawn(&mut command).expect("a role process spawns");
 
     assert_eq!(
-        wait_for(&mut attacker, "the claimant", Duration::from_secs(20)),
+        introduce::exit_code(&mut attacker, "the claimant", Duration::from_secs(20)),
         REFUSED,
         "a pipe owned by this process is not the introducer the claimant named, and a policy the \
          claimant wrote for itself cannot vouch for a pipe no introducer opened"

@@ -20,27 +20,39 @@
 //! these cases assert where a mapping landed, and the Windows backend does not ask the kernel for an
 //! address at all, so there is no alternate base to join at and nothing for such an assertion to
 //! answer to.
+//!
+//! Two seams here differ from every other multi-process claim, and both follow from the transport being
+//! the environment rather than a socket. The numbers of a channel entry, a port and a pool travel one
+//! key per number, spelled out by [`declare_port`]/[`declare_pool`] and read back by
+//! [`env_port`]/[`pool_id_from_env`], because there is no handover to carry them as bytes; and a role
+//! that has to report what only it can see — the member it became, the claims it holds — writes a file
+//! the parent reads after the exit, because a re-entered child's harness output goes to the void and a
+//! number printed there would be read by no one. The verdict each doomed role leaves with is handed to
+//! it as a number ([`cuts`]) rather than fixed in the arm that dies, so one number has one spelling
+//! here; [`AlternateEnvelope`]'s schema, by contrast, is the same words on both hosts by design, since
+//! it is the layout's own claim and not a process seam.
 
 use std::{
-    io::Write,
+    env, fs,
+    path::PathBuf,
     process::{Child, Command, ExitStatus},
-    thread,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(feature = "process")]
 use evering::process::Supervisor;
 use evering::{
-    Block, BlockRange, ChannelId as Id, Decline, DeclineCause, PoolId, PoolRef, Port, RoomWait, Rx,
-    Session, SessionError,
-    layout::{self, RegionId, Repr, SchemaId, SchemaKey, Shape, SharedSchema},
+    BlockRange, ChannelId as Id, DeclineCause, PoolId, Port, RoomWait, Session, SessionError,
+    layout::{self, RegionId, Repr, SchemaId, SchemaKey, SharedSchema},
     mapping::{Access, LayoutField, Peer, Request},
     os::unix::UnixFd,
 };
 
-const ROLE: &str = "EVERING_PROCESS_ROLE";
-const SHM_NAME: &str = "EVERING_PROCESS_SHM";
-const REGION_SIZE_ENV: &str = "EVERING_PROCESS_REGION_SIZE";
+mod support;
+use crate::support::{cuts, introduce, region, role};
+
+const NAME: &str = "EVERING_PROCESS_SHM";
+const READY: &str = "EVERING_PROCESS_READY";
 const ENTRY_SLAB: &str = "EVERING_PROCESS_ENTRY_SLAB";
 const ENTRY_INDEX: &str = "EVERING_PROCESS_ENTRY_INDEX";
 const ENTRY_GENERATION: &str = "EVERING_PROCESS_ENTRY_GENERATION";
@@ -55,6 +67,13 @@ const REGION_SIZE: usize = 4 * 1024 * 1024;
 const QUEUE_CAPACITY: usize = 8;
 const REGION_ID: RegionId = RegionId::new(0x4556_4552_494e_4701, 1);
 const TIMEOUT: Duration = Duration::from_secs(5);
+
+/// The doomed member of the layout scan: it publishes its own identity and leaves without releasing it.
+const DOOMED: i32 = 77;
+/// The member of a schema no default handler names: it reports itself and leaves the same way.
+const FOREIGN: i32 = 73;
+/// The pool filler: it exhausts the pool with claims it never releases, and leaves.
+const FILLED: i32 = 74;
 
 type UnixSession = Session;
 
@@ -100,143 +119,123 @@ fn unique_name() -> String {
     format!("evering-process-{}-{nonce}", std::process::id())
 }
 
-fn spawn_case(test: &str, role: &str, name: &str) -> ChildGuard {
-    ChildGuard(
-        Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg(test)
-            .arg("--nocapture")
-            .env(ROLE, role)
-            .env(SHM_NAME, name)
-            .spawn()
-            .expect("spawn peer process"),
-    )
+/// Where a role reports what only it can see, named per case so two roles cannot write one file.
+fn ready_path(case: &str) -> PathBuf {
+    env::temp_dir().join(format!(
+        "evering-process-ready-{}-{case}",
+        std::process::id()
+    ))
+}
+
+/// The child half of a case that only asserts from inside the role: meet in the named region, run, and
+/// be waited for.
+fn joins_as(role_name: &str, name: &str) -> ChildGuard {
+    let mut command = role::child(role_name);
+    command.env(NAME, name);
+    ChildGuard(command.spawn().expect("spawn the joining process"))
 }
 
 fn creator_session(name: &str) -> UnixSession {
     let fd = UnixFd::shm_create(name, REGION_SIZE).expect("create shared region");
-    Session::create(
-        fd,
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-        REGION_ID,
-    )
-    .expect("create session")
+    Session::create(fd, region::extent(REGION_SIZE), REGION_ID).expect("create session")
 }
 
 fn joiner_session(name: &str, parent_base: usize) -> UnixSession {
     let fd = UnixFd::shm_open(name).expect("open shared region");
     Session::open(
         fd.mapping().at(parent_base.wrapping_add(1 << 30)),
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
+        region::extent(REGION_SIZE),
         REGION_ID,
     )
     .expect("join session")
 }
 
-fn send_bounded<T>(
-    mut value: T,
-    mut send: impl FnMut(T) -> Result<(), Decline<T>>,
-    deadline: Instant,
-) {
-    loop {
-        let Decline { cause, value: sent } = match send(value) {
-            Ok(()) => return,
-            Err(decline) => decline,
-        };
-        match (cause, sent) {
-            (DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. }, Some(returned)) => {
-                value = returned
-            }
-            (DeclineCause::Sealed, _) => panic!("peer disconnected while sending"),
-            (_, None) => panic!("block lost its Pool authority: {cause:?}"),
-            (cause, Some(_)) => panic!("send refused for {cause:?}"),
-        }
-        assert!(Instant::now() < deadline, "queue remained full");
-        thread::yield_now();
-    }
+/// Spells one channel endpoint out, one number per key, for a role that can only be told by name.
+fn declare_port<T: Repr>(command: &mut Command, port: &Port<T>) {
+    let id = port.id();
+    command
+        .env(ENTRY_SLAB, id.slab().to_string())
+        .env(ENTRY_INDEX, id.entry().to_string())
+        .env(ENTRY_GENERATION, id.generation().to_string())
+        .env(ENTRY_CAPACITY, id.capacity().to_string())
+        .env(PORT_ROLE, port.role().to_string())
+        .env(PORT_GENERATION, port.generation().to_string());
 }
 
-fn adopt_bounded<'p, H, T>(recv: &Rx<H>, pool: PoolRef<'p>, deadline: Instant) -> (H, Block<'p, T>)
-where
-    H: Repr,
-    T: Repr + Shape + ?Sized,
-{
-    loop {
-        match recv.claim() {
-            Ok(received) => match received.adopt(pool) {
-                Ok(value) => return value,
-                Err(error) => panic!("matching Pool rejected transfer: {error:?}"),
-            },
-            Err(evering::ReceiveError::Empty | evering::ReceiveError::Busy) => {}
-            Err(evering::ReceiveError::Closed) => panic!("peer disconnected while receiving"),
-        }
-        assert!(Instant::now() < deadline, "queue remained empty");
-        thread::yield_now();
-    }
+/// Spells one pool out the same way.
+fn declare_pool(command: &mut Command, pool: PoolId) {
+    let (_, slab, entry, generation) = pool.parts();
+    command
+        .env(POOL_SLAB, slab.to_string())
+        .env(POOL_INDEX, entry.to_string())
+        .env(POOL_GENERATION, generation.to_string());
+}
+
+fn number(key: &str) -> usize {
+    env::var(key)
+        .expect(key)
+        .parse()
+        .expect("a numeric value beside the region name")
+}
+
+/// The region this role was pointed at, and the base its parent mapped it at: the alternate base a
+/// joining peer reaches is `PARENT_BASE` plus a deliberate offset, never an address it chose.
+fn shm_name() -> String {
+    env::var(NAME).expect("shared region name")
+}
+
+fn parent_base() -> usize {
+    number(PARENT_BASE)
+}
+
+fn env_port<T: Repr>() -> Port<T> {
+    let id = Id::new(
+        REGION_ID,
+        number(ENTRY_SLAB) as u32,
+        number(ENTRY_INDEX) as u32,
+        number(ENTRY_GENERATION),
+        number(ENTRY_CAPACITY),
+    );
+    Port::from_parts(id, number(PORT_ROLE) as u8, number(PORT_GENERATION)).expect("canonical Port")
 }
 
 fn pool_id_from_env() -> PoolId {
     PoolId::new(
         REGION_ID,
-        std::env::var(POOL_SLAB).unwrap().parse().unwrap(),
-        std::env::var(POOL_INDEX).unwrap().parse().unwrap(),
-        std::env::var(POOL_GENERATION).unwrap().parse().unwrap(),
+        number(POOL_SLAB) as u32,
+        number(POOL_INDEX) as u32,
+        number(POOL_GENERATION),
     )
 }
 
-fn server() {
-    let name = std::env::var(SHM_NAME).expect("shared region name");
-    let region_size = std::env::var(REGION_SIZE_ENV)
-        .expect("region size")
-        .parse::<usize>()
-        .expect("numeric region size");
-    assert_eq!(region_size, REGION_SIZE);
-    let id = Id::new(
-        REGION_ID,
-        std::env::var(ENTRY_SLAB)
-            .expect("entry slab")
-            .parse()
-            .expect("numeric entry slab"),
-        std::env::var(ENTRY_INDEX)
-            .expect("entry index")
-            .parse()
-            .expect("numeric entry index"),
-        std::env::var(ENTRY_GENERATION)
-            .expect("entry generation")
-            .parse()
-            .expect("numeric entry generation"),
-        std::env::var(ENTRY_CAPACITY)
-            .expect("entry capacity")
-            .parse()
-            .expect("numeric entry capacity"),
-    );
-    let port = Port::from_parts(
-        id,
-        std::env::var(PORT_ROLE)
-            .expect("port role")
-            .parse()
-            .expect("numeric port role"),
-        std::env::var(PORT_GENERATION)
-            .expect("port generation")
-            .parse()
-            .expect("numeric port generation"),
-    )
-    .expect("canonical Port");
-    let parent_base = std::env::var(PARENT_BASE)
-        .expect("parent base")
-        .parse::<usize>()
-        .expect("numeric parent base");
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("server", server),
+        ("announce-peer-and-exit", announce_peer_and_exit),
+        ("wrong-region", wrong_region),
+        ("talc-geometry", talc_geometry),
+        ("alternate-layout-owner", alternate_layout_owner),
+        ("pool-owner", pool_owner),
+    ]);
+}
 
-    let session = joiner_session(&name, parent_base);
+/// The answering peer of the round trip: join at a base it was handed, serve one request, and report
+/// where its own allocator landed.
+fn server() -> i32 {
+    let session = joiner_session(&shm_name(), parent_base());
     let pool = session
         .open_pool(pool_id_from_env())
         .expect("acquire transfer Pool");
     let server_base = session.base_addr();
-    let channel = session.adopt(port).expect("adopt current channel role");
+    let channel = session
+        .adopt(env_port::<()>())
+        .expect("adopt current channel role");
     let (send, recv) = channel.split();
     let deadline = Instant::now() + TIMEOUT;
 
-    let (_, request) = adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
+    let (_, request) = introduce::adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
     let value = *request;
     drop(request);
 
@@ -245,61 +244,132 @@ fn server() {
         .as_ref()
         .copy(&response_data)
         .expect("allocate response");
-    send_bounded(
+    introduce::send_bounded(
         response.transfer(()),
         |value| send.try_send(value),
         deadline,
     );
     send.close();
+    0
+}
+
+/// The doomed member: publish its own identity twice, then leave with the number the parent handed so
+/// no destructor runs.
+fn announce_peer_and_exit() -> i32 {
+    let session = joiner_session(&shm_name(), parent_base());
+    let channel = session
+        .adopt(env_port::<()>())
+        .expect("adopt current channel role");
+    let (send, _) = channel.split();
+    let deadline = Instant::now() + TIMEOUT;
+    let peer = session.peer();
+    let pool = session.open_pool(pool_id_from_env()).unwrap();
+    for value in [peer.slot() as u64, peer.generation() as u64] {
+        let record = pool.as_ref().put(value).expect("allocate identity");
+        introduce::send_bounded(
+            record.transfer(()),
+            |record| send.try_send(record),
+            deadline,
+        );
+    }
+    role::leave(cuts::code())
+}
+
+/// The refusal a role expects, read as a pass: a peer that joined a root naming another region.
+fn wrong_region() -> i32 {
+    let wrong = RegionId::new(REGION_ID.high, REGION_ID.low.wrapping_add(1));
+    let opened = Session::open(
+        UnixFd::shm_open(&shm_name()).unwrap(),
+        region::extent(REGION_SIZE),
+        wrong,
+    );
+    assert!(matches!(
+        opened,
+        Err(SessionError::LayoutMismatch(LayoutField::Region))
+    ));
+    0
+}
+
+/// The same shape for geometry: a request narrower than the creating build's is refused by the
+/// information that describes it.
+fn talc_geometry() -> i32 {
+    let opened = Session::open(
+        UnixFd::shm_open(&shm_name()).unwrap(),
+        region::extent(REGION_SIZE - 4096),
+        REGION_ID,
+    );
+    assert!(matches!(
+        opened,
+        Err(SessionError::LayoutMismatch(LayoutField::Info))
+    ));
+    0
+}
+
+/// The foreign-schema member: adopt the queue no default handler names, report the member this process
+/// became, and leave without unwinding it.
+fn alternate_layout_owner() -> i32 {
+    let session = joiner_session(&shm_name(), parent_base());
+    let _channel = session.adopt(env_port::<AlternateEnvelope>()).unwrap();
+    let peer = session.peer();
+    fs::write(
+        env::var_os(READY).expect("ready path"),
+        format!("{},{}", peer.slot(), peer.generation()),
+    )
+    .expect("report the member this process became");
+    role::leave(cuts::code())
+}
+
+/// The pool filler: exhaust the pool with claims this process never releases, report how many it holds,
+/// and leave the same way.
+fn pool_owner() -> i32 {
+    let session = joiner_session(&shm_name(), parent_base());
+    let peer = session.peer();
+    let pool = session.open_pool(pool_id_from_env()).unwrap();
+    let pool_ref = pool.as_ref();
+    let mut blocks = Vec::new();
+    let shortage = DeclineCause::NoRoom {
+        waits: RoomWait::Release,
+    };
+    loop {
+        match pool_ref.put(7_u64) {
+            Ok(block) => blocks.push(block),
+            Err(decline) if decline.cause == shortage => break,
+            Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
+        }
+    }
+    fs::write(
+        env::var_os(READY).expect("ready path"),
+        format!("{},{},{}", peer.slot(), peer.generation(), blocks.len()),
+    )
+    .expect("report the member this process became");
+    role::leave(cuts::code())
 }
 
 #[test]
 fn different_base_process_round_trip() {
-    if std::env::var_os(ROLE).is_some() {
-        server();
-        return;
-    }
-
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let session = creator_session(&name);
     let parent_base = session.base_addr();
     let pool = session.create_pool(64 * 1024, None).unwrap();
-    let pool_id = pool.id();
-    let (_, pool_slab, pool_index, pool_generation) = pool_id.parts();
     let (channel, port) = session
         .create_channel::<()>(QUEUE_CAPACITY)
         .expect("create channel");
-    let id = port.id();
     let (send, recv) = channel.split();
 
-    let mut child = ChildGuard(
-        Command::new(std::env::current_exe().expect("test executable"))
-            .arg("--exact")
-            .arg("different_base_process_round_trip")
-            .arg("--nocapture")
-            .env(ROLE, "server")
-            .env(SHM_NAME, &name)
-            .env(REGION_SIZE_ENV, REGION_SIZE.to_string())
-            .env(ENTRY_SLAB, id.slab().to_string())
-            .env(ENTRY_INDEX, id.entry().to_string())
-            .env(ENTRY_GENERATION, id.generation().to_string())
-            .env(ENTRY_CAPACITY, id.capacity().to_string())
-            .env(PORT_ROLE, port.role().to_string())
-            .env(PORT_GENERATION, port.generation().to_string())
-            .env(POOL_SLAB, pool_slab.to_string())
-            .env(POOL_INDEX, pool_index.to_string())
-            .env(POOL_GENERATION, pool_generation.to_string())
-            .env(PARENT_BASE, parent_base.to_string())
-            .spawn()
-            .expect("spawn server process"),
-    );
+    let mut command = role::child("server");
+    command
+        .env(NAME, &name)
+        .env(PARENT_BASE, parent_base.to_string());
+    declare_port(&mut command, &port);
+    declare_pool(&mut command, pool.id());
+    let mut child = ChildGuard(command.spawn().expect("spawn server process"));
 
     let deadline = Instant::now() + TIMEOUT;
     let request = pool.as_ref().put(14_u64).expect("allocate request");
-    send_bounded(request.transfer(()), |value| send.try_send(value), deadline);
+    introduce::send_bounded(request.transfer(()), |value| send.try_send(value), deadline);
 
-    let (_, response) = adopt_bounded::<(), [u64]>(&recv, pool.as_ref(), deadline);
+    let (_, response) = introduce::adopt_bounded::<(), [u64]>(&recv, pool.as_ref(), deadline);
     assert_eq!(&*response, &[42, response[1]]);
     assert_ne!(
         response[1] as usize, parent_base,
@@ -313,72 +383,22 @@ fn different_base_process_round_trip() {
 
 #[test]
 fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
-    if std::env::var(ROLE).as_deref() == Ok("announce-peer-and-exit") {
-        let name = std::env::var(SHM_NAME).expect("shared region name");
-        let parent_base = std::env::var(PARENT_BASE)
-            .expect("parent base")
-            .parse::<usize>()
-            .expect("numeric parent base");
-        let id = Id::new(
-            REGION_ID,
-            std::env::var(ENTRY_SLAB).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_INDEX).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_GENERATION).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_CAPACITY).unwrap().parse().unwrap(),
-        );
-        let port = Port::from_parts(
-            id,
-            std::env::var(PORT_ROLE).unwrap().parse().unwrap(),
-            std::env::var(PORT_GENERATION).unwrap().parse().unwrap(),
-        )
-        .unwrap();
-        let session = joiner_session(&name, parent_base);
-        let channel = session.adopt(port).expect("adopt current channel role");
-        let (send, _) = channel.split();
-        let deadline = Instant::now() + TIMEOUT;
-        let peer = session.peer();
-        let pool = session.open_pool(pool_id_from_env()).unwrap();
-        for value in [peer.slot() as u64, peer.generation() as u64] {
-            let record = pool.as_ref().put(value).expect("allocate identity");
-            send_bounded(
-                record.transfer(()),
-                |record| send.try_send(record),
-                deadline,
-            );
-        }
-        std::process::exit(77);
-    }
-
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let session = creator_session(&name);
     let parent_base = session.base_addr();
     let pool = session.create_pool(64 * 1024, None).unwrap();
-    let pool_id = pool.id();
-    let (_, pool_slab, pool_index, pool_generation) = pool_id.parts();
     let (channel, port) = session
         .create_channel::<()>(QUEUE_CAPACITY)
         .expect("create channel");
-    let id = channel.id();
     let (_, recv) = channel.split();
-    let mut command = Command::new(std::env::current_exe().expect("test executable"));
+    let mut command = role::child("announce-peer-and-exit");
     command
-        .arg("--exact")
-        .arg("dead_process_membership_is_reaped_after_a_complete_layout_scan")
-        .arg("--nocapture")
-        .env(ROLE, "announce-peer-and-exit")
-        .env(SHM_NAME, &name)
-        .env(REGION_SIZE_ENV, REGION_SIZE.to_string())
-        .env(ENTRY_SLAB, id.slab().to_string())
-        .env(ENTRY_INDEX, id.entry().to_string())
-        .env(ENTRY_GENERATION, id.generation().to_string())
-        .env(ENTRY_CAPACITY, id.capacity().to_string())
-        .env(PORT_ROLE, port.role().to_string())
-        .env(PORT_GENERATION, port.generation().to_string())
-        .env(POOL_SLAB, pool_slab.to_string())
-        .env(POOL_INDEX, pool_index.to_string())
-        .env(POOL_GENERATION, pool_generation.to_string())
+        .env(NAME, &name)
         .env(PARENT_BASE, parent_base.to_string());
+    declare_port(&mut command, &port);
+    declare_pool(&mut command, pool.id());
+    cuts::hand(&mut command, DOOMED);
     #[cfg(feature = "process")]
     let mut child = Supervisor::spawn(&mut command).expect("spawn doomed peer");
     #[cfg(not(feature = "process"))]
@@ -390,20 +410,21 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
     let status = exit.status();
     #[cfg(not(feature = "process"))]
     let status = child.wait();
-    assert_eq!(status.code(), Some(77), "child must skip Rust destructors");
+    assert_eq!(
+        status.code(),
+        Some(DOOMED),
+        "child must skip Rust destructors"
+    );
 
     let deadline = Instant::now() + TIMEOUT;
     let mut identity = [0_u64; 2];
     for part in &mut identity {
-        let (_, value) = adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
+        let (_, value) = introduce::adopt_bounded::<(), u64>(&recv, pool.as_ref(), deadline);
         *part = *value;
     }
     drop(recv);
 
     let peer = Peer::from_parts(identity[0] as u8, identity[1] as usize);
-    #[cfg(feature = "process")]
-    let recovery = unsafe { session.assume_dead(peer) }.expect("mark exact dead generation");
-    #[cfg(not(feature = "process"))]
     let recovery = unsafe { session.assume_dead(peer) }.expect("mark exact dead generation");
     // Naming no handler repairs nothing, although every member of this region is of the unit schema:
     // the refusal is the absence of a handler, and the claim comes back rather than being spent.
@@ -433,30 +454,12 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
 
 #[test]
 fn wrong_region_is_rejected_at_the_root() {
-    if std::env::var(ROLE).as_deref() == Ok("wrong-region") {
-        let name = std::env::var(SHM_NAME).expect("shared region name");
-        let wrong = RegionId::new(REGION_ID.high, REGION_ID.low.wrapping_add(1));
-        assert!(matches!(
-            Session::open(
-                UnixFd::shm_open(&name).unwrap(),
-                Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-                wrong,
-            ),
-            Err(SessionError::LayoutMismatch(LayoutField::Region))
-        ));
-        return;
-    }
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let _creator = creator_session(&name);
     assert!(
-        spawn_case(
-            "wrong_region_is_rejected_at_the_root",
-            "wrong-region",
-            &name
-        )
-        .wait()
-        .success()
+        joins_as("wrong-region", &name).wait().success(),
+        "a peer joined at a foreign root"
     );
 }
 
@@ -468,7 +471,7 @@ fn session_attachment_is_not_coupled_to_a_channel_count() {
 
     Session::open(
         UnixFd::shm_open(&name).unwrap(),
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
+        region::extent(REGION_SIZE),
         REGION_ID,
     )
     .expect("directory capacity is dynamic");
@@ -476,30 +479,12 @@ fn session_attachment_is_not_coupled_to_a_channel_count() {
 
 #[test]
 fn changed_talc_geometry_is_rejected_by_talc_information() {
-    if std::env::var(ROLE).as_deref() == Ok("talc-geometry") {
-        let name = std::env::var(SHM_NAME).expect("shared region name");
-        let result = Session::open(
-            UnixFd::shm_open(&name).unwrap(),
-            Request::new(REGION_SIZE - 4096, Access::READ | Access::WRITE),
-            REGION_ID,
-        );
-        assert!(matches!(
-            result,
-            Err(SessionError::LayoutMismatch(LayoutField::Info))
-        ));
-        return;
-    }
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let _creator = creator_session(&name);
     assert!(
-        spawn_case(
-            "changed_talc_geometry_is_rejected_by_talc_information",
-            "talc-geometry",
-            &name,
-        )
-        .wait()
-        .success()
+        joins_as("talc-geometry", &name).wait().success(),
+        "a peer asked for a narrower geometry"
     );
 }
 
@@ -510,12 +495,8 @@ fn session_attachment_is_not_coupled_to_a_channel_protocol() {
     let _creator = creator_session(&name);
 
     let fd = UnixFd::shm_open(&name).unwrap();
-    Session::open(
-        fd,
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-        REGION_ID,
-    )
-    .expect("each channel validates its own protocol");
+    Session::open(fd, region::extent(REGION_SIZE), REGION_ID)
+        .expect("each channel validates its own protocol");
 }
 
 #[test]
@@ -523,20 +504,12 @@ fn session_attachment_is_not_coupled_to_a_channel_revision() {
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let fd = UnixFd::shm_create(&name, REGION_SIZE).expect("create shared region");
-    let _creator = Session::create(
-        fd,
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-        REGION_ID,
-    )
-    .expect("create revision-one session");
+    let _creator = Session::create(fd, region::extent(REGION_SIZE), REGION_ID)
+        .expect("create revision-one session");
 
     let fd = UnixFd::shm_open(&name).unwrap();
-    Session::open(
-        fd,
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-        REGION_ID,
-    )
-    .expect("each channel validates its own revision");
+    Session::open(fd, region::extent(REGION_SIZE), REGION_ID)
+        .expect("each channel validates its own revision");
 }
 
 #[test]
@@ -559,79 +532,38 @@ fn admission_requires_write_permission() {
 
 #[test]
 fn recovery_dispatch_requires_the_exact_layout_handler() {
-    if std::env::var(ROLE).as_deref() == Ok("alternate-layout-owner") {
-        let name = std::env::var(SHM_NAME).unwrap();
-        let parent_base = std::env::var(PARENT_BASE)
-            .unwrap()
-            .parse::<usize>()
-            .unwrap();
-        let id: Id<AlternateEnvelope> = Id::new(
-            REGION_ID,
-            std::env::var(ENTRY_SLAB).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_INDEX).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_GENERATION).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_CAPACITY).unwrap().parse().unwrap(),
-        );
-        let fd = UnixFd::shm_open(&name).unwrap();
-        let session = Session::open(
-            fd.mapping().at(parent_base.wrapping_add(1 << 30)),
-            Request::new(REGION_SIZE, Access::READ | Access::WRITE),
-            REGION_ID,
-        )
-        .unwrap();
-        let port = Port::from_parts(
-            id,
-            std::env::var(PORT_ROLE).unwrap().parse().unwrap(),
-            std::env::var(PORT_GENERATION).unwrap().parse().unwrap(),
-        )
-        .unwrap();
-        let _channel = session.adopt(port).unwrap();
-        let peer = session.peer();
-        println!("EVERING_PEER={},{}", peer.slot(), peer.generation());
-        std::io::stdout().flush().unwrap();
-        std::process::exit(73);
-    }
-
+    let ready = ready_path("layout");
+    let _ = fs::remove_file(&ready);
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let session = creator_session(&name);
     let parent_base = session.base_addr();
     let alternate = Session::open(
         UnixFd::shm_open(&name).unwrap(),
-        Request::new(REGION_SIZE, Access::READ | Access::WRITE),
+        region::extent(REGION_SIZE),
         REGION_ID,
     )
     .unwrap();
     let (_channel, port) = alternate.create_channel::<AlternateEnvelope>(2).unwrap();
-    let id = port.id();
     drop(alternate);
-    let output = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("recovery_dispatch_requires_the_exact_layout_handler")
-        .arg("--nocapture")
-        .env(ROLE, "alternate-layout-owner")
-        .env(SHM_NAME, &name)
-        .env(PARENT_BASE, parent_base.to_string())
-        .env(ENTRY_SLAB, id.slab().to_string())
-        .env(ENTRY_INDEX, id.entry().to_string())
-        .env(ENTRY_GENERATION, id.generation().to_string())
-        .env(ENTRY_CAPACITY, id.capacity().to_string())
-        .env(PORT_ROLE, port.role().to_string())
-        .env(PORT_GENERATION, port.generation().to_string())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(73));
-    let output = String::from_utf8(output.stdout).unwrap();
-    let identity = output
-        .lines()
-        .find_map(|line| line.strip_prefix("EVERING_PEER="))
-        .unwrap();
-    let mut identity = identity.split(',');
-    let peer = Peer::from_parts(
-        identity.next().unwrap().parse().unwrap(),
-        identity.next().unwrap().parse().unwrap(),
-    );
-    let recovery = unsafe { session.assume_dead(peer) }.unwrap();
+
+    let mut command = role::child("alternate-layout-owner");
+    command
+        .env(NAME, &name)
+        .env(READY, &ready)
+        .env(PARENT_BASE, parent_base.to_string());
+    declare_port(&mut command, &port);
+    cuts::hand(&mut command, FOREIGN);
+    let mut child = ChildGuard(command.spawn().expect("spawn the foreign owner"));
+    assert_eq!(child.wait().code(), Some(FOREIGN), "no Rust destructor ran");
+    let report = fs::read_to_string(&ready).expect("the foreign owner's report");
+    fs::remove_file(&ready).expect("remove the report");
+    let mut fields = report
+        .split(',')
+        .map(|field| field.parse::<usize>().unwrap());
+    let peer = Peer::from_parts(fields.next().unwrap() as u8, fields.next().unwrap());
+
+    let recovery = unsafe { session.assume_dead(peer) }.expect("mark the exact dead generation");
     let recovery = recovery.reap().unwrap_err();
     let handler = layout::recovery_handler::<AlternateEnvelope>();
     // A handler naming a schema this member does not carry is refused the same way naming none is, so
@@ -645,43 +577,8 @@ fn recovery_dispatch_requires_the_exact_layout_handler() {
 
 #[test]
 fn pool_blocks_owned_by_an_exited_process_are_reclaimed() {
-    if std::env::var(ROLE).as_deref() == Ok("pool-owner") {
-        let name = std::env::var(SHM_NAME).unwrap();
-        let parent_base = std::env::var(PARENT_BASE).unwrap().parse().unwrap();
-        let id = PoolId::new(
-            REGION_ID,
-            std::env::var(ENTRY_SLAB).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_INDEX).unwrap().parse().unwrap(),
-            std::env::var(ENTRY_GENERATION).unwrap().parse().unwrap(),
-        );
-        let session = joiner_session(&name, parent_base);
-        let peer = session.peer();
-        let pool = session.open_pool(id).unwrap();
-        let pool_ref = pool.as_ref();
-        let mut blocks = Vec::new();
-        let shortage = DeclineCause::NoRoom {
-            waits: RoomWait::Release,
-        };
-        loop {
-            match pool_ref.put(7_u64) {
-                Ok(block) => blocks.push(block),
-                Err(decline) if decline.cause == shortage => break,
-                Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
-            }
-        }
-        println!(
-            "EVERING_POOL_PEER={},{},{}",
-            peer.slot(),
-            peer.generation(),
-            blocks.len()
-        );
-        std::io::stdout().flush().unwrap();
-        core::mem::forget(blocks);
-        core::mem::forget(pool);
-        core::mem::forget(session);
-        std::process::exit(74);
-    }
-
+    let ready = ready_path("pool");
+    let _ = fs::remove_file(&ready);
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let session = creator_session(&name);
@@ -689,33 +586,24 @@ fn pool_blocks_owned_by_an_exited_process_are_reclaimed() {
     let pool = session
         .create_pool(64 * 1024, Some(BlockRange::new(64, 64).unwrap()))
         .unwrap();
-    let id = pool.id();
-    let (_, slab, entry, generation) = id.parts();
-    let output = Command::new(std::env::current_exe().unwrap())
-        .arg("--exact")
-        .arg("pool_blocks_owned_by_an_exited_process_are_reclaimed")
-        .arg("--nocapture")
-        .env(ROLE, "pool-owner")
-        .env(SHM_NAME, &name)
-        .env(PARENT_BASE, parent_base.to_string())
-        .env(ENTRY_SLAB, slab.to_string())
-        .env(ENTRY_INDEX, entry.to_string())
-        .env(ENTRY_GENERATION, generation.to_string())
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(74));
-    let line = String::from_utf8(output.stdout)
-        .unwrap()
-        .lines()
-        .find_map(|line| line.strip_prefix("EVERING_POOL_PEER="))
-        .unwrap()
-        .to_owned();
-    let mut fields = line.split(',');
-    let peer = Peer::from_parts(
-        fields.next().unwrap().parse().unwrap(),
-        fields.next().unwrap().parse().unwrap(),
-    );
-    assert!(fields.next().unwrap().parse::<usize>().unwrap() >= 64);
+
+    let mut command = role::child("pool-owner");
+    command
+        .env(NAME, &name)
+        .env(READY, &ready)
+        .env(PARENT_BASE, parent_base.to_string());
+    declare_pool(&mut command, pool.id());
+    cuts::hand(&mut command, FILLED);
+    let mut child = ChildGuard(command.spawn().expect("spawn the pool filler"));
+    assert_eq!(child.wait().code(), Some(FILLED), "no Rust destructor ran");
+    let report = fs::read_to_string(&ready).expect("the filler's report");
+    fs::remove_file(&ready).expect("remove the report");
+    let mut fields = report
+        .split(',')
+        .map(|field| field.parse::<usize>().unwrap());
+    let peer = Peer::from_parts(fields.next().unwrap() as u8, fields.next().unwrap());
+    assert!(fields.next().unwrap() >= 64);
+
     let decline = pool
         .as_ref()
         .put(9_u64)

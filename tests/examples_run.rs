@@ -1,4 +1,8 @@
-#![cfg(all(feature = "os", feature = "tokio"))]
+//! The examples are part of the verified surface. An example nothing executes is documentation, and
+//! documentation cannot fail a build, so what lives here is the claim that one of them does: `inspect`, the
+//! streaming walker an `--index` run is built on, reached through the source file the example itself
+//! compiles, so the copy under test and the copy shipped cannot drift. The legs that hand over across
+//! processes are not here yet.
 
 #[allow(dead_code)]
 #[path = "../examples/index.rs"]

@@ -1,4 +1,5 @@
-#![cfg(feature = "tokio")]
+//! The notification model: every commit/ring interleaving a clear may retry through, which refusals are
+//! allowed to admit a peer-only wait, and how a deferred batch's rings are bounded.
 
 use std::collections::HashSet;
 

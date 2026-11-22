@@ -23,6 +23,9 @@ use evering::{
     process::{Bootstrap, Supervisor},
 };
 
+mod support;
+use crate::support::role;
+
 #[test]
 fn a_handoff_names_nothing_and_an_ungranted_process_is_refused() {
     let (handoff, grant) = Handoff::bind().unwrap();
@@ -48,27 +51,43 @@ use windows_sys::Win32::{
     },
 };
 
-const CHILD: &str = "EVERING_WINDOWS_EXCHANGE_CHILD";
 const SIZE: usize = 4 * 1024 * 1024;
 const REGION: RegionId = RegionId::new(0x5749_4e44_4f57_534d, 2);
-const IDENTITY: &str = "EVERING_WINDOWS_IDENTITY_CHILD";
-const COUNT: &str = "EVERING_WINDOWS_COUNT_CHILD";
-const READY: &str = "EVERING_WINDOWS_COUNT_READY";
-const DEADLINE: &str = "EVERING_WINDOWS_DEADLINE_CHILD";
-const POOL_CHILD: &str = "EVERING_WINDOWS_POOL_CHILD";
+/// The control pipe a role is pointed at, which each role that meets connects to.
+const RENDEZVOUS: &str = "EVERING_WINDOWS_EXCHANGE_NAME";
+/// The file a role writes once it is ready, so a parent that has to act between two of the child's
+/// steps can tell when to act.
+const READY: &str = "EVERING_WINDOWS_EXCHANGE_READY";
+
+/// The pipe a role is to connect to, named the only way a second process can hear it.
+fn rendezvous() -> String {
+    env::var(RENDEZVOUS).expect("a role that meets is told which pipe to connect to")
+}
+
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("sleeping", sleeping),
+        ("taker", taker),
+        ("connecting", connecting),
+        ("unrelated", unrelated),
+        ("counter", counter),
+        ("filler", filler),
+    ]);
+}
+
+/// The role the deadline claim spawns: stay alive without ever connecting, so an `accept` that is owed a
+/// timeout is given one.
+fn sleeping() -> i32 {
+    thread::sleep(Duration::from_secs(1));
+    0
+}
 
 #[test]
 fn control_pipe_accept_obeys_its_deadline() {
-    if env::var_os(DEADLINE).is_some() {
-        thread::sleep(Duration::from_secs(1));
-        return;
-    }
     let listener = Listener::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "control_pipe_accept_obeys_its_deadline"])
-        .env(DEADLINE, "1");
-    let child = Supervisor::spawn(&mut command).unwrap();
+    let child = Supervisor::spawn(&mut role::child("sleeping")).unwrap();
     assert_eq!(
         listener.accept(&child, Instant::now()).unwrap_err().kind(),
         std::io::ErrorKind::TimedOut
@@ -84,35 +103,35 @@ fn handle_count() -> u32 {
     count
 }
 
+/// The role the section handover spawns: open the region the parent sends, wait on one bell and ring the
+/// other.
+fn taker() -> i32 {
+    let socket = Socket::connect(&rendezvous()).unwrap();
+    let offer = socket.recv(3).unwrap();
+    assert_eq!(offer.bootstrap().as_ref(), b"selected-protocol-id");
+    let (_, resources) = offer.into_parts();
+    let mut resources = resources.into_vec();
+    let section = Section::from_owned_handle(resources.remove(0));
+    let session = Session::open(
+        section,
+        Request::new(SIZE, Access::READ | Access::WRITE),
+        REGION,
+    )
+    .unwrap();
+    assert_ne!(session.base_addr(), 0);
+    assert_eq!(
+        unsafe { WaitForSingleObject(resources[0].as_raw_handle().cast(), INFINITE) },
+        WAIT_OBJECT_0
+    );
+    assert_ne!(unsafe { SetEvent(resources[1].as_raw_handle().cast()) }, 0);
+    0
+}
+
 #[test]
 fn child_accepts_section_and_directional_events() {
-    if let Some(name) = env::var_os(CHILD) {
-        let socket = Socket::connect(name.to_str().unwrap()).unwrap();
-        let offer = socket.recv(3).unwrap();
-        assert_eq!(offer.bootstrap().as_ref(), b"selected-protocol-id");
-        let (_, resources) = offer.into_parts();
-        let mut resources = resources.into_vec();
-        let section = Section::from_owned_handle(resources.remove(0));
-        let session = Session::open(
-            section,
-            Request::new(SIZE, Access::READ | Access::WRITE),
-            REGION,
-        )
-        .unwrap();
-        assert_ne!(session.base_addr(), 0);
-        assert_eq!(
-            unsafe { WaitForSingleObject(resources[0].as_raw_handle().cast(), INFINITE) },
-            WAIT_OBJECT_0
-        );
-        assert_ne!(unsafe { SetEvent(resources[1].as_raw_handle().cast()) }, 0);
-        return;
-    }
-
     let listener = Listener::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "child_accepts_section_and_directional_events"])
-        .env(CHILD, listener.name());
+    let mut command = role::child("taker");
+    command.env(RENDEZVOUS, listener.name());
     let mut child = Supervisor::spawn(&mut command).unwrap();
     let socket = listener
         .accept(&child, Instant::now() + Duration::from_secs(5))
@@ -149,31 +168,30 @@ fn child_accepts_section_and_directional_events() {
     assert_ne!(session.base_addr(), 0);
 }
 
+/// The role the identity claim spawns as the participant the pipe was opened for: connect and hold, so
+/// the parent has a real instance to name.
+fn connecting() -> i32 {
+    let _socket = Socket::connect(&rendezvous()).unwrap();
+    thread::sleep(Duration::from_secs(1));
+    0
+}
+
+/// The role the identity claim spawns as somebody else: it never connects, so the only client on the
+/// pipe belongs to a process the retained child is not.
+fn unrelated() -> i32 {
+    loop {
+        thread::sleep(Duration::from_secs(1));
+    }
+}
+
 #[test]
 fn control_pipe_rejects_a_different_child_instance() {
-    if let Some(name) = env::var_os(IDENTITY) {
-        if name == "unrelated" {
-            loop {
-                thread::sleep(Duration::from_secs(1));
-            }
-        }
-        let _socket = Socket::connect(name.to_str().unwrap()).unwrap();
-        thread::sleep(Duration::from_secs(1));
-        return;
-    }
-
     let listener = Listener::bind().unwrap();
-    let mut connecting = Command::new(env::current_exe().unwrap());
-    connecting
-        .args(["--exact", "control_pipe_rejects_a_different_child_instance"])
-        .env(IDENTITY, listener.name());
+    let mut connecting = role::child("connecting");
+    connecting.env(RENDEZVOUS, listener.name());
     let connecting = Supervisor::spawn(&mut connecting).unwrap();
 
-    let mut unrelated = Command::new(env::current_exe().unwrap());
-    unrelated
-        .args(["--exact", "control_pipe_rejects_a_different_child_instance"])
-        .env(IDENTITY, "unrelated");
-    let unrelated = Supervisor::spawn(&mut unrelated).unwrap();
+    let unrelated = Supervisor::spawn(&mut role::child("unrelated")).unwrap();
 
     assert_eq!(
         listener
@@ -186,28 +204,27 @@ fn control_pipe_rejects_a_different_child_instance() {
     drop(unrelated);
 }
 
+/// The role the count claim spawns: ask for two resources when one is coming, and show the handle that
+/// arrived did not outlive the refusal.
+fn counter() -> i32 {
+    let socket = Socket::connect(&rendezvous()).unwrap();
+    let before = handle_count();
+    std::fs::File::create(env::var(READY).unwrap()).unwrap();
+    assert_eq!(
+        socket.recv(2).unwrap_err().kind(),
+        std::io::ErrorKind::InvalidData
+    );
+    assert_eq!(handle_count(), before);
+    0
+}
+
 #[test]
 fn count_mismatch_closes_every_remote_handle() {
-    if let Some(name) = env::var_os(COUNT) {
-        let socket = Socket::connect(name.to_str().unwrap()).unwrap();
-        let before = handle_count();
-        std::fs::File::create(env::var_os(READY).unwrap()).unwrap();
-        assert_eq!(
-            socket.recv(2).unwrap_err().kind(),
-            std::io::ErrorKind::InvalidData
-        );
-        assert_eq!(handle_count(), before);
-        return;
-    }
-
     let ready = env::temp_dir().join(format!("evering-exchange-ready-{}", std::process::id()));
     let _ = std::fs::remove_file(&ready);
     let listener = Listener::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "count_mismatch_closes_every_remote_handle"])
-        .env(COUNT, listener.name())
-        .env(READY, &ready);
+    let mut command = role::child("counter");
+    command.env(RENDEZVOUS, listener.name()).env(READY, &ready);
     let mut child = Supervisor::spawn(&mut command).unwrap();
     let socket = listener
         .accept(&child, Instant::now() + Duration::from_secs(5))
@@ -223,61 +240,60 @@ fn count_mismatch_closes_every_remote_handle() {
     std::fs::remove_file(ready).unwrap();
 }
 
+/// The role the reap claim spawns: fill the pool with blocks this process never releases, then leave
+/// without unwinding any of them.
+fn filler() -> i32 {
+    let socket = Socket::connect(&rendezvous()).unwrap();
+    let offer = socket.recv(1).unwrap();
+    let id = std::str::from_utf8(offer.bootstrap().as_ref()).unwrap();
+    let mut fields = id.split(',');
+    let id = PoolId::new(
+        REGION,
+        fields.next().unwrap().parse().unwrap(),
+        fields.next().unwrap().parse().unwrap(),
+        fields.next().unwrap().parse().unwrap(),
+    );
+    let (_, resources) = offer.into_parts();
+    let mut resources = resources.into_vec();
+    let section = Section::from_owned_handle(resources.remove(0));
+    let session = Session::open(
+        section,
+        Request::new(SIZE, Access::READ | Access::WRITE),
+        REGION,
+    )
+    .unwrap();
+    let peer = session.peer();
+    let pool = session.open_pool(id).unwrap();
+    let pool_ref = pool.as_ref();
+    let mut blocks = Vec::new();
+    let shortage = DeclineCause::NoRoom {
+        waits: RoomWait::Release,
+    };
+    loop {
+        match pool_ref.put(7_u64) {
+            Ok(block) => blocks.push(block),
+            Err(decline) if decline.cause == shortage => break,
+            Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
+        }
+    }
+    std::fs::write(
+        env::var(READY).unwrap(),
+        format!("{},{},{}", peer.slot(), peer.generation(), blocks.len()),
+    )
+    .unwrap();
+    core::mem::forget(blocks);
+    core::mem::forget(pool);
+    core::mem::forget(session);
+    0
+}
+
 #[test]
 fn exited_process_pool_ownership_is_reclaimed() {
-    if let Some(name) = env::var_os(POOL_CHILD) {
-        let socket = Socket::connect(name.to_str().unwrap()).unwrap();
-        let offer = socket.recv(1).unwrap();
-        let id = std::str::from_utf8(offer.bootstrap().as_ref()).unwrap();
-        let mut fields = id.split(',');
-        let id = PoolId::new(
-            REGION,
-            fields.next().unwrap().parse().unwrap(),
-            fields.next().unwrap().parse().unwrap(),
-            fields.next().unwrap().parse().unwrap(),
-        );
-        let (_, resources) = offer.into_parts();
-        let mut resources = resources.into_vec();
-        let section = Section::from_owned_handle(resources.remove(0));
-        let session = Session::open(
-            section,
-            Request::new(SIZE, Access::READ | Access::WRITE),
-            REGION,
-        )
-        .unwrap();
-        let peer = session.peer();
-        let pool = session.open_pool(id).unwrap();
-        let pool_ref = pool.as_ref();
-        let mut blocks = Vec::new();
-        let shortage = DeclineCause::NoRoom {
-            waits: RoomWait::Release,
-        };
-        loop {
-            match pool_ref.put(7_u64) {
-                Ok(block) => blocks.push(block),
-                Err(decline) if decline.cause == shortage => break,
-                Err(decline) => panic!("unexpected Pool decline: {:?}", decline.cause),
-            }
-        }
-        std::fs::write(
-            env::var_os(READY).unwrap(),
-            format!("{},{},{}", peer.slot(), peer.generation(), blocks.len()),
-        )
-        .unwrap();
-        core::mem::forget(blocks);
-        core::mem::forget(pool);
-        core::mem::forget(session);
-        return;
-    }
-
     let ready = env::temp_dir().join(format!("evering-pool-ready-{}", std::process::id()));
     let _ = std::fs::remove_file(&ready);
     let listener = Listener::bind().unwrap();
-    let mut command = Command::new(env::current_exe().unwrap());
-    command
-        .args(["--exact", "exited_process_pool_ownership_is_reclaimed"])
-        .env(POOL_CHILD, listener.name())
-        .env(READY, &ready);
+    let mut command = role::child("filler");
+    command.env(RENDEZVOUS, listener.name()).env(READY, &ready);
     let mut child = Supervisor::spawn(&mut command).unwrap();
     let socket = listener
         .accept(&child, Instant::now() + Duration::from_secs(5))

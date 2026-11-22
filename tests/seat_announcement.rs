@@ -30,22 +30,22 @@
 
 use std::{
     env,
-    process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
 use evering::{
     Session, SessionError,
     layout::RegionId,
-    mapping::{Access, Peer, Request},
-    os::{Grant, Handoff, Shared, shared},
+    mapping::Peer,
+    os::{Handoff, Shared},
     process::{Bootstrap, Supervisor},
 };
 
+mod support;
+use crate::support::{introduce, region, role};
+
 const SIZE: usize = 1 << 20;
 const REGION: RegionId = RegionId::new(0x0053_E480, 1);
-const ROLE: &str = "EVERING_SEAT_ROLE";
 /// The identity to check against, named by the parent and carried nowhere by the crate.
 const EXPECT: &str = "EVERING_SEAT_EXPECT";
 /// The key `src/process.rs` freezes for a promised slot, named here so a scribble can be written to it.
@@ -59,12 +59,15 @@ const UNANNOUNCED: i32 = 4;
 const SCRIBBLE_REFUSED: i32 = 5;
 /// Exited by a promised child that met and then died without arriving in the slot it was told of.
 const VANISHED: i32 = 6;
-/// Exited by a child for any other reason, which the line printed beside it names.
-const FAILED: i32 = 1;
-
-fn fail(reason: &str) -> i32 {
-    eprintln!("{reason}");
-    FAILED
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("announced", announced),
+        ("unannounced", unannounced),
+        ("scribbled", scribbled),
+        ("vanished", vanished),
+    ]);
 }
 
 fn expected() -> Peer {
@@ -78,13 +81,13 @@ fn expected() -> Peer {
 fn announced() -> i32 {
     let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
-        Err(error) => return fail(&format!("the promised child meets no one: {error}")),
+        Err(error) => return role::fail(&format!("the promised child meets no one: {error}")),
     };
     let Some(seat) = resources.seat else {
-        return fail("no member slot was announced to the child it was promised to");
+        return role::fail("no member slot was announced to the child it was promised to");
     };
     if (seat.region(), seat.peer()) != (REGION, expected()) {
-        return fail(&format!(
+        return role::fail(&format!(
             "the announcement named region {:?} slot {} at generation {}, and the parent promised it {:?}",
             seat.region(),
             seat.peer().slot(),
@@ -94,19 +97,19 @@ fn announced() -> i32 {
     }
     let arrived = match Session::open_as(
         resources.mapping,
-        Request::new(SIZE, Access::READ | Access::WRITE),
+        region::extent(SIZE),
         seat.region(),
         seat.peer(),
     ) {
         Ok(arrived) => arrived,
         Err(error) => {
-            return fail(&format!(
+            return role::fail(&format!(
                 "the slot announced to this process refused its arrival: {error}"
             ));
         }
     };
     if arrived.peer() != seat.peer() {
-        return fail(&format!(
+        return role::fail(&format!(
             "the member that arrived is {:?}, not the announced {:?}",
             arrived.peer(),
             seat.peer()
@@ -118,21 +121,17 @@ fn announced() -> i32 {
 fn unannounced() -> i32 {
     let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
-        Err(error) => return fail(&format!("the unpromised child meets no one: {error}")),
+        Err(error) => return role::fail(&format!("the unpromised child meets no one: {error}")),
     };
     if resources.seat.is_some() {
-        return fail("a grant that promised nothing announced a member slot anyway");
+        return role::fail("a grant that promised nothing announced a member slot anyway");
     }
-    let joined = match Session::open(
-        resources.mapping,
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-    ) {
+    let joined = match Session::open(resources.mapping, region::extent(SIZE), REGION) {
         Ok(joined) => joined,
-        Err(error) => return fail(&format!("the unpromised child could not join: {error}")),
+        Err(error) => return role::fail(&format!("the unpromised child could not join: {error}")),
     };
     if joined.peer() == expected() {
-        return fail(&format!(
+        return role::fail(&format!(
             "a child promised nothing arrived as the member already standing in {:?}",
             joined.peer()
         ));
@@ -142,9 +141,9 @@ fn unannounced() -> i32 {
 
 fn scribbled() -> i32 {
     match Handoff::receive() {
-        Ok(_) => fail("a scribbled slot announcement was met as if it named a slot"),
+        Ok(_) => role::fail("a scribbled slot announcement was met as if it named a slot"),
         Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => SCRIBBLE_REFUSED,
-        Err(error) => fail(&format!(
+        Err(error) => role::fail(&format!(
             "the scribbled announcement was refused for a different reason: {error}"
         )),
     }
@@ -153,49 +152,16 @@ fn scribbled() -> i32 {
 fn vanished() -> i32 {
     let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
-        Err(error) => return fail(&format!("the child that was to die meets no one: {error}")),
+        Err(error) => {
+            return role::fail(&format!("the child that was to die meets no one: {error}"));
+        }
     };
     if resources.seat.is_none() {
-        return fail("a promised child met the handoff it was never announced a slot for");
+        return role::fail("a promised child met the handoff it was never announced a slot for");
     }
     // Meeting and leaving is the whole role. The region this process was handed closes with it, and
     // the slot its announcement named is one it never stood in.
     VANISHED
-}
-
-fn wait_for(child: &mut Supervisor, label: &str, budget: Duration) -> i32 {
-    let until = Instant::now() + budget;
-    loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            return exit.status().code().unwrap_or(-1);
-        }
-        if Instant::now() >= until {
-            let _ = child.kill_wait();
-            panic!("{label} never finished");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// A region, the session that made it, and the meeting a child is admitted to.
-fn meeting(name: &str) -> (Shared, Session, Handoff, Grant, Bootstrap) {
-    let access = Access::READ | Access::WRITE;
-    let mapping = shared(name, SIZE, access).expect("a region to hold a member in");
-    let session = Session::create(mapping.borrow(), Request::new(SIZE, access), REGION)
-        .expect("create the session that admits");
-    let (handoff, grant) = Handoff::bind().expect("a meeting to admit a child to");
-    let bootstrap = Bootstrap::new(name.as_bytes()).expect("a bootstrap within the ceiling");
-    (mapping, session, handoff, grant, bootstrap)
-}
-
-/// The test binary, re-entering as one role of one case.
-fn child_command(test: &str, role: &str) -> Command {
-    let mut command = Command::new(env::current_exe().expect("the test binary is its own parent"));
-    command
-        .args(["--exact", test])
-        .env(ROLE, role)
-        .stdout(std::process::Stdio::null());
-    command
 }
 
 /// Moves the region, a doorbell and a bell to the process the grant was admitted to. Neither bell is
@@ -218,17 +184,12 @@ fn deliver(handoff: Handoff, child: &Supervisor, mapping: &Shared, bootstrap: &B
 
 #[test]
 fn a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announced_to() {
-    const TEST: &str =
-        "a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announced_to";
-    if env::var(ROLE).ok().as_deref() == Some("announced") {
-        std::process::exit(announced());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("seat-announced");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("seat-announced", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.peer();
 
-    let mut command = child_command(TEST, "announced");
+    let mut command = role::child("announced");
     command.env(
         EXPECT,
         format!("{}:{}", promised.slot(), promised.generation()),
@@ -241,7 +202,7 @@ fn a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announ
     deliver(handoff, &child, &mapping, &bootstrap);
 
     assert_eq!(
-        wait_for(&mut child, "the promised child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the promised child", Duration::from_secs(10)),
         ARRIVED,
         "the child the slot was promised to is the one that arrives in it"
     );
@@ -252,12 +213,8 @@ fn a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announ
     // which is the promise's whole purpose from the other side: the identity it named is answerable
     // for once, by one process.
     drop(seat);
-    let later = Session::open(
-        mapping.borrow(),
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-    )
-    .expect("join a third member after the promised one came and went");
+    let later = Session::open(mapping.borrow(), region::extent(SIZE), REGION)
+        .expect("join a third member after the promised one came and went");
     assert_eq!(
         later.peer().slot(),
         promised.slot(),
@@ -273,15 +230,11 @@ fn a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announ
 
 #[test]
 fn a_handoff_that_promised_nothing_announces_no_member_slot() {
-    const TEST: &str = "a_handoff_that_promised_nothing_announces_no_member_slot";
-    if env::var(ROLE).ok().as_deref() == Some("unannounced") {
-        std::process::exit(unannounced());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("seat-unannounced");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("seat-unannounced", SIZE, REGION);
     let held = parent.peer();
 
-    let mut command = child_command(TEST, "unannounced");
+    let mut command = role::child("unannounced");
     command.env(EXPECT, format!("{}:{}", held.slot(), held.generation()));
     grant
         .admit(&mut command)
@@ -290,7 +243,7 @@ fn a_handoff_that_promised_nothing_announces_no_member_slot() {
     deliver(handoff, &child, &mapping, &bootstrap);
 
     assert_eq!(
-        wait_for(&mut child, "the unpromised child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the unpromised child", Duration::from_secs(10)),
         UNANNOUNCED,
         "an admitted process with no promise is told nothing and joins as a member of its own"
     );
@@ -298,14 +251,10 @@ fn a_handoff_that_promised_nothing_announces_no_member_slot() {
 
 #[test]
 fn a_scribbled_member_slot_announcement_is_refused_as_the_text_it_is() {
-    const TEST: &str = "a_scribbled_member_slot_announcement_is_refused_as_the_text_it_is";
-    if env::var(ROLE).ok().as_deref() == Some("scribbled") {
-        std::process::exit(scribbled());
-    }
+    let (mapping, _parent, handoff, grant, bootstrap) =
+        region::meeting("seat-scribbled", SIZE, REGION);
 
-    let (mapping, _parent, handoff, grant, bootstrap) = meeting("seat-scribbled");
-
-    let mut command = child_command(TEST, "scribbled");
+    let mut command = role::child("scribbled");
     grant
         .admit(&mut command)
         .expect("admit a child before its announcement is scribbled over");
@@ -317,7 +266,7 @@ fn a_scribbled_member_slot_announcement_is_refused_as_the_text_it_is() {
     deliver(handoff, &child, &mapping, &bootstrap);
 
     assert_eq!(
-        wait_for(&mut child, "the scribbled child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the scribbled child", Duration::from_secs(10)),
         SCRIBBLE_REFUSED,
         "an unreadable announcement is refused rather than arrived at"
     );
@@ -325,17 +274,12 @@ fn a_scribbled_member_slot_announcement_is_refused_as_the_text_it_is() {
 
 #[test]
 fn a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_reap() {
-    const TEST: &str =
-        "a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_reap";
-    if env::var(ROLE).ok().as_deref() == Some("vanished") {
-        std::process::exit(vanished());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("seat-vanished");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("seat-vanished", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.peer();
 
-    let mut command = child_command(TEST, "vanished");
+    let mut command = role::child("vanished");
     grant
         .promising(seat.introduction())
         .admit(&mut command)
@@ -344,7 +288,7 @@ fn a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_rea
     deliver(handoff, &child, &mapping, &bootstrap);
 
     assert_eq!(
-        wait_for(
+        introduce::exit_code(
             &mut child,
             "the child that never arrived",
             Duration::from_secs(10)
@@ -363,12 +307,8 @@ fn a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_rea
     );
 
     drop(seat);
-    let later = Session::open(
-        mapping.borrow(),
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-    )
-    .expect("join the slot a dead child's promise gave back");
+    let later = Session::open(mapping.borrow(), region::extent(SIZE), REGION)
+        .expect("join the slot a dead child's promise gave back");
     assert_eq!(
         later.peer().slot(),
         promised.slot(),
@@ -382,12 +322,7 @@ fn a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_rea
     // Somebody else could have read the dead child's announcement — that is the leak this feature
     // documents rather than closes — and it buys that process nothing: the promise spent that
     // generation, so the identity the text names is nobody's to arrive in any more.
-    let imposter = Session::open_as(
-        mapping.borrow(),
-        Request::new(SIZE, Access::READ | Access::WRITE),
-        REGION,
-        promised,
-    );
+    let imposter = Session::open_as(mapping.borrow(), region::extent(SIZE), REGION, promised);
     let Err(refused) = imposter else {
         panic!("a process arrived in the member identity a dead child was promised");
     };

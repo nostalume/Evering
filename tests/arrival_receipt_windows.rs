@@ -29,14 +29,12 @@ use std::{
     io::ErrorKind,
     os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle},
     process::Command,
-    thread,
     time::{Duration, Instant},
 };
 
 use evering::{
     Session, SessionError,
     layout::RegionId,
-    mapping::{Access, Request},
     notify::Notify,
     os::{Attendance, Event, Grant, Handoff, Ring, Shared, shared},
     process::{Bootstrap, Death, Introduction, Supervisor},
@@ -46,11 +44,13 @@ use windows_sys::Win32::{
     Storage::FileSystem::{CreateFileW, FILE_ATTRIBUTE_NORMAL, OPEN_EXISTING, ReadFile, WriteFile},
 };
 
+mod support;
+use crate::support::{introduce, region, role};
+
 const SIZE: usize = 1 << 20;
 const REGION: RegionId = RegionId::new(0x0053_E490, 1);
 /// A second region, made by the same parent, which a death about [`REGION`] must never reach.
 const OTHER: RegionId = RegionId::new(0x0053_E491, 1);
-const ROLE: &str = "EVERING_RECEIPT_ROLE";
 /// The key `src/process.rs` freezes for the granted rendezvous; here its value is the pipe's address, and
 /// a child can write into that address without meeting over it.
 const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
@@ -68,22 +68,16 @@ const SILENT: i32 = 5;
 const FORGED: i32 = 7;
 /// Exited by a child that met, stayed connected and reported nothing until its parent gave up.
 const PARKED: i32 = 8;
-/// Exited by a child for any other reason, which the line printed beside it names.
-const FAILED: i32 = 1;
-
-fn access() -> Access {
-    Access::READ | Access::WRITE
-}
-
-fn fail(reason: &str) -> i32 {
-    eprintln!("{reason}");
-    FAILED
-}
-
-/// Leaves without running destructors, so a member this process stood in stays stood in: a slot its member
-/// left politely is what `Drop` is for, and only a slot whose process is gone is a reap's.
-fn leave(code: i32) -> ! {
-    std::process::exit(code)
+/// The child's whole program: the roles this claim defines, and nothing else.
+#[test]
+fn role_entry() {
+    role::dispatch(&[
+        ("reported", reported),
+        ("diverged", diverged),
+        ("silent", silent),
+        ("forged", forged),
+        ("parked", parked),
+    ]);
 }
 
 /// The child that keeps its promise: it arrives in the slot it was announced, reports what it became and
@@ -91,29 +85,31 @@ fn leave(code: i32) -> ! {
 fn reported() -> i32 {
     let (_, resources, report) = match Handoff::receive() {
         Ok(meeting) => meeting,
-        Err(error) => return fail(&format!("the promised child meets no one: {error}")),
+        Err(error) => return role::fail(&format!("the promised child meets no one: {error}")),
     };
     let Some(promised) = resources.seat else {
-        return fail("a promised child met a handoff that announced it no member slot");
+        return role::fail("a promised child met a handoff that announced it no member slot");
     };
     let arrived = match Session::open_as(
         resources.mapping,
-        Request::new(SIZE, access()),
+        region::extent(SIZE),
         promised.region(),
         promised.peer(),
     ) {
         Ok(arrived) => arrived,
-        Err(error) => return fail(&format!("the announced slot refused its arrival: {error}")),
+        Err(error) => {
+            return role::fail(&format!("the announced slot refused its arrival: {error}"));
+        }
     };
     if arrived.peer() != promised.peer() {
-        return fail("the member that arrived is not the slot this process was promised");
+        return role::fail("the member that arrived is not the slot this process was promised");
     }
     // What is reported is read back out of this process's own session rather than echoed from the
     // announcement: an echo would tell the parent nothing it did not already hold.
     if report.arrived(arrived.region(), arrived.peer()).is_err() {
-        return fail("the rendezvous closed before the arrival could be reported");
+        return role::fail("the rendezvous closed before the arrival could be reported");
     }
-    leave(REPORTED)
+    role::leave(REPORTED)
 }
 
 /// The child that breaks it: promised one slot, it joins as a member of its own and reports the identity
@@ -121,27 +117,27 @@ fn reported() -> i32 {
 fn diverged() -> i32 {
     let (_, resources, report) = match Handoff::receive() {
         Ok(meeting) => meeting,
-        Err(error) => return fail(&format!("the diverging child meets no one: {error}")),
+        Err(error) => return role::fail(&format!("the diverging child meets no one: {error}")),
     };
     let promised = match resources.seat {
         Some(promised) => promised,
-        None => return fail("a promised child met a handoff that announced it no member slot"),
+        None => {
+            return role::fail("a promised child met a handoff that announced it no member slot");
+        }
     };
-    let joined = match Session::open(
-        resources.mapping,
-        Request::new(SIZE, access()),
-        promised.region(),
-    ) {
+    let joined = match Session::open(resources.mapping, region::extent(SIZE), promised.region()) {
         Ok(joined) => joined,
-        Err(error) => return fail(&format!("the diverging child could not join: {error}")),
+        Err(error) => return role::fail(&format!("the diverging child could not join: {error}")),
     };
     if joined.peer() == promised.peer() {
-        return fail("a child promised one slot arrived in it while meaning to report another");
+        return role::fail(
+            "a child promised one slot arrived in it while meaning to report another",
+        );
     }
     if report.arrived(joined.region(), joined.peer()).is_err() {
-        return fail("the rendezvous closed before the divergent arrival could be reported");
+        return role::fail("the rendezvous closed before the divergent arrival could be reported");
     }
-    leave(DIVERGED)
+    role::leave(DIVERGED)
 }
 
 /// The child that meets and goes, saying nothing about what it became.
@@ -149,15 +145,15 @@ fn silent() -> i32 {
     let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
         Err(error) => {
-            return fail(&format!(
+            return role::fail(&format!(
                 "the child that leaves wordless meets no one: {error}"
             ));
         }
     };
     if resources.seat.is_none() {
-        return fail("a promised child met a handoff that announced it no member slot");
+        return role::fail("a promised child met a handoff that announced it no member slot");
     }
-    leave(SILENT)
+    role::leave(SILENT)
 }
 
 /// The child that meets, keeps the instance open and reports nothing. This is the one silence a parent
@@ -167,19 +163,19 @@ fn parked() -> i32 {
     let (_, resources, _report) = match Handoff::receive() {
         Ok(meeting) => meeting,
         Err(error) => {
-            return fail(&format!(
+            return role::fail(&format!(
                 "the child that stays connected meets no one: {error}"
             ));
         }
     };
     if resources.seat.is_none() {
-        return fail("a promised child met a handoff that announced it no member slot");
+        return role::fail("a promised child met a handoff that announced it no member slot");
     }
     let mut doorbell = [resources.event];
     if Event::wait_any(&mut doorbell).is_err() {
-        return fail("the doorbell handed over with the region cannot be waited on");
+        return role::fail("the doorbell handed over with the region cannot be waited on");
     }
-    leave(PARKED)
+    role::leave(PARKED)
 }
 
 /// The child that never meets at all and writes an offer-shaped frame into the rendezvous instead. The two
@@ -194,7 +190,7 @@ fn parked() -> i32 {
 fn forged() -> i32 {
     let announced = match env::var(RENDEZVOUS) {
         Ok(announced) => announced,
-        Err(_) => return fail("the forging child was granted no rendezvous to write into"),
+        Err(_) => return role::fail("the forging child was granted no rendezvous to write into"),
     };
     let address: Vec<u16> = announced.encode_utf16().chain([0]).collect();
     // SAFETY: the pointer is a live null-terminated wide string this call owns, and the handle that comes
@@ -211,7 +207,7 @@ fn forged() -> i32 {
         )
     };
     if opened == INVALID_HANDLE_VALUE {
-        return fail(&format!(
+        return role::fail(&format!(
             "the granted rendezvous could not be opened: {}",
             std::io::Error::last_os_error()
         ));
@@ -234,7 +230,7 @@ fn forged() -> i32 {
         )
     };
     if ok == 0 || written as usize != frame.len() {
-        return fail(&format!(
+        return role::fail(&format!(
             "the forged frame never reached the rendezvous: {}",
             std::io::Error::last_os_error()
         ));
@@ -253,46 +249,12 @@ fn forged() -> i32 {
         )
     };
     if landed == 0 {
-        return fail(&format!(
+        return role::fail(&format!(
             "the offer this child waited for never arrived: {}",
             std::io::Error::last_os_error()
         ));
     }
-    leave(FORGED)
-}
-
-fn exit_code(child: &mut Supervisor, label: &str, budget: Duration) -> i32 {
-    let until = Instant::now() + budget;
-    loop {
-        if let Some(exit) = child.try_wait().unwrap() {
-            return exit.status().code().unwrap_or(-1);
-        }
-        if Instant::now() >= until {
-            let _ = child.kill_wait();
-            panic!("{label} never finished");
-        }
-        thread::sleep(Duration::from_millis(20));
-    }
-}
-
-/// A region, the session that made it, and the meeting a child is admitted to.
-fn meeting(name: &str) -> (Shared, Session, Handoff, Grant, Bootstrap) {
-    let mapping = shared(name, SIZE, access()).expect("a region to hold a member in");
-    let session = Session::create(mapping.borrow(), Request::new(SIZE, access()), REGION)
-        .expect("create the session that admits");
-    let (handoff, grant) = Handoff::bind().expect("a meeting to admit a child to");
-    let bootstrap = Bootstrap::new(name.as_bytes()).expect("a bootstrap within the ceiling");
-    (mapping, session, handoff, grant, bootstrap)
-}
-
-/// The test binary, re-entering as one role of one case.
-fn child_command(test: &str, role: &str) -> Command {
-    let mut command = Command::new(env::current_exe().expect("the test binary is its own parent"));
-    command
-        .args(["--exact", test])
-        .env(ROLE, role)
-        .stdout(std::process::Stdio::null());
-    command
+    role::leave(FORGED)
 }
 
 /// Admits `role` with `promised` announced to it and moves the region, a doorbell and a bell over the
@@ -303,13 +265,12 @@ fn child_command(test: &str, role: &str) -> Command {
 fn admit(
     grant: Grant,
     promised: Introduction,
-    test: &str,
     role: &str,
     handoff: Handoff,
     mapping: &Shared,
     bootstrap: &Bootstrap,
 ) -> (Supervisor, Attendance, Ring) {
-    let mut command = child_command(test, role);
+    let mut command = role::child(role);
     grant
         .promising(promised)
         .admit(&mut command)
@@ -333,22 +294,17 @@ fn admit(
 
 #[test]
 fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
-    const TEST: &str = "a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe";
-    if env::var(ROLE).ok().as_deref() == Some("reported") {
-        std::process::exit(reported());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("receipt-reported");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-reported", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.introduction();
-    let (mut child, attendance, _notify) = admit(
-        grant, promised, TEST, "reported", handoff, &mapping, &bootstrap,
-    );
+    let (mut child, attendance, _notify) =
+        admit(grant, promised, "reported", handoff, &mapping, &bootstrap);
 
     // The exit is taken first, which is the order the Unix file uses and this arm has now shown it can
     // keep: the instance still names its client, and the message it wrote is still queued to be read.
     assert_eq!(
-        exit_code(&mut child, "the promised child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the promised child", Duration::from_secs(10)),
         REPORTED,
         "the child arrived in the slot it was promised, reported it and left the member standing"
     );
@@ -399,8 +355,8 @@ fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
     );
 
     // The same evidence in front of another roster is nothing at all: a `Death` answers for one region.
-    let other = shared("receipt-other", SIZE, access()).expect("a second region");
-    let outsider = Session::create(other.borrow(), Request::new(SIZE, access()), OTHER)
+    let other = shared("receipt-other", SIZE, region::access()).expect("a second region");
+    let outsider = Session::create(other.borrow(), region::extent(SIZE), OTHER)
         .expect("a session that was never in this meeting");
     assert!(
         outsider.recover(&death).is_none(),
@@ -410,7 +366,7 @@ fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
     // The slot came back through the reap, not through the promise: the child never released its member
     // and the parent never gave its `Seat` back before this point.
     drop(seat);
-    let later = Session::open(mapping.borrow(), Request::new(SIZE, access()), REGION)
+    let later = Session::open(mapping.borrow(), region::extent(SIZE), REGION)
         .expect("join the slot a reaped child left");
     assert_eq!(
         later.peer().slot(),
@@ -425,20 +381,15 @@ fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
 
 #[test]
 fn a_report_of_a_member_nobody_promised_that_child_is_refused_over_the_pipe() {
-    const TEST: &str = "a_report_of_a_member_nobody_promised_that_child_is_refused_over_the_pipe";
-    if env::var(ROLE).ok().as_deref() == Some("diverged") {
-        std::process::exit(diverged());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("receipt-diverged");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-diverged", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.introduction();
-    let (mut child, attendance, _notify) = admit(
-        grant, promised, TEST, "diverged", handoff, &mapping, &bootstrap,
-    );
+    let (mut child, attendance, _notify) =
+        admit(grant, promised, "diverged", handoff, &mapping, &bootstrap);
 
     assert_eq!(
-        exit_code(&mut child, "the diverging child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the diverging child", Duration::from_secs(10)),
         DIVERGED,
         "the child took a slot of its own and reported that one"
     );
@@ -469,7 +420,7 @@ fn a_report_of_a_member_nobody_promised_that_child_is_refused_over_the_pipe() {
     drop(seat);
     let imposter = Session::open_as(
         mapping.borrow(),
-        Request::new(SIZE, access()),
+        region::extent(SIZE),
         REGION,
         promised.peer(),
     );
@@ -484,20 +435,15 @@ fn a_report_of_a_member_nobody_promised_that_child_is_refused_over_the_pipe() {
 
 #[test]
 fn a_child_that_met_and_never_reported_is_answered_by_the_instance_itself() {
-    const TEST: &str = "a_child_that_met_and_never_reported_is_answered_by_the_instance_itself";
-    if env::var(ROLE).ok().as_deref() == Some("silent") {
-        std::process::exit(silent());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("receipt-silent");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-silent", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.introduction();
-    let (mut child, attendance, _notify) = admit(
-        grant, promised, TEST, "silent", handoff, &mapping, &bootstrap,
-    );
+    let (mut child, attendance, _notify) =
+        admit(grant, promised, "silent", handoff, &mapping, &bootstrap);
 
     assert_eq!(
-        exit_code(
+        introduce::exit_code(
             &mut child,
             "the child that left wordless",
             Duration::from_secs(10)
@@ -526,20 +472,15 @@ fn a_child_that_met_and_never_reported_is_answered_by_the_instance_itself() {
 
 #[test]
 fn an_offer_shaped_frame_is_refused_where_the_pipe_reads_a_receipt() {
-    const TEST: &str = "an_offer_shaped_frame_is_refused_where_the_pipe_reads_a_receipt";
-    if env::var(ROLE).ok().as_deref() == Some("forged") {
-        std::process::exit(forged());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("receipt-forged");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-forged", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.introduction();
-    let (mut child, attendance, _notify) = admit(
-        grant, promised, TEST, "forged", handoff, &mapping, &bootstrap,
-    );
+    let (mut child, attendance, _notify) =
+        admit(grant, promised, "forged", handoff, &mapping, &bootstrap);
 
     assert_eq!(
-        exit_code(&mut child, "the forging child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the forging child", Duration::from_secs(10)),
         FORGED,
         "the child wrote an offer-shaped frame down the rendezvous"
     );
@@ -563,18 +504,12 @@ fn an_offer_shaped_frame_is_refused_where_the_pipe_reads_a_receipt() {
 
 #[test]
 fn a_child_still_connected_and_silent_is_given_up_on_at_the_bound_the_caller_named() {
-    const TEST: &str =
-        "a_child_still_connected_and_silent_is_given_up_on_at_the_bound_the_caller_named";
-    if env::var(ROLE).ok().as_deref() == Some("parked") {
-        std::process::exit(parked());
-    }
-
-    let (mapping, parent, handoff, grant, bootstrap) = meeting("receipt-parked");
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-parked", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
     let promised = seat.introduction();
-    let (mut child, attendance, notify) = admit(
-        grant, promised, TEST, "parked", handoff, &mapping, &bootstrap,
-    );
+    let (mut child, attendance, notify) =
+        admit(grant, promised, "parked", handoff, &mapping, &bootstrap);
 
     // The other face of a child that will not report: the client has not gone, so the instance has no
     // departure to answer with and the read ends on the caller's word alone. The Unix arm reaches this
@@ -596,7 +531,7 @@ fn a_child_still_connected_and_silent_is_given_up_on_at_the_bound_the_caller_nam
         .notify()
         .expect("release the child the receipt read gave up on");
     assert_eq!(
-        exit_code(&mut child, "the parked child", Duration::from_secs(10)),
+        introduce::exit_code(&mut child, "the parked child", Duration::from_secs(10)),
         PARKED,
         "the promised child met, held the instance open and reported nothing"
     );

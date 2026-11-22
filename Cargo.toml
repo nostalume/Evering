@@ -15,6 +15,16 @@ include = [
     "/README.md", "/LICENSE-*", "/rust-toolchain.toml",
 ]
 
+# `tests/support.rs` is the harness the claim files import, not a target of its own, and the only way to
+# keep discovery from turning it into one is to name every target here. The list is therefore a check: a
+# claim file missing from it is built by nothing and reported by nobody.
+#
+# A claim whose legs are separate files lives in a directory named after its root, and the root reaches
+# those legs with `#[path]`: a crate root looks for its children beside itself, so a bare `mod unix;` in
+# `tests/foo.rs` would resolve to `tests/unix.rs` and land in the flat list the rows above are checked
+# against.
+autotests = false
+
 [features]
 default = ["std"]
 std = []
@@ -68,6 +78,83 @@ path = "benches/ipc/main.rs"
 harness = false
 test = false
 required-features = ["benchmark"]
+
+[[test]]
+name = "arrival_receipt"
+path = "tests/arrival_receipt.rs"
+
+[[test]]
+name = "arrival_receipt_windows"
+path = "tests/arrival_receipt_windows.rs"
+
+[[test]]
+name = "child_supervision"
+path = "tests/child_supervision.rs"
+required-features = ["process"]
+
+[[test]]
+name = "duplex_patience"
+path = "tests/duplex_patience.rs"
+
+[[test]]
+name = "examples_run"
+path = "tests/examples_run.rs"
+required-features = ["os", "tokio"]
+
+[[test]]
+name = "handoff_impostor"
+path = "tests/handoff_impostor.rs"
+
+[[test]]
+name = "handoff_impostor_windows"
+path = "tests/handoff_impostor_windows.rs"
+
+[[test]]
+name = "ipc_process"
+path = "tests/ipc_process.rs"
+
+[[test]]
+name = "latch_conformance"
+path = "tests/latch_conformance.rs"
+
+[[test]]
+name = "notify_commit_policy"
+path = "tests/notify_commit_policy.rs"
+
+[[test]]
+name = "notify_process"
+path = "tests/notify_process.rs"
+
+[[test]]
+name = "portable_contracts"
+path = "tests/portable_contracts.rs"
+required-features = ["map"]
+
+[[test]]
+name = "process_exchange"
+path = "tests/process_exchange.rs"
+
+[[test]]
+name = "process_exchange_windows"
+path = "tests/process_exchange_windows.rs"
+
+[[test]]
+name = "protocol_oracles"
+path = "tests/protocol_oracles.rs"
+# No `required-features`: the two models import no production code, so there is no feature that could
+# make them fail to build, and a gate here would only hide them from a narrower command.
+
+[[test]]
+name = "recovery_dispatch_windows"
+path = "tests/recovery_dispatch_windows.rs"
+
+[[test]]
+name = "recovery_process"
+path = "tests/recovery_process.rs"
+
+[[test]]
+name = "seat_announcement"
+path = "tests/seat_announcement.rs"
 
 [[test]]
 name = "ipc-study"

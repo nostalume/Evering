@@ -9,11 +9,13 @@ use std::{
 use evering::{
     DeclineCause, Encoded, ReceiveError, RoomWait, Session,
     layout::{RegionId, Repr, SchemaId, SchemaKey},
-    mapping::{Access, Request},
     notify::{
         Adaptive, Committed, Contention, Deferred, Notify, Patience, ProgressError, Signals, Wait,
     },
 };
+
+mod support;
+use crate::support::region;
 
 const REGION: RegionId = RegionId::new(0x6539_7375_7266_6163, 1);
 const RUNTIME: SchemaKey = SchemaKey::new(SchemaId(0x6539_7275_6e74_696d), 1);
@@ -81,14 +83,8 @@ impl Wait for FailedWait {
     }
 }
 
-#[cfg(unix)]
 fn sessions() -> (Session, Session) {
-    let source = evering::os::unix::UnixFd::memfd("evering-e9", 1 << 20, false).unwrap();
-    let request = Request::new(1 << 20, Access::READ | Access::WRITE);
-    (
-        Session::create(source.borrow(), request, REGION).unwrap(),
-        Session::open(source.borrow(), request, REGION).unwrap(),
-    )
+    region::pair("evering-e9", 1 << 20, REGION)
 }
 
 #[test]
@@ -115,17 +111,6 @@ fn signal_capabilities_are_static_and_commits_are_consumed_explicitly() {
     let bell = FaultBell(Cell::new(0));
     let ((), notified) = Signals::notify(&bell).close_tx(&tx).into_parts();
     assert_eq!(notified, Err(7));
-}
-
-#[cfg(windows)]
-fn sessions() -> (Session, Session) {
-    let source =
-        evering::os::windows::Section::anonymous(1 << 20, Access::READ | Access::WRITE).unwrap();
-    let request = Request::new(1 << 20, Access::READ | Access::WRITE);
-    (
-        Session::create(source.borrow(), request, REGION).unwrap(),
-        Session::open(source.borrow(), request, REGION).unwrap(),
-    )
 }
 
 #[tokio::test]
