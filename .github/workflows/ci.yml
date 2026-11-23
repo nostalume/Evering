@@ -67,7 +67,7 @@ jobs:
           status=0
           out=$(cargo run -q --features os,tokio --example second_introduction) || status=$?
           case "$status" in
-            0 | 3 | 4) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
+            0 | 3 | 4 | 6) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
             *) exit "$status" ;;
           esac
       # What each row says it needs, compiled at that width. `--all-features` hides this class twice over: a
@@ -135,7 +135,7 @@ jobs:
           status=0
           out=$(cargo run -q --features os,tokio --example second_introduction) || status=$?
           case "$status" in
-            0 | 3 | 4) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
+            0 | 3 | 4 | 6) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
             *) exit "$status" ;;
           esac
       # The same narrow compile as the linux job: the legs this host owns are the ones a wide row hides.

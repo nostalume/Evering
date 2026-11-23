@@ -18,27 +18,32 @@
 //! 3. The Unix arm of the attestation, which asserts that the peer behind the rendezvous *is this
 //!    process's parent*.
 //!
-//! What the run adds to those three is a fourth place, which is where the route actually stops on both
-//! hosts today: there is no constructor that turns a rendezvous somebody can look up into a [`Handoff`].
-//! `bind` returns the meeting it created and its socket field is private, so the introducer can only hold
-//! a named endpoint through the untyped leg API, and an offer written there is an offer no [`Attendance`]
-//! can ever be read for. That is why no offer in this program is written by a typed sender: it goes out
-//! as `Socket::send`, which nobody can take attendance on. The receivers do reach the typed seam — that
-//! is where Linux refuses — but a handover nobody sent through it has nothing for a receipt to answer.
+//! The weld this measurement fed has since landed, and round three below runs the route as the
+//! shipped seam now opens it: [`Handoff::granted`] takes the rendezvous as a descriptor rather than a
+//! number read out of an announcement, which removes blockage 2 as a way in — the target never
+//! writes a key for itself in the round that matters — and it also removes the fourth place in its
+//! predicted shape. There is still no constructor that turns a rendezvous somebody can look up into
+//! a [`Handoff`], but none is needed on the sender's side: an introducer makes its *own* meeting with
+//! [`Handoff::bind`] and moves the grant across as a descriptor over the address the target published,
+//! the same SCM route the untyped legs here already use. What survives of prediction 3 is the whole
+//! verdict: on Linux the typed entrance classifies the descriptor, asks it the one kernel question,
+//! and then refuses a peer the kernel names truthfully but who is not the reader's parent. And
+//! prediction 1 survives in a new place, because `Handoff::send` still demands a `&Supervisor` even
+//! where the arm ignores it — named below by a process this introducer spawned for nothing else.
 //!
 //! The two hosts then stop in different places, and the example prints which:
 //!
-//! - On Windows the blockage is on the **sending** side. `Listener::accept` takes the peer to be attested
-//!   as a `&Supervisor` — a process this one spawned and retained — so the introducer has to spawn an
-//!   unrelated process just to have something to name, and `Socket::send` duplicates its descriptors into
-//!   that same process handle. The receiver's own check is satisfied, because the pipe does carry the
-//!   introducer's process id, so its `receive` passes every refusal the seam makes and then waits for an
-//!   offer nobody could write.
-//! - On Linux the blockage is on the **receiving** side, and the mechanism below it works: the offer
-//!   arrives over the learned address, all three objects land in the target's descriptor table, and only
-//!   the attestation refuses. The run also prints the host's answer about a path-bound endpoint, which is
-//!   `pid = 0`: whether an introducer that is not a parent can be *evidenced* at all is therefore a
-//!   question for the re-measurement task, not something this example settles.
+//! - On Windows the blockage is on the **sending** side, and round three is not even run: the host
+//!   has no placed entrance, and handles reach only a process the sender duplicated into — the one
+//!   named by the same `&Supervisor` whose client check `Listener::accept` applies. The introducer
+//!   has to spawn an unrelated process just to have something to name, and the target waits on a
+//!   handle nobody can write.
+//! - On Linux the sending side completes: the grant crosses the learned address, the typed send is
+//!   accepted, and an `Attendance` is held. The route then stops on the **receiving** side at the
+//!   attestation sentence alone, with the introducer's true pid in the kernel's answer. Whether that
+//!   assertion may name a non-parent is the provider decision this measurement feeds, and its shape
+//!   is now measured rather than guessed: a pidfd delivered beside the grant witnesses the introducer
+//!   and turns readable when it exits, but watches without reaping.
 //!
 //! # Running
 //!
@@ -57,16 +62,20 @@
 //!
 //! # What this does not show
 //!
-//! It shows where the route is refused, on the two hosts this repository executes. A completed typed
-//! handover over a learned address is *not* one of the outcomes observed as of this writing, so the
-//! example exits nonzero; that is its result, not its failure. Two things it deliberately does not
-//! decide: whether the refusals above should be lifted (that is the provider decision this measurement
+//! It shows where the route is refused, on the two hosts this repository executes. What is *not* an
+//! observed outcome is a completed meeting — a target that takes the handover and is attested to the
+//! introducer that fed it — so the example exits nonzero; that is its result, not its failure. On Linux
+//! the sender's typed `send` into its own meeting now completes and an `Attendance` is held, and the
+//! grant's descriptor crosses a learned address, so the blockage has moved entirely to the receiver's
+//! parent assertion. Two things it deliberately does not
+//! decide: whether that refusal should be lifted (that is the provider decision this measurement
 //! feeds), and what a non-parent introducer would be *attested* as (that is the re-measurement task,
 //! whose evidence the readings printed here are meant to serve).
 //!
 //! [`Handoff::bind`]: evering::os::Handoff::bind
 //! [`Grant::admit`]: evering::os::Grant::admit
 //! [`Handoff::receive`]: evering::os::Handoff::receive
+//! [`Handoff::granted`]: evering::os::Handoff::granted
 //! [`Handoff`]: evering::os::Handoff
 //! [`Attendance`]: evering::os::Attendance
 
@@ -88,7 +97,6 @@ use evering::{
 use evering::os::unix::{UnixFd, process::Socket};
 #[cfg(windows)]
 use evering::os::windows::process::{Listener, Socket};
-#[cfg(windows)]
 use evering::process::Supervisor;
 #[cfg(unix)]
 use std::mem;
@@ -129,6 +137,11 @@ const MET: i32 = 0;
 const REFUSED: i32 = 3;
 /// The introducer could not put the offer into the meeting the target was told to reach.
 const NO_MEETING: i32 = 4;
+/// The placed entrance (`Handoff::granted`) took the descriptor the introducer moved across and was
+/// refused by the attestation's parent assertion alone — the peer it names is the introducer, which
+/// this process did not have as a parent. This is the round-three verdict on Linux, and it is the one
+/// sentence the provider decision is about.
+const NOT_PARENT: i32 = 6;
 /// Something this example does not expect: a host error, a step that never happened, a leg that
 /// answered in a shape nobody recorded.
 const BROKEN: i32 = 1;
@@ -253,6 +266,19 @@ fn launcher() -> io::Result<()> {
                  and below it the mechanism works",
             );
             REFUSED
+        }
+        (MET, NOT_PARENT) => {
+            report(
+                "launcher",
+                "verdict: the grant crossed a learned address as a descriptor and the typed entrance \
+                 read it; the introducer completed a typed `send` into its own meeting without ever \
+                 spawning the target, and the one sentence that still refuses is the attestation's \
+                 parent assertion. Whether a non-parent introducer may evidence the peer the kernel \
+                 names is the provider decision this measurement feeds — a pidfd delivered beside the \
+                 grant witnesses the introducer and turns readable when it exits, but watches without \
+                 reaping",
+            );
+            NOT_PARENT
         }
         (NO_MEETING, REFUSED) => {
             report(
@@ -435,6 +461,69 @@ fn introduce(dir: &Path) -> io::Result<i32> {
             "the target never finished, so the objects it was offered are still held here",
         )
     })?;
+
+    // Round three runs the route as the seam now opens it. Prediction 4 still holds — there is no
+    // constructor that turns a look-up-able rendezvous into a `Handoff` — but none is needed on the
+    // sender's side: this process makes its OWN meeting with `Handoff::bind` and moves that meeting's
+    // grant across as a single descriptor, over the address the target publishes for it, on the same SCM
+    // route the untyped legs used. What the target then holds is the other end of a socketpair it did
+    // not create and was never announced a number for.
+    let grant_meeting = await_step(dir, "grantme").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the target never published where to move the grant",
+        )
+    })?;
+    let (meeting, grant) = Handoff::bind()?;
+    let moved_over = Socket::connect(&grant_meeting)?;
+    let grant_label = Bootstrap::new(b"grant-leg").expect("the grant-leg label fits");
+    moved_over.send(&grant_label, &[grant.as_fd()])?;
+    publish(dir, "grant-sent", "moved")?;
+    report(
+        "introducer",
+        "moved a meeting's grant across as one descriptor over the address the target published; the \
+         target now holds the other end of a socketpair this process made, with no `EVERING_RENDEZVOUS` \
+         ever written for it",
+    );
+
+    // Prediction 1, in its new place: the typed sender still demands a `&Supervisor` this arm ignores.
+    // `Handoff::send` will not take the offer without naming a child, and the only way to obtain a
+    // `&Supervisor` is to spawn one — so a process is made here for nothing else, and Linux reads neither
+    // it nor the deadline.
+    let mut unrelated = Command::new("sleep");
+    unrelated.arg("2");
+    let named = Supervisor::spawn(&mut unrelated)?;
+    report(
+        "introducer",
+        format!(
+            "`Handoff::send` still wants a `&Supervisor` it discards on this arm, so I spawned a process \
+             unrelated to the meeting (id {named_pid}) purely to satisfy the signature — the offer is \
+             bound to the descriptor the grant crossed, not to the child named here",
+            named_pid = named.id(),
+        ),
+    );
+    let _attendance = meeting.send(
+        &named,
+        Instant::now() + STEP,
+        &bootstrap,
+        &mapping,
+        &wakes_target,
+        &rings_from_target,
+    )?;
+    report(
+        "introducer",
+        "the typed `send` completed into a meeting whose grant crossed a learned address, and an \
+         `Attendance` is held for the receipt the target would write back — the sender-side blockage of \
+         round two is gone on this host; what remains is the receiver's attestation",
+    );
+
+    await_step(dir, "grant-answer").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the target never answered the placed entrance",
+        )
+    })?;
+    drop((named, _attendance, grant, moved_over));
     drop((
         mapping,
         wakes_target,
@@ -584,6 +673,74 @@ fn arrive(dir: &Path) -> io::Result<i32> {
     for path in [&probe, &meeting] {
         let _ = fs::remove_file(path);
     }
+
+    // Round three: the placed entrance, met the way a host that speaks no evering protocol would place
+    // it. Nothing here reads `EVERING_RENDEZVOUS` — the introducer published no announcement and did not
+    // spawn this process; it moved the grant's descriptor to an address published below, and
+    // `Handoff::granted` is handed that descriptor. The one kernel question (`is_rendezvous`) is answered
+    // yes because a socketpair end is a datagram endpoint — the very question round two's pipe failed.
+    let grant_me = dir.join("grantme.sock");
+    let leg = Socket::bind(&grant_me)?;
+    publish(dir, "grantme", &grant_me.display().to_string())?;
+    report(
+        "target",
+        "bound an address for the grant itself and published it; round three has the introducer move a \
+         rendezvous here as a descriptor rather than announce a number for me to read",
+    );
+    await_step(dir, "grant-sent").ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::TimedOut,
+            "the introducer never moved its grant to the address I published",
+        )
+    })?;
+    let (_grant_label, handed) = leg.recv(1)?.into_parts();
+    let mut handed = handed.into_vec();
+    let rendezvous = handed.remove(0);
+    report(
+        "target",
+        "received the grant's descriptor over the SCM route as an owned `OwnedFd`; calling \
+         `Handoff::granted` with it and reading no `EVERING_RENDEZVOUS` at all",
+    );
+    let code = match Handoff::granted(rendezvous) {
+        Ok((peer, _resources, _receipt)) => {
+            report(
+                "target",
+                format!(
+                    "MEETS through the placed entrance: provenance {:?}, pid {:?}",
+                    peer.provenance(),
+                    peer.pid(),
+                ),
+            );
+            MET
+        }
+        Err(error) if error.to_string().contains("parent") => {
+            report(
+                "target",
+                format!(
+                    "REFUSED at the placed entrance solely by the attestation's parent assertion: {error} \
+                     — the descriptor passed the one kernel question (a socketpair end is a datagram \
+                     endpoint, unlike round two's pipe), and the introducer's {TRUST}=1 still stands in my \
+                     environment from round two and opened nothing here, because the kernel answered and no \
+                     policy word turns that answer into a different pid: the peer it names is my \
+                     introducer, which is not my parent",
+                ),
+            );
+            NOT_PARENT
+        }
+        Err(error) => {
+            report(
+                "target",
+                format!(
+                    "REFUSED at the placed entrance below the attestation: {error} (kind {:?}) — the \
+                     descriptor did not answer the one kernel question, so it names no rendezvous",
+                    error.kind(),
+                ),
+            );
+            REFUSED
+        }
+    };
+    publish(dir, "grant-answer", "answered")?;
+    let _ = fs::remove_file(&grant_me);
     Ok(code)
 }
 
@@ -671,6 +828,14 @@ fn introduce(dir: &Path) -> io::Result<i32> {
     publish(dir, "accepted", "attempted")?;
     report(
         "introducer",
+        "round three is not run on this host: `Handoff` has no placed entrance here — `Handoff::granted` \
+         is compiled out, so there is no descriptor route a foreign host could be handed an offer \
+         through. The only way an offer reaches a process here is `Socket::send` duplicating each handle \
+         into the process behind a `&Supervisor` this process spawned, which is the same blockage the \
+         accept check above names",
+    );
+    report(
+        "introducer",
         "not run, because there is nothing to run it on: `Socket::send` duplicates each handle into \
          the process behind the `Supervisor` it was given, so an offer for a process I did not spawn \
          has no target to duplicate into. The second name above stays unaccepted while I hold it, \
@@ -727,6 +892,12 @@ fn arrive(dir: &Path) -> io::Result<i32> {
              already refused or is inside a wait the seam does not bound",
             waiting, introducer
         ),
+    );
+    report(
+        "target",
+        "round three is not run on this host: this arm is handed `Handoff::receive` only, and \
+         `Handoff::granted` does not exist here, so the placed route has no entrance to measure. The \
+         Windows leg stops on the introducer's side, at the accept check above",
     );
     let outcome = Handoff::receive();
     publish(dir, "taken", "done")?;

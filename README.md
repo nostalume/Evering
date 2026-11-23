@@ -126,11 +126,15 @@ ABI compatibility, membership that cannot write, automatic application replay, o
 recovery of ambiguous general-heap mutation. Exact participant-death evidence
 is required before shared ownership recovery. Reading a region without joining
 it is supported by `Observer`, which is a standpoint outside the roster rather
-than a kind of membership.
+than a kind of membership. Which surface was checked against what, and what a `no-std`
+build actually keeps, is recorded per surface in
+[What a surface can be relied on for](docs/stability.md).
 
 ## Documentation
 
 - [Architecture and invariants](docs/architecture.md)
+- [What a surface can be relied on for](docs/stability.md)
+- [Placing a region that is already in your image](docs/porting.md)
 - [Technology and agent guide](docs/AGENT.md)
 - [Benchmark method and evidence](benches/README.md)
 
