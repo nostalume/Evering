@@ -10,12 +10,13 @@
 //! is that a parent can learn *who stood in which slot* from the host alone, so a test that also carried the
 //! identity in application data would not show which of the two the reap rested on.
 //!
-//! What is not evidence here: that an arrival is a death, which needs the reaped exit beside it
-//! (`Death::witnessed` compares the two pids and is the only way to hold a `Death` at all); that the host
-//! refuses a writer naming somebody else, which is a property of `SCM_CREDENTIALS` that the seam documents
-//! and no test in this crate re-proves; and which member a death reached for a process that was never
-//! promised anything, since an unpromised child has no receipt to reconcile and its parent is left with
-//! [`assume_dead`](crate::Session::assume_dead). The third case is where a receipt buys a caller the least
+//! What the four `witnessed` cases do not show: that an arrival is a death on its own — they hold a death only by
+//! comparing the arrival against a reaped exit, and that reap is what these four rest on. (`Death::credited`, the
+//! fifth case below, is a *second* entrance that reads the death off the kernel's delivered `pidfd` and reaps
+//! nothing to compose it; its claim is separate, not this paragraph's.) Nor do they show the host refusing a
+//! writer naming somebody else, which is a property of `SCM_CREDENTIALS` that the seam documents and no test in
+//! this crate re-proves; and which member a death reached for a process that was never promised anything, since an
+//! unpromised child has no receipt to reconcile and its parent is left with [`assume_dead`](crate::Session::assume_dead). The third case is where a receipt buys a caller the least
 //! and says so: a child that reports nothing gives the parent nothing to refuse either.
 //!
 //! One obligation is the parent's rather than the crate's: the `Command` a grant was admitted into holds the
@@ -76,6 +77,7 @@ pub(crate) const ROLES: &[(&str, role::Body)] = &[
     ("diverged", diverged),
     ("silent", silent),
     ("forged", forged),
+    ("introduced", introduced),
 ];
 
 /// The child that keeps its promise: it arrives in the slot it was announced, reports what it became and
@@ -179,6 +181,43 @@ fn forged() -> i32 {
             "the forged frame never reached the rendezvous: {error}"
         )),
     }
+}
+
+/// The child that keeps its promise and then leaves on its own: it reports the slot it arrived in, stays
+/// standing long enough for its parent to see the reference read as *not gone*, then exits. It is never reaped
+/// by that parent before the death is taken, so the parent witnesses it from the `pidfd` the kernel wrote
+/// beside the receipt — a live reference whose process has ended but has not yet been collected — which is the
+/// one thing `witnessed` cannot do without holding an exit. The shape the introduction route is built for: a
+/// member that introduced itself by meeting, not one launched into somebody's reaper.
+fn introduced() -> i32 {
+    let (_, resources, report) = match Handoff::receive() {
+        Ok(meeting) => meeting,
+        Err(error) => return role::fail(&format!("the introduced child meets no one: {error}")),
+    };
+    let Some(promised) = resources.seat else {
+        return role::fail("a promised child met a handoff that announced it no member slot");
+    };
+    let arrived = match Session::open_as(
+        resources.mapping,
+        region::extent(SIZE),
+        promised.region(),
+        promised.peer(),
+    ) {
+        Ok(arrived) => arrived,
+        Err(error) => {
+            return role::fail(&format!("the announced slot refused its arrival: {error}"));
+        }
+    };
+    if arrived.peer() != promised.peer() {
+        return role::fail("the member that arrived is not the slot this process was promised");
+    }
+    if report.arrived(arrived.region(), arrived.peer()).is_err() {
+        return role::fail("the rendezvous closed before the arrival could be reported");
+    }
+    // Stay standing briefly, the report already written and the member still held, then leave: the parent
+    // reads the receipt, sees the child alive, then sees the death through the reference before reaping it.
+    std::thread::sleep(Duration::from_secs(2));
+    role::leave(REPORTED)
 }
 
 /// Admits `role` with `promised` announced to it and moves the region, a doorbell and a bell over the
@@ -426,4 +465,110 @@ fn a_frame_shaped_like_the_offer_is_refused_where_a_receipt_is_read() {
         "a refused frame left a member nobody arrived in"
     );
     drop(seat);
+}
+
+/// The second entrance to a death, run against the first on the very same two processes. A child that
+/// introduced itself by meeting rather than being launched into this parent's reaper is credited by
+/// `Attendance::introduction`, which hands back the receipt's `Arrival` beside a `Writer` — the `pidfd` the
+/// kernel wrote into the same message — and `Death::credited` joins them with no `&Supervisor` and no birth-pid
+/// comparison anywhere. The claim these two cases pin is that the reference route is not a weaker one: it
+/// reaches the same slot `recover` releases, and composes a `Death` equal to the one `witnessed` builds from the
+/// reap of the same child.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_death_the_kernel_credited_recovers_the_slot_and_equals_a_death_witnessed_from_the_reap() {
+    let (mapping, parent, handoff, grant, bootstrap) =
+        region::meeting("receipt-introduced", SIZE, REGION);
+    let seat = parent.reserve_seat().expect("promise a member slot");
+    let promised = seat.introduction();
+    let (mut child, attendance) =
+        admit(grant, promised, "introduced", handoff, &mapping, &bootstrap);
+
+    // The receipt read through the conference route: no child handed to it, nothing waited, and the death not
+    // yet happened — the child has reported and is still standing.
+    let (arrival, writer) = attendance
+        .introduction(promised, Instant::now() + Duration::from_secs(10))
+        .expect("the receipt the kernel credited, with the writer's own reference beside it");
+    // The pid is read before `wait`, whose returned `Exit` borrows `child` for as long as it lives.
+    let id = child.id();
+    assert_eq!(
+        (arrival.region(), arrival.peer()),
+        (promised.region(), promised.peer()),
+        "the introduced arrival is the slot that was promised"
+    );
+    assert_eq!(
+        arrival.pid(),
+        id,
+        "the kernel credited the receipt to the child that wrote it"
+    );
+    assert!(
+        !writer
+            .gone()
+            .expect("poll the writer's reference while it still stands"),
+        "the introduced child is still standing when its receipt is read"
+    );
+
+    // Wait for the child to exit and prove the death from the reference alone, while it is still unreaped: a
+    // pidfd turns readable the instant its process ends, so `credited` is answered by the host rather than by
+    // an exit this parent has collected. Only after the death is taken is the child reaped. This is the whole
+    // distance from `witnessed`, which can only name a process this supervisor has already waited on.
+    let mut polls = 0;
+    while !writer.gone().expect("poll the writer's reference") {
+        std::thread::sleep(Duration::from_millis(20));
+        polls += 1;
+        assert!(
+            polls < 750,
+            "the introduced child never exited behind its reference"
+        );
+    }
+
+    let credited = Death::credited(&arrival, &writer)
+        .expect("the kernel's report and the kernel's reference agree on a process not yet reaped");
+    assert_eq!(
+        (credited.region(), credited.peer(), credited.pid()),
+        (promised.region(), promised.peer(), id),
+        "a credited death names the promised slot and the process the kernel credited"
+    );
+
+    let recovery = parent
+        .recover(&credited)
+        .expect("the introduced member stood in the slot, so the roster owes a reap");
+    assert_eq!(recovery.peer(), promised.peer());
+    if let Err(unreaped) = recovery.reap() {
+        panic!(
+            "a member that published nothing still finished its reap: {:?}",
+            unreaped.peer()
+        );
+    }
+    assert!(
+        parent.recover(&credited).is_none(),
+        "a reaped identity is spent and cannot be reaped a second time"
+    );
+
+    // The two entrances are not two authorities. Reap the child that has by now exited and join the same
+    // arrival to that exit: a `Death` equal to the credited one, so the reference route adds an acquisition
+    // path rather than a weaker proof — and it settled the reap before a single byte of the exit was held.
+    let exit = child
+        .wait()
+        .expect("reap the child that exited behind its own reference");
+    let witnessed = Death::witnessed(&arrival, &exit).expect("the same child, reaped");
+    assert_eq!(
+        credited, witnessed,
+        "a credited death is not a weaker death than one witnessed from the reap"
+    );
+
+    // The slot came back through the reap and not the promise: the child never released its member, so the
+    // death is what freed it — and a later arrival in it is a fresh generation, never the released identity.
+    drop(seat);
+    let later = Session::open(mapping.borrow(), region::extent(SIZE), REGION)
+        .expect("join the slot a reaped child left");
+    assert_eq!(
+        later.peer().slot(),
+        promised.peer().slot(),
+        "a completely reaped slot becomes reusable"
+    );
+    assert!(
+        later.peer().generation() > promised.peer().generation(),
+        "slot reuse cannot recreate the identity the death released"
+    );
 }

@@ -55,6 +55,9 @@ use crate::{
     },
 };
 
+#[cfg(target_os = "linux")]
+use crate::process::Writer;
+
 pub type Shared = UnixFd<std::os::fd::OwnedFd>;
 
 /// The descriptor number a granted rendezvous is installed at in the process it is granted to.
@@ -269,6 +272,55 @@ impl Attendance {
     ) -> io::Result<Arrival> {
         credited(&self.socket, child, promised, deadline)
     }
+
+    /// The receipt this rendezvous carries, credited to its writer and handed back with a live reference to
+    /// that writer — for a member that met here rather than being launched from here.
+    ///
+    /// `arrival` is the parent's route: it reconciles the report against the child *this* supervisor owns,
+    /// and so needs a `&Supervisor` to compare a pid with. A process that introduced a sibling it never
+    /// spawned has no such child, and nothing to `wait` on, so it cannot reach `Death` that way. This is the
+    /// other route: the endpoint is armed with `SO_PASSPIDFD`, and the kernel answers the receipt by passing
+    /// the writer's `pidfd` in the same message it writes the writer's identity into. Both halves leave one
+    /// `recvmsg`, so `Death::credited` needs no cross-channel pid comparison to join them.
+    ///
+    /// What this does *not* relax is the promise check: a report naming a member slot other than `promised`
+    /// is still refused, because a `Death` for a slot nobody promised would reap whoever does stand there.
+    /// The uid is still checked, because the kernel crediting a writer across a user namespace is not the
+    /// local writer the returned `Writer` vouches for. What is dropped, deliberately, is the pid equality
+    /// with a spawn — there is none — and it is replaced by something stronger: a reference the kernel chose
+    /// at delivery, which no number-reuse can retarget. Join the returned pair with
+    /// [`Death::credited`](crate::process::Death::credited) once [`Writer::gone`] answers true.
+    #[cfg(target_os = "linux")]
+    pub fn introduction(
+        self,
+        promised: Introduction,
+        deadline: Instant,
+    ) -> io::Result<(Arrival, Writer)> {
+        // Arming the option and reading with the widened buffer are one operation across `Socket::arrival`;
+        // calling this without the widening the same commit made to `read_receipt` fails every receipt, so
+        // the two are inseparable by construction.
+        self.socket.watch_writers()?;
+        let (arrived, credentials, writer) = self.socket.arrival(deadline)?;
+        // A rendezvous armed for it must answer with one; a `None` here means the endpoint is not the pair
+        // this route assumes, and there is no death witness to hand back.
+        let writer = writer.ok_or_else(|| {
+            refused("the receipt on this rendezvous carried no process for the kernel to name")
+        })?;
+        if credentials.uid != getuid().as_raw() {
+            return Err(refused(
+                "the receipt on this rendezvous was not written by a process this one can credit",
+            ));
+        }
+        if arrived != promised {
+            return Err(refused(
+                "the arrival reported is not the member slot that was promised",
+            ));
+        }
+        Ok((
+            Arrival::reported(arrived.region(), arrived.peer(), credentials.pid),
+            writer,
+        ))
+    }
 }
 
 impl Receipt {
@@ -475,7 +527,37 @@ fn attested(_socket: &Socket, trusts: bool) -> io::Result<Peer> {
 /// The pid arrives with the message rather than before it, which is the one difference from `attested`: a
 /// receipt is credited at the read, and there is nothing in it to adopt — no descriptor, no object, no
 /// state this process changes — so nothing is installed ahead of the answer about who wrote it.
-#[cfg(any(target_os = "linux", target_os = "android"))]
+#[cfg(target_os = "linux")]
+fn credited(
+    socket: &Socket,
+    child: &Supervisor,
+    promised: Introduction,
+    deadline: Instant,
+) -> io::Result<Arrival> {
+    // The Linux read can carry a `pidfd` beside the credentials, but this parent route already holds its own
+    // proof of the death — `child` — and does not need the reference, so the third slot is discarded. The
+    // conference route that has no `child` is `Attendance::introduction`, which keeps that reference.
+    let (arrived, credentials, _writer) = socket.arrival(deadline)?;
+    if credentials.pid != child.id() || credentials.uid != getuid().as_raw() {
+        return Err(refused(
+            "the receipt on this rendezvous was not written by the process it was promised to",
+        ));
+    }
+    if arrived != promised {
+        return Err(refused(
+            "the arrival reported is not the member slot that was promised",
+        ));
+    }
+    Ok(Arrival::reported(
+        arrived.region(),
+        arrived.peer(),
+        credentials.pid,
+    ))
+}
+
+/// The Android parent route: the same three checks, but the receipt carries no `pidfd` to hand back, so the
+/// read returns the writer's identity alone and this arm never produces a `Writer`.
+#[cfg(target_os = "android")]
 fn credited(
     socket: &Socket,
     child: &Supervisor,

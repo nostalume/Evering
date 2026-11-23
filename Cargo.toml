@@ -10,6 +10,9 @@ repository = "https://github.com/nostalume/evering"
 readme = "README.md"
 publish = true
 keywords = ["ipc", "shared-memory", "lock-free", "runtime"]
+# `no-std` is the scope `docs/stability.md` records, not a claim about the whole surface: with default
+# features off the byte, layout, storage, transport and notification-model layers stay, and every
+# host-gated feature is simply absent rather than narrower. The category points at that section.
 categories = ["concurrency", "data-structures", "no-std"]
 include = [
     "/src/**", "/examples/**", "/tests/**", "/docs/**", "/Cargo.toml", "/Cargo.lock",

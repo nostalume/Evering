@@ -56,7 +56,16 @@ use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::process::Introduction;
 
+#[cfg(target_os = "linux")]
+use crate::process::Writer;
+
 const HEADER: usize = 8;
+
+/// The `SOL_SOCKET` cmsg type that carries the ancillary `pidfd` `SO_PASSPIDFD` delivers beside a credited
+/// receipt. `nix` 0.30.1 decodes no cmsg of this type, so it surfaces as `ControlMessageOwned::Unknown` and
+/// its descriptor has to be taken out here — `UnknownCmsg` owns no `Drop`.
+#[cfg(target_os = "linux")]
+const SCM_PIDFD: nix::libc::c_int = 4;
 
 fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -197,6 +206,41 @@ impl Socket {
         Ok(())
     }
 
+    /// Asks the kernel to hand over, beside each credited receipt, a `pidfd` naming the process that wrote
+    /// it — `credit_writers` turned from an answer into an object.
+    ///
+    /// `SO_PASSCRED` makes the kernel *say* which process wrote; `SO_PASSPIDFD` makes it pass that process's
+    /// `pidfd` in the same message, so a reader that is not the writer's parent still ends up holding a live
+    /// reference the kernel chose at delivery rather than a number it looked up afterward. That reference is
+    /// what `super::handoff`'s `introduction` reads out and what `crate::process::Writer` wraps.
+    ///
+    /// Linux only, for the same reason `crate::process`'s `watch` opens its `pidfd` by syscall: the socket
+    /// option has no wrapper in the `nix` features this crate enables, and `SO_PASSPIDFD_THREAD` measured as
+    /// `ENOPROTOOPT` on the reference host, so the granularity is a thread group and no thread-only arm is
+    /// written. Widening `read_receipt`'s control buffer is mandatory alongside this call — a buffer sized
+    /// for credentials alone truncates the ancillary list, and the kernel answers a truncated control message
+    /// by discarding every cmsg in it — so arming the option without the widening fails every receipt.
+    #[cfg(target_os = "linux")]
+    pub fn watch_writers(&self) -> io::Result<()> {
+        const SO_PASSPIDFD: nix::libc::c_int = 76;
+        let enabled: nix::libc::c_int = 1;
+        // SAFETY: `self.0` is this endpoint's own descriptor, `SO_PASSPIDFD` is a `SOL_SOCKET` option that
+        // takes a single `c_int`, and `enabled` is a live local whose address is read only for the call.
+        let result = unsafe {
+            nix::libc::setsockopt(
+                self.0.as_raw_fd(),
+                nix::libc::SOL_SOCKET,
+                SO_PASSPIDFD,
+                &enabled as *const nix::libc::c_int as *const nix::libc::c_void,
+                std::mem::size_of::<nix::libc::c_int>() as nix::libc::socklen_t,
+            )
+        };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
     pub fn send(&self, bootstrap: &Bootstrap, resources: &[BorrowedFd<'_>]) -> io::Result<()> {
         if resources.len() > MAX_RESOURCES {
             return Err(io::Error::new(
@@ -263,7 +307,8 @@ impl Socket {
         self.datagram(&bytes, &[])
     }
 
-    /// Reads one receipt frame and the kernel's answer about the process that wrote it, by `deadline`.
+    /// Reads one receipt frame, the kernel's answer about the process that wrote it, and — on Linux, once
+    /// this endpoint is armed for it — a live reference to that process, by `deadline`.
     ///
     /// The bound is a `poll` in front of a non-blocking read rather than a socket option, so nothing is
     /// left set on the endpoint behind the caller's back and the pair's other end keeps its own timing.
@@ -277,7 +322,121 @@ impl Socket {
     /// no readiness, no hangup, only `EAGAIN` to a read. A parent waiting on a child that met and left
     /// without writing is therefore answered by its own `deadline` and by no signal from the host, which is
     /// why the bound is a parameter of this call rather than a policy inside it.
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    ///
+    /// The third slot changes nothing about the wire: it is `None` until `watch_writers` is called on this
+    /// endpoint, and the bytes the peer sends are the same either way. It is `Some` exactly when the kernel
+    /// delivered a `pidfd` beside the credentials, which is when an introduced — not spawned — writer's
+    /// death becomes something the reading process can prove without reaping it.
+    #[cfg(target_os = "linux")]
+    pub fn arrival(
+        &self,
+        deadline: Instant,
+    ) -> io::Result<(Introduction, Credentials, Option<Writer>)> {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(io::ErrorKind::TimedOut.into());
+            }
+            let budget = PollTimeout::from(remaining.as_millis().min(u16::MAX as u128) as u16);
+            let mut watched = [PollFd::new(self.as_fd(), PollFlags::POLLIN)];
+            match poll(&mut watched, budget) {
+                Ok(0) => continue,
+                Ok(_) => {}
+                // A signal is not a receipt, and an interrupted park is retried rather than reported.
+                Err(Errno::EINTR) => continue,
+                Err(error) => return Err(error.into()),
+            }
+            if watched[0].revents().is_none_or(|flags| flags.is_empty()) {
+                continue;
+            }
+            return self.read_receipt();
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_receipt(&self) -> io::Result<(Introduction, Credentials, Option<Writer>)> {
+        let mut bytes = [0; HEADER + MAX_BOOTSTRAP];
+        let mut data = [IoSliceMut::new(&mut bytes)];
+        // Room for the writer's credentials *and* the `pidfd` `SO_PASSPIDFD` puts beside them. A buffer
+        // sized for credentials alone truncates the ancillary list, and the kernel answers a truncated
+        // control message by discarding every cmsg it held — so arming the option without widening here is
+        // the one ordering this file cannot get wrong, and why the two change together.
+        let mut control = cmsg_space!(UnixCredentials, nix::libc::c_int);
+        let message = recvmsg::<()>(
+            self.0.as_raw_fd(),
+            &mut data,
+            Some(&mut control),
+            MsgFlags::MSG_DONTWAIT | MsgFlags::MSG_CMSG_CLOEXEC,
+        )
+        .map_err(io::Error::from)?;
+        let count = message.bytes;
+        let flags = message.flags;
+        let mut credited = None;
+        let mut writer = None;
+        for item in message.cmsgs().map_err(io::Error::from)? {
+            match item {
+                ControlMessageOwned::ScmCredentials(creds) => {
+                    credited = Some(Credentials {
+                        pid: creds.pid() as u32,
+                        uid: creds.uid(),
+                        gid: creds.gid(),
+                    });
+                }
+                ControlMessageOwned::ScmRights(_) => {
+                    return Err(invalid("a receipt carries no descriptors"));
+                }
+                // `SO_PASSPIDFD`'s data is not a variant `nix` 0.30.1 decodes, so it surfaces as `Unknown`
+                // with the `pidfd` packed into its data bytes — and `UnknownCmsg` owns no `Drop`, so the
+                // descriptor has to be taken out here or every receipt leaks one into this process's table.
+                ControlMessageOwned::Unknown(unknown)
+                    if unknown.cmsg_header.cmsg_type == SCM_PIDFD
+                        && unknown.data_bytes.len() >= std::mem::size_of::<RawFd>() =>
+                {
+                    let mut raw = [0u8; std::mem::size_of::<RawFd>()];
+                    raw.copy_from_slice(&unknown.data_bytes[..std::mem::size_of::<RawFd>()]);
+                    let fd = RawFd::from_ne_bytes(raw);
+                    // SAFETY: the kernel delivered `fd` as this receipt's writer `pidfd`, `MSG_CMSG_CLOEXEC`
+                    // marked it close-on-exec, and nothing else in this process holds it, so `OwnedFd` may
+                    // undertake to close it.
+                    writer = Some(Writer::received(unsafe { OwnedFd::from_raw_fd(fd) }));
+                }
+                // An ancillary item this endpoint was not told to expect — including an `Unknown` that is not
+                // a pidfd. There is nothing to hand back for it and no descriptor it could have smuggled, so
+                // it is dropped with the message.
+                _ => {}
+            }
+        }
+        if count == 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the peer closed the rendezvous without reporting its arrival",
+            ));
+        }
+        if flags.intersects(MsgFlags::MSG_TRUNC) {
+            return Err(invalid("truncated receipt"));
+        }
+        let credentials = credited.ok_or_else(|| {
+            invalid("the receipt arrived with no answer about the process that wrote it")
+        })?;
+        if count < HEADER || bytes[..4] != crate::process::ARRIVAL_MAGIC {
+            return Err(invalid("malformed receipt header"));
+        }
+        let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
+        let declared = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+        if len > MAX_BOOTSTRAP || count != HEADER + len || declared != 0 {
+            return Err(invalid("malformed receipt length"));
+        }
+        let text = std::str::from_utf8(&bytes[HEADER..count])
+            .map_err(|_| invalid("a receipt is not text"))?;
+        let arrived = Introduction::announced(text)
+            .ok_or_else(|| invalid("the receipt names no member identity"))?;
+        Ok((arrived, credentials, writer))
+    }
+
+    /// The same receipt read on Android, which answers `SO_PASSCRED` but delivers no `pidfd`: the writer's
+    /// identity and nothing more, so the control buffer stays sized for credentials alone and the reference
+    /// half of `Death`'s second entrance is not reachable here.
+    #[cfg(target_os = "android")]
     pub fn arrival(&self, deadline: Instant) -> io::Result<(Introduction, Credentials)> {
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
@@ -300,7 +459,7 @@ impl Socket {
         }
     }
 
-    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[cfg(target_os = "android")]
     fn read_receipt(&self) -> io::Result<(Introduction, Credentials)> {
         let mut bytes = [0; HEADER + MAX_BOOTSTRAP];
         let mut data = [IoSliceMut::new(&mut bytes)];
@@ -430,4 +589,78 @@ impl Offer {
     pub fn into_parts(self) -> (Bootstrap, Box<[OwnedFd]>) {
         (self.bootstrap, self.resources)
     }
+}
+
+/// How many descriptors this process currently holds that name a `pidfd`.
+///
+/// Counted by the symlink every `/proc/self/fd` entry points at, so only a kernel-delivered writer reference
+/// is visible here — no other test in this crate opens a `pidfd`, which is what makes the count a sound signal
+/// in a suite that runs its cases on parallel threads. A process-wide descriptor total would not be: another
+/// case's memfd, open mid-flight, would move it.
+#[cfg(all(test, target_os = "linux"))]
+fn pidfd_descriptors() -> usize {
+    let Ok(entries) = std::fs::read_dir("/proc/self/fd") else {
+        return usize::MAX;
+    };
+    entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            std::fs::read_link(entry.path())
+                .map(|target| target.to_string_lossy().contains("pidfd"))
+                .unwrap_or(false)
+        })
+        .count()
+}
+
+/// The one ordering `Socket` cannot get wrong, measured rather than documented: `SO_PASSPIDFD` and the widened
+/// control buffer are a single change, and a receipt read has to take the `pidfd` the kernel hands it.
+///
+/// Two claims, read off the same armed endpoint. A frame too short to pass the grammar is refused *for the
+/// frame* — which only happens if the credentials survived the `recvmsg`, and a control buffer sized for
+/// credentials alone would have truncated the ancillary list once `SO_PASSPIDFD` added a second cmsg, discarding
+/// every one of them and producing a different error. And across 100 such reads no `pidfd` descriptor is left
+/// open: the reference the kernel delivers is taken into a `Writer` and closed when the read returns, which is
+/// what `ControlMessageOwned::Unknown` owning no `Drop` makes this file responsible for rather than the kernel.
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn an_armed_endpoint_reads_every_receipt_and_keeps_no_writers_descriptor() {
+    let (reader, writer) = Socket::pair().expect("a connected datagram pair");
+    reader.credit_writers().expect("name each writer");
+    reader.watch_writers().expect("deliver each writer's pidfd");
+
+    // A well-formed receipt read first, so the leak check below is not vacuous: it proves this endpoint really
+    // does receive a writer reference, which is the only thing there is to leak.
+    writer
+        .report("7,3,1,2")
+        .expect("send one well-formed receipt");
+    let (_, _, delivered) = reader
+        .read_receipt()
+        .expect("read the armed receipt the writer just put down");
+    assert!(
+        delivered.is_some(),
+        "the armed endpoint delivered no writer pidfd, so a flat descriptor count below would prove nothing"
+    );
+    drop(delivered);
+
+    let not_a_receipt = [0u8; 4];
+    let before = pidfd_descriptors();
+    for _ in 0..100 {
+        writer.datagram(&not_a_receipt, &[]).expect("send a frame");
+        let error = match reader.read_receipt() {
+            Ok(_) => panic!("a four-byte frame was read as a receipt"),
+            Err(error) => error,
+        };
+        assert!(
+            error.to_string().contains("malformed receipt header"),
+            "the armed read refused the receipt for the wrong reason ({error}); a control buffer that had \
+             truncated the ancillary list would report a missing writer, not the frame — the widening has to \
+             travel with the arming"
+        );
+    }
+    assert_eq!(
+        pidfd_descriptors(),
+        before,
+        "100 armed receipts grew this process's pidfd descriptors: each reference the kernel delivered has to \
+         be taken into a `Writer`, which closes it when the read returns, not dropped beside the message"
+    );
 }

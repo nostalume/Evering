@@ -13,10 +13,14 @@
 //!
 //! `Arrival` and `Death` are the two compositions that turn a witness into authority over a member, and
 //! this file holds only their shapes: the frame a receipt travels in is written by an `os` leg, and so is
-//! the credit the host puts beside it. `Death::witnessed` is the single place the two halves are compared,
-//! which makes the pid in a receipt the obligation no test here can catch — a `Death` assembled from a
-//! report the kernel did not credit to the process it reaped would mark a live member dead, and
-//! `Session::recover` would call that recovery.
+//! the credit the host puts beside it. `Death::witnessed` is where a receipt read from one process is
+//! compared with the exit of another, which is what makes the pid in a receipt an obligation no test here
+//! can catch — a `Death` assembled from a report the kernel did not credit to the process it reaped would
+//! mark a live member dead, and `Session::recover` would call that recovery. Its sibling
+//! `Death::credited` skips that comparison for a reason worth stating: its two halves leave one `recvmsg`
+//! — the report and the `pidfd` the kernel wrote beside it for the writer — so there is no second channel
+//! to reconcile, and what binds them is not a number a caller typed but the fact that neither half has a
+//! constructor a caller can reach.
 //!
 //! `Drop` has to reap a child nobody waited on. The suite covers waiting, killing and a spawn that
 //! failed, and it reaches the drop arm only sideways — a witness that outlives the supervisor whose
@@ -33,7 +37,7 @@ use std::env;
 
 #[cfg(target_os = "linux")]
 use std::{
-    os::fd::{FromRawFd, OwnedFd},
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     sync::Arc,
 };
 
@@ -552,19 +556,26 @@ impl Exit<'_> {
     }
 }
 
-/// One member of a region whose process is proven gone: an arrival the host credited, joined to the
-/// reaped exit of that same process.
+/// One member of a region whose process is proven gone: an arrival the host credited, joined to proof
+/// that the reporting process is gone — the reaped exit of a child, or the `pidfd` the kernel delivered
+/// beside a receipt for a writer nobody spawned.
 ///
 /// This is the evidence [`crate::Session::recover`] asks for, and it is the reason that call is safe
 /// where [`crate::Session::assume_dead`] is not: `assume_dead` takes an identity and asks the caller to
 /// know the process behind it can never touch the region again, while a `Death` carries that knowledge
-/// itself, assembled from two things the host answered for — who reported arriving, and who was reaped.
+/// itself, assembled from two things the host answered for — who reported arriving, and which process is
+/// gone.
 ///
-/// Neither half proves the other, which is why `witnessed` is the only entrance and why it compares the
-/// two pids rather than trusting either. A receipt read from one child and an exit taken from another
-/// name two different processes, and joining them would hand recovery authority over a member whose
-/// process is still standing — the one failure this type exists to make unrepresentable, and the reason
-/// there is no `Death::from_parts` for a caller to reach for.
+/// Neither half proves the other, which is why the two entrances each bind their halves differently.
+/// [`Death::witnessed`] compares a receipt's pid with a reaped child's because they arrive on two
+/// channels — the report through `recvmsg`, the exit through `wait` — and only a shared pid says they name
+/// one process. [`Death::credited`] gets its `Arrival` and `Writer` from the same `recvmsg`, so it does not
+/// re-run that comparison; it checks the two things that can still fail once a caller holds the halves
+/// apart: that the reference has actually gone, and that it names the same process the report was credited
+/// to. What neither lets a caller do is supply the halves as numbers — there is no `Death::from_parts`, and
+/// `Writer` has no public constructor — because a receipt read from one process joined to a reference for
+/// another would hand recovery authority over a member whose process is still standing, the one failure
+/// this type exists to make unrepresentable.
 ///
 /// ```compile_fail
 /// use evering::layout::RegionId;
@@ -601,12 +612,44 @@ impl Death {
         Ok(Self { arrival: *arrival })
     }
 
+    /// Join a kernel-credited arrival to the reference the kernel delivered for the process that wrote it.
+    ///
+    /// This is the entrance for a member that was introduced by meeting rather than launched, so there is
+    /// no `&Supervisor` and no `wait` here: [`crate::os::Attendance::introduction`] reads the receipt on a
+    /// rendezvous armed with `SO_PASSPIDFD`, and the kernel answers *in the same message* — the writer's
+    /// report and the writer's `pidfd` together. Because they leave one `recvmsg` and the kernel writes both
+    /// halves, there is no second channel whose pid could disagree, so this deliberately does not repeat
+    /// `witnessed`'s comparison. What it does require is the two facts that survive once a caller holds an
+    /// `Arrival` and a `Writer` as separate public arguments — that the process the `Writer` names is gone
+    /// (`writer.gone()`), and that it is the process the report was credited to (`writer.pid()` against
+    /// `arrival.pid`). Without them, the seam's forbidden outcome — recovery authority over a member whose
+    /// process still stands — would become reachable by pairing one introduction's `Writer` with another's
+    /// `Arrival`. This is answered after the writer exits and before it is reaped: `writer.pid()` reads the
+    /// number the kernel still records for an unreaped process, so a death already collected by another route
+    /// is [`Death::witnessed`]'s to build, not this one's.
+    #[cfg(target_os = "linux")]
+    pub fn credited(arrival: &Arrival, writer: &Writer) -> io::Result<Self> {
+        if !writer.gone()? {
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "the process this writer names has not exited",
+            ));
+        }
+        if writer.pid()? != arrival.pid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "the arrival was reported by a process other than the one the kernel credited",
+            ));
+        }
+        Ok(Self { arrival: *arrival })
+    }
+
     /// The region whose roster holds the member this death releases.
     pub fn region(&self) -> RegionId {
         self.arrival.region
     }
 
-    /// The exact slot and generation that is no longer reachable by anybody.
+    /// The exact slot and generation whose process this death proves gone.
     pub fn peer(&self) -> Peer {
         self.arrival.member
     }
@@ -626,6 +669,99 @@ impl Exited {
         match &self.witness {
             Witness::Process(fd) => Some(fd),
             Witness::Recorded => None,
+        }
+    }
+}
+
+/// The writer of a receipt, as the kernel named it at delivery: a `pidfd` it handed over beside the
+/// message, not a number this process chose with `pidfd_open`.
+///
+/// This is `Death`'s second acquisition route. [`Supervisor::exited`] can only witness a process this
+/// supervisor spawned, and a bare `pidfd_open` names a process by a number a live process may already hold
+/// and may be reused for; a `Writer` arrives already bound to whoever the kernel credited with the receipt,
+/// so it can witness a member that was introduced by meeting rather than by being launched. It has no
+/// public constructor — only `os::unix` builds one, from the `SCM_PIDFD` ancillary descriptor the kernel
+/// wrote — because every argument [`Death::credited`] declines to compare rests on a `Writer` being an
+/// unforgeable reference the kernel installed, not one a caller pointed at a process of its choosing.
+///
+/// ```compile_fail
+/// use std::os::fd::OwnedFd;
+/// use evering::process::Writer;
+///
+/// // A `Writer` comes only from the kernel, beside a receipt; a descriptor cannot be promoted into one.
+/// fn forged(fd: OwnedFd) -> Writer {
+///     Writer::received(fd)
+/// }
+/// ```
+#[cfg(target_os = "linux")]
+pub struct Writer(Arc<OwnedFd>);
+
+#[cfg(target_os = "linux")]
+impl Writer {
+    /// Wrap the `pidfd` the kernel delivered as a receipt's writer. The only caller is `os::unix`'s receipt
+    /// read, which reaches it out of the `SCM_PIDFD` cmsg; nothing else in this process holds it, so it is
+    /// taken as owned here.
+    pub(crate) fn received(fd: OwnedFd) -> Self {
+        Self(Arc::new(fd))
+    }
+
+    /// Whether the process this reference names has exited, without consuming the readiness.
+    ///
+    /// A `pidfd` turns readable the instant its process is gone and stays readable after that, so `poll`ing
+    /// it with no timeout answers the question a second time as well as the first — which is what lets the
+    /// same `Writer` both prove a death to [`Death::credited`] and park a task on [`Writer::witness`].
+    /// Nothing drains the descriptor; readiness is the whole report.
+    pub fn gone(&self) -> io::Result<bool> {
+        let mut watched = [nix::poll::PollFd::new(
+            self.0.as_fd(),
+            nix::poll::PollFlags::POLLIN,
+        )];
+        match nix::poll::poll(&mut watched, nix::poll::PollTimeout::from(0u16)) {
+            Ok(_) => Ok(watched[0]
+                .revents()
+                .is_some_and(|flags| flags.intersects(nix::poll::PollFlags::POLLIN))),
+            // An interrupted park is not an answer about the process; it is retried by the next call.
+            Err(nix::errno::Errno::EINTR) => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    /// The process number the kernel recorded for this reference, read from its `fdinfo` entry.
+    ///
+    /// A `Writer` is not trusted for this field — the reference itself is what carries the authority — but it
+    /// lets the same death be shown `PartialEq` to one `witnessed` from a reaped child, and the number is one
+    /// the kernel chose at delivery rather than looked up after the fact. It is recorded only while the writer
+    /// is unreaped: the `fdinfo` entry keeps naming the process from its exit up to the moment somebody
+    /// collects it, and drops the number afterward, which is why `Death::credited` is a check on a death that
+    /// has happened and not yet been reaped — a death already reaped is `Death::witnessed`'s to compose.
+    pub fn pid(&self) -> io::Result<u32> {
+        use std::io::Read;
+        let path = format!("/proc/self/fdinfo/{}", self.0.as_raw_fd());
+        let mut text = String::new();
+        std::fs::File::open(&path)?.read_to_string(&mut text)?;
+        for line in text.lines() {
+            if let Some(rest) = line.strip_prefix("Pid:") {
+                return rest.trim().parse::<u32>().map_err(|_| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "the pidfd's fdinfo entry names no process",
+                    )
+                });
+            }
+        }
+        Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no Pid field in the pidfd's fdinfo entry",
+        ))
+    }
+
+    /// Hand this reference to the waiting lane, which parks a task until the writer is gone.
+    ///
+    /// [`crate::runtime`] already waits on exactly this descriptor shape — the `pidfd` `Supervisor::exited`
+    /// builds — so an introduced member's death is waited on with no new machinery there.
+    pub fn witness(&self) -> Exited {
+        Exited {
+            witness: Witness::Process(self.0.clone()),
         }
     }
 }
