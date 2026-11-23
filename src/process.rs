@@ -49,10 +49,11 @@ pub const MAX_RESOURCES: usize = 8;
 ///
 /// Published as data rather than kept as a writer's private constant, because a process written
 /// without this crate answers an offer in the same bytes, and until now the only place to read the
-/// four of them was `src`. Two things this is not: the width the tag sits in and the fields after it
-/// are still the layout publication's to make, and the tag is a collision test between two frame
-/// kinds, not a version a receiver negotiates. `tests/handover_attestation/labels.rs` pins both
-/// labels apart, so changing one fails a leg before it changes the wire.
+/// four of them was `src`. What it sits in is published beside it — [`FRAME_HEADER`] and the three
+/// offsets — so the tag is no longer the only readable half of a frame. One thing this is not: the tag
+/// is a collision test between two frame kinds, not a version a receiver negotiates.
+/// `tests/handover_attestation/labels.rs` pins both labels apart and pins the front's width, so
+/// changing one fails a leg before it changes the wire.
 pub const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 
 /// The tag a child's arrival receipt starts with, on the rendezvous it was granted.
@@ -60,14 +61,72 @@ pub const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 /// A second tag rather than `EVR1` with a new field or a zero resource count, because the two frames
 /// answer different questions: the offer says what the parent is giving, and the receipt says what the
 /// child became. A reader that could accept either would take a receipt as an offer with no resources,
-/// and the difference is the one thing the seam has to keep apart. Same header width, same two length
-/// fields, so the grammar a receiver refuses with stays the one `Introduction::announced` already
-/// defines — which is what lets a scribbled receipt be refused as the text it is.
+/// and the difference is the one thing the seam has to keep apart. The same [`FRAME_HEADER`] front with
+/// the same two count fields, so the grammar a receiver refuses with stays the one
+/// `Introduction::announced` already defines — which is what lets a scribbled receipt be refused as
+/// the text it is.
 ///
 /// Published beside [`HANDOFF_MAGIC`], and no longer gated on the host: what a receipt begins with is
 /// the same on every platform that runs this protocol, and the platform's own choice is how the frame
 /// is delivered.
 pub const ARRIVAL_MAGIC: [u8; 4] = *b"EVA1";
+
+/// The width of the fixed front both frame kinds carry, published beside the two tags.
+///
+/// A tag alone does not let a process written without this crate read a frame: knowing a receipt begins
+/// with `EVA1` says nothing about where its text starts. The front is this many bytes, and
+/// [`FRAME_TAG`], [`FRAME_LEN`] and [`FRAME_COUNT`] say what occupies them, so the payload begins at
+/// `FRAME_HEADER` and the two counts a receiver guards it with are readable at a stated offset rather
+/// than inferred from a reader's habit. The counts are little-endian `u16`s, which is why
+/// [`MAX_BOOTSTRAP`] and [`MAX_RESOURCES`] are the bounds they are.
+pub const FRAME_HEADER: usize = 8;
+/// Where the four tag bytes sit inside the front: [`FRAME_HEADER`] bytes, no more and no less.
+pub const FRAME_TAG: core::ops::Range<usize> = 0..4;
+/// Where the bootstrap length sits, as two little-endian bytes.
+pub const FRAME_LEN: core::ops::Range<usize> = 4..6;
+/// Where the resource count sits, as two little-endian bytes. Zero says a receipt travels alone.
+pub const FRAME_COUNT: core::ops::Range<usize> = 6..8;
+
+const _: () = assert!(
+    FRAME_TAG.end == FRAME_LEN.start
+        && FRAME_LEN.end == FRAME_COUNT.start
+        && FRAME_COUNT.end == FRAME_HEADER,
+    "the three published offsets have to tile the published width, or a porter reading them lands \
+     outside the front"
+);
+
+/// Assemble a frame's front: the tag the receiver compares, then the two counts it guards.
+///
+/// Both host writers go through this, because the two of them hand-rolling the same eight bytes is how
+/// a wire agreement stops being one agreement: a frame never crosses from one host's writer to the
+/// other's reader, so nothing but a shared owner can tell the two apart.
+pub(crate) fn stamp_front(
+    tag: [u8; 4],
+    bootstrap_len: usize,
+    resources: usize,
+) -> [u8; FRAME_HEADER] {
+    debug_assert!(
+        bootstrap_len <= MAX_BOOTSTRAP && resources <= MAX_RESOURCES,
+        "the front carries both counts as `u16`, and the published bounds sit far inside that"
+    );
+    let mut front = [0; FRAME_HEADER];
+    front[FRAME_TAG].copy_from_slice(&tag);
+    front[FRAME_LEN].copy_from_slice(&(bootstrap_len as u16).to_le_bytes());
+    front[FRAME_COUNT].copy_from_slice(&(resources as u16).to_le_bytes());
+    front
+}
+
+/// Read a frame's front, refusing bytes too short to have one or begun with the other kind's tag.
+///
+/// One answer for both entrances, and the caller turns `None` into the sentence its own seam reports.
+pub(crate) fn read_front(tag: [u8; 4], bytes: &[u8]) -> Option<(usize, usize)> {
+    if bytes.len() < FRAME_HEADER || bytes[FRAME_TAG] != tag {
+        return None;
+    }
+    let bootstrap = u16::from_le_bytes(bytes[FRAME_LEN].try_into().ok()?);
+    let resources = u16::from_le_bytes(bytes[FRAME_COUNT].try_into().ok()?);
+    Some((bootstrap as usize, resources as usize))
+}
 
 /// The one key by which a granted rendezvous is announced to the process it was granted to.
 ///
@@ -564,13 +623,24 @@ impl Exit<'_> {
 /// Neither half proves the other, which is why the two entrances each bind their halves differently.
 /// [`Death::witnessed`] compares a receipt's pid with a reaped child's because they arrive on two
 /// channels — the report through `recvmsg`, the exit through `wait` — and only a shared pid says they name
-/// one process. [`Death::credited`] gets its `Arrival` and `Writer` from the same `recvmsg`, so it does not
-/// re-run that comparison; it checks the two things that can still fail once a caller holds the halves
-/// apart: that the reference has actually gone, and that it names the same process the report was credited
-/// to. What neither lets a caller do is supply the halves as numbers — there is no `Death::from_parts`, and
-/// `Writer` has no public constructor — because a receipt read from one process joined to a reference for
-/// another would hand recovery authority over a member whose process is still standing, the one failure
-/// this type exists to make unrepresentable.
+/// one process.
+#[cfg_attr(
+    target_os = "linux",
+    doc = " [`Death::credited`] gets its `Arrival` and `Writer` from the same `recvmsg`, so it does not \
+           re-run that comparison; it checks the two things that can still fail once a caller holds the \
+           halves apart: that the reference has actually gone, and that it names the same process the \
+           report was credited to."
+)]
+#[cfg_attr(
+    not(target_os = "linux"),
+    doc = " The other entrance, `Death::credited`, is Linux's own: it joins a report to the `pidfd` the \
+           kernel wrote beside it, so it exists only where the kernel will hand over such a reference, and \
+           on this host a `Death` is assembled the one way above."
+)]
+/// What neither lets a caller do is supply the halves as numbers — there is no `Death::from_parts`, and
+/// the reference type has no public constructor — because a receipt read from one process joined to a
+/// reference for another would hand recovery authority over a member whose process is still standing, the
+/// one failure this type exists to make unrepresentable.
 ///
 /// ```compile_fail
 /// use evering::layout::RegionId;

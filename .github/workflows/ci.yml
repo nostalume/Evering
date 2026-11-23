@@ -107,6 +107,12 @@ jobs:
           toolchain: 1.100.0
           components: rustfmt, clippy
       - run: cargo test --features os,tokio,tracing
+      # The doc surface is gated on this arm too, not only on Linux. `Death::credited` is a Linux-only
+      # entrance, so an intra-doc link that resolves in the linux job's docs is a broken link on the host
+      # whose readers get no docs at all — and the rows above compile code, which cannot see a doc link.
+      - name: the documented surface builds without warnings
+        shell: bash
+        run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
       # The four example runs, on the arm whose code they take: the rendezvous here is a pipe name rather
       # than a descriptor number, and the death witness is written for Linux alone, so this host is the one
       # that would otherwise carry an unexecuted example. The accepted codes of the last row are explained

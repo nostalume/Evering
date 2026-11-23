@@ -51,15 +51,16 @@ use nix::{
     sys::socket::{UnixCredentials, setsockopt},
 };
 
-use crate::process::{Bootstrap, MAX_BOOTSTRAP, MAX_RESOURCES};
+use crate::process::{
+    ARRIVAL_MAGIC, Bootstrap, FRAME_HEADER as HEADER, HANDOFF_MAGIC, MAX_BOOTSTRAP, MAX_RESOURCES,
+    read_front, stamp_front,
+};
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 use crate::process::Introduction;
 
 #[cfg(target_os = "linux")]
 use crate::process::Writer;
-
-const HEADER: usize = 8;
 
 /// The `SOL_SOCKET` cmsg type that carries the ancillary `pidfd` `SO_PASSPIDFD` delivers beside a credited
 /// receipt. `nix` 0.30.1 decodes no cmsg of this type, so it surfaces as `ControlMessageOwned::Unknown` and
@@ -249,9 +250,11 @@ impl Socket {
             ));
         }
         let mut bytes = Vec::with_capacity(HEADER + bootstrap.as_ref().len());
-        bytes.extend_from_slice(&crate::process::HANDOFF_MAGIC);
-        bytes.extend_from_slice(&(bootstrap.as_ref().len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&(resources.len() as u16).to_le_bytes());
+        bytes.extend_from_slice(&stamp_front(
+            HANDOFF_MAGIC,
+            bootstrap.as_ref().len(),
+            resources.len(),
+        ));
         bytes.extend_from_slice(bootstrap.as_ref());
         let raw: Vec<_> = resources.iter().map(AsRawFd::as_raw_fd).collect();
         self.datagram(&bytes, &raw)
@@ -300,9 +303,7 @@ impl Socket {
             ));
         }
         let mut bytes = Vec::with_capacity(HEADER + announcement.len());
-        bytes.extend_from_slice(&crate::process::ARRIVAL_MAGIC);
-        bytes.extend_from_slice(&(announcement.len() as u16).to_le_bytes());
-        bytes.extend_from_slice(&0u16.to_le_bytes());
+        bytes.extend_from_slice(&stamp_front(ARRIVAL_MAGIC, announcement.len(), 0));
         bytes.extend_from_slice(announcement.as_bytes());
         self.datagram(&bytes, &[])
     }
@@ -418,11 +419,8 @@ impl Socket {
         let credentials = credited.ok_or_else(|| {
             invalid("the receipt arrived with no answer about the process that wrote it")
         })?;
-        if count < HEADER || bytes[..4] != crate::process::ARRIVAL_MAGIC {
-            return Err(invalid("malformed receipt header"));
-        }
-        let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        let declared = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+        let (len, declared) = read_front(ARRIVAL_MAGIC, &bytes[..count])
+            .ok_or_else(|| invalid("malformed receipt header"))?;
         if len > MAX_BOOTSTRAP || count != HEADER + len || declared != 0 {
             return Err(invalid("malformed receipt length"));
         }
@@ -501,11 +499,8 @@ impl Socket {
         let credentials = credited.ok_or_else(|| {
             invalid("the receipt arrived with no answer about the process that wrote it")
         })?;
-        if count < HEADER || bytes[..4] != crate::process::ARRIVAL_MAGIC {
-            return Err(invalid("malformed receipt header"));
-        }
-        let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        let declared = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+        let (len, declared) = read_front(ARRIVAL_MAGIC, &bytes[..count])
+            .ok_or_else(|| invalid("malformed receipt header"))?;
         if len > MAX_BOOTSTRAP || count != HEADER + len || declared != 0 {
             return Err(invalid("malformed receipt length"));
         }
@@ -548,11 +543,8 @@ impl Socket {
         if flags.intersects(MsgFlags::MSG_TRUNC | MsgFlags::MSG_CTRUNC) {
             return Err(invalid("truncated control datagram"));
         }
-        if count < HEADER || bytes[..4] != crate::process::HANDOFF_MAGIC {
-            return Err(invalid("malformed control header"));
-        }
-        let len = u16::from_le_bytes([bytes[4], bytes[5]]) as usize;
-        let declared = u16::from_le_bytes([bytes[6], bytes[7]]) as usize;
+        let (len, declared) = read_front(HANDOFF_MAGIC, &bytes[..count])
+            .ok_or_else(|| invalid("malformed control header"))?;
         if len > MAX_BOOTSTRAP || count != HEADER + len {
             return Err(invalid("malformed bootstrap length"));
         }

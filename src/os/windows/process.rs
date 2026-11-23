@@ -57,9 +57,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::process::{Bootstrap, Introduction, MAX_BOOTSTRAP, MAX_RESOURCES, Supervisor};
-
-const HEADER: usize = 8;
+use crate::process::{
+    ARRIVAL_MAGIC, Bootstrap, FRAME_HEADER as HEADER, HANDOFF_MAGIC, Introduction, MAX_BOOTSTRAP,
+    MAX_RESOURCES, Supervisor, read_front, stamp_front,
+};
 const MAX_MESSAGE: usize = HEADER + MAX_BOOTSTRAP + MAX_RESOURCES * size_of::<usize>();
 static NEXT_PIPE: AtomicU64 = AtomicU64::new(0);
 
@@ -228,9 +229,11 @@ impl Socket {
         let mut message = Vec::with_capacity(
             HEADER + bootstrap.as_ref().len() + remote.len() * size_of::<usize>(),
         );
-        message.extend_from_slice(&crate::process::HANDOFF_MAGIC);
-        message.extend_from_slice(&(bootstrap.as_ref().len() as u16).to_le_bytes());
-        message.extend_from_slice(&(remote.len() as u16).to_le_bytes());
+        message.extend_from_slice(&stamp_front(
+            HANDOFF_MAGIC,
+            bootstrap.as_ref().len(),
+            remote.len(),
+        ));
         message.extend_from_slice(bootstrap.as_ref());
         for handle in &remote {
             message.extend_from_slice(&(*handle as usize).to_le_bytes());
@@ -271,9 +274,7 @@ impl Socket {
             ));
         }
         let mut message = Vec::with_capacity(HEADER + announcement.len());
-        message.extend_from_slice(&crate::process::ARRIVAL_MAGIC);
-        message.extend_from_slice(&(announcement.len() as u16).to_le_bytes());
-        message.extend_from_slice(&0u16.to_le_bytes());
+        message.extend_from_slice(&stamp_front(ARRIVAL_MAGIC, announcement.len(), 0));
         message.extend_from_slice(announcement.as_bytes());
         self.write(&message)
     }
@@ -371,11 +372,8 @@ impl Socket {
             });
         }
         let read = read as usize;
-        if read < HEADER || message[..4] != crate::process::ARRIVAL_MAGIC {
-            return Err(invalid("malformed receipt header"));
-        }
-        let len = u16::from_le_bytes([message[4], message[5]]) as usize;
-        let declared = u16::from_le_bytes([message[6], message[7]]) as usize;
+        let (len, declared) = read_front(ARRIVAL_MAGIC, &message[..read])
+            .ok_or_else(|| invalid("malformed receipt header"))?;
         if len > MAX_BOOTSTRAP || read != HEADER + len || declared != 0 {
             return Err(invalid("malformed receipt length"));
         }
@@ -406,11 +404,8 @@ impl Socket {
             return Err(io::Error::last_os_error());
         }
         let read = read as usize;
-        if read < HEADER || message[..4] != crate::process::HANDOFF_MAGIC {
-            return Err(invalid("malformed control header"));
-        }
-        let len = u16::from_le_bytes([message[4], message[5]]) as usize;
-        let declared = u16::from_le_bytes([message[6], message[7]]) as usize;
+        let (len, declared) = read_front(HANDOFF_MAGIC, &message[..read])
+            .ok_or_else(|| invalid("malformed control header"))?;
         if len > MAX_BOOTSTRAP || declared > MAX_RESOURCES {
             return Err(invalid("control bounds exceeded"));
         }
