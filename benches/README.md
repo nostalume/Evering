@@ -290,6 +290,15 @@ beside the first; the entries come from `strace -f -yy -e signal=none` over ten
 `smoke local-ipc-unix` runs with `EVERING_MARKER_DIRECTORY` set, read by the
 phase-marker counter retained from the stage 0.3c counting work.
 
+That instrument is Linux's, and this paragraph is here to keep the claim inside
+what it measures. The Windows arm is covered by the behavior its legs execute —
+the same descriptor refused with the same words, the same receipt read off a pipe
+instance — and no entry count is offered for it. The reason is not that counting
+there is hard: a library-side call counter would be cheap, and would say how many
+times evering asked rather than how many times the kernel answered. Putting the
+two under one name would weaken the bounded attribution above rather than extend
+it, so the estimand stays where the instrument is.
+
 ## Robustness and validity
 
 The comparison admits a performance value only when:
