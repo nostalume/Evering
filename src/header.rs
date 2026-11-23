@@ -478,7 +478,8 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
                     if let Some(field) = unsafe { Self::mismatch_at(pointer, &conf, ctx) } {
                         return Err(AdmitError::Mismatch(field));
                     }
-                    let mut membership = unsafe { Self::claim(pointer, slot) }?;
+                    let members = unsafe { &*ptr::addr_of!((*pointer).members) };
+                    let mut membership = Self::claim(members, slot)?;
                     return match T::attach(unsafe { &*ptr::addr_of!((*pointer).inner) }, &conf) {
                         Status::Initialized => {
                             membership.disarm();
@@ -527,8 +528,11 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
 }
 
 impl<T: Layout> RcHeader<T> {
-    unsafe fn claim(pointer: *mut Self, slot: Option<u8>) -> Result<Membership, AdmitError> {
-        let members = unsafe { &*ptr::addr_of!((*pointer).members) };
+    /// Seat a member in the word `members` names, or refuse with the cause that says why.
+    ///
+    /// The caller reaches the word, so the refusals here are decisions about its bits — closed,
+    /// already seated, or contested — and the guard carries the same borrow back out.
+    fn claim<'a>(members: &'a AtomicUsize, slot: Option<u8>) -> Result<Membership<'a>, AdmitError> {
         let Some(slot) = slot else {
             return Ok(Membership::new(members, 0));
         };
@@ -610,13 +614,18 @@ impl<T: Layout> RcHeader<T> {
     }
 }
 
-struct Membership {
-    members: *const AtomicUsize,
+/// A member bit this process holds in one header's member word, discharged when the guard goes
+/// away. It borrows the word rather than recording its address, which is what [`InitClaim`] does
+/// for the status byte beside it: the clear in `Drop` is reached through the same borrow the claim
+/// was made against, so a guard cannot outlive the header it seated into and restates a bit in
+/// bytes no other path is naming.
+struct Membership<'a> {
+    members: &'a AtomicUsize,
     bit: usize,
 }
 
-impl Membership {
-    const fn new(members: &AtomicUsize, bit: usize) -> Self {
+impl<'a> Membership<'a> {
+    const fn new(members: &'a AtomicUsize, bit: usize) -> Self {
         Self { members, bit }
     }
 
@@ -625,10 +634,10 @@ impl Membership {
     }
 }
 
-impl Drop for Membership {
+impl Drop for Membership<'_> {
     fn drop(&mut self) {
         if self.bit != 0 {
-            unsafe { &*self.members }.fetch_and(!self.bit, Ordering::AcqRel);
+            self.members.fetch_and(!self.bit, Ordering::AcqRel);
         }
     }
 }
@@ -689,17 +698,39 @@ impl AdmitLayout for () {
 }
 
 pub(crate) const PARTICIPANT_CAPACITY: usize = usize::BITS as usize - 1;
-const MEMBER_STATE_BITS: usize = 3;
-const MEMBER_STATE_MASK: usize = (1 << MEMBER_STATE_BITS) - 1;
-const MEMBER_FREE: usize = 0;
-const MEMBER_LIVE: usize = 1;
-const MEMBER_DEAD: usize = 2;
-const MEMBER_RETIRED: usize = 3;
-const MEMBER_RESERVED: usize = 4;
-const MEMBER_GENERATION_MAX: usize = usize::MAX >> MEMBER_STATE_BITS;
 
-// Five states in three bits: 5, 6 and 7 stay unused, and the freeze is what makes taking one of them
-// a deliberate act — a further state has to be said so here before the word will hold it.
+/// How a root's member word is cut, published because a process joining a region without this crate
+/// has to write that word the same way. The low `MEMBER_STATE_BITS` hold one of the five states
+/// below and the rest hold the member's generation, so a word is
+/// `(generation << MEMBER_STATE_BITS) | state` and the two halves separate with
+/// `MEMBER_STATE_MASK`. This is the same kind of fact as
+/// [`crate::mapping::REGION_ALIGN`], published for the same reason.
+///
+/// The width is a `usize` because one member is one atomic, which makes the generation's ceiling
+/// target-dependent: [`MEMBER_GENERATION_MAX`] is where a claim is refused rather than wrapped.
+/// Five states in three bits leaves 5, 6 and 7 unassigned, and the freeze below is what makes
+/// taking one of them a deliberate act — a further state has to be said so here before the word
+/// will hold it. `tests/portable_contracts/member_word.rs` pins every number here as published.
+pub const MEMBER_STATE_BITS: usize = 3;
+/// The mask over the state half of a member word.
+pub const MEMBER_STATE_MASK: usize = (1 << MEMBER_STATE_BITS) - 1;
+/// The largest generation a member word holds.
+pub const MEMBER_GENERATION_MAX: usize = usize::MAX >> MEMBER_STATE_BITS;
+/// No process holds the member: what a fresh word holds, and what a released seat or a promise no
+/// arrival filled returns to.
+pub const MEMBER_FREE: usize = 0;
+/// The member's process stands.
+pub const MEMBER_LIVE: usize = 1;
+/// That process is gone, in the generation the word still names.
+pub const MEMBER_DEAD: usize = 2;
+/// A reap settled the member and kept its generation, so evidence older than the reap still
+/// resolves to the member it named.
+pub const MEMBER_RETIRED: usize = 3;
+/// A parent promised this member a seat, and no arrival has filled the promise yet.
+pub const MEMBER_RESERVED: usize = 4;
+
+// Five states in three bits, stated once more as a compile-time fact than the docs above claim: 5, 6
+// and 7 stay unused until a line here says otherwise.
 const _: () = assert!(MEMBER_RESERVED == 4 && MEMBER_RESERVED + 1 < 1 << MEMBER_STATE_BITS);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

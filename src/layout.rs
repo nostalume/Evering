@@ -1,8 +1,9 @@
 //! The one address for what a type claims to be: `Layout`, `RcHeader`, `Magic`, `Status`,
-//! `AbiProfile` and the recovery types from `header`, `Repr` from `msg`, the schema and region keys
-//! from `schema`, `Shape` from `token`, plus `recovery_handler`, which is how a caller mints the
-//! handler `Recovery::reap_with` matches against. Those four modules are private, so this is where
-//! their vocabulary is published; nothing here is a second name for something the root already holds.
+//! `AbiProfile`, the recovery types and the cut of a member word from `header`, `Repr` from `msg`, the
+//! schema and region keys from `schema`, `Shape` from `token`, plus `recovery_handler`, which is how a
+//! caller mints the handler `Recovery::reap_with` matches against. Those four modules are private, so
+//! this is where their vocabulary is published; nothing here is a second name for something the root
+//! already holds.
 //!
 //! A handler is frozen against `AbiProfile::NATIVE` when it is made, and recovery compares against
 //! what a member's header recorded rather than what the caller expects. Bumping a revision while
@@ -10,6 +11,13 @@
 //! refused, but nothing checks the other direction, and the profile itself is target-dependent.
 pub use crate::header::{
     AbiProfile, Layout, Magic, RcHeader, RecoveryContext, RecoveryHandler, Status,
+};
+// The member word's cut as published data rather than as a header internal: a process that joins a
+// region without this crate writes that word, and the numbers it has to match were only readable in
+// `src`. `tests/portable_contracts/member_word.rs` pins them.
+pub use crate::header::{
+    MEMBER_DEAD, MEMBER_FREE, MEMBER_GENERATION_MAX, MEMBER_LIVE, MEMBER_RESERVED, MEMBER_RETIRED,
+    MEMBER_STATE_BITS, MEMBER_STATE_MASK,
 };
 pub use crate::msg::Repr;
 // The two keys a caller can defend are derived, not typed in: `SchemaId(pub u64)` accepts any

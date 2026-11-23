@@ -222,6 +222,13 @@ struct Class {
 }
 
 impl Class {
+    /// The address of `slot`'s authority word: a location inside the region rather than one of
+    /// this struct's fields, since the control array is laid out by [`Geometry`] and reached from
+    /// the base its mapping's owner holds. This is the only spelling of that arithmetic.
+    ///
+    /// [`PoolRef::control`], [`RecoveryContext::control`] and [`RcHeader::control`] are what turn
+    /// the address into a borrow, and each states the claim that bounds how long the word may be
+    /// used. [`Storage::init`] is the only writer of a raw one, while no word yet holds a state.
     fn control(self, base: *const u8, slot: usize) -> *const AtomicU32 {
         base.wrapping_add(self.controls)
             .cast::<AtomicU32>()
@@ -230,6 +237,32 @@ impl Class {
 
     fn payload(self, base: *mut u8, slot: usize) -> *mut u8 {
         base.wrapping_add(self.payload + slot * self.bytes)
+    }
+}
+
+/// The authority words of a region settled by a reap, which reaches the pool as a
+/// [`RecoveryContext`] rather than as a live handle.
+impl RecoveryContext<'_, Storage> {
+    /// `slot`'s word in the region this context names.
+    ///
+    /// Settling a dead participant's ownership holds the mapping only for the call, so the borrow
+    /// is the context's and not a lifetime a caller picks: a word restated here cannot be carried
+    /// out of the reap that restated it.
+    fn control(&self, class: Class, slot: usize) -> &AtomicU32 {
+        unsafe { &*class.control(self.base, slot) }
+    }
+}
+
+/// The authority words of a region named by the header that fronts it, which is how the transfer
+/// arms reach a pool they hold no handle for.
+impl RcHeader<Storage> {
+    /// `slot`'s word in the region whose header this is.
+    ///
+    /// A control array begins at the region's base, and the region's base is where its header
+    /// sits, so the header's own borrow bounds the word — the same proof [`Storage::recover`] owes
+    /// when it holds a [`RecoveryContext`] instead.
+    fn control(&self, class: Class, slot: usize) -> &AtomicU32 {
+        unsafe { &*class.control(core::ptr::from_ref(self).cast(), slot) }
     }
 }
 
@@ -435,7 +468,7 @@ unsafe impl header::Layout for Storage {
         };
         for class in geometry.classes.iter() {
             for slot in 0..class.slots {
-                let control = unsafe { &*class.control(context.base, slot) };
+                let control = context.control(*class, slot);
                 let mut raw = control.load(Ordering::Acquire);
                 loop {
                     let state = State(raw);
@@ -556,6 +589,16 @@ unsafe impl Send for PoolRef<'_> {}
 unsafe impl Sync for PoolRef<'_> {}
 
 impl<'p> PoolRef<'p> {
+    /// `slot`'s authority word in `class`, as a borrow of the mapping this handle holds.
+    ///
+    /// Every allocation, release and transfer read or restatement of a control word goes through
+    /// here, so the one address-to-borrow step in the live path is checked in one place: the
+    /// mapping outlives `'p`, `&self` is shorter than `'p`, and a word reached through a handle
+    /// cannot outlive the handle that named it.
+    fn control(&self, class: Class, slot: usize) -> &AtomicU32 {
+        unsafe { &*class.control(self.base.as_ptr(), slot) }
+    }
+
     pub fn reserve<T: Repr>(&self) -> Result<Vacant<'p, T>, DeclineCause> {
         let () = T::VALID;
         self.claim(AllocLayout::new::<T>())
@@ -639,7 +682,7 @@ impl<'p> PoolRef<'p> {
             let start = index.wrapping_mul(0x9e37) % class.slots;
             for probe in 0..class.slots {
                 let slot = (start + probe) % class.slots;
-                let control = unsafe { &*class.control(self.base.as_ptr(), slot) };
+                let control = self.control(*class, slot);
                 let free = State(control.load(Ordering::Acquire));
                 if !free.canonical() {
                     // Owner bits with the allocation bit clear: `State` has no constructor that
@@ -692,13 +735,13 @@ impl<'p> PoolRef<'p> {
     #[cfg(test)]
     pub(crate) fn corrupt_authority_word_for_test(&self, class: usize, slot: usize) {
         let class = self.geometry.classes[class];
-        let control = unsafe { &*class.control(self.base.as_ptr(), slot) };
+        let control = self.control(class, slot);
         control.store(State(1).0, Ordering::Relaxed);
     }
 
     fn release(self, class: usize, slot: usize, generation: u32) {
         let class = self.geometry.classes[class];
-        let control = unsafe { &*class.control(self.base.as_ptr(), slot) };
+        let control = self.control(class, slot);
         let local = State::local(generation, self.owner.slot()).unwrap();
         let released = control.compare_exchange(
             local.0,
@@ -772,7 +815,7 @@ impl<'p> PoolRef<'p> {
         if token.span.slot >= class.slots {
             return Err(AdoptError::Span);
         }
-        let control = unsafe { &*class.control(self.base.as_ptr(), token.span.slot) };
+        let control = self.control(class, token.span.slot);
         let detached = State::detached(token.generation);
         let local = State::local(token.generation, self.owner.slot()).unwrap();
         control
@@ -812,7 +855,7 @@ impl<'p> Allocation<'p> {
             return Ok(());
         }
         let class = self.pool.geometry.classes[self.class];
-        let control = unsafe { &*class.control(self.pool.base.as_ptr(), self.slot) };
+        let control = self.pool.control(class, self.slot);
         let local = State::local(self.generation, self.pool.owner.slot()).unwrap();
         control
             .compare_exchange(
@@ -1049,8 +1092,7 @@ pub(crate) fn release_token<H: Repr>(
             if token.span.slot >= class.slots {
                 return false;
             }
-            let control =
-                unsafe { &*class.control(core::ptr::from_ref(header).cast(), token.span.slot) };
+            let control = header.control(*class, token.span.slot);
             let mut raw = control.load(Ordering::Acquire);
             loop {
                 let state = State(raw);

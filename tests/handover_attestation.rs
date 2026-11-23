@@ -8,7 +8,9 @@
 //! Which platform leg runs is the host's choice rather than a case's: `unix` reads the receipt off a field
 //! beside the datagram, `windows` off the pipe instance the child connected to, and each keeps its own account
 //! of what that difference buys — a departed child is something a pipe can report and a datagram pair cannot.
-//! `announcement` runs on both, since the same grant carries the promise either way.
+//! `announcement` runs on both, since the same grant carries the promise either way. `labels` runs on neither
+//! in particular: it asks only that the two tags a frame begins with are published from outside this crate and
+//! differ from each other, which is the one wire fact a porter used to have to copy out of `src`.
 //!
 //! The row asks for `os`. The platform term stays in the manifest's place because Cargo has no key for it, and
 //! saying it once at the root is what keeps a leg from looking like it compiled. The root also holds the
@@ -21,6 +23,8 @@ mod support;
 
 #[path = "handover_attestation/announcement.rs"]
 mod announcement;
+#[path = "handover_attestation/labels.rs"]
+mod labels;
 #[cfg(unix)]
 #[path = "handover_attestation/unix.rs"]
 mod unix;

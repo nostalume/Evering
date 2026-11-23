@@ -13,12 +13,23 @@
 //!
 //! What is deliberately not claimed here. That every shared field has an accessor: a field read
 //! only inside its own module needs none, and no spelling says whether another module reaches for
-//! it. And the words a pool or the heap computes from a base address, handed out as locations by
-//! signatures naming no atomic type, which the register below cannot see — `Class::control` is in it
-//! because its return type says `AtomicU32`, while `Queue::header` and `talc.rs`'s pointer
-//! arithmetic are not, and those are the seams the retirement work names. The floor in the first law
-//! is the vacuity guard: a count pinned to today would fail the day a field is added for a good
-//! reason, and a pattern that stopped matching would pass forever.
+//! it. And a word reached by address, since a signature appears below only if its return type names
+//! an atomic type: `Class::control` is registered because it says `AtomicU32`, while
+//! `Queue::header`, `Queue::buf` and `Talc::allocator` are not. Where this law is blind, the
+//! declaration carries the record, and the retirement work left each of those seams standing for its
+//! own reason. The pool's control array is now borrowed by the three owners that can name its
+//! region — a live handle, a recovery context mid-reap, the header that fronts it — and each states
+//! at its declaration whose claim bounds the borrow and how long it may be used. The heap's
+//! allocator state is borrowed only through `Talc::allocator`, which asks for the `Mutation` whose
+//! word was claimed and checks that identity itself. The queue record is still handed out whole, on
+//! purpose: the same two counters are read `Relaxed` where a slot is reserved and claimed, beside
+//! `SeqCst` fences and `SeqCst` compare-exchanges, and read `SeqCst` where a port asks whether the
+//! queue is empty, so closing that gap is a memory-model decision with registered entry ratios
+//! riding on it, not a change of spelling. `Mutation::owns`' `ptr::eq` on its own `state` is not a
+//! hand-out and owes nothing here: it is the proof that a guard claims the word it says it claims,
+//! which is why no accessor is expected in its place. The floor in the first law is the vacuity
+//! guard: a count pinned to today would fail the day a field is added for a good reason, and a
+//! pattern that stopped matching would pass forever.
 
 use std::{
     fs,
@@ -122,13 +133,21 @@ fn no_shared_field_is_visible_outside_the_module_declaring_it() {
 }
 
 /// The atom hand-outs as they stand, one entry per declaration. Adding a hand-out is allowed and is
-/// not free: it means editing this list, which is where the reason belongs. The pair is spelled
-/// twice for `src/queue.rs` because a trait method and the mock that implements it are two
-/// signatures reaching the same word.
-const REGISTERED: [(&str, &str); 6] = [
+/// not free: it means editing this list, whose length is the claim a reader checks. The pair for
+/// `src/queue.rs` is two spellings reaching one word: a trait method and the mock that implements
+/// it. The quartet for `src/pool.rs` is one control array: the address a slot of it is computed at,
+/// and the three owners — a live handle, a recovery context mid-reap, the region's header — that
+/// each borrow that address and say at their declarations whose claim bounds the borrow. The
+/// remaining three are the shape the rule asks for instead, each handing out a word its caller
+/// already borrows: a channel's lifecycle byte as a mapped field, a slab's `next` word as one of
+/// two arms, a root member's word as an array element.
+const REGISTERED: [(&str, &str); 9] = [
     ("src/channel.rs", "lifecycle"),
     ("src/dir.rs", "next"),
     ("src/header.rs", "member"),
+    ("src/pool.rs", "control"),
+    ("src/pool.rs", "control"),
+    ("src/pool.rs", "control"),
     ("src/pool.rs", "control"),
     ("src/queue.rs", "lifecycle"),
     ("src/queue.rs", "lifecycle"),

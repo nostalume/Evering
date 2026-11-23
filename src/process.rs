@@ -45,7 +45,15 @@ use crate::{mem::Peer, schema::RegionId};
 
 pub const MAX_BOOTSTRAP: usize = 4096;
 pub const MAX_RESOURCES: usize = 8;
-pub(crate) const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
+/// The tag a handoff offer starts with.
+///
+/// Published as data rather than kept as a writer's private constant, because a process written
+/// without this crate answers an offer in the same bytes, and until now the only place to read the
+/// four of them was `src`. Two things this is not: the width the tag sits in and the fields after it
+/// are still the layout publication's to make, and the tag is a collision test between two frame
+/// kinds, not a version a receiver negotiates. `tests/handover_attestation/labels.rs` pins both
+/// labels apart, so changing one fails a leg before it changes the wire.
+pub const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 
 /// The tag a child's arrival receipt starts with, on the rendezvous it was granted.
 ///
@@ -55,8 +63,11 @@ pub(crate) const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 /// and the difference is the one thing the seam has to keep apart. Same header width, same two length
 /// fields, so the grammar a receiver refuses with stays the one `Introduction::announced` already
 /// defines — which is what lets a scribbled receipt be refused as the text it is.
-#[cfg(all(feature = "process", any(unix, windows)))]
-pub(crate) const ARRIVAL_MAGIC: [u8; 4] = *b"EVA1";
+///
+/// Published beside [`HANDOFF_MAGIC`], and no longer gated on the host: what a receipt begins with is
+/// the same on every platform that runs this protocol, and the platform's own choice is how the frame
+/// is delivered.
+pub const ARRIVAL_MAGIC: [u8; 4] = *b"EVA1";
 
 /// The one key by which a granted rendezvous is announced to the process it was granted to.
 ///
@@ -283,22 +294,6 @@ impl AsRef<[u8]> for Bootstrap {
     fn as_ref(&self) -> &[u8] {
         &self.0
     }
-}
-
-#[cfg(test)]
-#[test]
-fn handoff_version_is_frozen() {
-    assert_eq!(HANDOFF_MAGIC, *b"EVR1");
-}
-
-#[cfg(all(test, feature = "process", any(unix, windows)))]
-#[test]
-fn a_receipt_frame_is_tagged_apart_from_the_offer_it_answers() {
-    assert_eq!(ARRIVAL_MAGIC, *b"EVA1");
-    assert_ne!(
-        ARRIVAL_MAGIC, HANDOFF_MAGIC,
-        "a reader that took a receipt for an offer would adopt nothing and report it as success"
-    );
 }
 
 #[cfg(all(test, feature = "process", any(unix, windows)))]

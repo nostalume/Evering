@@ -1258,6 +1258,9 @@ impl TalckMeta {
         unsafe { self.talc.as_ref_unchecked() }
     }
 
+    /// The address of the region's allocator state, which is the layout knowledge this module
+    /// keeps to itself. [`Talc::allocator`] is what borrows it, and the mutation which proves the
+    /// borrow exclusive is checked there, so no call site names an address.
     #[inline]
     const fn talc_ptr(&self) -> *mut TalcMeta {
         self.talc.get()
@@ -1307,6 +1310,24 @@ fn crash_after(point: usize) {
 }
 
 impl<H: Deref<Target = Header>> Talc<H> {
+    /// The region's allocator state, as mutable as the mutation held over it.
+    ///
+    /// `TalcMeta` sits in shared bytes, so no borrow checker can see that exactly one process is
+    /// writing it: the `Mutation` is that claim, and `owns` is the check that the caller holding it
+    /// is the process which claimed the word. Every edit of the allocator's state goes through
+    /// here, because a borrow taken beside an unclaimed word would land one transaction's writes
+    /// inside another's — the damage `commit` records and `Drop` poisons.
+    #[expect(
+        clippy::mut_from_ref,
+        reason = "the mutation is the claim that this process alone may edit the region's shared \
+                  allocator state, which is what the assertion below refuses to hand out"
+    )]
+    #[inline]
+    fn allocator(&self, mutation: &Mutation<'_>) -> &mut TalcMeta {
+        debug_assert!(mutation.owns(&self.header.mutation, self.owner));
+        unsafe { &mut *self.header.talc_ptr() }
+    }
+
     #[inline]
     pub(crate) fn base_ptr(&self) -> *const u8 {
         self.header.talc_ref().base_ptr()
@@ -1357,7 +1378,7 @@ impl<H: Deref<Target = Header>> Talc<H> {
         crash_after(FREE_CLAIMED);
         unsafe {
             core::ptr::drop_in_place(pointer);
-            (&mut *self.header.talc_ptr()).deallocate(
+            self.allocator(&mutation).deallocate(
                 meta.as_nonnull(self.base_ptr()),
                 layout.size(),
                 self.geometry,
@@ -1380,9 +1401,8 @@ impl<H: Deref<Target = Header>> Talc<H> {
         mutation: &Mutation<'_>,
         layout: alloc::Layout,
     ) -> Result<Meta, DeclineCause> {
-        debug_assert!(mutation.owns(&self.header.mutation, self.owner));
         unsafe {
-            (&mut *self.header.talc_ptr())
+            self.allocator(mutation)
                 .allocate(layout, self.geometry)
                 .map(|ptr| Meta::from_ptr(ptr.as_ptr(), self.base_ptr(), layout.size()))
                 // Nothing in the region can hold the request until the region itself grows.
@@ -1398,9 +1418,9 @@ impl<H: Deref<Target = Header>> Talc<H> {
         ptr: NonNull<u8>,
         layout: alloc::Layout,
     ) {
-        debug_assert!(mutation.owns(&self.header.mutation, self.owner));
         unsafe {
-            (&mut *self.header.talc_ptr()).deallocate(ptr, layout.size(), self.geometry);
+            self.allocator(mutation)
+                .deallocate(ptr, layout.size(), self.geometry);
         }
     }
 
