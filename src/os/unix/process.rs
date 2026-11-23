@@ -62,6 +62,24 @@ fn invalid(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+/// Whether the kernel says this descriptor can carry a rendezvous, asked before anything owns it.
+///
+/// One question, asked once, because two entrances have to get the same answer: the descriptor number a
+/// grant announced in the environment, and a descriptor a host placed here by its own means. A datagram
+/// or seqpacket endpoint is taken over as a meeting; anything else is refused without a byte of it being
+/// read, and the refusal says so in the same words whichever way it arrived.
+fn is_rendezvous(announced: &BorrowedFd<'_>) -> io::Result<()> {
+    let kind = getsockopt(announced, sockopt::SockType).map_err(io::Error::from)?;
+    if matches!(kind, SockType::Datagram | SockType::SeqPacket) {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "the descriptor offered as a rendezvous is not a datagram endpoint",
+        ))
+    }
+}
+
 /// What the kernel recorded about the process that owns the peer end of a socket.
 ///
 /// The identifiers are the kernel's own, captured when the two ends were connected, so neither side
@@ -106,6 +124,22 @@ impl Socket {
         Self(UnixDatagram::from(fd))
     }
 
+    /// Adopts a descriptor this process already owns as the rendezvous it was granted.
+    ///
+    /// The same classification as [`Socket::granted`], reached without a number anyone announced: a host
+    /// that places a rendezvous in a process by its own means — a shell's redirection, a socket the
+    /// service manager opened, a supervisor that speaks no evering protocol — hands over the descriptor
+    /// and nothing else. Whether that is a meeting is answered by the kernel here exactly as it is in the
+    /// announced case, so the two entrances cannot disagree about what a rendezvous is.
+    ///
+    /// A descriptor that fails the check is closed, because ownership arrived with it. The announced leg
+    /// leaves a false claim open for a different reason: there nobody owns the number, and taking it over
+    /// would be the claim's doing.
+    pub fn from_granted(granted: OwnedFd) -> io::Result<Self> {
+        is_rendezvous(&granted.as_fd())?;
+        Ok(Self::from_owned_fd(granted))
+    }
+
     /// Adopts the descriptor number a grant announced to this process.
     ///
     /// The number arrives from the environment, so it is a claim rather than authority, and it is
@@ -123,13 +157,7 @@ impl Socket {
         // SAFETY: borrowed, not owned, for exactly as long as it takes to decide whether the claim
         // is a rendezvous at all; ownership is taken only on the path that returns `Ok`.
         let announced = unsafe { BorrowedFd::borrow_raw(raw) };
-        let kind = getsockopt(&announced, sockopt::SockType).map_err(io::Error::from)?;
-        if !matches!(kind, SockType::Datagram | SockType::SeqPacket) {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "the announced descriptor is not a datagram endpoint",
-            ));
-        }
+        is_rendezvous(&announced)?;
         Ok(Self::from_owned_fd(unsafe { OwnedFd::from_raw_fd(raw) }))
     }
 

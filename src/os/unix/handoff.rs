@@ -36,7 +36,7 @@
 
 use std::{
     env, io,
-    os::fd::{AsFd, AsRawFd, RawFd},
+    os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd},
     os::unix::process::CommandExt,
     process::Command,
     time::Instant,
@@ -86,10 +86,15 @@ pub struct Handoff {
 
 /// The capability to admit exactly one process to one meeting.
 ///
-/// There is nothing here to read, copy, or hand over a command line: the rendezvous is a pair of
-/// connected descriptors, and admitting a process means giving it one of them at `exec`. A name
-/// that can be looked up can be claimed by whoever looks it up first; a descriptor that has to be
-/// inherited cannot, which is why `Grant` replaced the address string.
+/// The rendezvous is a pair of connected descriptors, and admitting a process means giving it one of them
+/// at `exec`. A name that can be looked up can be claimed by whoever looks it up first; a descriptor that
+/// has to be inherited cannot, which is why `Grant` replaced the address string.
+///
+/// There is nothing here that stands in for the descriptor. What can be read is the *terms* of the meeting —
+/// the slot promised, the policy word, and through [`AsFd`] the end itself — for a launcher that installs
+/// them by its own means rather than through [`Command`](std::process::Command). Reading them spends nothing;
+/// only [`admit`](Grant::admit) does, and what the readable half costs the single-use promise is the
+/// holder's own doing, which the [`AsFd`] note says plainly.
 ///
 /// The `promised` half is a different kind of thing: not a capability but a message, the member slot
 /// the holder of a [`Seat`](crate::Seat) decided this process should arrive at. Carrying it here
@@ -169,23 +174,56 @@ impl Handoff {
     /// [`Handoff::send`](Handoff::send) answer with whatever the host reports for a vanished peer, which
     /// is the one outcome the two arms cannot be allowed to disagree about.
     pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
-        let socket = granted_socket()?;
-        let peer = attested(&socket, announced_trust()?)?;
-        let (bootstrap, resources) = socket.recv(3)?.into_parts();
-        let mut resources = resources.into_vec();
-        let promised = announced_seat()?;
-        Ok((
-            peer,
-            ReceivedResources {
-                bootstrap,
-                mapping: UnixFd::from_fd(resources.remove(0)).map_err(io::Error::from)?,
-                event: Event::from_owned_fd(resources.remove(0)),
-                ring: Ring::from_owned_fd(resources.remove(0)),
-                seat: promised,
-            },
-            Receipt { socket },
-        ))
+        received(granted_socket()?)
     }
+
+    /// Takes the handover whose rendezvous end this process was handed rather than told about.
+    ///
+    /// The same meeting, read in the same order as [`receive`](Handoff::receive) reads it, and classified
+    /// by the same kernel question. What differs is only where the end comes from: here it is a descriptor
+    /// this process already owns, so no `EVERING_RENDEZVOUS` announcement is read, and none is needed.
+    ///
+    /// This is the entrance for a host that places a rendezvous by its own means — a shell's redirection,
+    /// a socket a service manager opened before the process existed, a supervisor that speaks no evering
+    /// protocol. Such a host cannot write this crate's environment, and the descriptor is exactly the
+    /// thing it can hand over, because a descriptor carries what the environment cannot: an open channel.
+    ///
+    /// The introducer's policy word is still read from the environment, and still decides the same one
+    /// thing it decides there. Nothing here lets the receiver vouch for a peer on its own behalf: a host
+    /// that placed the descriptor *and* announced the word is the introducer making its promise, while a
+    /// host that placed only the descriptor is refused on the arms where the kernel answers nothing, which
+    /// is the rule that keeps the permission announced rather than compiled.
+    ///
+    /// # Ownership
+    ///
+    /// `granted` is taken over, and closed if it turns out to name no rendezvous. Passing a descriptor this
+    /// process still means to use is a mistake this function cannot undo, which is why the argument is an
+    /// owned descriptor the caller converts, not a number or a borrow: the transfer is the caller's call.
+    pub fn granted(granted: impl Into<OwnedFd>) -> io::Result<(Peer, ReceivedResources, Receipt)> {
+        received(Socket::from_granted(granted.into())?)
+    }
+}
+
+/// Reads the handover behind a rendezvous this process holds, in the one order that answers for it.
+///
+/// Both entrances arrive here: the descriptor either was adopted from an announcement or was handed over,
+/// and from this point the two are the same channel, so neither can be read in an order the other refuses.
+fn received(socket: Socket) -> io::Result<(Peer, ReceivedResources, Receipt)> {
+    let peer = attested(&socket, announced_trust()?)?;
+    let (bootstrap, resources) = socket.recv(3)?.into_parts();
+    let mut resources = resources.into_vec();
+    let promised = announced_seat()?;
+    Ok((
+        peer,
+        ReceivedResources {
+            bootstrap,
+            mapping: UnixFd::from_fd(resources.remove(0)).map_err(io::Error::from)?,
+            event: Event::from_owned_fd(resources.remove(0)),
+            ring: Ring::from_owned_fd(resources.remove(0)),
+            seat: promised,
+        },
+        Receipt { socket },
+    ))
 }
 
 /// The parent's end of a meeting it has held, which is where an admitted process reports what it became.
@@ -272,6 +310,27 @@ impl Grant {
         self
     }
 
+    /// The member slot this grant announces to the process it admits, if it names one.
+    ///
+    /// Reading the terms apart from installing them is what lets a launcher that is not
+    /// [`Command`](std::process::Command) carry them: a host that places descriptors by its own means has
+    /// to know which slot it is placing *for*, and this is the only way it can be told. What a reader does
+    /// with the answer is the introducer's policy, and this grant's [`admit`](Grant::admit) is written from
+    /// the same words, so the two cannot drift.
+    pub fn promised(&self) -> Option<&Introduction> {
+        self.promised.as_ref()
+    }
+
+    /// Whether this grant announces that a peer the admitted process cannot attest may complete.
+    ///
+    /// The same reason as [`promised`](Grant::promised): the word is the introducer's, and a launcher that
+    /// is not `Command` has to be told it rather than guess it. Reading it changes nothing about who may
+    /// read it — a receiver that wants the policy has to be handed the announcement, which is a decision
+    /// the introducer makes by calling [`trusting_introduction`](Grant::trusting_introduction) at all.
+    pub fn trusts_introduction(&self) -> bool {
+        self.trusts
+    }
+
     /// Installs this rendezvous in `command`, so that the process it spawns holds the granted end.
     ///
     /// `dup2` is the whole mechanism and one of its details is load-bearing: both ends of the pair this
@@ -290,10 +349,10 @@ impl Grant {
     /// keeps a receiver from having to decide either of them about itself.
     pub fn admit(self, command: &mut Command) -> io::Result<()> {
         command.env(RENDEZVOUS, INHERITED.to_string());
-        if let Some(promised) = &self.promised {
+        if let Some(promised) = self.promised() {
             command.env(SEAT, promised.announcement());
         }
-        if self.trusts {
+        if self.trusts_introduction() {
             command.env(TRUST, "1");
         }
         let granted = self.socket;
@@ -310,6 +369,23 @@ impl Grant {
             });
         }
         Ok(())
+    }
+}
+
+/// The rendezvous end this grant holds, for a launcher that is not [`Command`](std::process::Command).
+///
+/// A host that places descriptors itself — `posix_spawn` file actions, a shell redirection, a supervisor
+/// with its own convention for where things land — needs the channel rather than the number this module
+/// happens to use, and the child it launches reads that descriptor through [`Handoff::granted`] instead of
+/// from an announcement. What that costs is the single-use promise [`admit`](Grant::admit) keeps by
+/// construction: a borrowed end can be copied, so a holder that dups this descriptor twice has two grants
+/// for one meeting. The second arrival does not buy anything — the roster refuses a child that takes a slot
+/// nobody promised it, and a report of a slot other than the promised one is refused by
+/// [`Attendance::arrival`] before it becomes a [`Death`](crate::process::Death) — and a process that was
+/// never handed the descriptor still cannot claim the meeting, which is the property the name is for.
+impl AsFd for Grant {
+    fn as_fd(&self) -> BorrowedFd<'_> {
+        self.socket.as_fd()
     }
 }
 

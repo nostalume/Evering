@@ -25,6 +25,10 @@ const LOCAL_RETRY_LIMIT: usize = 32;
 ///
 /// A notification carries no state of its own: the shared region stays the sole
 /// authority on what was published, and a wake only says re-examining it may pay.
+/// Nor does ringing one order anything: what makes a publication visible is the
+/// release store that closes a mutation, not a fence placed near the wake, so code
+/// that wrote plainly through that borrow supplies no ordering of its own.
+///
 /// A conformant provider is sticky (a kick that arrives before any waiter exists
 /// is not lost), may coalesce without counting (a hundred kicks may act as one),
 /// and lets a cancelled wait consume nothing. How many waiters one kick releases

@@ -15,11 +15,19 @@
 //! answered at the first line of `granted_socket`, which is what the pair is for — a descriptor you were
 //! handed is not an announcement made to you. They came from the file that borrowed a handoff to move a
 //! region, which is not where a claim about who may meet belongs.
+//!
+//! The other two legs measure the route that needs no announcement at all. `Handoff::granted` is met by a host
+//! that places a descriptor and writes none of this crate's keys — a shell's redirection, a socket a service
+//! manager opened, a supervisor with a convention of its own — so the placed leg installs the granted end by
+//! `dup2` and meets, while the placebo leg hands a pipe to *both* entrances and requires one answer from both.
+//! That pair is what the weld is for and what falsifies it: a descriptor that has to be inherited cannot be
+//! claimed, and a descriptor is only ever asked one question about whether it is a rendezvous.
 
 use std::{
     env,
-    os::fd::AsRawFd,
+    os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
     os::unix::net::UnixDatagram,
+    os::unix::process::CommandExt,
     path::PathBuf,
     process::Command,
     time::{Duration, Instant},
@@ -40,6 +48,10 @@ const RENDEZVOUS: &str = "EVERING_RENDEZVOUS";
 const TRUST: &str = "EVERING_TRUST";
 const ATTACKER: &str = "attacker";
 const CHILD: &str = "child";
+/// The process whose rendezvous was placed in its table by the host, with no announcement of it.
+const PLACED: &str = "placed";
+/// The process handed a descriptor that names no rendezvous, both ways one can arrive.
+const PLACEBO: &str = "placebo";
 const ANNOUNCED: &str = "3";
 const EXPECT_PEER: &str = "EVERING_EXPECT_PEER";
 const SIZE: usize = 4096;
@@ -132,10 +144,106 @@ fn child() -> i32 {
     }
 }
 
+/// The host's own entrance taken: a rendezvous that was placed in this process's table and never announced.
+///
+/// Nothing here reads `EVERING_RENDEZVOUS`. The driver installed the granted end at `ANNOUNCED` and said no
+/// word about it, which is the shape of a host that speaks no evering protocol — a shell redirection, a
+/// socket a service manager opened, a supervisor with its own convention. What the meeting is answered by
+/// the descriptor and the kernel, exactly as an announced one is.
+fn placed() -> i32 {
+    let expected: u32 = env::var(EXPECT_PEER)
+        .expect("the placed process is told which peer the test expects")
+        .parse()
+        .expect("a numeric peer id");
+    // SAFETY: the driver dup2'd the granted end onto this number between fork and exec and owns nothing
+    // of it afterwards, so this process is the only owner and takes the single-use grant over whole.
+    let rendezvous = unsafe { OwnedFd::from_raw_fd(ANNOUNCED.parse().unwrap()) };
+    match Handoff::granted(rendezvous) {
+        Ok((peer, resources, _report)) => {
+            if peer.pid() != Some(expected) {
+                eprintln!(
+                    "the peer behind a placed rendezvous is {:?}, not {expected}",
+                    peer.pid()
+                );
+                return FAILED;
+            }
+            if peer.provenance() != Provenance::Attested {
+                eprintln!(
+                    "a placed rendezvous that answered is reported as {:?}",
+                    peer.provenance()
+                );
+                return FAILED;
+            }
+            if resources.bootstrap.as_ref() != b"selected-protocol-id" {
+                eprintln!("the placed handover carried the wrong bootstrap");
+                return FAILED;
+            }
+            if resources.mapping.size() != SIZE {
+                eprintln!("the placed handover carried the wrong region");
+                return FAILED;
+            }
+            if resources.seat.is_some() {
+                eprintln!(
+                    "a handover nobody announced a slot into reported {:?} as its seat",
+                    resources.seat
+                );
+                return FAILED;
+            }
+            ATTESTED
+        }
+        Err(error) => {
+            eprintln!("the placed rendezvous was refused: {error}");
+            FAILED
+        }
+    }
+}
+
+/// The same false descriptor both ways it can arrive, measured against each other.
+///
+/// One pipe end is handed over as the rendezvous; the other is installed at the number an announcement
+/// names. Both are refused, and what this role checks is not that they are refused — the attacker above
+/// already shows that — but that they are refused *alike*, which is the claim that a port has one question
+/// to answer about a descriptor rather than one per entrance.
+fn placebo() -> i32 {
+    let (handed, announced) =
+        nix::unistd::pipe().expect("a role makes two pipes it holds no rendezvous in");
+    let handed_over = match Handoff::granted(handed) {
+        Ok(_) => {
+            eprintln!("a pipe was admitted as a rendezvous");
+            return FAILED;
+        }
+        Err(error) => error,
+    };
+    // SAFETY: this process runs nothing else at this point, and `dup2` is async-signal-safe. The pipe end
+    // is copied onto the number the driver announced, so the announced leg is offered the same kind of
+    // thing the attacker offered it: a descriptor this process made for itself.
+    unsafe { nix::libc::dup2(announced.as_raw_fd(), ANNOUNCED.parse().unwrap()) };
+    // Left open on purpose: the announced leg classifies a claim through a borrow and closes nothing, so a
+    // close here would say the refusal had handed the descriptor back before it had read it.
+    core::mem::forget(announced);
+    let announced = match Handoff::receive() {
+        Ok(_) => {
+            eprintln!("an announced pipe was admitted as a rendezvous");
+            return FAILED;
+        }
+        Err(error) => error,
+    };
+    if handed_over.kind() != announced.kind() || handed_over.to_string() != announced.to_string() {
+        eprintln!("handed over: {handed_over}\nannounced: {announced}");
+        return FAILED;
+    }
+    REFUSED
+}
+
 /// The roles this leg defines, kept beside their bodies. The claim root's single `role_entry` runs whichever
 /// platform leg was compiled, because the harness re-enters a child by exact item name and only one item in a
 /// target may answer to it.
-pub(crate) const ROLES: &[(&str, role::Body)] = &[(ATTACKER, attacker), (CHILD, child)];
+pub(crate) const ROLES: &[(&str, role::Body)] = &[
+    (ATTACKER, attacker),
+    (CHILD, child),
+    (PLACED, placed),
+    (PLACEBO, placebo),
+];
 
 #[test]
 fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
@@ -202,4 +310,78 @@ fn an_ungranted_process_finds_no_rendezvous_to_meet_at() {
         .err()
         .expect("an ungranted process meets no one");
     assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+}
+
+/// Weld A: the entrance for a host that places the descriptor and writes no announcement.
+///
+/// The grant is spent the way a shell's redirection or a service manager's socket spends it — `dup2` into
+/// the number the launcher and its child agree on, and nothing in the environment. What the child answers
+/// with is the same triple `receive` returns, from the same kernel answer about who owns the other end, so
+/// the only thing this route gives up is the announcement, which is the one thing a foreign host cannot
+/// make correctly anyway.
+#[test]
+fn a_rendezvous_the_host_placed_by_hand_is_admitted_without_an_announcement() {
+    let (handoff, grant) = Handoff::bind().unwrap();
+    let mapping = shared("placed", SIZE, Access::READ | Access::WRITE).unwrap();
+    let (_notify, child_wait) = evering::os::event().unwrap();
+    let (child_ring, _event) = evering::os::event().unwrap();
+    let bootstrap = Bootstrap::new(b"selected-protocol-id").unwrap();
+
+    let mut command = role::child(PLACED);
+    command.env(EXPECT_PEER, std::process::id().to_string());
+    let placed = grant;
+    // SAFETY: the hook runs between fork and exec in the child and calls only `dup2`, which is
+    // async-signal-safe. `placed` is moved into it so the granted end stays open until the command
+    // spawns; no `EVERING_*` key is written, because this child is met through the descriptor alone.
+    unsafe {
+        command.pre_exec(move || {
+            let here = placed.as_fd().as_raw_fd();
+            if nix::libc::dup2(here, ANNOUNCED.parse().unwrap()) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut granted = Supervisor::spawn(&mut command).expect("a role process spawns");
+
+    handoff
+        .send(
+            &granted,
+            Instant::now() + Duration::from_secs(5),
+            &bootstrap,
+            &mapping,
+            &child_wait,
+            &child_ring,
+        )
+        .unwrap();
+
+    assert_eq!(
+        introduce::exit_code(&mut granted, "the placed child", Duration::from_secs(10)),
+        ATTESTED,
+        "a descriptor the host installed is a granted rendezvous whether or not anybody announced it, and \
+         the handover behind it carries the same offer and the same peer the announced route answers with"
+    );
+}
+
+/// The one question a descriptor is asked, asked from both entrances.
+///
+/// A port that classified an announced number and an owned descriptor separately could accept a rendezvous
+/// on one route and refuse it on the other, which is the disagreement the two entrances exist to avoid. This
+/// leg hands the same kind of impostor — a pipe — to both and requires the same answer from both.
+#[test]
+fn a_descriptor_names_no_rendezvous_the_same_way_handed_over_or_announced() {
+    let mut command = role::child(PLACEBO);
+    command.env(RENDEZVOUS, ANNOUNCED);
+    let mut placebo = Supervisor::spawn(&mut command).expect("a role process spawns");
+
+    assert_eq!(
+        introduce::exit_code(
+            &mut placebo,
+            "the child holding two pipes",
+            Duration::from_secs(10)
+        ),
+        REFUSED,
+        "neither entrance takes a pipe for a rendezvous, and neither says something different about it \
+         than the other does — an owned descriptor is refused in the same words an announced number is"
+    );
 }
