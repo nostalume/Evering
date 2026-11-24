@@ -298,3 +298,23 @@ allocator recovery, or performance superiority outside a registered and
 matched study condition. Read-only observation is offered, and it is offered as
 a standpoint outside the roster rather than as a kind of membership. These
 limits are protocol boundaries, not hidden fallback behavior.
+
+## Where each claim is owned
+
+The published pages divide the same material by question, and the division is a
+rule rather than a habit:
+
+| The question | Its owner |
+| --- | --- |
+| What is the model, and which invariants must survive? | this page |
+| Which surface was checked, against what, and how would you learn it moved? | [stability.md](stability.md) |
+| What must a base arrange to implement the two seams? | [porting.md](porting.md) |
+| What does the code do today? | the source, and `cargo doc` |
+| Is a design choice settled, and what would reopen it? | kept outside the published crate |
+
+A sentence about a verdict therefore belongs on the verdict page even when the
+model is what motivated it, and a sentence about the model belongs here even
+when a test is what proves it. Where two pages disagree: about a verdict, the
+verdict page wins; about the model, this page wins; about a port's obligations,
+the porting page wins; and about the shape of the code, the source wins over all
+three. A change that moves a verdict moves that page in the same commit.

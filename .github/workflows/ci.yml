@@ -40,7 +40,7 @@ jobs:
       - name: the indexer hands four jobs to two worker processes
         shell: bash
         run: |
-          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENT.md absent)
+          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENTS.md absent)
           test "$(grep -c $'\tok$' <<<"$out")" = 3
           grep -q $'^3\t.*\tabsent' <<<"$out"
       - name: the compile cache round-trips with a daemon across an exec, and reaps it
@@ -120,7 +120,7 @@ jobs:
       - name: the indexer hands four jobs to two worker processes
         shell: bash
         run: |
-          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENT.md absent)
+          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENTS.md absent)
           test "$(grep -c $'\tok$' <<<"$out")" = 3
           grep -q $'^3\t.*\tabsent' <<<"$out"
       - name: the compile cache round-trips with a daemon across an exec, and reaps it

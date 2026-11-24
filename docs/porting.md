@@ -33,18 +33,35 @@ the directory into your extent, so:
   principle and deliberately not offered: a fully initialized region carries a directory
   and pool state as well as a header, its byte layout is [provisional](stability.md), and
   today no port needs it. If you do, say so — the shape you would need is a `const fn`
-  over the concrete header type, which compiles at
-  `riscv32imac-unknown-none-elf` and `aarch64-unknown-none` on stable, whereas the same
+  over the concrete header type, which compiled at
+  `riscv32imac-unknown-none-elf` and `aarch64-unknown-none` on stable in a probe that is
+  not part of this tree (the verdict page records that row as one whose check is
+  missing), whereas the same
   image as a byte array additionally pins which bytes belong to no field, the
   target-dependent tail, and endianness.
+
+## What you can do with no host at all
+
+Composing a region, seating members, and transporting are not host features:
+`Session::create`, `open_as`, `reserve_seat`, `create_channel` and `adopt` are all
+reachable with default features off. What the features remove is the `impl
+std::error::Error` blocks and the two adapters, not the methods. A port therefore does
+not need a third seam to get a working region — it needs the two below and a layout.
 
 ## What does not exist here
 
 The handover seam: there is no descriptor inheritance to grant, no peer credential to
 attest against, and no exit status to reap, so process admission is not a degraded port —
-it is absent. Membership therefore arrives as a static roster you supply, and recovery
-keys on that roster rather than on `assume_dead`, which a port could only assert and never
-prove. `Observer`-style reading needs no membership either, so a monitor that cannot write
+it is absent. Membership therefore arrives as a static roster you supply.
+
+Recovery does not get a host-free form of that roster. The only entrance that needs no
+death evidence from a host is `Session::assume_dead`, which is `unsafe` precisely
+because you, not the crate, are the authority for it. A roster says which slots are
+occupied; it never says an occupant stopped, so it can narrow which assertion you are
+allowed to make and cannot substitute for one. A port that wants recovery without an
+assertion has to bring the proof itself — a hypervisor notice, a watchdog token, a
+generation it cannot increment — and hand it to `assume_dead`'s caller.
+`Observer`-style reading needs no membership either, so a monitor that cannot write
 shared truth is the one process-free shape that does exist.
 
 ## Checking your own target

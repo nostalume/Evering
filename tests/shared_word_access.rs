@@ -2,7 +2,7 @@
 //! error: a field declared with a visibility its neighbours do not have, which is how a new shared
 //! field could be read from another module without an accessor ever being written; and a signature
 //! that hands out an atom, which is the exception the rule allows and the one thing that has to be
-//! counted. `docs/AGENT.md` states the rule; `docs/architecture.md` states the width discipline a
+//! counted. `docs/AGENTS.md` states the rule; `docs/architecture.md` states the width discipline a
 //! new field owes it.
 //!
 //! `src/` is read as text for the same reason the manifest and the integration tree are in

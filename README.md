@@ -135,8 +135,13 @@ build actually keeps, is recorded per surface in
 - [Architecture and invariants](docs/architecture.md)
 - [What a surface can be relied on for](docs/stability.md)
 - [Placing a region that is already in your image](docs/porting.md)
-- [Technology and agent guide](docs/AGENT.md)
+- [Technology and agent guide](docs/AGENTS.md)
 - [Benchmark method and evidence](benches/README.md)
+
+Every one of these describes what exists, and each kind of statement has one owner:
+the verdict page holds every "this was checked" claim, the architecture page holds the
+model, the porting page holds a port's obligations. Whether a design choice is settled
+is recorded in none of them.
 
 ## License
 

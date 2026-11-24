@@ -136,3 +136,30 @@ close, remove, and practical indexer flow coherent while freezing wire owners,
 schema revisions, failure authority, documentation, and CI evidence. Minor API
 changes are accepted only when they remove duplicated validation or make a
 linear transition harder to misuse without adding hot-path work.
+
+## Which page owns which statement
+
+Each kind of statement has one owner, and a second copy of it is a defect rather
+than a convenience:
+
+- `docs/architecture.md` owns the model and its invariants — what the layers are,
+  and which rules a change must not break.
+- `docs/stability.md` owns every "this surface was checked" claim. A verdict row
+  cites checks that could disagree: a file that consumes the surface from outside
+  the crate, plus something that compiles or runs it under a different
+  configuration. Two arms of one host pair are one check. A row whose check is not
+  in the repository says so in the row rather than citing an artifact that does
+  not ship.
+- `docs/porting.md` owns what a base implementing the two seams has to arrange.
+- `README.md` owns the first-run path: what to install, what to run, and what a
+  printed measurement means.
+- This page owns engineering rules: toolchain, gates, naming, verification, and
+  delivery.
+
+Whether a design choice is settled, and what work follows from it, belongs to none
+of these pages and is not published with the crate.
+
+Between a document and the source, an anchor names a symbol (`src/mem.rs:
+Map::reserve`), never a line number: line numbers rot while symbol lookups
+resolve. A commit is cited by its delivery block, because squashing renumbers the
+rest.
