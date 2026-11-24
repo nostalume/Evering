@@ -1510,6 +1510,79 @@ mod admission_tests {
     }
 
     #[test]
+    fn a_plausible_foreign_profile_is_refused_before_the_record_s_other_words() {
+        let mut storage = MaybeUninit::<Header<Narrow>>::zeroed();
+        let pointer = storage.as_mut_ptr();
+        let ctx = LayoutContext {
+            region: RegionId::new(61, 62),
+            offset: 0,
+            allow_init: true,
+        };
+        unsafe { <Header<Narrow> as AdmitLayout>::admit(pointer, (), ctx, None) }.unwrap();
+        let join = LayoutContext {
+            allow_init: false,
+            ..ctx
+        };
+        let other_word = if core::mem::size_of::<usize>() == 8 {
+            4
+        } else {
+            8
+        };
+        // The control: while the profile stays native, a wide body over a narrow region is refused
+        // for the typed word. The same refusal has to become a profile refusal once the record says
+        // it was written by a target of the other width, because the typed word is then unreadable.
+        assert_eq!(
+            unsafe { <Header<Wide> as AdmitLayout>::admit(pointer.cast(), (), join, None) },
+            Err(AdmitError::Mismatch(LayoutField::HeaderSize))
+        );
+        let native = unsafe { (*pointer).record.profile };
+        unsafe { (*pointer).record.profile = [other_word, other_word, native[2]] };
+        assert_eq!(
+            unsafe { <Header<Wide> as AdmitLayout>::admit(pointer.cast(), (), join, None) },
+            Err(AdmitError::Mismatch(LayoutField::Profile))
+        );
+        unsafe { (*pointer).record.profile = native };
+        unsafe { (*pointer).record.profile[2] = native[2] ^ 1 };
+        assert_eq!(
+            unsafe { <Header<Narrow> as AdmitLayout>::admit(pointer, (), join, None) },
+            Err(AdmitError::Mismatch(LayoutField::Profile))
+        );
+    }
+
+    #[test]
+    fn a_reader_that_may_not_write_refuses_a_region_of_another_width() {
+        let mut storage = MaybeUninit::<Header<Root>>::zeroed();
+        let pointer = storage.as_mut_ptr();
+        let ctx = LayoutContext {
+            region: RegionId::new(63, 64),
+            offset: 0,
+            allow_init: true,
+        };
+        unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) }.unwrap();
+        assert_eq!(
+            unsafe { Header::<Root>::published_region_at(pointer) },
+            Some(ctx.region)
+        );
+        let native = unsafe { (*pointer).record.profile };
+        let other_word = if core::mem::size_of::<usize>() == 8 {
+            4
+        } else {
+            8
+        };
+        unsafe { (*pointer).record.profile = [other_word, native[1], native[2]] };
+        assert_eq!(
+            unsafe { Header::<Root>::published_region_at(pointer) },
+            None,
+            "a discovery reader named a region whose recorded width it could not read"
+        );
+        unsafe { (*pointer).record.profile = native };
+        assert_eq!(
+            unsafe { Header::<Root>::published_region_at(pointer) },
+            Some(ctx.region)
+        );
+    }
+
+    #[test]
     fn layout_membership_is_unique_until_the_owner_leaves() {
         let mut storage = MaybeUninit::<Header<Root>>::zeroed();
         let pointer = storage.as_mut_ptr();

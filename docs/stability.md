@@ -42,7 +42,7 @@ on an artifact that is not in this repository.
 | Public error types | checked as shapes | Every refusal prints and chains (`Display`, `Error::source`), and `cargo doc` under `-D warnings` gates the surface, including every intra-doc link to it — on both hosts, since the Windows job runs that row too. A link to an item only one platform builds is the failure that row exists to catch, which is why the death lane's second entrance is named in prose on the host that lacks it rather than linked. |
 | Refusal sentence text | provisional | Integration legs compare the strings themselves — [`tests/handover_admission`](../tests/handover_admission) requires the same descriptor to be refused with the same words through both entrances — so a wording change is a test change, announced as one. |
 | `process`, `runtime`, and the non-seam part of `os` | provisional | std- and `os`-gated, so a `no-std` reader never meets them, and their shape is what two hosts execute. The second death entrance is landed and Linux-only: `Writer`, `Death::credited`, and the `Witness::Process` arm behind them are gated to `target_os = "linux"`, so a host without it builds without them — the only witness it can hold is `Recorded`, which is why `Exited` carries its witness under a dead-code allowance there instead of reading it. |
-| A region shared by peers of different target width or byte order | provisional, and its check is not in this repository | Sharing is not offered, and it is not unguarded either: the root record persists the word width, atomic width and byte order it was created with (`header::AbiProfile`), and `header::recorded_at` compares that profile against the reader's own before it reads any natural-width word, so a foreign geometry is refused with `Error::LayoutMismatch(LayoutField::Profile)` and the discovery route yields `Error::InvalidHeader` rather than a half-read region. The record's own bytes are target-independent — `#[repr(C)]`, align 1, `size_of` 35, both asserted in a `const` block — which is what makes the refusal reachable instead of a misread. No file here executes it: `grep -n i686 .github/workflows/ci.yml` answers a target-install line and one `cargo check` line, with no test target behind either, so the row rests on source alone until the check below lands. Cross-target sharing stays out of scope, which is why the quantities that differ between targets stay unpublished ([abi.md](abi.md)). |
+| A region shared by peers of different target width or byte order | provisional, and the second check that would settle it is not in this repository | Sharing is not offered, and it is not unguarded either: the root record persists the word width, atomic width and byte order it was created with (`header::AbiProfile`), and `header::recorded_at` compares that profile against the reader's own before it reads any natural-width word, so a foreign geometry is refused with `Error::LayoutMismatch(LayoutField::Profile)` and the discovery route yields `Error::InvalidHeader` rather than a half-read region. The record's own bytes are target-independent — `#[repr(C)]`, align 1, `size_of` 35, both asserted in a `const` block — which is what makes the refusal reachable instead of a misread. Both entrances are executed here: `header::admission_tests` composes one region, forges a recorded profile of the other word width, asserts the profile refusal on the member entrance, and reads the same region back through the discovery route. What none of those tests can do is supply a profile another target's compiler wrote — each is forged on the host that reads it, which is why the row is one check rather than two. `grep -n i686 .github/workflows/ci.yml` answers a target-install line and one `cargo check` line, with no test target behind either. Cross-target sharing stays out of scope, which is why the quantities that differ between targets stay unpublished ([abi.md](abi.md)). |
 | MSRV | a published fact, not a verdict | `rust-version = "1.100.0"`, with the same channel pinned in [`rust-toolchain.toml`](../rust-toolchain.toml); the crate builds on stable and needs no nightly. |
 
 ## What a `no-std` build gets
@@ -75,10 +75,12 @@ all, is in [porting.md](porting.md).
 
 - The initial-image row, until its probe is tracked; the CI rows above check the
   crate, not a `const` image placed in a `static`.
-- The cross-geometry refusal, until a test composes one region and admits a member
-  whose recorded profile is not its own. The `i686` CI row checks that the crate
-  compiles at that width, not that a 32-bit member and a 64-bit region refuse each
-  other.
+- The cross-geometry refusal's second check. One host already composes a region and
+  admits a member whose recorded profile is not its own, through both entrances; what
+  is owed is the same refusal against a record a build of the other width wrote, which
+  needs the tracked initial image and an `i686` leg that executes rather than compiles —
+  the CI row checks that the crate builds at that width, not that a 32-bit member and a
+  64-bit region refuse each other.
 
 ## What this page does not promise
 
