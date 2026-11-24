@@ -49,11 +49,11 @@ quietly needs a dependency feature some wider layer turns on composes only in
 name. The core also checks with default features disabled.
 
 The crate builds on stable Rust; nothing in it needs a nightly compiler.
-`rust-toolchain.toml` pins the version the checks below were run on
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the version the checks below were run on
 (`1.100.0`, with rustfmt and Clippy) and `rustup` installs it on first use. A
 check run through `+nightly` or another stable version compares a different
 compiler build than CI does. That pin is also the minimum supported version, and
-`Cargo.toml` now states it: older compilers were run rather than reasoned about,
+[`Cargo.toml`](Cargo.toml) now states it: older compilers were run rather than reasoned about,
 and `1.99.0` fails on the three standard-library faces this crate leans on —
 `allocator_api`, `unsafe_cell_access`, and a `const` `UnsafeCell::as_ref_unchecked`
 — all stable at `1.100.0`. The floor is where the library became sufficient, not
@@ -120,8 +120,14 @@ analysis, and extension rules; plots are generated on demand.
 
 ## Limits
 
-Evering currently assumes peers agree on build, target architecture, protocol
-representations, and session composition. It does not promise cross-build Rust
+Evering currently assumes peers agree on build, protocol representations, and
+session composition. Peers that disagree on target width or byte order do not
+share a region: a region records the geometry it was created with, and a member
+whose own differs is refused when it is admitted rather than served translated
+field widths. A region created on one target is therefore not made readable with
+the same geometry on another, so the quantities that differ between targets are not
+published. Which byte facts are handed over, and in what shape, is
+[Which byte facts are published](docs/abi.md). It does not promise cross-build Rust
 ABI compatibility, membership that cannot write, automatic application replay, or
 recovery of ambiguous general-heap mutation. Exact participant-death evidence
 is required before shared ownership recovery. Reading a region without joining
@@ -134,13 +140,15 @@ build actually keeps, is recorded per surface in
 
 - [Architecture and invariants](docs/architecture.md)
 - [What a surface can be relied on for](docs/stability.md)
+- [Which byte facts are published](docs/abi.md)
 - [Placing a region that is already in your image](docs/porting.md)
 - [Technology and agent guide](docs/AGENTS.md)
 - [Benchmark method and evidence](benches/README.md)
 
 Every one of these describes what exists, and each kind of statement has one owner:
 the verdict page holds every "this was checked" claim, the architecture page holds the
-model, the porting page holds a port's obligations. Whether a design choice is settled
+model, the ABI page holds which shared-byte facts are handed over and how, the porting
+page holds a port's obligations. Whether a design choice is settled
 is recorded in none of them.
 
 ## License

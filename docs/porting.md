@@ -5,7 +5,7 @@ firmware image where the shared extent exists because the linker put it there. T
 seams you implement are `mapping::Source`/`Map` and `notify::Notify`/`Wait`; nothing
 else in the crate asks to be replaced. What this page adds to
 [the verdicts](stability.md) is the arrangement a base has to be in, which today lives
-only inside `tests/portable_contracts/static_source.rs`.
+only inside [`tests/portable_contracts/static_source.rs`](../tests/portable_contracts/static_source.rs).
 
 ## The three numbers, and which one you cannot compute
 

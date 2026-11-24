@@ -93,10 +93,11 @@ the enclosing identity. Compatibility is behavioral across native word widths:
 each architecture may use its natural representation, but both obey the same
 state transitions and reject values that cannot be represented locally. Within
 that promise, a new or touched shared word is written fixed-width little-endian
-with an explicit atomic-width class, the shape `Id<L>::to_bytes` in `src/dir.rs`
-already sets, so a field stops inheriting its width from the host the day it is
-written; the natural-width fields that predate this are left as they are until a
-32-bit participant makes the difference observable. The project does not promise
+with an explicit atomic-width class, the shape `Id<L>::to_bytes` in
+[`src/dir.rs`](../src/dir.rs) already sets, so a field stops inheriting its width from the host the day it is
+written; the natural-width fields that predate this are left as they are, because a
+peer of a different width never reads them — it is refused at admission before the
+first natural-width word. The project does not promise
 a byte-identical Rust ABI across builds or targets.
 
 ## Storage and ownership
@@ -189,7 +190,7 @@ against the primitive itself in its own module. An extension that reports a caus
 would be admissible only where a provider can both carry it and be checked
 carrying it, and only to skip work a re-examination could have found. The clauses
 a new provider is checked against are recorded in
-`tests/notification_latch/latch_clauses.rs`.
+[`tests/notification_latch/latch_clauses.rs`](../tests/notification_latch/latch_clauses.rs).
 
 A park can also be asked of a whole set of latches, which reports the one that
 answered and consumes that one alone. It multiplexes latches rather than causes, so
@@ -208,7 +209,7 @@ holding both sides of a duplex channel stops reading while it does that. If the
 peer is written the same way, each waits on the ring the other would free by
 reading, and nothing inside either loop can notice, so an agent with both roles
 bounds its budget or attempts a read between publishes.
-`tests/publish_and_kick/ring_limit.rs` demonstrates both shapes against one
+[`tests/publish_and_kick/ring_limit.rs`](../tests/publish_and_kick/ring_limit.rs) demonstrates both shapes against one
 geometry.
 
 Native latches may coalesce signals or wake spuriously. Concurrent waiters are
@@ -301,20 +302,9 @@ limits are protocol boundaries, not hidden fallback behavior.
 
 ## Where each claim is owned
 
-The published pages divide the same material by question, and the division is a
-rule rather than a habit:
-
-| The question | Its owner |
-| --- | --- |
-| What is the model, and which invariants must survive? | this page |
-| Which surface was checked, against what, and how would you learn it moved? | [stability.md](stability.md) |
-| What must a base arrange to implement the two seams? | [porting.md](porting.md) |
-| What does the code do today? | the source, and `cargo doc` |
-| Is a design choice settled, and what would reopen it? | kept outside the published crate |
-
-A sentence about a verdict therefore belongs on the verdict page even when the
-model is what motivated it, and a sentence about the model belongs here even
-when a test is what proves it. Where two pages disagree: about a verdict, the
-verdict page wins; about the model, this page wins; about a port's obligations,
-the porting page wins; and about the shape of the code, the source wins over all
-three. A change that moves a verdict moves that page in the same commit.
+The published pages divide the same material by question, and the division is a rule
+rather than a habit. [AGENTS.md](AGENTS.md) states it once: which page owns which kind of
+statement, which page wins when two of them disagree, and that a change moves the pages it
+affects in one commit. A sentence about a verdict therefore belongs on the verdict page even
+when the model is what motivated it, and a sentence about the model belongs here even when a
+test is what proves it.

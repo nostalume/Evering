@@ -4,16 +4,13 @@ This page names, for each public surface, a verdict and the checks in this repos
 that pin it. It is not a release, a compatibility window, or a deprecation policy;
 released boundaries are named by tags, and there is one so far (`v0.1.0`). The
 argument behind a verdict is not here either — a row that moved is explained in the
-commit that moved it, and this page moves in that same commit, which is the whole
+commit that moved it, and the same-commit rule in [AGENTS.md](AGENTS.md) is the whole
 notification promise here.
 
-The split is a rule, not a habit. [architecture.md](architecture.md) owns the model
-and its invariants; [porting.md](porting.md) owns what a base that implements the two
-seams has to arrange; this page owns every "this was checked" sentence. Whether a
-design choice is settled is recorded nowhere in the published tree. Where two pages
-disagree: about a verdict, this page wins; about the model, architecture wins; about a
-port's obligations, porting wins; and about the shape of the code, the source wins over
-all three.
+The split is a rule, not a habit, and [AGENTS.md](AGENTS.md) states it once: which page owns
+which kind of statement, and which page wins when two disagree. This page owns every "this was
+checked" sentence, and no other page should carry one. Whether a design choice is settled is
+recorded nowhere in the published tree.
 
 ## The three verdicts
 
@@ -35,17 +32,18 @@ on an artifact that is not in this repository.
 
 | Surface | Verdict | The checks it rests on |
 | --- | --- | --- |
-| `mapping::Source`, `mapping::Map` | checked | `tests/portable_contracts/static_source.rs` implements the seam the way a port does — one extent already in its own binary's image, no memfd, no descriptor, nothing to unmap; `section_source.rs` holds a Windows section to its declared access; `type_shape.rs` checks what the types alone answer. Independently, the core compiles where there is no libc to map with: `cargo check --no-default-features --target riscv32imac-unknown-none-elf` and `…--target aarch64-unknown-none`, both CI rows. |
-| `notify::Notify`, `notify::Wait`, and what a latch must guarantee | checked | `tests/notification_latch/latch_clauses.rs` states the four clauses — sticky, coalescing without counting, cancelling takes nothing, one ring paired with one condition — and is what any new adapter, including a kernel-side provider, is measured against; `cross_process.rs` and both host backends execute them, so a wake that releases only its head waiter still re-examines shared truth. |
-| Wire identity bytes (`PoolId`, `Port`, region ids) | checked | `tests/portable_contracts/identity_bytes.rs` fixes the exact words those occupy, the round trip that reads them back, and the malformed buffers that are refused rather than repaired. |
-| Handover framing (`HANDOFF_MAGIC`, `ARRIVAL_MAGIC`, `FRAME_HEADER`, `FRAME_TAG`, `FRAME_LEN`, `FRAME_COUNT`) | provisional | Published as data: both tags, the width a frame's front is cut to, and the three offsets that tile it — the tag, then the bootstrap length and the resource count as little-endian `u16`s. `tests/handover_attestation/labels.rs` pins the tags apart, the offsets, and that `MAX_BOOTSTRAP` and `MAX_RESOURCES` still fit the field widths they are stamped into; a `const` assertion refuses a build where the offsets stop tiling the published width; every host writer and reader goes through the one `stamp_front`/`read_front` pair. Still not readable out of the crate: that a tag is a collision test between two frame kinds rather than a version a receiver negotiates. |
-| Root-header layout (record, member-state encoding, geometry words) | provisional | Published as data: region alignment (`REGION_ALIGN`), the extent a block class requires (`BlockRange::required_extent`), and the cut of the one word a member's state and generation share (`layout::MEMBER_*`, pinned by `tests/portable_contracts/member_word.rs`) — so the word a non-Rust process writes is no longer something it has to copy out of `src`. Not published: which bytes belong to no field, the tail whose length differs between a 32- and a 64-bit target, and the byte order of an initial image. |
+| `mapping::Source`, `mapping::Map` | checked | [`tests/portable_contracts/static_source.rs`](../tests/portable_contracts/static_source.rs) implements the seam the way a port does — one extent already in its own binary's image, no memfd, no descriptor, nothing to unmap; [`tests/portable_contracts/section_source.rs`](../tests/portable_contracts/section_source.rs) holds a Windows section to its declared access; [`tests/portable_contracts/type_shape.rs`](../tests/portable_contracts/type_shape.rs) checks what the types alone answer. Independently, the core compiles where there is no libc to map with: `cargo check --no-default-features --target riscv32imac-unknown-none-elf` and `…--target aarch64-unknown-none`, both CI rows. |
+| `notify::Notify`, `notify::Wait`, and what a latch must guarantee | checked | [`tests/notification_latch/latch_clauses.rs`](../tests/notification_latch/latch_clauses.rs) states the four clauses — sticky, coalescing without counting, cancelling takes nothing, one ring paired with one condition — and is what any new adapter, including a kernel-side provider, is measured against; [`tests/notification_latch/cross_process.rs`](../tests/notification_latch/cross_process.rs) and both host backends execute them, so a wake that releases only its head waiter still re-examines shared truth. |
+| Wire identity bytes (`PoolId`, `Port`, region ids) | checked | [`tests/portable_contracts/identity_bytes.rs`](../tests/portable_contracts/identity_bytes.rs) fixes the exact words those occupy, the round trip that reads them back, and the malformed buffers that are refused rather than repaired. |
+| Handover framing (`HANDOFF_MAGIC`, `ARRIVAL_MAGIC`, `FRAME_HEADER`, `FRAME_TAG`, `FRAME_LEN`, `FRAME_COUNT`) | provisional | Published as data: both tags, the width a frame's front is cut to, and the three offsets that tile it — the tag, then the bootstrap length and the resource count as little-endian `u16`s. [`tests/handover_attestation/labels.rs`](../tests/handover_attestation/labels.rs) pins the tags apart, the offsets, and that `MAX_BOOTSTRAP` and `MAX_RESOURCES` still fit the field widths they are stamped into; a `const` assertion refuses a build where the offsets stop tiling the published width; every host writer and reader goes through the one `stamp_front`/`read_front` pair. Still not readable out of the crate: that a tag is a collision test between two frame kinds rather than a version a receiver negotiates. |
+| Root-header layout (record, member-state encoding, geometry words) | provisional | Published as data: region alignment (`REGION_ALIGN`), the extent a block class requires (`BlockRange::required_extent`), and the cut of the one word a member's state and generation share (`layout::MEMBER_*`, pinned by [`tests/portable_contracts/member_word.rs`](../tests/portable_contracts/member_word.rs)) — so the word a non-Rust process writes is no longer something it has to copy out of `src`. Not published: which bytes belong to no field, the tail whose length differs between a 32- and a 64-bit target, and the byte order of an initial image. |
 | A const-constructible initial region image | provisional, and its check is not in this repository | The typed route — a non-generic `const fn` over concrete `#[repr(C)]` atomics, placed in a `static` and handed to `Source` as `*mut u8` — compiled at both `*-none-elf` targets on stable while this row was written, and no file here compiles it today: the probe sits in a build directory, so `cargo clean` deletes the only evidence. Until that probe is a tracked test and the two CI rows above run it, this row is a claim about a toolchain, not about the crate. The same image as a byte array additionally needs the three unpublished header items above, and is not offered — no second implementation reads an initial image yet. |
-| `layout` vocabulary (`SchemaKey`, `Repr`, `RegionId`, `recovery_handler`) | provisional | Names of identity and policy rather than of the wire, so recompiling is the entire consequence of a change. `tests/portable_contracts/type_shape.rs` is the in-tree consumer that has to spell `Repr` and `SchemaKey` correctly. |
+| `layout` vocabulary (`SchemaKey`, `Repr`, `RegionId`, `recovery_handler`) | provisional | Names of identity and policy rather than of the wire, so recompiling is the entire consequence of a change. [`tests/portable_contracts/type_shape.rs`](../tests/portable_contracts/type_shape.rs) is the in-tree consumer that has to spell `Repr` and `SchemaKey` correctly. |
 | Public error types | checked as shapes | Every refusal prints and chains (`Display`, `Error::source`), and `cargo doc` under `-D warnings` gates the surface, including every intra-doc link to it — on both hosts, since the Windows job runs that row too. A link to an item only one platform builds is the failure that row exists to catch, which is why the death lane's second entrance is named in prose on the host that lacks it rather than linked. |
-| Refusal sentence text | provisional | Integration legs compare the strings themselves — `tests/handover_admission` requires the same descriptor to be refused with the same words through both entrances — so a wording change is a test change, announced as one. |
+| Refusal sentence text | provisional | Integration legs compare the strings themselves — [`tests/handover_admission`](../tests/handover_admission) requires the same descriptor to be refused with the same words through both entrances — so a wording change is a test change, announced as one. |
 | `process`, `runtime`, and the non-seam part of `os` | provisional | std- and `os`-gated, so a `no-std` reader never meets them, and their shape is what two hosts execute. The second death entrance is landed and Linux-only: `Writer`, `Death::credited`, and the `Witness::Process` arm behind them are gated to `target_os = "linux"`, so a host without it builds without them — the only witness it can hold is `Recorded`, which is why `Exited` carries its witness under a dead-code allowance there instead of reading it. |
-| MSRV | a published fact, not a verdict | `rust-version = "1.100.0"`, with the same channel pinned in `rust-toolchain.toml`; the crate builds on stable and needs no nightly. |
+| A region shared by peers of different target width or byte order | provisional, and its check is not in this repository | Sharing is not offered, and it is not unguarded either: the root record persists the word width, atomic width and byte order it was created with (`header::AbiProfile`), and `header::recorded_at` compares that profile against the reader's own before it reads any natural-width word, so a foreign geometry is refused with `Error::LayoutMismatch(LayoutField::Profile)` and the discovery route yields `Error::InvalidHeader` rather than a half-read region. The record's own bytes are target-independent — `#[repr(C)]`, align 1, `size_of` 35, both asserted in a `const` block — which is what makes the refusal reachable instead of a misread. No file here executes it: `grep -n i686 .github/workflows/ci.yml` answers a target-install line and one `cargo check` line, with no test target behind either, so the row rests on source alone until the check below lands. Cross-target sharing stays out of scope, which is why the quantities that differ between targets stay unpublished ([abi.md](abi.md)). |
+| MSRV | a published fact, not a verdict | `rust-version = "1.100.0"`, with the same channel pinned in [`rust-toolchain.toml`](../rust-toolchain.toml); the crate builds on stable and needs no nightly. |
 
 ## What a `no-std` build gets
 
@@ -77,9 +75,10 @@ all, is in [porting.md](porting.md).
 
 - The initial-image row, until its probe is tracked; the CI rows above check the
   crate, not a `const` image placed in a `static`.
-- Handover framing, until something other than this crate's own two host arms reads a
-  frame. Both arms are the same pair of writers and readers, which is why the shared
-  `stamp_front`/`read_front` owner is the fix and not the evidence.
+- The cross-geometry refusal, until a test composes one region and admits a member
+  whose recorded profile is not its own. The `i686` CI row checks that the crate
+  compiles at that width, not that a 32-bit member and a 64-bit region refuse each
+  other.
 
 ## What this page does not promise
 
@@ -89,3 +88,10 @@ automatic replay of application work, and performance outside a registered and m
 study condition. The behavioral reasons for those limits are in
 [architecture.md](architecture.md); this page exists only to say which surfaces were
 checked, against what, and how you would find out.
+
+Handover framing carries a second kind of limit, and it is listed here rather than above
+because no work would lift it: the two host arms are the same pair of writers and readers, so
+the shared `stamp_front`/`read_front` owner removed a defect and did not add a check, and no
+implementation outside this crate is expected to read a frame. The row therefore stays
+`provisional` permanently. A check that will not be pursued is a limit on what the page can
+say, not a debt this repository owes somebody.
