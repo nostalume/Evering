@@ -93,6 +93,15 @@ jobs:
       # every bound derived from `usize` answer differently at 32 bits.
       - run: cargo check --no-default-features --target riscv32imac-unknown-none-elf
       - run: cargo check --no-default-features --target aarch64-unknown-none
+      # Those two rows compile the crate at a bare target; neither can compile what a bare port writes.
+      # `probe/bare_port` is the row for that: a `#![no_std]` crate of its own, holding the `Source` over its
+      # own image, the doorbell pair, and the const-constructed initial region image, and reaching `evering`
+      # only through its published surface. It is not under `tests/` because an integration target links the
+      # `std` harness and so builds at no `*-none-elf` target at all — the one configuration this asks about.
+      # 32 bits is the width where a bound derived from `usize` can answer differently, and the rows above
+      # cover the other; it stays a `check` and never a `test`, because a bare target has no harness, so all
+      # this row can establish is that the image compiles there, not that anything ran.
+      - run: cargo check --manifest-path probe/bare_port/Cargo.toml --target riscv32imac-unknown-none-elf
       - run: cargo package --list
 
   windows:

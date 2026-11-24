@@ -33,12 +33,13 @@ the directory into your extent, so:
   principle and deliberately not offered: a fully initialized region carries a directory
   and pool state as well as a header, its byte layout is [provisional](stability.md), and
   today no port needs it. If you do, say so — the shape you would need is a `const fn`
-  over the concrete header type, which compiled at
-  `riscv32imac-unknown-none-elf` and `aarch64-unknown-none` on stable in a probe that is
-  not part of this tree (the verdict page records that row as one whose check is
-  missing), whereas the same
-  image as a byte array additionally pins which bytes belong to no field, the
-  target-dependent tail, and endianness.
+  over concrete `#[repr(C)]` atomics, and
+  [`probe/bare_port`](../probe/bare_port/Cargo.toml) is the crate in this repository that
+  compiles it, as a typed `static` and as a byte array, at
+  `riscv32imac-unknown-none-elf` on stable. What it compiles is your image, not one the
+  crate hands out: the shipped header type has no reachable constructor. The byte-array
+  route additionally pins which bytes belong to no field, the target-dependent tail, and
+  endianness.
 
 ## What you can do with no host at all
 

@@ -1,4 +1,6 @@
 /target
+/probe/*/target/
+/probe/*/Cargo.lock
 .vscode/
 rustc-ice*
 /.codex/plans/

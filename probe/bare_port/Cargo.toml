@@ -1,0 +1,20 @@
+# The bare-target half of the checks in this repository: what a port that has no libc, no descriptor and
+# no process model can compile against `evering`. It is a check, not a product — `publish = false`, and the
+# root manifest's `include` list names no directory above it, so `cargo package --list` never shows it.
+# CI compiles it (`.github/workflows/ci.yml`, `--target riscv32imac-unknown-none-elf`) and cannot run it,
+# because there is no harness on that target; every claim resting on it says "compiles", never "executes".
+[package]
+name = "bare_port"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+evering = { path = "../..", default-features = false }
+
+# Its own workspace root. The crate under test is a path dependency rather than a sibling, so nothing here
+# joins the published package's build, and `cargo build` at the repository root does not reach it either.
+# That isolation has one cost worth naming: the root `cargo fmt --all` and `cargo clippy --all-targets`
+# legs read the root workspace only, so an edit here is formatted by hand, with
+# `cargo fmt --manifest-path probe/bare_port/Cargo.toml --all`.
+[workspace]
