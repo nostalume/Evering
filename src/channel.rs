@@ -184,7 +184,28 @@ pub struct Port<H: Repr> {
     pub(crate) generation: usize,
 }
 
+// A port's bytes are the id's own width, then the two counts stamped beside it. `capacity` and
+// `generation` are `usize` in Rust and a `u64` on the wire, and `role` is stamped as a `u8`, so each
+// width below comes from what is written, not from the field's declared type — deriving from the
+// field would sum to 56 and pin nothing.
+const PORT_ID: core::ops::Range<usize> = 0..crate::dir::ID_BYTES;
+const PORT_CAPACITY: core::ops::Range<usize> =
+    PORT_ID.end..PORT_ID.end + core::mem::size_of::<u64>();
+const PORT_ROLE: core::ops::Range<usize> =
+    PORT_CAPACITY.end..PORT_CAPACITY.end + core::mem::size_of::<u8>();
+const PORT_GENERATION: core::ops::Range<usize> =
+    PORT_ROLE.end..PORT_ROLE.end + core::mem::size_of::<u64>();
+// The total a peer copies is stated rather than summed, so widening a segment fails the assertion
+// under it instead of quietly moving 49 to 56.
 const PORT_BYTES: usize = 49;
+
+const _: () = assert!(
+    PORT_CAPACITY.end == PORT_ROLE.start
+        && PORT_ROLE.end == PORT_GENERATION.start
+        && PORT_GENERATION.end == PORT_BYTES,
+    "the four widths have to tile a port's bytes, or the total a peer copies stops naming the \
+     segments it copies"
+);
 
 impl<H: Repr> Port<H> {
     pub const BYTE_LEN: usize = PORT_BYTES;
@@ -226,14 +247,10 @@ impl<H: Repr> Port<H> {
 
     pub fn to_bytes(&self) -> [u8; PORT_BYTES] {
         let mut bytes = [0; PORT_BYTES];
-        bytes[..crate::dir::ID_BYTES].copy_from_slice(&self.id.inner.to_bytes());
-        for (offset, value) in [
-            (32, self.id.capacity() as u64),
-            (41, self.generation as u64),
-        ] {
-            bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
-        }
-        bytes[40] = self.role();
+        bytes[PORT_ID].copy_from_slice(&self.id.inner.to_bytes());
+        bytes[PORT_CAPACITY].copy_from_slice(&(self.id.capacity() as u64).to_le_bytes());
+        bytes[PORT_ROLE.start] = self.role();
+        bytes[PORT_GENERATION].copy_from_slice(&(self.generation as u64).to_le_bytes());
         bytes
     }
 
@@ -241,12 +258,17 @@ impl<H: Repr> Port<H> {
         if bytes.len() != Self::BYTE_LEN {
             return None;
         }
-        let u64_at = |offset| u64::from_le_bytes(bytes[offset..offset + 8].try_into().unwrap());
+        let word_at =
+            |range: core::ops::Range<usize>| u64::from_le_bytes(bytes[range].try_into().unwrap());
         let id = Id {
-            inner: crate::dir::Id::from_bytes(&bytes[..crate::dir::ID_BYTES])?,
-            capacity: usize::try_from(u64_at(32)).ok()?,
+            inner: crate::dir::Id::from_bytes(&bytes[PORT_ID])?,
+            capacity: usize::try_from(word_at(PORT_CAPACITY)).ok()?,
         };
-        Self::from_parts(id, bytes[40], usize::try_from(u64_at(41)).ok()?)
+        Self::from_parts(
+            id,
+            bytes[PORT_ROLE.start],
+            usize::try_from(word_at(PORT_GENERATION)).ok()?,
+        )
     }
 }
 

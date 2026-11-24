@@ -35,7 +35,26 @@ const GROW: usize = 2;
 const STATE_BITS: usize = 3;
 const STATE_MASK: usize = (1 << STATE_BITS) - 1;
 const GENERATION_MAX: usize = usize::MAX >> STATE_BITS;
+
+// The widths below are the widths an id occupies on the wire: `generation` is a `usize` in Rust and
+// a `u64` here, so each segment comes from the type that is stamped, never from the field's own.
+const ID_REGION_HIGH: core::ops::Range<usize> = 0..core::mem::size_of::<u64>();
+const ID_REGION_LOW: core::ops::Range<usize> =
+    ID_REGION_HIGH.end..ID_REGION_HIGH.end + core::mem::size_of::<u64>();
+const ID_SLAB: core::ops::Range<usize> =
+    ID_REGION_LOW.end..ID_REGION_LOW.end + core::mem::size_of::<u32>();
+const ID_ENTRY: core::ops::Range<usize> = ID_SLAB.end..ID_SLAB.end + core::mem::size_of::<u32>();
+const ID_GENERATION: core::ops::Range<usize> =
+    ID_ENTRY.end..ID_ENTRY.end + core::mem::size_of::<u64>();
+// The total is what a peer copies, so it stays stated rather than summed: a widened segment has to
+// fail at the assertion below instead of quietly moving 32 to 36.
 pub(crate) const ID_BYTES: usize = 32;
+
+const _: () = assert!(
+    ID_GENERATION.end == ID_BYTES,
+    "the five derived segments have to tile the published width, or an id's bytes stop naming what \
+     a peer copies"
+);
 
 #[cfg(test)]
 pub(crate) const CREATE_PENDING: usize = 1;
@@ -1622,11 +1641,11 @@ impl<L> Id<L> {
 
     pub(crate) fn to_bytes(self) -> [u8; ID_BYTES] {
         let mut bytes = [0; ID_BYTES];
-        bytes[..8].copy_from_slice(&self.region.high.to_le_bytes());
-        bytes[8..16].copy_from_slice(&self.region.low.to_le_bytes());
-        bytes[16..20].copy_from_slice(&self.slab.to_le_bytes());
-        bytes[20..24].copy_from_slice(&self.entry.to_le_bytes());
-        bytes[24..].copy_from_slice(&(self.generation as u64).to_le_bytes());
+        bytes[ID_REGION_HIGH].copy_from_slice(&self.region.high.to_le_bytes());
+        bytes[ID_REGION_LOW].copy_from_slice(&self.region.low.to_le_bytes());
+        bytes[ID_SLAB].copy_from_slice(&self.slab.to_le_bytes());
+        bytes[ID_ENTRY].copy_from_slice(&self.entry.to_le_bytes());
+        bytes[ID_GENERATION].copy_from_slice(&(self.generation as u64).to_le_bytes());
         bytes
     }
 
@@ -1636,12 +1655,12 @@ impl<L> Id<L> {
         }
         Some(Self::from_parts(
             RegionId::new(
-                u64::from_le_bytes(bytes[..8].try_into().unwrap()),
-                u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
+                u64::from_le_bytes(bytes[ID_REGION_HIGH].try_into().unwrap()),
+                u64::from_le_bytes(bytes[ID_REGION_LOW].try_into().unwrap()),
             ),
-            u32::from_le_bytes(bytes[16..20].try_into().unwrap()),
-            u32::from_le_bytes(bytes[20..24].try_into().unwrap()),
-            usize::try_from(u64::from_le_bytes(bytes[24..].try_into().unwrap())).ok()?,
+            u32::from_le_bytes(bytes[ID_SLAB].try_into().unwrap()),
+            u32::from_le_bytes(bytes[ID_ENTRY].try_into().unwrap()),
+            usize::try_from(u64::from_le_bytes(bytes[ID_GENERATION].try_into().unwrap())).ok()?,
         ))
     }
 }

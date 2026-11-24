@@ -45,6 +45,11 @@ use crate::{mem::Peer, schema::RegionId};
 
 pub const MAX_BOOTSTRAP: usize = 4096;
 pub const MAX_RESOURCES: usize = 8;
+// The front is assembled from these two widths rather than hand-counted: the tag's own width, which
+// both tags below are declared at, and the wire width of a count. The total a peer copies stays the
+// literal `FRAME_HEADER`, and the assertion under the three ranges is what ties the two together.
+const TAG_BYTES: usize = 4;
+const COUNT_BYTES: usize = core::mem::size_of::<u16>();
 /// The tag a handoff offer starts with.
 ///
 /// Published as data rather than kept as a writer's private constant, because a process written
@@ -54,7 +59,7 @@ pub const MAX_RESOURCES: usize = 8;
 /// is a collision test between two frame kinds, not a version a receiver negotiates.
 /// `tests/handover_attestation/labels.rs` pins both labels apart and pins the front's width, so
 /// changing one fails a leg before it changes the wire.
-pub const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
+pub const HANDOFF_MAGIC: [u8; TAG_BYTES] = *b"EVR1";
 
 /// The tag a child's arrival receipt starts with, on the rendezvous it was granted.
 ///
@@ -69,7 +74,7 @@ pub const HANDOFF_MAGIC: [u8; 4] = *b"EVR1";
 /// Published beside [`HANDOFF_MAGIC`], and no longer gated on the host: what a receipt begins with is
 /// the same on every platform that runs this protocol, and the platform's own choice is how the frame
 /// is delivered.
-pub const ARRIVAL_MAGIC: [u8; 4] = *b"EVA1";
+pub const ARRIVAL_MAGIC: [u8; TAG_BYTES] = *b"EVA1";
 
 /// The width of the fixed front both frame kinds carry, published beside the two tags.
 ///
@@ -80,12 +85,14 @@ pub const ARRIVAL_MAGIC: [u8; 4] = *b"EVA1";
 /// than inferred from a reader's habit. The counts are little-endian `u16`s, which is why
 /// [`MAX_BOOTSTRAP`] and [`MAX_RESOURCES`] are the bounds they are.
 pub const FRAME_HEADER: usize = 8;
-/// Where the four tag bytes sit inside the front: [`FRAME_HEADER`] bytes, no more and no less.
-pub const FRAME_TAG: core::ops::Range<usize> = 0..4;
-/// Where the bootstrap length sits, as two little-endian bytes.
-pub const FRAME_LEN: core::ops::Range<usize> = 4..6;
-/// Where the resource count sits, as two little-endian bytes. Zero says a receipt travels alone.
-pub const FRAME_COUNT: core::ops::Range<usize> = 6..8;
+/// Where the tag bytes sit inside the front: `TAG_BYTES` of them, no more and no less.
+pub const FRAME_TAG: core::ops::Range<usize> = 0..TAG_BYTES;
+/// Where the bootstrap length sits, as `COUNT_BYTES` little-endian bytes.
+pub const FRAME_LEN: core::ops::Range<usize> = TAG_BYTES..TAG_BYTES + COUNT_BYTES;
+/// Where the resource count sits, as `COUNT_BYTES` little-endian bytes. Zero says a receipt travels
+/// alone.
+pub const FRAME_COUNT: core::ops::Range<usize> =
+    TAG_BYTES + COUNT_BYTES..TAG_BYTES + 2 * COUNT_BYTES;
 
 const _: () = assert!(
     FRAME_TAG.end == FRAME_LEN.start
