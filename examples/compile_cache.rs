@@ -132,7 +132,7 @@ fn spawn_serving(
     role: &str,
     boot: &Bootstrap,
     shared: &Shared,
-    wakes: &evering::os::Event,
+    wakes: evering::os::Event,
     rings: &evering::os::Ring,
 ) -> Result<Supervisor, String> {
     let mut command = Command::new(std::env::current_exe().map_err(text)?);
@@ -346,7 +346,7 @@ async fn traffic(session: &Session, pool: &Pool, shared: &Shared) -> Result<(), 
     let (to_daemon, daemon_wakes) = event().map_err(text)?;
     let (daemon_rings, my_wakes) = event().map_err(text)?;
     let boot = encode_boot(pool.id(), &jobs_port, &verdicts_port);
-    let mut daemon = spawn_serving("--serve", &boot, shared, &daemon_wakes, &daemon_rings)?;
+    let mut daemon = spawn_serving("--serve", &boot, shared, daemon_wakes, &daemon_rings)?;
     let wait = Wait::new(my_wakes).map_err(text)?;
     let signals = Signals::new(&to_daemon, &wait);
 
@@ -410,7 +410,7 @@ async fn liveness(session: &Session, pool: &Pool, shared: &Shared) -> Result<(),
     let boot = encode_boot(pool.id(), &jobs_port, &verdicts_port);
     let (to_child, child_wakes) = event().map_err(text)?;
     let (child_rings, my_wakes) = event().map_err(text)?;
-    let mut child = spawn_serving("--dying", &boot, shared, &child_wakes, &child_rings)?;
+    let mut child = spawn_serving("--dying", &boot, shared, child_wakes, &child_rings)?;
     let pid = child.id();
     let wait = Wait::new(my_wakes).map_err(text)?;
 

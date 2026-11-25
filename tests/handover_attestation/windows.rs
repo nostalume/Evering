@@ -281,7 +281,7 @@ fn admit(
             Instant::now() + Duration::from_secs(5),
             bootstrap,
             mapping,
-            &child_wait,
+            child_wait,
             &child_ring,
         )
         .expect("hand the region to the admitted child");

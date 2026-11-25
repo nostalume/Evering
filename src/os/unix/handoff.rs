@@ -142,13 +142,21 @@ impl Handoff {
     /// the receipt the admitted process writes down that end. Keeping it is the only way the parent
     /// learns which member its promise filled, and dropping it is what tells the child that nobody is
     /// taking attendance any more.
+    ///
+    /// The reading end moves and the writing end is borrowed, which is the latch's own rule stated as a
+    /// signature: `Event::clear` reads the whole counter, so a second peer admitted to the same doorbell
+    /// would be handed a wake its sibling had already taken — a readiness that was spent before this
+    /// process parked cannot be re-reported to it. Many writers on one `Ring` is the shape the
+    /// coalescing is built for, because the one consumer re-examines its condition until it is drained.
+    /// A caller that really does mean one condition shared by several peers duplicates the descriptor
+    /// itself, through [`Event::from_owned_fd`](Event::from_owned_fd), and owns the lost wakes.
     pub fn send<F: AsFd>(
         self,
         _child: &Supervisor,
         _deadline: Instant,
         bootstrap: &Bootstrap,
         mapping: &UnixFd<F>,
-        event: &Event,
+        event: Event,
         ring: &Ring,
     ) -> io::Result<Attendance> {
         let socket = self.socket;

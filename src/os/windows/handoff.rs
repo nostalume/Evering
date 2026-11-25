@@ -109,13 +109,22 @@ impl Handoff {
     /// What `accept` reached is kept rather than closed: the instance is the only channel this process
     /// has back to the child it admitted, and one instance serves one client, so the same handle that
     /// carried the offer is the one that takes the receipt.
+    ///
+    /// The reading end moves and the writing end is borrowed, which is the latch's own rule stated as a
+    /// signature: this arm's latch is one bit shared by every holder of the object, so a second peer
+    /// admitted to the same doorbell would be handed a wake whose bit a sibling had already reset — and
+    /// a readiness that was spent before this process parked cannot be re-reported to it. Many writers on
+    /// one `Ring` is what the coalescing is built for, because the one consumer re-examines its condition
+    /// until it is drained. A caller that really does mean one condition shared by several peers hands
+    /// over a duplicated handle and rebuilds the end itself, through
+    /// [`Event::from_owned_handle`](Event::from_owned_handle), and owns the lost wakes.
     pub fn send<F: AsHandle>(
         self,
         child: &Supervisor,
         deadline: Instant,
         bootstrap: &Bootstrap,
         mapping: &Section<F>,
-        event: &Event,
+        event: Event,
         ring: &Ring,
     ) -> io::Result<Attendance> {
         let socket = self.listener.accept(child, deadline)?;

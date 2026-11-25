@@ -5,10 +5,13 @@
 //! kernel accepting concurrent calls on one handle rather than on anything in this file.
 //!
 //! A manual-reset object is one bit shared by every holder, so `clear` takes the pending notification
-//! from *all* of them at once — including a peer in another process that received the handle through a
-//! handover and had not woken yet. Nothing here holds two processes, and the other two arms of this
-//! module hold a byte queue and a counter, so a change to this file cannot be checked against them from
-//! a Windows run either.
+//! from *all* of them at once — including a second holder made by a caller that duplicated the handle and
+//! rebuilt an end of its own. That is what the types here refuse: `Ring` is `Clone`, because many writers
+//! on one latch is the shape a bit is built for, while `Event` is not, because a consumer that shares its
+//! readiness loses it to whichever holder reset the bit first. The handover moves its reading end, and
+//! borrows its writing end, for the same reason. Nothing here holds two processes, and the other two arms
+//! of this module hold a byte queue and a counter, so a change to this file cannot be checked against them
+//! from a Windows run either.
 //!
 //! `Event::wait_any` is the one operation whose refusal belongs to this arm alone: the kernel admits 64
 //! objects into a wait array, so a wider set is answered with an error here and with a park on the two
@@ -54,7 +57,7 @@ impl Drop for Handle {
 #[derive(Clone, Debug)]
 pub struct Ring(Arc<Handle>);
 
-#[derive(Clone, Debug)]
+#[derive(Debug)]
 pub struct Event(Arc<Handle>);
 
 /// Creates the two local owners of one sticky manual-reset event.

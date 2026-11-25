@@ -25,10 +25,17 @@ const WORKERS: usize = 2;
 const BOOT_MAGIC: u64 = 0x4556_494e_4458_0001;
 /// How long the coordinator lets a job stay outstanding. A queue reports contention and closure and never
 /// silence, so a worker that died before answering leaves the peer-bound park with no cause to end on:
-/// the run has to carry the bound, which is what an integration holding both roles is told to do.
+/// the run has to carry the bound, which is what an integration holding both roles is told to do. Where the
+/// platform has a death witness the same clock bounds the reap too, because closing a channel is still a
+/// wake the worker has to be given.
 const BUDGET: Duration = Duration::from_secs(30);
 const STUCK: &str =
     "a job stayed outstanding past the run's budget; the workers' own lines name why";
+/// Only the arm with a death witness can report an unreaped worker: the others have no wake to bound a wait
+/// on, so their reap runs as long as the child does and nothing here is left to name.
+#[cfg(target_os = "linux")]
+const UNREAPED: &str =
+    "a worker outlived the run's budget with its channels closed; its own lines name why";
 pub(crate) type Result<T> = std::result::Result<T, String>;
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -179,7 +186,7 @@ fn spawn(
     index: usize,
     boot: &Bootstrap,
     shared: &evering::os::Shared,
-    event: &Event,
+    event: Event,
     ring: &Ring,
 ) -> Result<Supervisor> {
     let (handoff, grant) = evering::os::Handoff::bind().map_err(text)?;
@@ -226,9 +233,9 @@ struct Peer {
 async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
     let (session, shared) = create()?;
     let pool = session.create_pool(8 * 1024 * 1024, None).map_err(text)?;
-    let (notify, worker_event) = evering::os::event().map_err(text)?;
     let (worker_ring, event) = evering::os::event().map_err(text)?;
     let wait = Wait::new(event).map_err(text)?;
+    let mut rings = Vec::new();
     let mut peers = Vec::new();
     for index in 0..WORKERS {
         let (jobs, job_port) = session.create_channel(4).map_err(text)?;
@@ -237,14 +244,20 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
         let (results_tx, results_rx) = results.split();
         drop((jobs_rx, results_tx));
         let boot = encode_boot(index, pool.id(), &job_port, &result_port);
+        // One doorbell per worker, because the reading end moves into the child and a latch has exactly
+        // one consuming owner: two peers parked on one pair would each clear the other's readiness, and a
+        // wake spent before a process parks is never re-reported. The workers' ring back is one pair for
+        // the whole set, since many writers on a single reader is what a coalescing latch is for.
+        let (notify, worker_event) = evering::os::event().map_err(text)?;
+        let child = spawn(index, &boot, &shared, worker_event, &worker_ring)?;
+        rings.push(notify);
         peers.push(Peer {
             jobs: jobs_tx,
             results: results_rx,
             channels: [jobs, results],
-            child: spawn(index, &boot, &shared, &worker_event, &worker_ring)?,
+            child,
         });
     }
-    let signals = Signals::new(&notify, &wait);
     let window = WORKERS * 2;
     let mut output: Vec<Option<Index>> = (0..paths.len()).map(|_| None).collect();
     let mut sent = 0;
@@ -257,7 +270,9 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
     };
     while sent < paths.len() || received < sent {
         if sent < paths.len() && sent - received < window {
-            let peer = &peers[sent % peers.len()];
+            let slot = sent % peers.len();
+            let peer = &peers[slot];
+            let signals = Signals::new(&rings[slot], &wait);
             let permit = tokio::time::timeout(remaining()?, signals.reserve(&peer.jobs))
                 .await
                 .map_err(|_| STUCK.to_owned())?
@@ -274,9 +289,9 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
             continue;
         }
         let mut progress = false;
-        for peer in &peers {
+        for (slot, peer) in peers.iter().enumerate() {
             if let Ok(claim) = peer.results.claim() {
-                let committed = signals
+                let committed = Signals::new(&rings[slot], &wait)
                     .admit::<[u8]>(claim, pool.as_ref(), OUTCOME)
                     .map_err(text)?;
                 let (block, notified) = committed.into_parts();
@@ -296,10 +311,29 @@ async fn coordinator(paths: Vec<PathBuf>) -> Result<Vec<Index>> {
                 .map_err(text)?;
         }
     }
-    for peer in &peers {
-        signals.close_tx(&peer.jobs).into_parts().1.map_err(text)?;
+    for (slot, peer) in peers.iter().enumerate() {
+        Signals::new(&rings[slot], &wait)
+            .close_tx(&peer.jobs)
+            .into_parts()
+            .1
+            .map_err(text)?;
     }
     for peer in &mut peers {
+        // The reap is the one step with no queue left to report contention or closure on, so the run's
+        // bound has to reach here too: a worker parked on a wake that was spent elsewhere would turn a
+        // budgeted run into a parent that waits forever. Linux parks this task on the child itself; the
+        // arms with no death witness wait on the reap, which is what `compile_cache` does for the same
+        // reason.
+        #[cfg(target_os = "linux")]
+        {
+            let death = peer.child.exited().map_err(text)?;
+            if tokio::time::timeout(remaining()?, death.wait())
+                .await
+                .is_err()
+            {
+                return Err(UNREAPED.to_owned());
+            }
+        }
         if !peer.child.wait().map_err(text)?.success() {
             return Err("worker failed".into());
         }

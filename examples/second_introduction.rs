@@ -507,7 +507,7 @@ fn introduce(dir: &Path) -> io::Result<i32> {
         Instant::now() + STEP,
         &bootstrap,
         &mapping,
-        &wakes_target,
+        wakes_target,
         &rings_from_target,
     )?;
     report(
@@ -524,12 +524,10 @@ fn introduce(dir: &Path) -> io::Result<i32> {
         )
     })?;
     drop((named, _attendance, grant, moved_over));
-    drop((
-        mapping,
-        wakes_target,
-        rings_from_target,
-        _rings_toward_target,
-    ));
+    // The typed `send` above moved this process's reading end into the meeting, so the only ends left to
+    // release are the writing ones and the mapping; the round-two offer was a duplicate and was never ours
+    // to hand away.
+    drop((mapping, rings_from_target, _rings_toward_target));
     let _ = fs::remove_file(dir.join("introducer.sock"));
     Ok(MET)
 }

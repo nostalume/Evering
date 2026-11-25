@@ -187,12 +187,18 @@ wait is cancelled. It promises nothing about how many waiters one notification
 releases or about which change caused it, and the model survives both answers
 because one primitive is paired with one condition — one ring, one direction —
 so a wake that releases only its head waiter, as a kernel notification does,
-still leads to re-examined shared truth. Whether a latch is empty after a park is
-not observable through a wait, so an adapter's further properties are proved
-against the primitive itself in its own module. An extension that reports a cause
-would be admissible only where a provider can both carry it and be checked
-carrying it, and only to skip work a re-examination could have found. The clauses
-a new provider is checked against are recorded in
+still leads to re-examined shared truth. The pairing crosses a process boundary
+the same way: a handover is given the reading end and keeps the writing end, so
+one latch has exactly one consuming owner even between processes, and
+`Handoff::send` carries that as a signature rather than a rule to remember. A
+caller that does mean one condition shared by several peers duplicates the
+descriptor itself and owns the wakes that costs it. Whether a latch is empty
+after a park is not observable through a wait, so an adapter's further
+properties are proved against the primitive itself in its own module. An
+extension that reports a cause would be admissible only where a provider can
+both carry it and be checked carrying it, and only to skip work a
+re-examination could have found. The clauses a new provider is checked against
+are recorded in
 [`tests/notification_latch/latch_clauses.rs`](../tests/notification_latch/latch_clauses.rs).
 
 A park can also be asked of a whole set of latches, which reports the one that

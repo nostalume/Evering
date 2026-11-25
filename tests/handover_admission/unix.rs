@@ -258,7 +258,7 @@ fn a_claimed_rendezvous_slot_is_refused_and_the_granted_child_still_meets() {
             Instant::now() + Duration::from_secs(5),
             &bootstrap,
             &mapping,
-            &child_wait,
+            child_wait,
             &child_ring,
         )
         .unwrap();
@@ -340,7 +340,7 @@ fn a_rendezvous_the_host_placed_by_hand_is_admitted_without_an_announcement() {
             Instant::now() + Duration::from_secs(5),
             &bootstrap,
             &mapping,
-            &child_wait,
+            child_wait,
             &child_ring,
         )
         .unwrap();

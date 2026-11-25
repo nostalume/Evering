@@ -11,10 +11,13 @@
 //! Resources travel positionally: the order a sender puts the mapping, the event and the ring into a
 //! handover is matched by index on the receiving side, and `ReceivedResources` carries no tag saying
 //! which is which, so a sender and a reader disagreeing about that order receive each other's objects
-//! with nothing to complain. The promised member slot beside them is the one thing the map carries
-//! that is not positional — it is announced through the environment, and only the roster decides
-//! whether it was ever promised. The one thing that goes back the other way is a receipt, and it is
-//! named by two types and no resource: `Receipt` is the admitted process's means of reporting the
+//! with nothing to complain. The event goes as a whole reading end and the ring as a borrow, which is the
+//! latch's one-owner rule carried by a signature rather than left to the caller: a second peer admitted to
+//! one doorbell would have its readiness taken by whichever consumer served it first, while many writers on
+//! one latch is what a coalescing bit or counter is built for. The promised member slot beside them is the
+//! one thing the map carries that is not positional — it is announced through the environment, and only the
+//! roster decides whether it was ever promised. The one thing that goes back the other way is a receipt, and
+//! it is named by two types and no resource: `Receipt` is the admitted process's means of reporting the
 //! member it became, `Attendance` is the parent's bounded read of that report, and what makes a report
 //! evidence is that the host names its writer — a claim the writer cannot choose, and the reason no
 //! object travels with it. The whole map is also gated on `std`, so it simply is not there under

@@ -127,7 +127,7 @@ fn a_granted_process_names_the_peer_it_met() {
             Instant::now() + Duration::from_secs(10),
             &bootstrap,
             &mapping,
-            &child_wait,
+            child_wait,
             &child_ring,
         )
         .unwrap();
