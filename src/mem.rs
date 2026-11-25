@@ -212,9 +212,9 @@ pub enum DeclineCause {
     /// the race left no name behind — a lost cursor compare-exchange knows it lost and not to whom. A
     /// slot rather than a [`Peer`](crate::mapping::Peer), because a compare-exchange loses to a word
     /// whose generation nobody has read, and inventing one would hand out a credential for nothing.
-    Contested { member: Option<u8> },
+    Busy { member: Option<u8> },
     /// The layout is closed, so this kind of request will not be answered again.
-    Sealed,
+    Closed,
     /// An authority word names a state no participant writes: the region needs adjudication, not a retry.
     Corrupted,
     /// A mutation word is poisoned — what a writer that died mid-change leaves, and what `Recovery` settles.
@@ -241,7 +241,7 @@ impl DeclineCause {
     /// most sharply `ReadOnly`, which nothing any member of this mapping can do will turn into a
     /// `yes`, because the refusal is about the mapping the caller came through.
     pub const fn is_retryable(&self) -> bool {
-        matches!(self, Self::Contested { .. } | Self::NoRoom { .. })
+        matches!(self, Self::Busy { .. } | Self::NoRoom { .. })
     }
 
     /// Bundles this cause with the value the caller keeps.
@@ -270,16 +270,16 @@ impl core::fmt::Display for DeclineCause {
             Self::NoRoom { waits } => {
                 write!(f, "nothing was free where the request needed room, so {waits}")
             }
-            Self::Contested {
+            Self::Busy {
                 member: Some(member),
             } => write!(
                 f,
                 "member {member} holds the authority word this request needed, so a retry may take it"
             ),
-            Self::Contested { member: None } => f.write_str(
+            Self::Busy { member: None } => f.write_str(
                 "another member won the word this request needed, and the race names no holder",
             ),
-            Self::Sealed => f.write_str("the shared layout is closed to this kind of request"),
+            Self::Closed => f.write_str("the shared layout is closed to this kind of request"),
             Self::Corrupted => f.write_str(
                 "an authority word names a state no participant writes, so the region needs adjudication",
             ),

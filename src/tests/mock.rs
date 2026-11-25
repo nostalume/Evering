@@ -468,7 +468,7 @@ fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
     assert!(!heap.finish_recovery(dead.wrapping_add(1)));
     assert_eq!(
         heap.allocate(core::alloc::Layout::new::<u64>()),
-        Err(crate::mem::DeclineCause::Contested { member: Some(dead) })
+        Err(crate::mem::DeclineCause::Busy { member: Some(dead) })
     );
 
     assert_eq!(

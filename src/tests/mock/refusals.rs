@@ -67,9 +67,9 @@ fn a_refused_send_says_whose_progress_changes_the_answer() {
         waits: RoomWait::Drain,
     };
     says(&full, "receiver");
-    says(&DeclineCause::Contested { member: None }, "another member");
-    says(&DeclineCause::Contested { member: Some(3) }, "member 3");
-    says(&DeclineCause::Sealed, "closed");
+    says(&DeclineCause::Busy { member: None }, "another member");
+    says(&DeclineCause::Busy { member: Some(3) }, "member 3");
+    says(&DeclineCause::Closed, "closed");
 }
 
 /// One call answers both ways, which is why the value sits beside the cause rather than in an arm of
@@ -81,7 +81,7 @@ fn a_refused_send_says_whether_the_value_came_back() {
         waits: RoomWait::Drain,
     };
     let returned = full.decline(Unprintable);
-    let gone = DeclineCause::Contested { member: None }.declined::<Unprintable>();
+    let gone = DeclineCause::Busy { member: None }.declined::<Unprintable>();
     assert!(
         returned.value.is_some(),
         "a send that found no room comes back to the caller"
@@ -100,8 +100,8 @@ fn a_refused_send_says_whether_the_value_came_back() {
 #[test]
 fn only_waiting_on_somebody_else_is_worth_asking_again() {
     for cause in [
-        DeclineCause::Contested { member: None },
-        DeclineCause::Contested { member: Some(3) },
+        DeclineCause::Busy { member: None },
+        DeclineCause::Busy { member: Some(3) },
         DeclineCause::NoRoom {
             waits: RoomWait::Drain,
         },
@@ -118,7 +118,7 @@ fn only_waiting_on_somebody_else_is_worth_asking_again() {
         assert!(cause.is_retryable(), "{cause:?} waits on somebody else");
     }
     for cause in [
-        DeclineCause::Sealed,
+        DeclineCause::Closed,
         DeclineCause::TooWide,
         DeclineCause::Overflow,
         DeclineCause::Corrupted,
@@ -149,7 +149,7 @@ fn a_refusal_is_reportable_whatever_it_carries_back() {
         Box::new(shortage.decline(Unprintable)),
         Box::new(DeclineCause::TooWide.decline(Unprintable)),
         Box::new(full.decline(Unprintable)),
-        Box::new(DeclineCause::Contested { member: None }.declined::<Unprintable>()),
+        Box::new(DeclineCause::Busy { member: None }.declined::<Unprintable>()),
         Box::new(ReceiveError::Closed),
         Box::new(BlockRangeError),
     ];

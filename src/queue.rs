@@ -113,15 +113,15 @@ const fn holder(control: u16) -> Option<u8> {
 
 /// The three ways a reservation says no, in the words the whole crate declines with. A reservation is
 /// where a send still holds its value, so the answer carries a cause and the caller adds the value.
-const SEALED: DeclineCause = DeclineCause::Sealed;
+const CLOSED: DeclineCause = DeclineCause::Closed;
 const FULL: DeclineCause = DeclineCause::NoRoom {
     waits: RoomWait::Drain,
 };
-const BUSY: DeclineCause = DeclineCause::Contested { member: None };
+const BUSY: DeclineCause = DeclineCause::Busy { member: None };
 
 /// A lost claim over a slot's control word, attributed to whoever's word won it if the word says.
-const fn contested(control: u16) -> DeclineCause {
-    DeclineCause::Contested {
+const fn busy(control: u16) -> DeclineCause {
+    DeclineCause::Busy {
         member: holder(control),
     }
 }
@@ -281,7 +281,7 @@ pub trait Queue {
     {
         let header = self.header();
         if self.state() != 0 {
-            return Err(SEALED);
+            return Err(CLOSED);
         }
         let tail = header.tail.load(Ordering::Relaxed);
         let one_lap = self.one_lap();
@@ -303,7 +303,7 @@ pub trait Queue {
             return if header.head.load(Ordering::Relaxed).wrapping_add(one_lap) == tail {
                 Err(FULL)
             } else {
-                Err(contested(control))
+                Err(busy(control))
             };
         }
         if slot.turn.load(Ordering::Acquire) != tail || header.tail.load(Ordering::Relaxed) != tail
@@ -313,7 +313,7 @@ pub trait Queue {
         }
         if self.state() != 0 {
             slot.control.store(EMPTY, Ordering::Release);
-            return Err(SEALED);
+            return Err(CLOSED);
         }
         if header
             .tail
@@ -686,7 +686,7 @@ mod ownership_tests {
         let decline = sender
             .try_send(41)
             .expect_err("a closed queue refuses the item it was handed");
-        assert_eq!(decline.cause, DeclineCause::Sealed);
+        assert_eq!(decline.cause, DeclineCause::Closed);
         assert_eq!(decline.value, Some(41));
         let receiver = QueueRx { rx: &queue };
         assert!(matches!(
@@ -708,7 +708,7 @@ mod ownership_tests {
         let decline = sender
             .try_send(43)
             .expect_err("local producer contention is declined, not accepted");
-        assert_eq!(decline.cause, DeclineCause::Contested { member: Some(0) });
+        assert_eq!(decline.cause, DeclineCause::Busy { member: Some(0) });
         assert_eq!(decline.value, Some(43));
     }
 
@@ -806,12 +806,12 @@ mod ownership_tests {
                                 break;
                             }
                             Err(decline) => match (decline.cause, decline.value) {
-                                (DeclineCause::Contested { .. }, Some(returned)) => {
+                                (DeclineCause::Busy { .. }, Some(returned)) => {
                                     pending = returned;
                                     std::thread::yield_now();
                                 }
                                 (
-                                    DeclineCause::Sealed | DeclineCause::NoRoom { .. },
+                                    DeclineCause::Closed | DeclineCause::NoRoom { .. },
                                     Some(returned),
                                 ) => {
                                     assert_eq!(returned, value);

@@ -453,13 +453,13 @@ where
                     path.send_full().map_err(|_| "path count overflow")?;
                     Ok(Step::Pending)
                 }
-                (DeclineCause::Contested { .. }, Some(value)) => {
+                (DeclineCause::Busy { .. }, Some(value)) => {
                     self.staged = Some(value);
                     self.contended = true;
                     path.send_busy().map_err(|_| "path count overflow")?;
                     Ok(Step::Pending)
                 }
-                (DeclineCause::Sealed, Some(value)) => {
+                (DeclineCause::Closed, Some(value)) => {
                     self.staged = Some(value);
                     Err("disconnected".into())
                 }

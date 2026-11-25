@@ -112,11 +112,10 @@ async fn alternate(
                     tally.published.set(tally.published.get() + 1);
                 }
                 Err(Decline { cause, value }) => match (cause, value) {
-                    (
-                        DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. },
-                        Some(returned),
-                    ) => staged.push(returned),
-                    (DeclineCause::Sealed, _) => panic!("the peer closed early"),
+                    (DeclineCause::NoRoom { .. } | DeclineCause::Busy { .. }, Some(returned)) => {
+                        staged.push(returned)
+                    }
+                    (DeclineCause::Closed, _) => panic!("the peer closed early"),
                     (_, None) => panic!("the block lost its authority: {cause:?}"),
                     (cause, Some(_)) => panic!("the peer refused for {cause:?}"),
                 },

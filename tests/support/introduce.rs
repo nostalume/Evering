@@ -51,7 +51,7 @@ pub fn exit_code(child: &mut Supervisor, label: &str, budget: Duration) -> i32 {
 
 /// Publishes `value` through `send` for as long as the queue may still be draining.
 ///
-/// Only a full or contested queue is retried: a refusal that took the block's authority with it, or that
+/// Only a full or busy queue is retried: a refusal that took the block's authority with it, or that
 /// says the peer is gone, is the claim's failure to report, not something to loop on. The deadline is the
 /// caller's, because the caller knows what it is waiting the peer to do.
 pub fn send_bounded<T>(
@@ -65,10 +65,10 @@ pub fn send_bounded<T>(
             Err(decline) => decline,
         };
         match (cause, sent) {
-            (DeclineCause::NoRoom { .. } | DeclineCause::Contested { .. }, Some(returned)) => {
+            (DeclineCause::NoRoom { .. } | DeclineCause::Busy { .. }, Some(returned)) => {
                 value = returned
             }
-            (DeclineCause::Sealed, _) => panic!("peer disconnected while sending"),
+            (DeclineCause::Closed, _) => panic!("peer disconnected while sending"),
             (_, None) => panic!("block lost its Pool authority: {cause:?}"),
             (cause, Some(_)) => panic!("send refused for {cause:?}"),
         }

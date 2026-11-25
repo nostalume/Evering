@@ -24,7 +24,7 @@ const LOCAL_RETRY_LIMIT: usize = 32;
 fn decline_to_contention(cause: DeclineCause) -> Contention {
     match cause {
         DeclineCause::NoRoom { .. } => Contention::Full,
-        DeclineCause::Contested { .. } => Contention::Busy,
+        DeclineCause::Busy { .. } => Contention::Busy,
         cause => unreachable!("a channel reservation never answers {cause:?}"),
     }
 }
@@ -452,7 +452,7 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
             // with it: a decline with nothing to hand back.
             Ok(reserved) => deferred
                 .publish(reserved.stage(value))
-                .map_err(|_| DeclineCause::Contested { member: None }.declined())?,
+                .map_err(|_| DeclineCause::Busy { member: None }.declined())?,
             Err(cause) => return Err(cause.decline(value)),
         }
         Ok(())
@@ -498,7 +498,7 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
                     });
                 }
                 Err(cause) => match cause {
-                    DeclineCause::Sealed => return Err(ProgressError::Closed),
+                    DeclineCause::Closed => return Err(ProgressError::Closed),
                     cause => decline_to_contention(cause),
                 },
             };

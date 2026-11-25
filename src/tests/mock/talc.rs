@@ -878,7 +878,7 @@ fn transfer_admission_keeps_the_claim_until_pool_authority_moves() {
     assert!(
         matches!(
             refused.cause,
-            crate::DeclineCause::NoRoom { .. } | crate::DeclineCause::Contested { .. }
+            crate::DeclineCause::NoRoom { .. } | crate::DeclineCause::Busy { .. }
         ),
         "the queue refused for room or contention, not {refused:?}"
     );

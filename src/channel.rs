@@ -903,7 +903,7 @@ impl<H: Repr> Tx<H> {
             Ok(reserved) => reserved
                 .stage(value)
                 .publish()
-                .map_err(|_| DeclineCause::Contested { member: None }.declined()),
+                .map_err(|_| DeclineCause::Busy { member: None }.declined()),
             Err(cause) => Err(cause.decline(value)),
         }
     }

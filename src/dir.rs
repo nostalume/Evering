@@ -293,12 +293,12 @@ impl Error {
             Self::Admission(ProjectionError::ArithmeticOverflow) => Some(DeclineCause::Overflow),
             Self::Admission(ProjectionError::Admission(error)) => match error {
                 crate::header::RecordAdmitError::Contention => {
-                    Some(DeclineCause::Contested { member: None })
+                    Some(DeclineCause::Busy { member: None })
                 }
-                crate::header::RecordAdmitError::Closed => Some(DeclineCause::Sealed),
+                crate::header::RecordAdmitError::Closed => Some(DeclineCause::Closed),
                 _ => None,
             },
-            Self::Busy(member) => Some(DeclineCause::Contested {
+            Self::Busy(member) => Some(DeclineCause::Busy {
                 member: Some(*member),
             }),
             Self::Full => Some(DeclineCause::NoRoom {

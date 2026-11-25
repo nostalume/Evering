@@ -1474,7 +1474,7 @@ impl<'a> Mutation<'a> {
             Err(MUTATION_POISONED) => Err(DeclineCause::Poisoned),
             // The word this claim lost still names its holder, so the contention is attributable: a
             // peer worth waiting for is a different diagnosis from a race that leaves no name behind.
-            Err(holder) => Err(DeclineCause::Contested {
+            Err(holder) => Err(DeclineCause::Busy {
                 member: Some((holder - 1) as u8),
             }),
         }
@@ -1532,7 +1532,7 @@ mod mutation_tests {
         let held = Mutation::claim(&state, 2).unwrap();
         assert_eq!(
             Mutation::claim(&state, 1).err(),
-            Some(DeclineCause::Contested { member: Some(2) }),
+            Some(DeclineCause::Busy { member: Some(2) }),
             "the word is claimed, so this claim is declined"
         );
         held.commit();
