@@ -51,11 +51,11 @@ impl MockBackend<'_> {
         self.map(
             start,
             size,
-            crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(0, start as u64)),
+            crate::place::RegionAdmission::Create(crate::place::RegionId::new(0, start as u64)),
         )
     }
 
-    fn map(self, start: usize, size: usize, admission: crate::schema::RegionAdmission) -> Build {
+    fn map(self, start: usize, size: usize, admission: crate::place::RegionAdmission) -> Build {
         assert!(
             start
                 .checked_add(size)
@@ -117,7 +117,8 @@ fn area_init() {
 #[test]
 fn directory_create_publishes_only_an_initialized_talc_allocation() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     struct Created(u32);
     struct Reject;
@@ -252,7 +253,8 @@ fn directory_create_publishes_only_an_initialized_talc_allocation() {
 #[test]
 fn recovery_stands_down_when_a_live_mutation_finishes_inside_its_clear() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     struct Entry(u32);
 
@@ -316,7 +318,8 @@ fn recovery_stands_down_when_a_live_mutation_finishes_inside_its_clear() {
 #[test]
 fn recovery_refuses_a_staged_span_outside_the_region() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     struct Staged(u32);
 
@@ -483,7 +486,8 @@ fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
 #[test]
 fn directory_resumes_a_rolled_back_create_once_when_two_threads_race_it() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     #[derive(Debug)]
     struct Resumed(u32);
@@ -570,7 +574,8 @@ fn directory_resumes_a_rolled_back_create_once_when_two_threads_race_it() {
 #[test]
 fn recovery_refuses_a_second_reaper_of_a_claimed_remove_before_it_reads_the_span() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     struct Reaped(u32);
 
@@ -712,7 +717,8 @@ fn directory_recovery_rejects_authority_from_another_region() {
 #[test]
 fn directory_grows_past_its_first_slab_and_reopens_every_layout() {
     use crate::header::{Layout, Status};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     struct Managed(u32);
 
@@ -864,7 +870,7 @@ fn failed_root_admission_releases_the_map() {
     assert!(matches!(
         Build::new(
             map,
-            crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(1, 1))
+            crate::place::RegionAdmission::Create(crate::place::RegionId::new(1, 1))
         ),
         Err(crate::mem::Error::UnenoughSpace { .. })
     ));
@@ -874,7 +880,7 @@ fn failed_root_admission_releases_the_map() {
 #[test]
 fn a_read_only_view_answers_the_two_questions_the_entrance_asks_first() {
     use crate::mem::{MemOps, read_root};
-    use crate::schema::RegionAdmission;
+    use crate::place::RegionAdmission;
 
     #[repr(align(64))]
     struct Storage([u8; 0x2000]);
@@ -894,13 +900,13 @@ fn a_read_only_view_answers_the_two_questions_the_entrance_asks_first() {
     match read_root(&reader) {
         Ok(region) => assert_eq!(
             region,
-            writer.region_id(),
+            writer.region(),
             "a mapping that may not write still learns which region this root claims"
         ),
         Err(error) => panic!("the read-only view was refused: {error:?}"),
     }
 
-    let refused = Build::new(reader, RegionAdmission::Discover)
+    let refused = Build::new(reader, RegionAdmission::Expect(writer.region()))
         .err()
         .expect("a read-only mapping is admitted nowhere");
     assert!(
@@ -931,7 +937,8 @@ fn a_read_only_view_answers_the_two_questions_the_entrance_asks_first() {
 fn a_reader_with_no_slot_answers_what_a_published_record_claims_and_writes_nothing() {
     use crate::header::{Layout, RootHeader, Status};
     use crate::mem::{MemOps, Observer};
-    use crate::schema::{LayoutContext, SchemaKey, SharedSchema, schema_id};
+    use crate::place::LayoutContext;
+    use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
     #[repr(C)]
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1001,7 +1008,7 @@ fn a_reader_with_no_slot_answers_what_a_published_record_claims_and_writes_nothi
 
     assert_eq!(
         observer.region(),
-        writer.region_id(),
+        writer.region(),
         "the standpoint names a different region than the root it read claims"
     );
     assert_eq!(
@@ -1042,7 +1049,7 @@ fn a_reader_with_no_slot_answers_what_a_published_record_claims_and_writes_nothi
 fn a_full_roster_turns_a_member_away_and_answers_a_reader() {
     use crate::header::PARTICIPANT_CAPACITY;
     use crate::mem::Observer;
-    use crate::schema::{RegionAdmission, RegionId};
+    use crate::place::{RegionAdmission, RegionId};
 
     #[repr(align(64))]
     struct Storage([u8; 0x2000]);
@@ -1113,7 +1120,7 @@ fn failed_session_composition_detaches_and_releases_once() {
         unsafe { Map::from_raw_parts(pointer, len, Access::READ | Access::WRITE, count_release) };
     let layout = Build::new(
         map,
-        crate::schema::RegionAdmission::Create(crate::schema::RegionId::new(2, 2)),
+        crate::place::RegionAdmission::Create(crate::place::RegionId::new(2, 2)),
     )
     .expect("root fits");
 
@@ -1123,22 +1130,22 @@ fn failed_session_composition_detaches_and_releases_once() {
 
 #[test]
 fn mapped_drop_releases_its_layout_membership() {
-    use crate::header::{AdmitError, AdmitLayout, RcHeader, Root};
+    use crate::header::{AdmitLayout, RcHeader, RecordAdmitError, Root};
 
     let mut pt = [0; MAX_ADDR];
     let mut layout = MockBackend(&mut pt).shared(0, 0x4000);
     let mapped = layout.push::<RcHeader<Root>>(()).unwrap();
     let pointer = core::ptr::NonNull::from(&*mapped).as_ptr();
     let slot = mapped.peer().slot();
-    let ctx = crate::schema::LayoutContext {
-        region: mapped.region_id(),
+    let ctx = crate::place::LayoutContext {
+        region: mapped.region(),
         offset: mapped.layout_id().offset,
         allow_init: false,
     };
 
     assert_eq!(
         unsafe { <RcHeader<Root> as AdmitLayout>::admit(pointer, (), ctx, Some(slot)) },
-        Err(AdmitError::DuplicateMember)
+        Err(RecordAdmitError::DuplicateMember)
     );
     drop(mapped);
     assert_eq!(

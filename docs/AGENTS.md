@@ -54,8 +54,10 @@ conceptually separable.
   base address the way pools and queue records are, an accessor that names the
   location. A new hand-out of raw shared bytes is that second shape and owes a
   reason at its declaration.
-- Treat `Repr` and `Layout` implementations as unsafe portability proofs;
-  reject process-local representation and ownership at that boundary.
+- Treat `Repr` and `SharedSchema` implementations as unsafe portability proofs;
+  reject process-local representation and ownership at that boundary. `Layout` is
+  not a caller's implementation point — every layout a region composes is one this
+  crate wrote, so what a caller picks is a payload and a capacity.
 - Keep the mapping root responsible only for region identity and mapping
   lifetime. Let each persistent layout own and validate its schema and immutable
   typed information; do not introduce a session-wide manifest.

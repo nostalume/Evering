@@ -1,9 +1,10 @@
 //! The question this file compiles instead of answering in prose: can a target with no libc under it build
-//! an initial region image in `const` context, and in which shape? Nothing here is shipped, and nothing
-//! here reaches inside `evering` — `evering::layout::RcHeader` is published as a name, but neither its
-//! fields nor its `Root` type parameter are reachable from outside the crate, so a port that wants its
-//! region already initialized when it boots builds the image itself. What is modelled below is the shipped
-//! field order; every claim here is about that order, never about a type this repository hands out.
+//! an initial region image in `const` context, and in which shape? Nothing here reaches inside `evering`:
+//! the crate's header type is not published at all, so a port that wants its region already initialized when
+//! it boots builds the image itself and compares it against the two numbers the crate does hand over,
+//! `evering::layout::HEADER_PREFIX_BYTES` and `HEADER_PREFIX_ALIGN`. What is modelled below is the shipped
+//! field order, and shape five is pinned to it: its length and alignment are asserted against those two
+//! numbers. Every other claim here is about the order, never about a type this repository hands out.
 //!
 //! Five shapes, all over concrete `#[repr(C)]` structs of atomics — no generic `const fn`, so none of them
 //! asks stable for the generic const surface it does not have:
@@ -31,10 +32,12 @@ use core::sync::atomic::{AtomicU8, AtomicU32, AtomicUsize};
 
 const CAPACITY: usize = 64;
 
-/// The field classes a root header actually has, after `evering::layout::RcHeader`: one magic halfword, a
-/// schema id and revision, control words that are written atomically (`members`, the member array), and plain
-/// `u64` geometry words. That split is not decoration — `riscv32imac` has no `AtomicU64` at all, so a
-/// header whose sizes were 64-bit atomics could not be const-built on the target this crate is checked at.
+/// The field classes a header is built from, in the shape this question needs: one magic halfword, a schema
+/// id and revision, control words that are written atomically (`members`, the member array), and plain `u64`
+/// words. Shapes one to four are chosen to reproduce the compiler's padding, not to copy the crate: the word
+/// list here is longer than the shipped header's, and `Shipped` below is the one that models its order.
+/// That split is not decoration — `riscv32imac` has no `AtomicU64` at all, so a header whose sizes were
+/// 64-bit atomics could not be const-built on the target this crate is checked at.
 #[repr(C)]
 pub struct Header {
     magic: u16,
@@ -358,26 +361,21 @@ pub struct Record {
 const _RECORD_AS_SHIPPED: () =
     assert!(core::mem::align_of::<Record>() == 1 && core::mem::size_of::<Record>() == 35);
 
-/// Shape five: the header as `evering::layout::RcHeader` orders it — record, the one atomic, the identity and
-/// geometry words, then the layout body. Modelled with the same field classes: `RegionId` is two `u64` (the
-/// public `evering::layout::RegionId`), `SchemaId` one, and the body is an array of `AtomicUsize`.
+/// Shape five: the header as `evering` orders it — record, the one atomic, the identity
+/// words, the writer's info schema, then the layout body. Modelled with the same field classes: `RegionId` is
+/// two `u64` (the public `evering::layout::RegionId`), `SchemaId` one, and the body is an array of
+/// `AtomicUsize`. The header's own `*_size`/`*_align` words are gone from the crate, so they are gone here too.
 ///
-/// No gap field appears here, because this type's job is to be the thing measured: the three places the
-/// compiler reserves padding are what a published byte image has to name.
+/// No gap field appears here, because this type's job is to be the thing measured: the places the compiler
+/// reserves padding are what a published byte image has to name.
 #[repr(C)]
 pub struct Shipped {
     record: Record,
     members: AtomicUsize,
     region: RegionId,
     offset: u64,
-    header_size: u64,
-    header_align: u64,
     info_schema: u64,
     info_revision: u32,
-    info_size: u64,
-    info_align: u64,
-    body_size: u64,
-    body_align: u64,
     inner: [AtomicUsize; CAPACITY],
 }
 
@@ -391,20 +389,27 @@ pub struct RegionId {
 
 /// Shape five's first measurement: everything through `info_revision`, which is where the second gap is.
 ///
-/// `SEAM` and `WORD_GAP` are read off types that keep the padding, so they are the compiler's numbers
-/// rather than this file's arithmetic: after a 35-byte record the `AtomicUsize` wants 4 on riscv32 and 8 on
-/// aarch64, and after a `u32` in the geometry run the next `u64` wants 8 on both.
+/// `SEAM` and `WORD_GAP` are read off types that keep the padding, so they are the compiler's numbers rather
+/// than this file's arithmetic: after a 35-byte record the `AtomicUsize` wants 4 on riscv32 and 8 on aarch64,
+/// and the run after it ends on a `u32` inside an 8-aligned struct.
 #[repr(C)]
 pub struct Recorded {
     record: Record,
     members: AtomicUsize,
     region: RegionId,
     offset: u64,
-    header_size: u64,
-    header_align: u64,
     info_schema: u64,
     info_revision: u32,
 }
+
+/// The one check that keeps shape five from ageing the way its `Record` copy was allowed to: the prefix is
+/// measured against the crate rather than against this file. `HEADER_PREFIX_BYTES` is the shipped order with
+/// both trailing fields zero-sized, so it is exactly `Recorded`'s length on every target the probe is
+/// compiled at.
+const _RECORDED_IS_THE_CRATE: () = assert!(
+    core::mem::size_of::<Recorded>() == evering::layout::HEADER_PREFIX_BYTES
+        && core::mem::align_of::<Recorded>() == evering::layout::HEADER_PREFIX_ALIGN
+);
 
 const SEAM: usize = core::mem::offset_of!(Shipped, members) - core::mem::size_of::<Record>();
 const WORD_GAP: usize =
@@ -418,15 +423,9 @@ pub struct Assembled {
     members: AtomicUsize,
     region: RegionId,
     offset: u64,
-    header_size: u64,
-    header_align: u64,
     info_schema: u64,
     info_revision: u32,
     word_gap: [u8; WORD_GAP],
-    info_size: u64,
-    info_align: u64,
-    body_size: u64,
-    body_align: u64,
     inner: [AtomicUsize; CAPACITY],
 }
 
@@ -440,6 +439,12 @@ const ROOT_TAIL: usize = core::mem::size_of::<Assembled>()
 /// size**, because each of them is padding the compiler already put there. If `Shipped` and `Published`
 /// agree in size and the byte image compiles, then publishing an initial root image costs a const
 /// constructor and three padding fields — not a layout event.
+///
+/// The identity words come from the crate rather than from this file: `schema_id` and `AbiProfile::NATIVE`
+/// are published, so an image built here carries the root's real schema and the target's real profile,
+/// which is what makes the claim below — that a booting port needs no reinitialisation — checkable instead
+/// of aspirational. The body length is the one part a port must supply, since `Root`'s capacity is not
+/// published.
 #[repr(C)]
 pub struct Published {
     record: Record,
@@ -448,16 +453,10 @@ pub struct Published {
     members: AtomicUsize,
     region: RegionId,
     offset: u64,
-    header_size: u64,
-    header_align: u64,
     info_schema: u64,
     info_revision: u32,
-    /// The bytes between the 4-byte revision word and the 8-byte geometry word after it: 4 on both targets.
+    /// The bytes between the 4-byte revision word and whatever 8-aligned field follows it.
     word_gap: [u8; WORD_GAP],
-    info_size: u64,
-    info_align: u64,
-    body_size: u64,
-    body_align: u64,
     inner: [AtomicUsize; CAPACITY],
     /// The bytes the struct's own alignment rounds it up by, which on these two targets is none.
     tail: [u8; ROOT_TAIL],
@@ -467,19 +466,26 @@ impl Published {
     pub const fn initial(
         region_high: u64,
         region_low: u64,
-        body_size: u64,
-        body_align: u64,
+        extent: u64,
+        extent_align: u64,
     ) -> Self {
+        let root = evering::layout::schema_id("evering.root");
+        let unit = evering::layout::schema_id("evering.unit");
+        let profile = evering::layout::AbiProfile::NATIVE;
         Self {
             record: Record {
                 status: AtomicU8::new(2),
                 format: 1,
-                profile: [0, 0, 1],
+                profile: [
+                    profile.word_bytes,
+                    profile.atomic_bytes,
+                    profile.little_endian as u8,
+                ],
                 magic: 0xABCDu16.to_le_bytes(),
                 revision: 2u32.to_le_bytes(),
-                schema: 0x0001_0002u64.to_le_bytes(),
-                extent: (1u64 << 16).to_le_bytes(),
-                extent_align: 4096u64.to_le_bytes(),
+                schema: root.0.to_le_bytes(),
+                extent: extent.to_le_bytes(),
+                extent_align: extent_align.to_le_bytes(),
             },
             seam: [0; SEAM],
             members: AtomicUsize::new(0),
@@ -488,15 +494,9 @@ impl Published {
                 low: region_low,
             },
             offset: 0,
-            header_size: core::mem::size_of::<Self>() as u64,
-            header_align: core::mem::align_of::<Self>() as u64,
-            info_schema: 0x0001_0002,
-            info_revision: 2,
+            info_schema: unit.0,
+            info_revision: 1,
             word_gap: [0; WORD_GAP],
-            info_size: 0,
-            info_align: 8,
-            body_size,
-            body_align,
             inner: [const { AtomicUsize::new(0) }; CAPACITY],
             tail: [0; ROOT_TAIL],
         }
@@ -518,5 +518,6 @@ const _IMAGE_IS_THE_TYPE: () = assert!(PUBLISHED_BYTES.len() == core::mem::size_
 const _REIMAGE_GRAMMAR: () = assert!(
     PUBLISHED_BYTES[core::mem::offset_of!(Record, magic)] == 0xCD
         && PUBLISHED_BYTES[core::mem::offset_of!(Record, magic) + 1] == 0xAB
-        && PUBLISHED_BYTES[core::mem::offset_of!(Published, info_schema)] == 0x02
+        && PUBLISHED_BYTES[core::mem::offset_of!(Record, schema)]
+            == (evering::layout::schema_id("evering.root").0 as u8)
 );

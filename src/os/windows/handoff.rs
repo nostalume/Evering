@@ -36,7 +36,7 @@ use std::{env, io, os::windows::io::AsHandle, process::Command, time::Instant};
 use crate::{
     layout::RegionId,
     os::{
-        Event, Peer, Provenance, ReceivedResources, Ring,
+        Event, Provenance, ReceivedResources, Ring,
         windows::{
             Section,
             process::{Listener, Socket},
@@ -144,7 +144,7 @@ impl Handoff {
     /// The announced slot is read after the offer for the same reason the Unix leg reads it there: a
     /// message-mode pipe write has no queue to outlive its reader, so a child that declined before
     /// taking the handover would report itself to its parent as a broken pipe.
-    pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
+    pub fn receive() -> io::Result<(Provenance, ReceivedResources, Receipt)> {
         let address = env::var(RENDEZVOUS)
             .map_err(|_| refused("no evering rendezvous was granted to this process"))?;
         let introducer: u32 = env::var(INTRODUCER)
@@ -153,20 +153,20 @@ impl Handoff {
             .map_err(|_| refused("the announced introducer is not a process id"))?;
         let trusts = announced_trust()?;
         let socket = Socket::connect(&address)?;
-        let peer = match socket.server_pid() {
-            Ok(server) if server == introducer => Peer::introduced(server),
+        let provenance = match socket.server_pid() {
+            Ok(server) if server == introducer => Provenance::Attested { pid: server },
             Ok(_) => {
                 return Err(refused(
                     "the peer behind the granted rendezvous is not the process that granted it",
                 ));
             }
-            Err(_) => Peer::unattested(Provenance::Unavailable, true, trusts)?,
+            Err(_) => Provenance::unattested(Provenance::Unavailable, true, trusts)?,
         };
         let (bootstrap, resources) = socket.recv(3)?.into_parts();
         let mut resources = resources.into_vec();
         let promised = announced_seat()?;
         Ok((
-            peer,
+            provenance,
             ReceivedResources {
                 bootstrap,
                 mapping: Section::from_owned_handle(resources.remove(0)),

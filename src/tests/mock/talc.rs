@@ -32,14 +32,16 @@ struct Small(u64);
 
 // Deliberately violates Repr's schema-identity law to prove that exact extent
 // admission still prevents a colliding schema from forming the wrong pointer.
-unsafe impl Repr for Large {
+impl crate::schema::SharedSchema for Large {
     const SCHEMA: crate::schema::SchemaKey =
         crate::schema::SchemaKey::new(crate::schema::SchemaId(91), 1);
 }
-unsafe impl Repr for Small {
+unsafe impl Repr for Large {}
+impl crate::schema::SharedSchema for Small {
     const SCHEMA: crate::schema::SchemaKey =
         crate::schema::SchemaKey::new(crate::schema::SchemaId(91), 1);
 }
+unsafe impl Repr for Small {}
 
 fn mock_alloc(bk: &mut [u8], start: usize, size: usize) -> MockAlloc {
     let bk = MockBackend(bk);
@@ -54,7 +56,7 @@ pub(super) fn peer_session(bk: &mut [u8]) -> MockSession {
     Session::from(MockBackend(bk).map(
         0,
         MAX_ADDR,
-        crate::schema::RegionAdmission::Expect(crate::schema::RegionId::new(0, 0)),
+        crate::place::RegionAdmission::Expect(crate::place::RegionId::new(0, 0)),
     ))
     .unwrap()
 }
@@ -75,13 +77,13 @@ fn create_channel_returns_one_admitted_role_and_its_peer_port() {
 #[test]
 fn peer_port_admits_exactly_one_opposite_role() {
     let mut pt = [0; MAX_ADDR];
-    let region = crate::schema::RegionId::new(0, 0);
+    let region = crate::place::RegionId::new(0, 0);
     let first = mock_session(&mut pt, 0, MAX_ADDR);
     let (left, port) = first.create_channel::<()>(3).unwrap();
     let second = Session::from(MockBackend(&mut pt).map(
         0,
         MAX_ADDR,
-        crate::schema::RegionAdmission::Expect(region),
+        crate::place::RegionAdmission::Expect(region),
     ))
     .unwrap();
 
@@ -93,14 +95,14 @@ fn peer_port_admits_exactly_one_opposite_role() {
 #[test]
 fn reinvite_invalidates_the_previous_port_generation() {
     let mut pt = [0; MAX_ADDR];
-    let region = crate::schema::RegionId::new(0, 0);
+    let region = crate::place::RegionId::new(0, 0);
     let first = mock_session(&mut pt, 0, MAX_ADDR);
     let (left, stale) = first.create_channel::<()>(3).unwrap();
     let current = left.invite().expect("replace invitation");
     let second = Session::from(MockBackend(&mut pt).map(
         0,
         MAX_ADDR,
-        crate::schema::RegionAdmission::Expect(region),
+        crate::place::RegionAdmission::Expect(region),
     ))
     .unwrap();
 
@@ -133,7 +135,7 @@ fn closed_channel_can_be_removed_after_its_last_local_role_drops() {
 #[test]
 fn admitted_channel_receiver_reconstructs_pool_transfer() {
     let mut pt = [0; MAX_ADDR];
-    let region = crate::schema::RegionId::new(0, 0);
+    let region = crate::place::RegionId::new(0, 0);
     let first = mock_session(&mut pt, 0, MAX_ADDR);
     let first_pool = first.create_pool(32 * 1024, None).unwrap();
     let pool_id = first_pool.id();
@@ -141,7 +143,7 @@ fn admitted_channel_receiver_reconstructs_pool_transfer() {
     let second = Session::from(MockBackend(&mut pt).map(
         0,
         MAX_ADDR,
-        crate::schema::RegionAdmission::Expect(region),
+        crate::place::RegionAdmission::Expect(region),
     ))
     .unwrap();
     let second_pool = second.open_pool(pool_id).unwrap();
@@ -330,14 +332,14 @@ fn a_range_reports_the_extent_it_costs_before_any_region_exists() {
 #[test]
 fn pool_reclaims_only_the_dead_participant_owner() {
     let mut pt = [0; MAX_ADDR];
-    let region = crate::schema::RegionId::new(0, 0);
+    let region = crate::place::RegionId::new(0, 0);
     let first = mock_session(&mut pt, 0, MAX_ADDR);
     let first_pool = first.create_pool(64 * 1024, None).unwrap();
     let id = first_pool.id();
     let second = Session::from(MockBackend(&mut pt).map(
         0,
         MAX_ADDR,
-        crate::schema::RegionAdmission::Expect(region),
+        crate::place::RegionAdmission::Expect(region),
     ))
     .unwrap();
     let peer = second.peer();
@@ -527,10 +529,11 @@ fn pool_errors_keep_values_and_concurrent_claims_unique() {
     #[derive(Debug, PartialEq, Eq)]
     struct OverAligned(u64);
 
-    unsafe impl Repr for OverAligned {
+    impl crate::schema::SharedSchema for OverAligned {
         const SCHEMA: crate::schema::SchemaKey =
             crate::schema::SchemaKey::new(crate::schema::SchemaId(0x504f_4f4c_414c_4947), 1);
     }
+    unsafe impl Repr for OverAligned {}
 
     let mut pt = [0; MAX_ADDR];
     let session = mock_session(&mut pt, 0, MAX_ADDR);

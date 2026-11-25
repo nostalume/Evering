@@ -69,15 +69,18 @@ that owner to the region. Every failure releases it. Platform sources may use
 files, anonymous sections, reserved memory, or another mechanism, but their
 types and errors do not survive admission.
 
-The root has a caller-chosen region identity. Creation may initialize an empty
-root. Expected-identity and discovery modes only attach, so a peer cannot turn
-missing shared state into a new region by accident. Joining a region needs
+The root has a caller-chosen region identity, and an admission either creates one or
+expects the one already there; only creation may initialize an empty root, so a peer
+cannot turn missing shared state into a new region by accident. Joining a region needs
 writable access, because attachment updates participant state. Reading one does
 not: `Observer::discover` maps the same extent under the same access
-declaration, reports which region the published root claims, and answers what a
-published record says it is. It holds no member slot and takes no part in the
-roster, so what it can name is the shape of what is published rather than a
-position in the exchange, and it is not a consumer of anybody's queue.
+declaration, reports which region the published root claims, and refuses a root that
+does not answer. It holds no member slot and takes no part in the
+roster, so what it can name is which region is published rather than a position in the
+exchange, and it is not a consumer of anybody's queue. What a record at an offset says
+it is is verified by the same code a member's entrance runs, so a reader and a member
+cannot disagree; spelling that answer out, though, needs a layout name, and layouts are
+this crate's own to compose, so the read is not an entrance offered outside the crate.
 
 Every layout begins with a fixed record followed by layout-owned information
 and body bytes. The record binds state, magic, recursive schema, region,

@@ -14,7 +14,7 @@
 use crate::os::unix::UnixFd;
 
 use crate::mem::{Access, Request, Source};
-use crate::schema::{RegionAdmission, RegionId};
+use crate::place::{RegionAdmission, RegionId};
 use crate::tests;
 
 type UnixAlloc = crate::talc::MapTalc;

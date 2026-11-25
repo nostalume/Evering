@@ -4,7 +4,7 @@
 
 use evering::{
     Encoded, PoolId, Port,
-    layout::{RegionId, Repr},
+    layout::{RegionId, SharedSchema},
 };
 
 const REGION: RegionId = RegionId::new(7, 11);

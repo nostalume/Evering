@@ -13,7 +13,7 @@
 
 use crate::mem::{Access, Build, Request, Source};
 use crate::os::unix::UnixFd;
-use crate::schema::{RegionAdmission, RegionId};
+use crate::place::{RegionAdmission, RegionId};
 use crate::tests;
 
 mod recovery;

@@ -244,6 +244,12 @@ impl<T> Drop for Claim<'_, T> {
     }
 }
 
+/// The ring's two cursors: the claim counter, then the publish counter, each alone on a cache line.
+///
+/// `Duplex` embeds a pair of these in a region a peer maps, and the record compares only their
+/// extent — nothing in the persisted bytes says which counter comes first. `repr(C)` is what makes
+/// that order a promise rather than this build's layout choice.
+#[repr(C)]
 pub struct Header {
     head: CachePadded<AtomicUsize>,
     tail: CachePadded<AtomicUsize>,

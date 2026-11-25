@@ -1,9 +1,10 @@
 //! The platform's object names and one identity a handover can claim: which primitive backs `Event`,
-//! `Ring` and `Shared` on each target, and the `Peer` a completed handover reports. `Peer` exists either
-//! through `introduced`, which `Handoff::receive` reaches once the kernel's answer and the introduction
-//! agree, or through `unattested`, which is the whole say a policy has in this map: it releases a
-//! silent rendezvous only when the grant that admitted this process asked for that and the descriptor is
-//! already established as one that was handed over. An impostor — a peer that answered and disagreed —
+//! `Ring` and `Shared` on each target, and the `Provenance` a completed handover reports. `Provenance`
+//! arrives as `Attested`, which `Handoff::receive` reaches once the kernel's answer and the introduction
+//! agree and which carries the process id the kernel named, or it arrives through `unattested`, which is
+//! the whole say a policy has in this map: it releases a silent rendezvous only when the grant that
+//! admitted this process asked for that and the descriptor is already established as one that was handed
+//! over. An impostor — a peer that answered and disagreed —
 //! is an `Err` under every policy, and so is any silence on a pair whose kernel always answers, which is
 //! why no value here can be overlooked into a handover.
 //!
@@ -69,31 +70,20 @@ mod handoff;
 #[cfg(all(feature = "process", any(unix, windows)))]
 pub use handoff::{Attendance, Grant, Handoff, Receipt, Shared, shared};
 
-/// The process at the other end of a completed handover, as the host kernel reported it and as
-/// checked against the process that admitted the grant.
+/// Which assertion a completed handover is entitled to make about the process behind its rendezvous, and
+/// that process's id when an answer named it.
 ///
-/// This is a *process* identity, and is not the `Peer` of [`crate::mapping`], which names a
-/// participant of a shared region by slot and generation. A handover produces both: this one says
-/// who the bytes arrived from, that one says which directory member may claim them.
-///
-/// [`Handoff::receive`] reaches one of two ways. It names the peer and the introduction agrees with
-/// the name, which is [`Provenance::Attested`] and the only arm that carries a process id. Or the
-/// rendezvous answers nothing and the grant that admitted this process said so out loud, which is one
-/// of the other two arms and carries no id at all. A peer that answered and disagreed is neither: it
-/// is an `Err` under every policy, because that is the case a policy has nothing to add to.
-#[cfg(all(feature = "process", any(unix, windows)))]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Peer {
-    pid: Option<u32>,
-    provenance: Provenance,
-}
-
-/// Which assertion a completed handover is entitled to make about the peer behind its rendezvous.
+/// This is a *process* identity, and is not the `Peer` of [`crate::mapping`], which names a participant of
+/// a shared region by slot and generation. A handover produces both answers, and a handover reports them
+/// separately: this one says who the bytes arrived from, that one says which directory member may claim
+/// them.
 ///
 /// The arms differ in who answered, not in how sure the receiver feels:
 ///
-/// * `Attested` — the kernel named the peer and the name is the one the introduction expected. The
-///   only arm with a [`Peer::pid`].
+/// * `Attested` — the kernel named the peer and the name is the one the introduction expected. The only
+///   arm with a process id, and the id travels with the arm that earned it rather than resting beside
+///   every assertion: a peer a handover cannot name is a peer whose id would be invented, and a relay that
+///   keys on an invented one fails silently rather than loudly.
 /// * `Delegated` — this target's rendezvous answers nothing about its other end and never will, and the
 ///   introducer's grant said to complete anyway: every authority for who the peer is came from the step
 ///   that admitted this process. Card 3.4's no-second-rendezvous-party target is what the arm is for.
@@ -105,44 +95,39 @@ pub struct Peer {
 #[cfg(all(feature = "process", any(unix, windows)))]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Provenance {
-    Attested,
+    /// The kernel named the process at the other end, and the name is the one the introduction expected.
+    Attested {
+        /// The process id the kernel reported for the peer end of the rendezvous.
+        pid: u32,
+    },
+    /// This target's rendezvous answers nothing about its other end, and the introducer's grant said to
+    /// complete anyway.
     Delegated,
+    /// A peer that could be asked is there and this handover got no answer, which the introducer's policy
+    /// carried through regardless.
     Unavailable,
 }
 
 #[cfg(all(feature = "process", any(unix, windows)))]
-impl Peer {
-    pub(crate) const fn introduced(pid: u32) -> Self {
-        Self {
-            pid: Some(pid),
-            provenance: Provenance::Attested,
-        }
-    }
-
+impl Provenance {
     /// Decide what a handover may claim about a peer whose rendezvous answered nothing about it.
     ///
     /// The three inputs each own one part of the answer, which is why the answer is not spelled out at
-    /// any one call site. `kind` says which kind of nothing this is: a target whose rendezvous answers
-    /// nothing, or a meeting that was not asked. `established` says whether the rendezvous is known to
-    /// be one this process was *given*, and that is the only thing a policy can speak about — on a unix
-    /// pair the kernel's own answer is what establishes it, so silence there indicts the descriptor
-    /// rather than the asking, and no introduction releases it. `trusts` is the introducer's word read
-    /// off the announcement its grant wrote: the receiver reads that policy and never owns it, because
-    /// a process that sets its own proof burden has set none.
+    /// any one call site. `kind` says which kind of nothing this is — a target whose rendezvous answers
+    /// nothing, or a meeting that was not asked — and is the arm a released handover takes.
+    /// `established` says whether the rendezvous is known to be one this process was *given*, and that is
+    /// the only thing a policy can speak about: on a unix pair the kernel's own answer is what
+    /// establishes it, so silence there indicts the descriptor rather than the asking, and no
+    /// introduction releases it. `trusts` is the introducer's word read off the announcement its grant
+    /// wrote: the receiver reads that policy and never owns it, because a process that sets its own proof
+    /// burden has set none.
     ///
     /// The two refusals name different missing things, because the two failures ask a caller for
     /// different repairs: one has no policy to read and can be given one, while the other has a policy
     /// that cannot apply here, so no further word from the same introducer changes the answer.
-    pub(crate) fn unattested(
-        kind: Provenance,
-        established: bool,
-        trusts: bool,
-    ) -> io::Result<Self> {
+    pub(crate) fn unattested(kind: Self, established: bool, trusts: bool) -> io::Result<Self> {
         if established && trusts {
-            return Ok(Self {
-                pid: None,
-                provenance: kind,
-            });
+            return Ok(kind);
         }
         Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -155,19 +140,6 @@ impl Peer {
                  announcement is not one that was handed over"
             },
         ))
-    }
-
-    /// The process the kernel named at the other end, when it named one.
-    ///
-    /// `None` is not a number to fall back on: a peer this handover cannot name is a peer whose id
-    /// would be invented, and a relay that keys on an invented one fails silently rather than loudly.
-    pub fn pid(&self) -> Option<u32> {
-        self.pid
-    }
-
-    /// Which of the three assertions this identity rests on.
-    pub fn provenance(&self) -> Provenance {
-        self.provenance
     }
 }
 
@@ -193,7 +165,7 @@ pub struct ReceivedResources {
 #[test]
 fn an_unreleased_no_answer_is_refused_by_the_thing_that_is_missing() {
     for kind in [Provenance::Delegated, Provenance::Unavailable] {
-        let error = Peer::unattested(kind, true, false)
+        let error = Provenance::unattested(kind, true, false)
             .err()
             .unwrap_or_else(|| panic!("{kind:?} completed a handover nobody released"));
         assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -208,7 +180,7 @@ fn an_unreleased_no_answer_is_refused_by_the_thing_that_is_missing() {
 #[cfg(all(test, feature = "process", any(unix, windows)))]
 #[test]
 fn a_policy_releases_no_handover_whose_rendezvous_was_never_established_as_a_granted_one() {
-    let error = Peer::unattested(Provenance::Unavailable, false, true).expect_err(
+    let error = Provenance::unattested(Provenance::Unavailable, false, true).expect_err(
         "an unestablished rendezvous completes nothing, however trusting the introducer",
     );
     assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
@@ -222,18 +194,19 @@ fn a_policy_releases_no_handover_whose_rendezvous_was_never_established_as_a_gra
 #[cfg(all(test, feature = "process", any(unix, windows)))]
 #[test]
 fn a_released_no_answer_still_says_which_question_went_unanswered() {
-    let delegated = Peer::unattested(Provenance::Delegated, true, true).unwrap();
-    let unavailable = Peer::unattested(Provenance::Unavailable, true, true).unwrap();
-    assert_eq!(delegated.pid(), None);
-    assert_eq!(unavailable.pid(), None);
+    let delegated = Provenance::unattested(Provenance::Delegated, true, true).unwrap();
+    let unavailable = Provenance::unattested(Provenance::Unavailable, true, true).unwrap();
+    assert_eq!(
+        delegated,
+        Provenance::Delegated,
+        "a released handover takes the arm its rendezvous actually is, not one the policy prefers"
+    );
+    assert_eq!(unavailable, Provenance::Unavailable);
     assert_ne!(
         delegated, unavailable,
         "one target answers nothing about its peer end and the other answered nothing this time, which \
          are two different things for a caller to have agreed to"
     );
-    let met = Peer::introduced(7);
-    assert_eq!(met.provenance(), Provenance::Attested);
-    assert_eq!(met.pid(), Some(7));
 }
 
 #[cfg(all(test, feature = "notify"))]

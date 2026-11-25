@@ -1,39 +1,19 @@
-//! Authors the identity every layout claims: the 128-bit `RegionId`, the `SchemaId` and revision a
-//! record carries, and the mixing rule `compose_schema` uses to join a domain with a part. A type
-//! states its own key through `SharedSchema`, `Repr` or `Layout`; only `Session`'s `create` and `open`
-//! choose a `RegionAdmission`, which is what says whether a region may initialise anything at all.
+//! What a piece of bytes claims to be: the `SchemaId` and revision a record carries, the `SchemaKey`
+//! pair that joins them, and the mixing rule `compose_schema` uses to fold a domain with a part. A type
+//! states its own key through `SharedSchema`, `Repr` or `Layout`.
+//!
+//! Position and standing live in `crate::place`, which is why nothing here names a region: an identity
+//! is a property of a type and a coordinate is a property of a mapping, and the record's `region` field
+//! is the only place the two are allowed to meet.
+//!
+//! `LayoutInfo` stays here rather than beside `Layout` because it bounds `SharedSchema` and carries no
+//! extent — it says a value of this identity may be handed out by copy, not how big it is. Its one
+//! in-crate `impl` is the `()` pair below, which would otherwise have to be split across two pages.
 //!
 //! The FNV parameters and the rotate constants are wire identity, not local detail: change one and
 //! every key recorded in an existing region stops matching, while the only test in this file asserts
 //! that two different names hash differently. No expected value is pinned, so a constant can drift
 //! with the suite green.
-#[repr(C)]
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct RegionId {
-    pub high: u64,
-    pub low: u64,
-}
-
-impl RegionId {
-    pub const fn new(high: u64, low: u64) -> Self {
-        Self { high, low }
-    }
-}
-
-#[repr(C)]
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct LayoutId {
-    pub region: RegionId,
-    pub offset: u64,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RegionAdmission {
-    Create(RegionId),
-    Expect(RegionId),
-    Discover,
-}
-
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct SchemaId(pub u64);
@@ -62,13 +42,9 @@ pub trait SharedSchema {
 /// Implementations must have a stable representation for their schema revision
 /// and must not contain process-local pointers, references, handles, or padding
 /// whose value is left uninitialized.
-pub unsafe trait LayoutInfo: SharedSchema + Copy + Eq + core::fmt::Debug {}
-
-#[derive(Clone, Copy, Debug)]
-pub struct LayoutContext {
-    pub region: RegionId,
-    pub offset: u64,
-    pub allow_init: bool,
+pub(crate) unsafe trait LayoutInfo:
+    SharedSchema + Copy + Eq + core::fmt::Debug
+{
 }
 
 pub const fn schema_id(name: &str) -> SchemaId {
@@ -93,7 +69,7 @@ pub const fn compose_schema(domain: SchemaKey, part: SchemaKey) -> SchemaKey {
 }
 
 #[cfg(test)]
-pub const fn compose_const(domain: SchemaKey, value: u64) -> SchemaKey {
+pub(crate) const fn compose_const(domain: SchemaKey, value: u64) -> SchemaKey {
     compose_schema(domain, SchemaKey::new(SchemaId(value), 0))
 }
 

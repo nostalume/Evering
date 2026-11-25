@@ -613,13 +613,11 @@ fn arrive(dir: &Path) -> io::Result<i32> {
 
     let outcome = Handoff::receive();
     let code = match outcome {
-        Ok((peer, resources, _report)) => {
+        Ok((provenance, resources, _report)) => {
             report(
                 "target",
                 format!(
-                    "MEETS: provenance {:?}, pid {:?}, bootstrap {:?}, region {} bytes",
-                    peer.provenance(),
-                    peer.pid(),
+                    "MEETS: {provenance:?}, bootstrap {:?}, region {} bytes",
                     String::from_utf8_lossy(resources.bootstrap.as_ref()),
                     resources.mapping.size()
                 ),
@@ -702,14 +700,10 @@ fn arrive(dir: &Path) -> io::Result<i32> {
          `Handoff::granted` with it and reading no `EVERING_RENDEZVOUS` at all",
     );
     let code = match Handoff::granted(rendezvous) {
-        Ok((peer, _resources, _receipt)) => {
+        Ok((provenance, _resources, _receipt)) => {
             report(
                 "target",
-                format!(
-                    "MEETS through the placed entrance: provenance {:?}, pid {:?}",
-                    peer.provenance(),
-                    peer.pid(),
-                ),
+                format!("MEETS through the placed entrance: {provenance:?}"),
             );
             MET
         }
@@ -902,13 +896,11 @@ fn arrive(dir: &Path) -> io::Result<i32> {
     let outcome = Handoff::receive();
     publish(dir, "taken", "done")?;
     match outcome {
-        Ok((peer, resources, _report)) => {
+        Ok((provenance, resources, _report)) => {
             report(
                 "target",
                 format!(
-                    "MEETS: provenance {:?}, pid {:?}, bootstrap {:?}",
-                    peer.provenance(),
-                    peer.pid(),
+                    "MEETS: {provenance:?}, bootstrap {:?}",
                     String::from_utf8_lossy(resources.bootstrap.as_ref())
                 ),
             );

@@ -29,10 +29,15 @@
 //! name. `layout` and `mapping` are re-export shims over private modules; they are public so a
 //! vocabulary has one address, not because their implementation is reachable.
 //!
-//! Two nouns still mean more than one thing, and the rule names them rather than fixing them:
-//! `Geometry` is both the pool's block-class layout and the heap's capacity (`HeapGeometry`), and
-//! `Peer` is both `mapping::Peer` (a mapped peer region) and `os::Peer` (a process). The second is
-//! open work, not a documentation choice.
+//! One noun used to answer two questions and no longer does. `Peer` is a roster's word: the admitted
+//! process reports the member it became to the process that admitted it, so `Receipt::arrived` names a
+//! `mapping::Peer` — which directory slot, under which generation — while the process that completed the
+//! handover beside it is an `os::Provenance`, whose `Attested` arm carries the id the kernel named. The
+//! two answers were never the same kind of thing, so the second is named by what it rests on instead of
+//! sharing `Peer`'s word, and the id travels with the arm that earned it: a caller no longer asks one type
+//! for an assertion and for a number it may not have. `Geometry` collides the way `Peer` did one level
+//! down and inside the crate only, between the pool's block-class layout and the heap's capacity, and the
+//! one of them a caller can reach already says whose (`HeapGeometry`).
 //!
 //! # What a module header says
 //!
@@ -57,6 +62,7 @@ mod mem;
 mod msg;
 pub mod notify;
 pub mod os;
+mod place;
 mod pool;
 #[cfg(feature = "process")]
 pub mod process;
@@ -71,7 +77,8 @@ mod token;
 
 /// A live value owned by the shared heap borrowed for `'a`.
 ///
-/// The allocator implementation is deliberately absent from the public type.
+/// The allocator implementation is deliberately absent from the public type: the only constructor
+/// that takes one is crate-internal, so a caller cannot hand in an allocator of their own.
 ///
 /// ```compile_fail
 /// use evering::boxed::PBox;
@@ -79,8 +86,8 @@ mod token;
 ///
 /// ```compile_fail
 /// # use evering::PBox;
-/// # fn cannot_bypass_heap<'a, A>(allocator: A) {
-/// let _ = PBox::<'a, u64>::new_in(7, allocator);
+/// # fn cannot_bypass_heap<'a, A>(value: u64, allocator: A) -> PBox<'a, u64> {
+/// PBox::try_new_in(value, allocator).unwrap()
 /// # }
 /// ```
 ///
@@ -124,10 +131,6 @@ pub use session::{
     SeatError, Session, SessionError, SessionOptions,
 };
 pub use talc::{Geometry as HeapGeometry, GeometryError as HeapGeometryError};
-
-mod seal {
-    pub trait Sealed {}
-}
 
 mod numeric {
     pub mod bit {

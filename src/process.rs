@@ -41,7 +41,7 @@ use std::{
     sync::Arc,
 };
 
-use crate::{mem::Peer, schema::RegionId};
+use crate::{mem::Peer, place::RegionId};
 
 pub const MAX_BOOTSTRAP: usize = 4096;
 pub const MAX_RESOURCES: usize = 8;

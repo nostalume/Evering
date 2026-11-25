@@ -52,11 +52,8 @@ const FAILED: i32 = 1;
 /// introducer never opened.
 fn attacker() -> i32 {
     match Handoff::receive() {
-        Ok((peer, _, _report)) => {
-            eprintln!(
-                "attacker was handed the meeting by a peer at {:?}",
-                peer.pid()
-            );
+        Ok((provenance, _, _report)) => {
+            eprintln!("attacker was handed the meeting by {provenance:?}");
             HIJACKED
         }
         Err(error)
@@ -80,20 +77,16 @@ fn child() -> i32 {
         .parse()
         .expect("a numeric peer id");
     match Handoff::receive() {
-        Ok((peer, resources, _report)) => {
-            if peer.pid() != Some(expected) {
+        Ok((provenance, resources, _report)) => {
+            let Provenance::Attested { pid } = provenance else {
                 eprintln!(
-                    "attested peer {:?} is not the expected {expected}",
-                    peer.pid()
+                    "a rendezvous that answered is reported as {provenance:?}, and the grant's policy \
+                     cannot make a kernel's silence out of an answer"
                 );
                 return FAILED;
-            }
-            if peer.provenance() != Provenance::Attested {
-                eprintln!(
-                    "a rendezvous that answered is reported as {:?}, and the grant's policy cannot \
-                     make a kernel's silence out of an answer",
-                    peer.provenance()
-                );
+            };
+            if pid != expected {
+                eprintln!("attested peer {pid} is not the expected {expected}");
                 return FAILED;
             }
             if resources.bootstrap.as_ref() != b"selected-protocol-id" {

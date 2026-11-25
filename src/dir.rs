@@ -14,7 +14,8 @@ use core::mem::MaybeUninit;
 use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::header::{self, Layout};
-use crate::schema::{LayoutContext, RegionId, SchemaKey, SharedSchema, schema_id};
+use crate::place::{LayoutContext, RegionId};
+use crate::schema::{SchemaKey, SharedSchema, schema_id};
 
 const CAPACITY: usize = 32;
 const CLEAN: usize = 0;
@@ -270,7 +271,7 @@ pub(crate) enum Error {
     Heap(crate::mem::DeclineCause),
     RolledBack,
     InUse,
-    Close(crate::header::CloseError),
+    Close(crate::header::MemberCloseError),
 }
 
 impl Error {
@@ -291,10 +292,10 @@ impl Error {
             Self::Admission(ProjectionError::ReadOnly) => Some(DeclineCause::ReadOnly { region }),
             Self::Admission(ProjectionError::ArithmeticOverflow) => Some(DeclineCause::Overflow),
             Self::Admission(ProjectionError::Admission(error)) => match error {
-                crate::header::AdmitError::Contention => {
+                crate::header::RecordAdmitError::Contention => {
                     Some(DeclineCause::Contested { member: None })
                 }
-                crate::header::AdmitError::Closed => Some(DeclineCause::Sealed),
+                crate::header::RecordAdmitError::Closed => Some(DeclineCause::Sealed),
                 _ => None,
             },
             Self::Busy(member) => Some(DeclineCause::Contested {
@@ -342,13 +343,13 @@ impl OpenCause {
         }
     }
 
-    fn admission(error: crate::header::AdmitError) -> Self {
+    fn admission(error: crate::header::RecordAdmitError) -> Self {
         match error {
-            crate::header::AdmitError::Contention => Self::Busy,
-            crate::header::AdmitError::Closed => Self::Closed,
-            crate::header::AdmitError::DuplicateMember => Self::DuplicateMember,
-            crate::header::AdmitError::InvalidHeader => Self::InvalidHeader,
-            crate::header::AdmitError::Mismatch(field) => Self::Mismatch(field),
+            crate::header::RecordAdmitError::Contention => Self::Busy,
+            crate::header::RecordAdmitError::Closed => Self::Closed,
+            crate::header::RecordAdmitError::DuplicateMember => Self::DuplicateMember,
+            crate::header::RecordAdmitError::InvalidHeader => Self::InvalidHeader,
+            crate::header::RecordAdmitError::Mismatch(field) => Self::Mismatch(field),
         }
     }
 }
@@ -390,7 +391,7 @@ impl MapDirectory {
                             .map_err(Error::Admission)?;
                         if !visit(
                             Id::from_parts(
-                                self.region_id(),
+                                self.region(),
                                 slab_index,
                                 entry_index as u32,
                                 word >> STATE_BITS,
@@ -424,9 +425,6 @@ impl MapDirectory {
         dead: u8,
         live: u8,
     ) -> bool {
-        if recorded.mismatch::<L>().is_some() {
-            return false;
-        }
         let Ok(offset) = self.offset(id) else {
             return false;
         };
@@ -434,11 +432,11 @@ impl MapDirectory {
             return false;
         };
         let ctx = LayoutContext {
-            region: self.region_id(),
+            region: self.region(),
             offset: offset as u64,
             allow_init: false,
         };
-        if unsafe { header::RcHeader::<L>::inspect_at(header, ctx) }.is_err()
+        if unsafe { header::RcHeader::<L>::inspect_recorded(header, ctx, recorded) }.is_err()
             || !L::recover(header::RecoveryContext {
                 layout: &header.inner,
                 info: header.layout_info(),
@@ -455,17 +453,17 @@ impl MapDirectory {
         !header.has_member(dead)
     }
 
-    pub(crate) fn matches<L>(&self, id: Id<L>, layout: crate::schema::LayoutId) -> bool {
+    pub(crate) fn matches<L>(&self, id: Id<L>, layout: crate::place::LayoutId) -> bool {
         self.offset(id)
-            .is_ok_and(|offset| layout.region == self.region_id() && layout.offset == offset as u64)
+            .is_ok_and(|offset| layout.region == self.region() && layout.offset == offset as u64)
     }
 
     pub(crate) fn inspect_layout<L: Layout, R>(
         &self,
-        layout: crate::schema::LayoutId,
+        layout: crate::place::LayoutId,
         inspect: impl FnOnce(&header::RcHeader<L>, usize) -> R,
     ) -> Option<R> {
-        if layout.region != self.region_id() {
+        if layout.region != self.region() {
             return None;
         }
         let mut found = None;
@@ -484,11 +482,11 @@ impl MapDirectory {
         let offset = self.offset(id).ok()?;
         let header = unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.ok()?;
         let context = LayoutContext {
-            region: self.region_id(),
+            region: self.region(),
             offset: offset as u64,
             allow_init: false,
         };
-        unsafe { header::RcHeader::<L>::inspect_at(header, context) }.ok()?;
+        unsafe { header::RcHeader::<L>::inspect_recorded(header, context, recorded) }.ok()?;
         Some(inspect(header, recorded.extent))
     }
 
@@ -508,7 +506,7 @@ impl MapDirectory {
         discover: impl FnOnce(L::Info, usize) -> Option<(L::Config, U)>,
     ) -> Result<(crate::mem::Mapped<header::RcHeader<L>>, U), OpenCause> {
         let offset = self.offset(id).map_err(|_| {
-            if id.region != self.region_id() {
+            if id.region != self.region() {
                 OpenCause::WrongRegion
             } else {
                 OpenCause::Absent
@@ -523,15 +521,17 @@ impl MapDirectory {
         let header =
             unsafe { self.ref_at::<header::RcHeader<L>>(offset) }.map_err(OpenCause::projection)?;
         let info = unsafe {
-            header::RcHeader::<L>::inspect_at(
+            header::RcHeader::<L>::inspect_recorded(
                 header,
                 LayoutContext {
-                    region: self.region_id(),
+                    region: self.region(),
                     offset: offset as u64,
                     allow_init: false,
                 },
+                recorded,
             )
         }
+        .map_err(header::RecordAdmitError::Mismatch)
         .map_err(OpenCause::admission)?;
         let (conf, value) = discover(info, recorded.extent).ok_or(OpenCause::Undiscoverable)?;
         let mapped = self
@@ -546,25 +546,22 @@ impl MapDirectory {
         heap: &crate::talc::MapTalc,
         conf: L::Config,
     ) -> Result<(Id<L>, crate::mem::Mapped<header::RcHeader<L>>), Error> {
-        self.create_in(
-            heap,
-            conf,
-            core::alloc::Layout::new::<header::RcHeader<L>>(),
-        )
+        self.create_in(heap, conf)
     }
 
     pub(crate) fn create_in<L: Layout>(
         &self,
         heap: &crate::talc::MapTalc,
         conf: L::Config,
-        layout: core::alloc::Layout,
     ) -> Result<(Id<L>, crate::mem::Mapped<header::RcHeader<L>>), Error> {
-        if self.region_id() != heap.region_id() {
+        if self.region() != heap.region() {
             return Err(Error::Stale);
         }
-        if L::storage(&conf) != Some(layout) {
+        // The extent is derived here and nowhere else: a caller that supplied its own would be
+        // asked to agree with `L::storage`, which is the same function on the same argument.
+        let Some(layout) = L::storage(&conf) else {
             return Err(Error::Stale);
-        }
+        };
         let owner = self.peer().slot();
         let mut transaction = match self.inner.claim(owner) {
             Ok(transaction) => transaction,
@@ -676,7 +673,7 @@ impl MapDirectory {
         transaction.commit();
         Ok((
             Id {
-                region: self.region_id(),
+                region: self.region(),
                 slab: slot.slab,
                 entry: slot.entry as u32,
                 generation: slot.generation,
@@ -693,7 +690,7 @@ impl MapDirectory {
         mut mapped: crate::mem::Mapped<header::RcHeader<L>>,
         layout: core::alloc::Layout,
     ) -> Result<(), (Error, crate::mem::Mapped<header::RcHeader<L>>)> {
-        if self.region_id() != heap.region_id() {
+        if self.region() != heap.region() {
             return Err((Error::Stale, mapped));
         }
         let header = core::alloc::Layout::new::<header::RcHeader<L>>();
@@ -704,7 +701,7 @@ impl MapDirectory {
             Ok(offset) => offset,
             Err(error) => return Err((error, mapped)),
         };
-        if mapped.region_id() != self.region_id() || mapped.layout_id().offset != offset as u64 {
+        if mapped.region() != self.region() || mapped.layout_id().offset != offset as u64 {
             return Err((Error::Stale, mapped));
         }
         let mut transaction = match self.inner.claim(self.peer().slot()) {
@@ -902,7 +899,7 @@ impl MapDirectory {
     }
 
     fn offset<L>(&self, id: Id<L>) -> Result<usize, Error> {
-        if id.region != self.region_id() {
+        if id.region != self.region() {
             return Err(Error::Stale);
         }
         let entry = self.entry(id.slab, id.entry as usize)?;
@@ -960,7 +957,7 @@ impl MapDirectory {
         heap: &crate::talc::MapTalc,
         dead: u8,
     ) -> Result<Recovered, Error> {
-        if self.region_id() != heap.region_id() {
+        if self.region() != heap.region() {
             return Err(Error::Stale);
         }
         use crate::talc::MutationState;

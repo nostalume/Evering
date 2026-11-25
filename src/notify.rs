@@ -18,6 +18,25 @@ use crate::{
 
 const LOCAL_RETRY_LIMIT: usize = 32;
 
+// Refusal alphabet: single-source translations from layer-specific errors to the shared Contention
+// vocabulary. These functions are the only place where the spelling of a reason changes between
+// layers; deleting an arm here is a compile error (exhaustiveness), which is the fire check for B4.
+fn decline_to_contention(cause: DeclineCause) -> Contention {
+    match cause {
+        DeclineCause::NoRoom { .. } => Contention::Full,
+        DeclineCause::Contested { .. } => Contention::Busy,
+        cause => unreachable!("a channel reservation never answers {cause:?}"),
+    }
+}
+
+fn receive_to_contention(err: ReceiveError) -> Contention {
+    match err {
+        ReceiveError::Busy => Contention::Busy,
+        ReceiveError::Empty => Contention::Empty,
+        ReceiveError::Closed => unreachable!("closed is handled separately"),
+    }
+}
+
 /// Sends an advisory notification after shared state has committed.
 ///
 /// The `os` adapters report `io::Error` on every platform, so a value returned
@@ -480,9 +499,7 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
                 }
                 Err(cause) => match cause {
                     DeclineCause::Sealed => return Err(ProgressError::Closed),
-                    DeclineCause::NoRoom { .. } => Contention::Full,
-                    DeclineCause::Contested { .. } => Contention::Busy,
-                    cause => unreachable!("a channel reservation never answers {cause:?}"),
+                    cause => decline_to_contention(cause),
                 },
             };
             let further = patience.step(reason).await.map_err(ProgressError::Wait)?;
@@ -520,8 +537,7 @@ impl<N: Notify + ?Sized, W: ?Sized> Signals<'_, N, W> {
             let reason = match rx.claim() {
                 Ok(received) => return Ok(received),
                 Err(ReceiveError::Closed) => return Err(ProgressError::Closed),
-                Err(ReceiveError::Busy) => Contention::Busy,
-                Err(ReceiveError::Empty) => Contention::Empty,
+                Err(err) => receive_to_contention(err),
             };
             let further = patience.step(reason).await.map_err(ProgressError::Wait)?;
             if !further {

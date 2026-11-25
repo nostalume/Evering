@@ -282,9 +282,10 @@ fn a_batched_publish_group_costs_one_doorbell_and_the_instrument_admits_it() {
     #[repr(C)]
     struct Door(u64);
 
-    unsafe impl Repr for Door {
+    impl evering::layout::SharedSchema for Door {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x73315f335f646f6f), 1);
     }
+    unsafe impl Repr for Door {}
 
     struct Counted<'r>(&'r os::Ring, Cell<usize>);
 

@@ -47,7 +47,7 @@ use nix::unistd::{getppid, getuid};
 use crate::{
     layout::RegionId,
     os::{
-        Event, Peer, Provenance, ReceivedResources, Ring,
+        Event, Provenance, ReceivedResources, Ring,
         unix::{UnixFd, process::Socket},
     },
     process::{
@@ -176,7 +176,7 @@ impl Handoff {
     /// writing has to reach somebody: a reader that left first makes the parent's
     /// [`Handoff::send`](Handoff::send) answer with whatever the host reports for a vanished peer, which
     /// is the one outcome the two arms cannot be allowed to disagree about.
-    pub fn receive() -> io::Result<(Peer, ReceivedResources, Receipt)> {
+    pub fn receive() -> io::Result<(Provenance, ReceivedResources, Receipt)> {
         received(granted_socket()?)
     }
 
@@ -202,7 +202,9 @@ impl Handoff {
     /// `granted` is taken over, and closed if it turns out to name no rendezvous. Passing a descriptor this
     /// process still means to use is a mistake this function cannot undo, which is why the argument is an
     /// owned descriptor the caller converts, not a number or a borrow: the transfer is the caller's call.
-    pub fn granted(granted: impl Into<OwnedFd>) -> io::Result<(Peer, ReceivedResources, Receipt)> {
+    pub fn granted(
+        granted: impl Into<OwnedFd>,
+    ) -> io::Result<(Provenance, ReceivedResources, Receipt)> {
         received(Socket::from_granted(granted.into())?)
     }
 }
@@ -211,13 +213,13 @@ impl Handoff {
 ///
 /// Both entrances arrive here: the descriptor either was adopted from an announcement or was handed over,
 /// and from this point the two are the same channel, so neither can be read in an order the other refuses.
-fn received(socket: Socket) -> io::Result<(Peer, ReceivedResources, Receipt)> {
-    let peer = attested(&socket, announced_trust()?)?;
+fn received(socket: Socket) -> io::Result<(Provenance, ReceivedResources, Receipt)> {
+    let provenance = attested(&socket, announced_trust()?)?;
     let (bootstrap, resources) = socket.recv(3)?.into_parts();
     let mut resources = resources.into_vec();
     let promised = announced_seat()?;
     Ok((
-        peer,
+        provenance,
         ReceivedResources {
             bootstrap,
             mapping: UnixFd::from_fd(resources.remove(0)).map_err(io::Error::from)?,
@@ -484,15 +486,15 @@ fn announced_seat() -> io::Result<Option<Introduction>> {
 /// A granted pair answers this question because the kernel wrote the name when it connected the two ends,
 /// so an answer that does not match the introduction is an impostor under any policy, and no answer at all
 /// says more about the descriptor than about the target: the handover was never established as a granted
-/// one, which is the fact a policy has to bear on. So the silence goes to `Peer::unattested` as
+/// one, which is the fact a policy has to bear on. So the silence goes to `Provenance::unattested` as
 /// unestablished, and the decision it cannot release is that arm's to make and say. The host's own error is
 /// kept for a receiver that was never given a policy to fail by, because for that caller the missing thing
 /// is an introduction and the kernel's sentence is the truer report.
 #[cfg(any(target_os = "linux", target_os = "android"))]
-fn attested(socket: &Socket, trusts: bool) -> io::Result<Peer> {
+fn attested(socket: &Socket, trusts: bool) -> io::Result<Provenance> {
     let credentials = match socket.peer_credentials() {
         Ok(credentials) => credentials,
-        Err(_) if trusts => return Peer::unattested(Provenance::Unavailable, false, trusts),
+        Err(_) if trusts => return Provenance::unattested(Provenance::Unavailable, false, trusts),
         Err(error) => return Err(error),
     };
     let parent = getppid().as_raw() as u32;
@@ -501,7 +503,9 @@ fn attested(socket: &Socket, trusts: bool) -> io::Result<Peer> {
             "the peer behind the granted rendezvous is not this process's parent",
         ));
     }
-    Ok(Peer::introduced(credentials.pid))
+    Ok(Provenance::Attested {
+        pid: credentials.pid,
+    })
 }
 
 /// No other unix variant is refused for lack of a mechanism name, but for lack of one that has been
@@ -512,8 +516,8 @@ fn attested(socket: &Socket, trusts: bool) -> io::Result<Peer> {
 /// little proof is enough. Writing a mechanism for another host therefore cannot quietly permit an
 /// unattested handover — the permission is announced, not compiled.
 #[cfg(not(any(target_os = "linux", target_os = "android")))]
-fn attested(_socket: &Socket, trusts: bool) -> io::Result<Peer> {
-    Peer::unattested(Provenance::Delegated, true, trusts)
+fn attested(_socket: &Socket, trusts: bool) -> io::Result<Provenance> {
+    Provenance::unattested(Provenance::Delegated, true, trusts)
 }
 
 /// The receipt this rendezvous carries, credited to the admitted process and reconciled with the promise.

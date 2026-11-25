@@ -19,7 +19,7 @@
 //! and nothing in the suite exercises the ordering.
 use core::{alloc::Layout, mem::MaybeUninit};
 
-use crate::channel::{self as shared, Channel, CloseError, Id, Port};
+use crate::channel::{self as shared, Channel, Id, Port, RoleCloseError};
 use crate::{
     boxed::PBox,
     dir,
@@ -29,7 +29,7 @@ use crate::{
     pool, talc,
 };
 
-use crate::{schema::RegionId, talc::Geometry};
+use crate::{place::RegionId, talc::Geometry};
 
 #[derive(Clone)]
 pub struct GeneralHeap<'a> {
@@ -462,7 +462,8 @@ impl Recovery<'_> {
     /// Reaps with only the built-in handler, which is the Pool's own storage.
     ///
     /// Every published member of the region must be adjudicated for a reap to finish, and each is
-    /// matched to a handler by the schema and ABI profile recorded in its header. A member that
+    /// matched to a handler by the schema recorded in its header, whose ABI profile was already
+    /// required to be this build's. A member that
     /// matches no handler fails the reap rather than being skipped, so `reap()` cannot finish a
     /// region that holds anything beyond Pool storage — the member a `Channel<H>` publishes is a
     /// `Duplex<H>`, and its handler is [`crate::layout::recovery_handler`]. Without it the reap
@@ -478,7 +479,7 @@ impl Recovery<'_> {
     /// transaction that names the dead peer is repairable here: one held by any live participant —
     /// including the caller's own, mid-send — fails the reap untouched. The allocator's in-flight
     /// mutation is then closed, or poisoned if it cannot be attributed. Then every published member
-    /// is visited, each handed to exactly one handler whose schema and profile match it; an
+    /// is visited, each handed to exactly one handler whose schema matches it; an
     /// ambiguous match is refused the same way a missing one is. The walk must complete twice, so a
     /// repair that leaves another member unsettled is caught by the second pass instead of being
     /// reported as done. Finally the member is removed from every header that still names it and
@@ -601,7 +602,7 @@ impl Seat<'_> {
 
     /// The region the promised slot belongs to.
     pub fn region(&self) -> RegionId {
-        self.session.dir.region_id()
+        self.session.dir.region()
     }
 
     /// What the process this slot is promised to is told, which is the only way an announcement is
@@ -662,7 +663,7 @@ impl Session {
         Self::admit(
             source,
             request,
-            crate::schema::RegionAdmission::Create(region),
+            crate::place::RegionAdmission::Create(region),
             None,
             options.heap,
         )
@@ -676,7 +677,7 @@ impl Session {
         Self::admit(
             source,
             request,
-            crate::schema::RegionAdmission::Expect(region),
+            crate::place::RegionAdmission::Expect(region),
             None,
             None,
         )
@@ -720,7 +721,7 @@ impl Session {
         Self::admit(
             source,
             request,
-            crate::schema::RegionAdmission::Expect(region),
+            crate::place::RegionAdmission::Expect(region),
             Some(peer),
             None,
         )
@@ -734,7 +735,7 @@ impl Session {
     fn admit<S: Source>(
         source: S,
         request: Request,
-        admission: crate::schema::RegionAdmission,
+        admission: crate::place::RegionAdmission,
         promised: Option<Peer>,
         geometry: Option<Geometry>,
     ) -> Result<Self, SessionError<S::Error>> {
@@ -793,7 +794,7 @@ impl Session {
     /// what it *became*, and the region is what says which roster the answer is about — the same pair
     /// `Seat::region` and `Seat::peer` name from the other side, before anybody arrives.
     pub fn region(&self) -> RegionId {
-        self.dir.region_id()
+        self.dir.region()
     }
 
     pub fn heap(&self) -> GeneralHeap<'_> {
@@ -825,10 +826,10 @@ impl Session {
     ) -> Result<(Channel<H>, Port<H>), ChannelCreateError> {
         let geometry = shared::Duplex::<H>::geometry(capacity)
             .map_err(|_| ChannelCreateError::InvalidCapacity)?;
-        let region = self.dir.region_id();
+        let region = self.dir.region();
         let (inner, mapped) = self
             .dir
-            .create_in::<shared::Duplex<H>>(&self.alloc, capacity, geometry.layout)
+            .create_in::<shared::Duplex<H>>(&self.alloc, capacity)
             .map_err(|error| match error.declined(region) {
                 Some(cause) => ChannelCreateError::Declined(cause),
                 None => ChannelCreateError::Record,
@@ -839,7 +840,7 @@ impl Session {
     }
 
     pub fn adopt<H: Repr>(&self, port: Port<H>) -> Result<Channel<H>, AdmitError<H>> {
-        if port.id.region() != self.dir.region_id() {
+        if port.id.region() != self.dir.region() {
             return Err(AdmitError::WrongRegion(port));
         }
         let mapped = match self
@@ -852,7 +853,7 @@ impl Session {
                 // mapping therefore refuses the adopt before any role word is read, and naming the
                 // region is the only way the caller learns that the port is fine and this entrance
                 // is not.
-                let cause = error.declined(self.dir.region_id());
+                let cause = error.declined(self.dir.region());
                 return Err(match cause {
                     Some(cause) => AdmitError::Declined(port, cause),
                     None => AdmitError::Open(port),
@@ -892,8 +893,8 @@ impl Session {
         }
         match channel.close_with(|token| pool::release_token(&self.dir, token, None)) {
             Ok(()) => {}
-            Err(CloseError::Busy) => return Err(RemoveError::Busy(channel)),
-            Err(CloseError::Evidence) => return Err(RemoveError::Evidence(channel)),
+            Err(RoleCloseError::Busy) => return Err(RemoveError::Busy(channel)),
+            Err(RoleCloseError::Evidence) => return Err(RemoveError::Evidence(channel)),
         }
         // Closing the issuer first makes a racing Port adoption roll back
         // before this observation can authorize layout reclamation.
@@ -957,7 +958,7 @@ impl Session {
     /// A `None` is still not a claim that the peer is gone, only that this roster owes nobody a reap.
     #[cfg(all(feature = "process", any(unix, windows)))]
     pub fn recover(&self, death: &crate::process::Death) -> Option<Recovery<'_>> {
-        if death.region() != self.dir.region_id() {
+        if death.region() != self.dir.region() {
             return None;
         }
         // SAFETY: what `assume_dead` asks its caller to know, this carries as evidence. A process the
@@ -974,9 +975,8 @@ impl Session {
         let builtins = [RecoveryHandler::of::<pool::Storage>()];
         self.dir
             .scan(|id, recorded| {
-                let matches = |item: &&RecoveryHandler| {
-                    item.schema == recorded.schema && item.profile == recorded.profile
-                };
+                let matches =
+                    |item: &&RecoveryHandler| item.schema == recorded.schema;
                 let mut selected = builtins.iter().chain(handlers).filter(matches);
                 let first = selected.next();
                 let Some(handler) = first else {

@@ -21,12 +21,11 @@ use alloc::sync::Arc;
 use crate::header::{self, RcHeader, RecoveryContext};
 use crate::mem::{Decline, DeclineCause, Mapped};
 use crate::msg::Repr;
+use crate::place::LayoutContext;
 use crate::queue::{
     Claim, ClaimError, Header, Queue, Repair, Reserved, Slot, Staged, repair_slot_with,
 };
-use crate::schema::{
-    LayoutContext, LayoutInfo, SchemaKey, SharedSchema, compose_schema, schema_id,
-};
+use crate::schema::{LayoutInfo, SchemaKey, SharedSchema, compose_schema, schema_id};
 use crate::token::Token;
 
 type Item<H> = Token<H>;
@@ -145,7 +144,7 @@ impl<H: Repr> Clone for Id<H> {
 
 impl<H: Repr> Id<H> {
     pub const fn new(
-        region: crate::schema::RegionId,
+        region: crate::place::RegionId,
         slab: u32,
         entry: u32,
         generation: usize,
@@ -157,7 +156,7 @@ impl<H: Repr> Id<H> {
         }
     }
 
-    pub const fn region(self) -> crate::schema::RegionId {
+    pub const fn region(self) -> crate::place::RegionId {
         self.inner.parts().0
     }
 
@@ -218,7 +217,7 @@ impl<H: Repr> Port<H> {
         }
     }
 
-    pub const fn region(&self) -> crate::schema::RegionId {
+    pub const fn region(&self) -> crate::place::RegionId {
         self.id.region()
     }
 
@@ -290,7 +289,7 @@ pub enum InviteError {
     Retired,
 }
 
-pub(crate) enum CloseError {
+pub(crate) enum RoleCloseError {
     Busy,
     Evidence,
 }
@@ -386,12 +385,8 @@ unsafe impl<H: Repr> header::Layout for Duplex<H> {
         header::Status::Initialized
     }
 
-    fn attach(&self, conf: &Config) -> header::Status {
-        if Self::geometry(*conf).is_ok() {
-            header::Status::Initialized
-        } else {
-            header::Status::Corrupted
-        }
+    fn attach(&self, _: &Config) -> header::Status {
+        header::Status::Initialized
     }
 
     fn recover(context: RecoveryContext<'_, Self>) -> bool {
@@ -579,7 +574,7 @@ impl<H: Repr> Channel<H> {
             .is_none()
     }
 
-    pub(crate) fn layout_id(&self) -> crate::schema::LayoutId {
+    pub(crate) fn layout_id(&self) -> crate::place::LayoutId {
         self.role.mapped.layout_id()
     }
 
@@ -751,7 +746,7 @@ impl<H: Repr> Channel<H> {
     pub(crate) fn close_with(
         &self,
         mut release: impl FnMut(&Token<H>) -> bool,
-    ) -> Result<(), CloseError> {
+    ) -> Result<(), RoleCloseError> {
         let authority = &self.role.mapped.roles[self.role.index];
         let mut raw = authority.load(Ordering::Acquire);
         loop {
@@ -761,7 +756,7 @@ impl<H: Repr> Channel<H> {
                 return if terminal && owner.is_none() {
                     Ok(())
                 } else {
-                    Err(CloseError::Busy)
+                    Err(RoleCloseError::Busy)
                 };
             }
             if terminal {
@@ -800,24 +795,24 @@ impl<H: Repr> Channel<H> {
                             // The Queue remains authoritative until its storage
                             // evidence has been resolved and released.
                             core::mem::forget(claim);
-                            return Err(CloseError::Evidence);
+                            return Err(RoleCloseError::Evidence);
                         }
                         let _ = claim.take();
                     }
                     Err(ClaimError::Empty) => break,
                     Err(ClaimError::Busy | ClaimError::Closed) => {
-                        return Err(CloseError::Busy);
+                        return Err(RoleCloseError::Busy);
                     }
                 }
             }
             if !handle.0.send_closed() || !handle.0.is_empty() {
-                return Err(CloseError::Busy);
+                return Err(RoleCloseError::Busy);
             }
         }
         for handle in &handles {
             handle.0.close_recv();
             if !handle.0.recv_closed() {
-                return Err(CloseError::Busy);
+                return Err(RoleCloseError::Busy);
             }
         }
 
@@ -832,7 +827,7 @@ impl<H: Repr> Channel<H> {
                 if terminal && owner.is_none() {
                     Ok(())
                 } else {
-                    Err(CloseError::Busy)
+                    Err(RoleCloseError::Busy)
                 }
             }
         }
@@ -1168,15 +1163,17 @@ mod tests {
     #[repr(C, align(64))]
     struct Aligned([u8; 64]);
 
-    unsafe impl Repr for Aligned {
+    impl crate::schema::SharedSchema for Aligned {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x414c_4947_4e45_4401), 1);
     }
+    unsafe impl Repr for Aligned {}
 
     struct NonClone;
 
-    unsafe impl Repr for NonClone {
+    impl crate::schema::SharedSchema for NonClone {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x4e4f_4e43_4c4f_4e45), 1);
     }
+    unsafe impl Repr for NonClone {}
 
     fn parameterless_split<H: Repr>(channel: &Channel<H>) -> (Tx<H>, Rx<H>) {
         channel.split()
@@ -1192,7 +1189,7 @@ mod tests {
 
     #[test]
     fn port_wire_reconstruction_rejects_invalid_authority_parts() {
-        let id = Id::<()>::new(crate::schema::RegionId::new(1, 2), 3, 4, 5, 8);
+        let id = Id::<()>::new(crate::place::RegionId::new(1, 2), 3, 4, 5, 8);
         assert!(Port::from_parts(id, 0, 7).is_some());
         assert!(Port::from_parts(id, 1, 7).is_some());
         assert!(Port::from_parts(id, 2, 7).is_none());

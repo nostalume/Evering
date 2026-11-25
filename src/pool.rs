@@ -23,7 +23,8 @@ use crate::{
     header::{self, RcHeader, RecoveryContext},
     mem::{Decline, DeclineCause, Mapped, RoomWait},
     msg::Repr,
-    schema::{LayoutContext, LayoutInfo, SchemaKey, SharedSchema, schema_id},
+    place::LayoutContext,
+    schema::{LayoutInfo, SchemaKey, SharedSchema, schema_id},
     talc::MapTalc,
     token::{Shape, Span, Token},
 };
@@ -186,7 +187,7 @@ impl std::error::Error for PoolCreateError {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdoptError {
+pub(crate) enum AdoptError {
     Pool,
     Span,
     Type,
@@ -332,12 +333,17 @@ impl Geometry {
     /// below states it where the geometry consumes it. `min` arrives from a caller's `BlockRange` here
     /// and from a peer-written `Info` through `recorded`, so a bad one is a typed refusal in both builds
     /// rather than a debug assertion.
+    ///
+    /// A count of zero is refused for the same reason as a count too large to shift: it builds a
+    /// geometry with no class, and `info` reads the first class to describe one. The round trip
+    /// `recorded` takes then has no answer rather than an unequal one, so the refusal belongs here,
+    /// where every geometry is made, and not at a caller that would have to remember it.
     fn build(min: usize, count: u32, base: usize) -> Result<Self, PoolCreateError> {
         // Doubling `min` cannot survive more than one class per address bit, so a wider set is already
         // inadmissible and the loop below would reject it. Refusing it here is what keeps a
         // peer-written `Info.classes` count — which reaches this function through `recorded` — from
         // sizing the reserve below before that loop ever runs.
-        if u64::from(count) > u64::from(usize::BITS) {
+        if count == 0 || u64::from(count) > u64::from(usize::BITS) {
             return Err(PoolCreateError::InvalidExtent);
         }
         let mut layout = AllocLayout::new::<RcHeader<Storage>>();
@@ -454,12 +460,11 @@ unsafe impl header::Layout for Storage {
         header::Status::Initialized
     }
 
-    fn attach(&self, conf: &Config) -> header::Status {
-        if Geometry::recorded(conf.info, conf.layout.size()).is_some() {
-            header::Status::Initialized
-        } else {
-            header::Status::Corrupted
-        }
+    fn attach(&self, _: &Config) -> header::Status {
+        // Nothing to re-derive: `Config`'s only constructor is `Geometry::config`, so every conf
+        // that reaches here already names a geometry that built. Re-running `recorded` would ask
+        // `build` to disagree with itself.
+        header::Status::Initialized
     }
 
     fn recover(context: RecoveryContext<'_, Self>) -> bool {
@@ -500,8 +505,16 @@ pub struct PoolId(dir::Id<Storage>);
 impl PoolId {
     pub const BYTE_LEN: usize = dir::ID_BYTES;
 
+    /// Reconstructs a pool identifier from its wire parts without validation.
+    ///
+    /// # Safety
+    ///
+    /// This is a raw naming capability: a bare port that holds a static roster must be able to name
+    /// a pool by region, slab, entry, and generation. Validation of those parts (bounds, liveness)
+    /// is the caller's obligation, not this constructor's — see `Port::from_parts` for the validated
+    /// counterpart.
     pub const fn new(
-        region: crate::schema::RegionId,
+        region: crate::place::RegionId,
         slab: u32,
         entry: u32,
         generation: usize,
@@ -509,7 +522,7 @@ impl PoolId {
         Self(dir::Id::from_parts(region, slab, entry, generation))
     }
 
-    pub const fn parts(self) -> (crate::schema::RegionId, u32, u32, usize) {
+    pub const fn parts(self) -> (crate::place::RegionId, u32, u32, usize) {
         self.0.parts()
     }
 
@@ -578,7 +591,7 @@ pub struct ClassInfo {
 pub struct PoolRef<'p> {
     base: NonNull<u8>,
     geometry: &'p Geometry,
-    id: crate::schema::LayoutId,
+    id: crate::place::LayoutId,
     owner: crate::mem::Peer,
     _mapped: &'p Mapped<RcHeader<Storage>>,
 }
@@ -1045,9 +1058,9 @@ pub(crate) fn create(
 ) -> Result<Pool, PoolCreateError> {
     let geometry = Geometry::create(bound, range)?;
     let config = geometry.config();
-    let region = heap.region_id();
+    let region = heap.region();
     directory
-        .create_in::<Storage>(heap, config, config.layout)
+        .create_in::<Storage>(heap, config)
         .map(|(id, mapped)| Pool::new(PoolId(id), mapped, geometry))
         .map_err(|error| match error.declined(region) {
             Some(cause) => PoolCreateError::Declined(cause),
@@ -1121,7 +1134,7 @@ pub(crate) fn release_token<H: Repr>(
 
 #[cfg(test)]
 mod geometry_tests {
-    use super::{Geometry, PoolCreateError};
+    use super::{Geometry, Info, PoolCreateError, RcHeader, Storage};
 
     /// A peer writes the `Info` that `recorded` rebuilds a geometry from, so the class count is peer
     /// input before it is arithmetic input. The loop in `build` rejects a shift that cannot be
@@ -1140,6 +1153,24 @@ mod geometry_tests {
         // The bound itself stays admissible: nothing is rejected that the loop would have accepted.
         assert!(Geometry::build(64, usize::BITS, 64).is_err());
         assert!(Geometry::build(64, 3, 64).is_ok());
+    }
+
+    /// The other end of the same door. A count that is not too large is not thereby usable: `info`
+    /// projects a geometry by reading its first class, so an empty class list has no `Info` and the
+    /// round trip `recorded` makes cannot be taken. The number arrives from a peer's record, so this
+    /// is a refusal `build` owes and a caller cannot supply on its behalf.
+    #[test]
+    fn an_empty_class_count_is_refused_rather_than_projected() {
+        let empty = Info {
+            min: 64,
+            base: 64,
+            classes: 0,
+        };
+        assert!(Geometry::recorded(empty, core::mem::size_of::<RcHeader<Storage>>()).is_none());
+        assert_eq!(
+            Geometry::build(64, 0, 64).err(),
+            Some(PoolCreateError::InvalidExtent)
+        );
     }
 }
 

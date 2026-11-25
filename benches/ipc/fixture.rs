@@ -30,9 +30,10 @@ pub(crate) const KEYS: [&str; 6] = [
 #[derive(Clone, Copy)]
 struct Record(u64);
 
-unsafe impl Repr for Record {
+impl evering::layout::SharedSchema for Record {
     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x6d65_6368_2d72_6563), 1);
 }
+unsafe impl Repr for Record {}
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 pub struct Memory {

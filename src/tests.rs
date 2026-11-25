@@ -111,10 +111,11 @@ impl Info {
     }
 }
 
-unsafe impl Repr for Info {
+impl crate::schema::SharedSchema for Info {
     const SCHEMA: crate::schema::SchemaKey =
         crate::schema::SchemaKey::new(crate::schema::schema_id("evering.test.info"), 1);
 }
+unsafe impl Repr for Info {}
 
 fn analyze_latencies(all: Vec<Vec<u64>>) {
     use hdrhistogram::Histogram;

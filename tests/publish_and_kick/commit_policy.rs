@@ -29,9 +29,10 @@ const RUNTIME: SchemaKey = SchemaKey::new(SchemaId(0x6539_7275_6e74_696d), 1);
 #[derive(Debug)]
 struct Envelope(u64);
 
-unsafe impl Repr for Envelope {
+impl evering::layout::SharedSchema for Envelope {
     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x6539_656e_7665_6c6f), 1);
 }
+unsafe impl Repr for Envelope {}
 
 struct Bell(Cell<usize>);
 

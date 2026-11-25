@@ -1,8 +1,8 @@
 //! Authors the transfer locator's bytes — pool identity, class and slot, generation, metadata tag,
 //! type id — and the mechanical size rule the value behind them follows. `Block::transfer_with` is the
 //! only thing that mints one; `map` and `update` rewrite the header half; `adopt_id` and `takeover`
-//! read it back. `Shape` is sealed, so a caller satisfies it through the blanket impls here rather than
-//! by declaring one.
+//! read it back. The two `Shape` impls below already cover every sized type and every slice, so a
+//! caller satisfies that bound rather than declaring one, and a third impl would collide with them.
 //!
 //! The tag encoding sits outside the composed schema key, so reshaping these fields keeps every schema
 //! valid while an unrecognised tag simply decodes as no metadata and is refused as a type mismatch —
@@ -13,7 +13,8 @@ use core::{alloc::Layout, mem, ptr};
 
 use crate::{
     msg::{Repr, TypeId},
-    schema::{LayoutId, SchemaKey, SharedSchema, compose_schema, schema_id},
+    place::LayoutId,
+    schema::{SchemaKey, SharedSchema, compose_schema, schema_id},
 };
 
 #[repr(C)]
@@ -77,9 +78,7 @@ impl<H: Repr> SharedSchema for Token<H> {
         compose_schema(SchemaKey::new(schema_id("evering.transfer"), 1), H::SCHEMA);
 }
 
-unsafe impl<H: Repr> Repr for Token<H> {
-    const SCHEMA: SchemaKey = <Self as SharedSchema>::SCHEMA;
-}
+unsafe impl<H: Repr> Repr for Token<H> {}
 
 impl<H: Repr + core::fmt::Debug> core::fmt::Debug for Token<H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -104,12 +103,14 @@ impl<H: Repr> Token<H> {
 }
 
 /// Mechanical metadata for sized values and slices.
-pub trait Shape: crate::seal::Sealed {
+///
+/// There is nothing for a caller to implement: the two blanket impls below cover every sized type and
+/// every slice, so an attempt to write a third is a coherence conflict. A `Sealed` supertrait would have
+/// repeated that guarantee without adding it, which is why none is here.
+pub trait Shape {
     fn metadata(ptr: *const Self) -> Metadata;
     fn layout(metadata: Metadata) -> Result<Layout, MetadataError>;
 }
-
-impl<T> crate::seal::Sealed for T {}
 
 impl<T> Shape for T {
     #[inline(always)]
@@ -125,8 +126,6 @@ impl<T> Shape for T {
     }
 }
 
-impl<T> crate::seal::Sealed for [T] {}
-
 impl<T> Shape for [T] {
     #[inline(always)]
     fn metadata(ptr: *const Self) -> Metadata {
@@ -141,15 +140,27 @@ impl<T> Shape for [T] {
     }
 }
 
+/// What [`Shape`] says travels beside a value's address: nothing, or a slice's element count.
+///
+/// This is the metadata half of a `*const T where T: ?Sized`, read off the pointer by
+/// [`Shape::metadata`] and turned back into bytes by [`Shape::layout`]. It is a `MetadataError`
+/// away from a layout rather than an option because the count arrived through a queue header and a
+/// caller has to be able to tell "not a slice" from "too many elements to name".
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Metadata {
+    /// The value is sized, so the pointer alone describes it.
     Sized,
+    /// The value is a slice of this many elements.
     Slice(usize),
 }
 
+/// Why [`Shape::layout`] refuses to turn [`Metadata`] into a layout.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MetadataError {
+    /// The metadata is for the other kind — a length where the type has none, or none where the
+    /// type is a slice. This is what a payload whose element type differs reports.
     WrongKind,
+    /// The element count times the element size does not fit in `usize`.
     Overflow,
 }
 

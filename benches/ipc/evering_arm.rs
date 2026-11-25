@@ -52,9 +52,10 @@ pub(super) struct Envelope {
     digest: u64,
 }
 
-unsafe impl Repr for Envelope {
+impl evering::layout::SharedSchema for Envelope {
     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x6970_632e_656e_7631), 2);
 }
+unsafe impl Repr for Envelope {}
 
 fn text(error: impl ToString) -> String {
     error.to_string()

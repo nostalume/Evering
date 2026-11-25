@@ -82,10 +82,7 @@ struct AlternateEnvelope(u64);
 impl SharedSchema for AlternateEnvelope {
     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x414c_5445_524e_4154), 1);
 }
-
-unsafe impl Repr for AlternateEnvelope {
-    const SCHEMA: SchemaKey = <Self as SharedSchema>::SCHEMA;
-}
+unsafe impl Repr for AlternateEnvelope {}
 
 fn channel_only(port: &Port<AlternateEnvelope>) -> Bootstrap {
     let id = port.id();

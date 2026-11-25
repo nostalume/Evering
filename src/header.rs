@@ -18,11 +18,10 @@ use core::{
     sync::atomic::{AtomicU8, AtomicUsize, Ordering},
 };
 
-use crate::schema::{
-    LayoutContext, LayoutId, LayoutInfo, RegionId, SchemaId, SchemaKey, SharedSchema, schema_id,
-};
+use crate::place::{LayoutContext, LayoutId, RegionId};
+use crate::schema::{LayoutInfo, SchemaId, SchemaKey, SharedSchema, schema_id};
 
-pub type Magic = u16;
+pub(crate) type Magic = u16;
 
 const RECORD_FORMAT: u8 = 1;
 
@@ -83,7 +82,6 @@ impl Record {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct RecordedLayout {
     pub(crate) schema: SchemaKey,
-    pub(crate) profile: AbiProfile,
     pub(crate) magic: Magic,
     pub(crate) extent: usize,
     pub(crate) extent_align: usize,
@@ -101,7 +99,7 @@ static CLAIM_TEST_WAITERS: AtomicUsize = AtomicUsize::new(0);
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Status {
+pub(crate) enum Status {
     Uninitialized = 0,
     Initializing = 1,
     Initialized = 2,
@@ -131,7 +129,7 @@ impl Status {
 ///
 /// Implementors must give the declared schema a stable shared representation.
 /// `init` must fully initialize `destination` without first reading it.
-pub unsafe trait Layout: SharedSchema + Sized + Sync {
+pub(crate) unsafe trait Layout: SharedSchema + Sized + Sync {
     type Config: Copy;
     type Info: LayoutInfo + Sync;
 
@@ -151,6 +149,10 @@ pub unsafe trait Layout: SharedSchema + Sized + Sync {
     /// `destination` must be valid, properly aligned, writable storage for one
     /// `Self`. No live value may currently occupy that storage.
     unsafe fn init(destination: *mut Self, conf: Self::Config) -> Status;
+    /// Whether a member may attach to an already-initialized layout body.
+    ///
+    /// `admit` reaches this only after `storage(conf)` returned a layout and each recorded field
+    /// agreed with it, so a verdict re-derived from `conf` alone restates one already given.
     fn attach(&self, conf: &Self::Config) -> Status;
 
     /// Repairs ownership left by `context.dead()` and returns true only when
@@ -160,63 +162,78 @@ pub unsafe trait Layout: SharedSchema + Sized + Sync {
     }
 }
 
-#[doc(hidden)]
-pub trait AdmitLayout: Layout {
-    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout>;
-
+pub(crate) trait AdmitLayout: Layout {
     unsafe fn admit(
         pointer: *mut Self,
         conf: Self::Config,
         ctx: LayoutContext,
         slot: Option<u8>,
-    ) -> Result<(), AdmitError>;
+    ) -> Result<(), RecordAdmitError>;
 
     unsafe fn leave(pointer: *mut Self, slot: u8);
 }
 
 #[repr(C)]
-pub struct RcHeader<T: Layout> {
+pub(crate) struct RcHeader<T: Layout> {
     record: Record,
     members: AtomicUsize,
     region: RegionId,
     offset: u64,
-    header_size: u64,
-    header_align: u64,
     info_schema: SchemaId,
     info_revision: u32,
-    info_size: u64,
-    info_align: u64,
-    body_size: u64,
-    body_align: u64,
     info: T::Info,
     pub inner: T,
 }
 
+/// Which word of a published record refused, and the only cause alphabet a caller can match on.
+///
+/// Every arm names a *word*, not a reason: the question one answers is "at which byte did the reader
+/// have to stop", and the other question — which step of a request declined, and what to do about it —
+/// is answered by the layer's own refusal type, not here.
+///
+/// Three of the words carry more than one question, and that is a limit written down rather than an
+/// oversight to fix. `State` collapses the three status values that are not `Initialized` — never
+/// written, mid-initialization, and every byte value the decode has to read as corrupted — into one
+/// refusal, because each of them ends the read the same way, and it also answers a step that is not
+/// permitted to initialize an empty record. `Extent` and `ExtentAlign`
+/// each refuse because the word does not fit this host's `usize`, because it is not a legal size or
+/// alignment in itself, and because it disagrees with the caller's own type. A caller that had to tell
+/// those apart would need a reason type beside the field, and giving one is a public-face change rather
+/// than a documentation one; nothing today asks for it, because every leg has the same repair: these
+/// bytes and this build do not describe one layout through this entrance.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LayoutField {
+    /// The status word does not permit this read or admission to go on.
     State,
+    /// The record's own framing version is not the one this build reads.
     Format,
+    /// The word width, atomic width or byte order recorded is not this build's.
     Profile,
+    /// The two-byte tag is not the one this layout writes.
     Magic,
-    Revision,
+    /// The composed schema id is not this type's.
     Schema,
+    /// The schema id matched and the revision did not.
+    Revision,
+    /// The region the header names is not the one it was read out of.
     Region,
+    /// The offset the header names is not where the header was found.
     Offset,
-    HeaderSize,
-    HeaderAlign,
-    Extent,
-    ExtentAlign,
+    /// The stored info's schema id is not this build's info type's.
     InfoSchema,
+    /// The stored info's schema revision is not this build's info type's.
     InfoRevision,
-    InfoSize,
-    InfoAlign,
-    Size,
-    Align,
+    /// The extent word — unreadable here, too small to hold a record, or not what this type costs.
+    Extent,
+    /// The extent alignment word — unreadable here, not a power of two the address satisfies, or not
+    /// what this type requires.
+    ExtentAlign,
+    /// The information bytes are not the ones this type would write for this configuration.
     Info,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdmitError {
+pub(crate) enum RecordAdmitError {
     Contention,
     Closed,
     DuplicateMember,
@@ -224,7 +241,7 @@ pub enum AdmitError {
     Mismatch(LayoutField),
 }
 
-pub struct RecoveryContext<'a, L: Layout> {
+pub(crate) struct RecoveryContext<'a, L: Layout> {
     pub layout: &'a L,
     pub info: L::Info,
     pub extent: usize,
@@ -239,24 +256,24 @@ type RecoverFn =
 
 /// One layout's standing to settle a dead participant's member of that layout.
 ///
-/// A reap matches a handler to a member by the [`SchemaKey`] and [`AbiProfile`] the member's own
-/// header recorded, never by what the caller expects to find there. A handler that does not match is
-/// not run, a member no handler matches stops the reap, and a member two handlers match stops it
-/// too. Build one with [`RecoveryHandler::of`], or for a channel's payload with
-/// [`crate::layout::recovery_handler`].
+/// A reap matches a handler to a member by the [`SchemaKey`] the member's own header recorded, never
+/// by what the caller expects to find there. An [`AbiProfile`] other than this build's is refused
+/// while the header is decoded, before any handler is consulted, so the schema alone decides. A
+/// handler that does not match is not run, a member no handler matches stops the reap, and a member
+/// two handlers match stops it too. [`crate::layout::recovery_handler`] is the only public
+/// entrance: it mints one for a channel member carrying a given payload.
 #[derive(Clone, Copy)]
 pub struct RecoveryHandler {
     pub(crate) schema: SchemaKey,
-    pub(crate) profile: AbiProfile,
     pub(crate) run: RecoverFn,
 }
 
 impl RecoveryHandler {
-    /// A handler for `L` as this build's ABI profile implements it.
-    pub const fn of<L: Layout>() -> Self {
+    /// A handler for `L` as this build implements it. A record whose stored ABI profile is not this
+    /// build's never reaches the match: `recorded_at` refuses it, so the schema alone decides.
+    pub(crate) const fn of<L: Layout>() -> Self {
         Self {
             schema: L::SCHEMA,
-            profile: AbiProfile::NATIVE,
             run: recover_as::<L>,
         }
     }
@@ -283,34 +300,32 @@ impl RecordedLayout {
     }
 }
 
-pub(crate) unsafe fn recorded_at(pointer: *const u8) -> Result<RecordedLayout, AdmitError> {
+pub(crate) unsafe fn recorded_at(pointer: *const u8) -> Result<RecordedLayout, RecordAdmitError> {
     let record = unsafe { &*pointer.cast::<Record>() };
     if Status::from_u8(record.status.load(Ordering::Acquire)) != Status::Initialized {
-        return Err(AdmitError::Mismatch(LayoutField::State));
+        return Err(RecordAdmitError::Mismatch(LayoutField::State));
     }
     if record.format != RECORD_FORMAT {
-        return Err(AdmitError::Mismatch(LayoutField::Format));
+        return Err(RecordAdmitError::Mismatch(LayoutField::Format));
     }
-    let profile = record.profile();
-    if profile != AbiProfile::NATIVE {
-        return Err(AdmitError::Mismatch(LayoutField::Profile));
+    if record.profile() != AbiProfile::NATIVE {
+        return Err(RecordAdmitError::Mismatch(LayoutField::Profile));
     }
     let extent = usize::try_from(u64::from_le_bytes(record.extent))
-        .map_err(|_| AdmitError::Mismatch(LayoutField::Extent))?;
+        .map_err(|_| RecordAdmitError::Mismatch(LayoutField::Extent))?;
     let extent_align = usize::try_from(u64::from_le_bytes(record.extent_align))
-        .map_err(|_| AdmitError::Mismatch(LayoutField::ExtentAlign))?;
+        .map_err(|_| RecordAdmitError::Mismatch(LayoutField::ExtentAlign))?;
     if extent < mem::size_of::<Record>() {
-        return Err(AdmitError::Mismatch(LayoutField::Extent));
+        return Err(RecordAdmitError::Mismatch(LayoutField::Extent));
     }
     if !extent_align.is_power_of_two() || !pointer.addr().is_multiple_of(extent_align) {
-        return Err(AdmitError::Mismatch(LayoutField::ExtentAlign));
+        return Err(RecordAdmitError::Mismatch(LayoutField::ExtentAlign));
     }
     Ok(RecordedLayout {
         schema: SchemaKey::new(
             SchemaId(u64::from_le_bytes(record.schema)),
             u32::from_le_bytes(record.revision),
         ),
-        profile,
         magic: u16::from_le_bytes(record.magic),
         extent,
         extent_align,
@@ -320,7 +335,7 @@ pub(crate) unsafe fn recorded_at(pointer: *const u8) -> Result<RecordedLayout, A
 const CLOSED: usize = 1usize << (usize::BITS - 1);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CloseError {
+pub(crate) enum MemberCloseError {
     Contention,
     MissingMember,
     Closed,
@@ -366,18 +381,18 @@ impl<T: Layout> RcHeader<T> {
         self.info
     }
 
-    pub(crate) fn close_unique(&self, slot: u8) -> Result<(), CloseError> {
+    pub(crate) fn close_unique(&self, slot: u8) -> Result<(), MemberCloseError> {
         let bit = 1usize << slot;
         self.members
             .compare_exchange(bit, CLOSED, Ordering::AcqRel, Ordering::Acquire)
             .map(|_| ())
             .map_err(|observed| {
                 if observed & CLOSED != 0 {
-                    CloseError::Closed
+                    MemberCloseError::Closed
                 } else if observed & bit == 0 {
-                    CloseError::MissingMember
+                    MemberCloseError::MissingMember
                 } else {
-                    CloseError::Contention
+                    MemberCloseError::Contention
                 }
             })
     }
@@ -409,6 +424,12 @@ unsafe impl<T: Layout> Layout for RcHeader<T> {
 
     const MAGIC: Magic = T::MAGIC;
 
+    /// Wrapping a payload must not invent a second extent: a record's allocation is what
+    /// `T::storage` already answers.
+    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout> {
+        T::storage(conf)
+    }
+
     fn info(conf: &Self::Config, ctx: LayoutContext) -> Self::Info {
         T::info(conf, ctx)
     }
@@ -427,22 +448,18 @@ impl<T: Layout> SharedSchema for RcHeader<T> {
 }
 
 impl<T: Layout> AdmitLayout for RcHeader<T> {
-    fn storage(conf: &Self::Config) -> Option<core::alloc::Layout> {
-        T::storage(conf)
-    }
-
     unsafe fn admit(
         pointer: *mut Self,
         conf: Self::Config,
         ctx: LayoutContext,
         slot: Option<u8>,
-    ) -> Result<(), AdmitError> {
-        let layout = T::storage(&conf).ok_or(AdmitError::InvalidHeader)?;
+    ) -> Result<(), RecordAdmitError> {
+        let layout = T::storage(&conf).ok_or(RecordAdmitError::InvalidHeader)?;
         let status = unsafe { &*ptr::addr_of!((*pointer).record.status) };
         loop {
             match Status::from_u8(status.load(Ordering::Acquire)) {
                 Status::Uninitialized if !ctx.allow_init => {
-                    return Err(AdmitError::Mismatch(LayoutField::State));
+                    return Err(RecordAdmitError::Mismatch(LayoutField::State));
                 }
                 Status::Uninitialized => {
                     #[cfg(test)]
@@ -472,11 +489,14 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
                     }
                     break;
                 }
-                Status::Initializing => return Err(AdmitError::Contention),
-                Status::Corrupted => return Err(AdmitError::InvalidHeader),
+                Status::Initializing => return Err(RecordAdmitError::Contention),
+                Status::Corrupted => return Err(RecordAdmitError::InvalidHeader),
                 Status::Initialized => {
-                    if let Some(field) = unsafe { Self::mismatch_at(pointer, &conf, ctx) } {
-                        return Err(AdmitError::Mismatch(field));
+                    let recorded = unsafe { recorded_at(pointer.cast()) }?;
+                    if let Some(field) =
+                        unsafe { Self::mismatch_at(pointer, &conf, layout, recorded, ctx) }
+                    {
+                        return Err(RecordAdmitError::Mismatch(field));
                     }
                     let members = unsafe { &*ptr::addr_of!((*pointer).members) };
                     let mut membership = Self::claim(members, slot)?;
@@ -485,8 +505,8 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
                             membership.disarm();
                             Ok(())
                         }
-                        Status::Initializing => Err(AdmitError::Contention),
-                        _ => Err(AdmitError::InvalidHeader),
+                        Status::Initializing => Err(RecordAdmitError::Contention),
+                        _ => Err(RecordAdmitError::InvalidHeader),
                     };
                 }
             }
@@ -500,20 +520,14 @@ impl<T: Layout> AdmitLayout for RcHeader<T> {
             ptr::addr_of_mut!((*pointer).members).write(AtomicUsize::new(bit));
             ptr::addr_of_mut!((*pointer).region).write(ctx.region);
             ptr::addr_of_mut!((*pointer).offset).write(ctx.offset);
-            ptr::addr_of_mut!((*pointer).header_size).write(mem::size_of::<Self>() as u64);
-            ptr::addr_of_mut!((*pointer).header_align).write(mem::align_of::<Self>() as u64);
             ptr::addr_of_mut!((*pointer).info_schema).write(T::Info::SCHEMA.id);
             ptr::addr_of_mut!((*pointer).info_revision).write(T::Info::SCHEMA.revision);
-            ptr::addr_of_mut!((*pointer).info_size).write(mem::size_of::<T::Info>() as u64);
-            ptr::addr_of_mut!((*pointer).info_align).write(mem::align_of::<T::Info>() as u64);
-            ptr::addr_of_mut!((*pointer).body_size).write(mem::size_of::<T>() as u64);
-            ptr::addr_of_mut!((*pointer).body_align).write(mem::align_of::<T>() as u64);
             ptr::addr_of_mut!((*pointer).info).write(info);
         }
         let members = unsafe { &*ptr::addr_of!((*pointer).members) };
         let mut membership = Membership::new(members, bit);
         if unsafe { T::init(ptr::addr_of_mut!((*pointer).inner), conf) } != Status::Initialized {
-            return Err(AdmitError::InvalidHeader);
+            return Err(RecordAdmitError::InvalidHeader);
         }
         status.store(Status::Initialized as u8, Ordering::Release);
         membership.disarm();
@@ -532,17 +546,20 @@ impl<T: Layout> RcHeader<T> {
     ///
     /// The caller reaches the word, so the refusals here are decisions about its bits — closed,
     /// already seated, or contested — and the guard carries the same borrow back out.
-    fn claim<'a>(members: &'a AtomicUsize, slot: Option<u8>) -> Result<Membership<'a>, AdmitError> {
+    fn claim<'a>(
+        members: &'a AtomicUsize,
+        slot: Option<u8>,
+    ) -> Result<Membership<'a>, RecordAdmitError> {
         let Some(slot) = slot else {
             return Ok(Membership::new(members, 0));
         };
         let bit = 1usize << slot;
         let observed = members.load(Ordering::Acquire);
         if observed & CLOSED != 0 {
-            return Err(AdmitError::Closed);
+            return Err(RecordAdmitError::Closed);
         }
         if observed & bit != 0 {
-            return Err(AdmitError::DuplicateMember);
+            return Err(RecordAdmitError::DuplicateMember);
         }
         members
             .compare_exchange(
@@ -552,7 +569,7 @@ impl<T: Layout> RcHeader<T> {
                 Ordering::Acquire,
             )
             .map(|_| Membership::new(members, bit))
-            .map_err(|_| AdmitError::Contention)
+            .map_err(|_| RecordAdmitError::Contention)
     }
 }
 
@@ -560,51 +577,64 @@ impl<T: Layout> RcHeader<T> {
     pub(crate) unsafe fn inspect_at(
         pointer: *const Self,
         ctx: LayoutContext,
-    ) -> Result<T::Info, AdmitError> {
+    ) -> Result<T::Info, RecordAdmitError> {
         let recorded = unsafe { recorded_at(pointer.cast()) }?;
+        unsafe { Self::inspect_recorded(pointer, ctx, recorded) }
+            .map_err(RecordAdmitError::Mismatch)
+    }
+
+    /// Verify a header against a record its reader already decoded at this same address.
+    ///
+    /// # Safety
+    ///
+    /// `recorded` must be the decode of `pointer` — what `recorded_at(pointer.cast())` answers. The
+    /// identity and extent legs of a record are written once, by `Record::initialize`, and never
+    /// rewritten, so a decode taken while the status reads `Initialized` stays that record's answer;
+    /// a decode from a different address would let this frame certify bytes it never read.
+    pub(crate) unsafe fn inspect_recorded(
+        pointer: *const Self,
+        ctx: LayoutContext,
+        recorded: RecordedLayout,
+    ) -> Result<T::Info, LayoutField> {
         if let Some(field) = recorded.mismatch::<T>() {
-            return Err(AdmitError::Mismatch(field));
+            return Err(field);
         }
         macro_rules! check {
             ($member:ident, $expected:expr, $field:ident) => {
                 if unsafe { ptr::addr_of!((*pointer).$member).read() } != $expected {
-                    return Err(AdmitError::Mismatch(LayoutField::$field));
+                    return Err(LayoutField::$field);
                 }
             };
         }
         check!(region, ctx.region, Region);
         check!(offset, ctx.offset, Offset);
-        check!(header_size, mem::size_of::<Self>() as u64, HeaderSize);
-        check!(header_align, mem::align_of::<Self>() as u64, HeaderAlign);
         check!(info_schema, T::Info::SCHEMA.id, InfoSchema);
         check!(info_revision, T::Info::SCHEMA.revision, InfoRevision);
-        check!(info_size, mem::size_of::<T::Info>() as u64, InfoSize);
-        check!(info_align, mem::align_of::<T::Info>() as u64, InfoAlign);
-        check!(body_size, mem::size_of::<T>() as u64, Size);
-        check!(body_align, mem::align_of::<T>() as u64, Align);
         Ok(unsafe { ptr::addr_of!((*pointer).info).read() })
     }
 
+    /// The reader's seven legs plus the two a reader cannot answer for itself: what the record claims
+    /// to hold, and what the caller's own type says a value of it costs. Those two are why this is the
+    /// writer's entrance and not a shared verifier — they consult a `Config`.
+    ///
+    /// The extent is compared as the decoded number, not as the stored bytes: `recorded_at` already
+    /// refused whatever it cannot represent, so re-encoding `layout` and reading `[u8; 8]` again would
+    /// put the same question to a second spelling of the same quantity.
     unsafe fn mismatch_at(
         pointer: *const Self,
         conf: &T::Config,
+        layout: core::alloc::Layout,
+        recorded: RecordedLayout,
         ctx: LayoutContext,
     ) -> Option<LayoutField> {
-        let info = match unsafe { Self::inspect_at(pointer, ctx) } {
+        let info = match unsafe { Self::inspect_recorded(pointer, ctx, recorded) } {
             Ok(info) => info,
-            Err(AdmitError::Mismatch(field)) => return Some(field),
-            // A closed, contended, already-attached or structurally unreadable header: nothing below
-            // is reachable until the state word makes sense, so `State` is the truest name left and
-            // the arm stays one because a caller's answer to all four is the same refusal.
-            Err(_) => return Some(LayoutField::State),
+            Err(field) => return Some(field),
         };
-        let Some(layout) = T::storage(conf) else {
-            return Some(LayoutField::Extent);
-        };
-        if unsafe { (*pointer).record.extent } != (layout.size() as u64).to_le_bytes() {
+        if recorded.extent != layout.size() {
             return Some(LayoutField::Extent);
         }
-        if unsafe { (*pointer).record.extent_align } != (layout.align() as u64).to_le_bytes() {
+        if recorded.extent_align != layout.align() {
             return Some(LayoutField::ExtentAlign);
         }
         if info != T::info(conf, ctx) {
@@ -681,16 +711,12 @@ unsafe impl Layout for () {
 }
 
 impl AdmitLayout for () {
-    fn storage(_: &Self::Config) -> Option<core::alloc::Layout> {
-        Some(core::alloc::Layout::new::<Self>())
-    }
-
     unsafe fn admit(
         _: *mut Self,
         _: Self::Config,
         _: LayoutContext,
         _: Option<u8>,
-    ) -> Result<(), AdmitError> {
+    ) -> Result<(), RecordAdmitError> {
         Ok(())
     }
 
@@ -767,11 +793,11 @@ pub(crate) enum Claim {
 /// nobody has died if nobody arrived.
 #[repr(C)]
 #[derive(Debug)]
-pub struct Root {
+pub(crate) struct Root {
     members: [AtomicUsize; PARTICIPANT_CAPACITY],
 }
 
-pub type RootHeader = RcHeader<Root>;
+pub(crate) type RootHeader = RcHeader<Root>;
 
 impl SharedSchema for Root {
     /// Revision 2 widened the member state field to make room for `RESERVED`, which re-fits the
@@ -935,12 +961,11 @@ impl Root {
 #[cfg(test)]
 mod admission_tests {
     use super::{
-        AdmitError, AdmitLayout, Layout, LayoutField, RECORD_FORMAT, RcHeader as Header, Root,
-        Status,
+        AdmitLayout, Layout, LayoutField, RECORD_FORMAT, RcHeader as Header, RecordAdmitError,
+        Root, Status,
     };
-    use crate::schema::{
-        LayoutContext, RegionId, SchemaKey, SharedSchema, compose_const, schema_id,
-    };
+    use crate::place::{LayoutContext, RegionId};
+    use crate::schema::{SchemaKey, SharedSchema, compose_const, schema_id};
     use core::mem::MaybeUninit;
     use core::panic::AssertUnwindSafe;
     use core::sync::atomic::{AtomicUsize, Ordering};
@@ -991,11 +1016,11 @@ mod admission_tests {
         assert_eq!(INITS.load(Ordering::Relaxed), 1);
         assert_eq!(
             unsafe { <Header<Reject> as AdmitLayout>::admit(header, (&INITS, true), ctx, Some(3)) },
-            Err(AdmitError::InvalidHeader)
+            Err(RecordAdmitError::InvalidHeader)
         );
         assert_eq!(
             unsafe { <Header<Reject> as AdmitLayout>::admit(header, (&INITS, true), ctx, Some(3)) },
-            Err(AdmitError::InvalidHeader)
+            Err(RecordAdmitError::InvalidHeader)
         );
         assert_eq!(INITS.load(Ordering::Relaxed), 1);
     }
@@ -1021,13 +1046,23 @@ mod admission_tests {
             unsafe { <Header<Reject> as AdmitLayout>::admit(header, (&INITS, false), first, None) },
             Ok(())
         );
+        let conf = &(&INITS, false);
+        let recorded = unsafe { super::recorded_at(header as *const u8) }.unwrap();
         assert_eq!(
-            unsafe { Header::<Reject>::mismatch_at(header, &(&INITS, false), moved) },
+            unsafe {
+                Header::<Reject>::mismatch_at(
+                    header,
+                    conf,
+                    <Reject as Layout>::storage(conf).unwrap(),
+                    recorded,
+                    moved,
+                )
+            },
             Some(LayoutField::Offset)
         );
         assert_eq!(
             unsafe { <Header<Reject> as AdmitLayout>::admit(header, (&INITS, false), moved, None) },
-            Err(AdmitError::Mismatch(LayoutField::Offset))
+            Err(RecordAdmitError::Mismatch(LayoutField::Offset))
         );
     }
 
@@ -1101,7 +1136,7 @@ mod admission_tests {
         };
         assert_eq!(
             unsafe { <Header<FailedInit> as AdmitLayout>::admit(pointer, (), ctx, None) },
-            Err(AdmitError::InvalidHeader)
+            Err(RecordAdmitError::InvalidHeader)
         );
         assert_eq!(unsafe { &*pointer }.status(), Status::Corrupted);
     }
@@ -1147,9 +1182,45 @@ mod admission_tests {
                     None,
                 )
             },
-            Err(AdmitError::Mismatch(LayoutField::Region))
+            Err(RecordAdmitError::Mismatch(LayoutField::Region))
         );
         assert!(unsafe { (*pointer).inner.leave(first) });
+    }
+
+    #[test]
+    fn a_wider_or_less_aligned_record_is_refused_by_the_leg_that_changed() {
+        // Each of the two extent legs has to be able to fire on its own, or the comparison it
+        // belongs to is not answering a question that anything else answers.
+        let mut storage = MaybeUninit::<Header<Root>>::zeroed();
+        let header = storage.as_mut_ptr();
+        let ctx = LayoutContext {
+            region: RegionId::new(51, 52),
+            offset: 0,
+            allow_init: true,
+        };
+        assert_eq!(
+            unsafe { <Header<Root> as AdmitLayout>::admit(header, (), ctx, None) },
+            Ok(())
+        );
+        let reattach = LayoutContext {
+            allow_init: false,
+            ..ctx
+        };
+        let recorded = unsafe { super::recorded_at(header as *const u8) }.unwrap();
+        let stored = <Root as Layout>::storage(&()).unwrap();
+        let wider =
+            core::alloc::Layout::from_size_align(stored.size() + stored.align(), stored.align())
+                .unwrap();
+        assert_eq!(
+            unsafe { Header::<Root>::mismatch_at(header, &(), wider, recorded, reattach) },
+            Some(LayoutField::Extent)
+        );
+        let remounted =
+            core::alloc::Layout::from_size_align(stored.size(), stored.align() * 2).unwrap();
+        assert_eq!(
+            unsafe { Header::<Root>::mismatch_at(header, &(), remounted, recorded, reattach) },
+            Some(LayoutField::ExtentAlign)
+        );
     }
 
     #[test]
@@ -1174,13 +1245,22 @@ mod admission_tests {
             ..ctx
         };
         unsafe { core::ptr::addr_of_mut!((*header).record.revision).write(1u32.to_le_bytes()) };
+        let revision_one = unsafe { super::recorded_at(header as *const u8) }.unwrap();
         assert_eq!(
-            unsafe { Header::<Root>::mismatch_at(header, &(), reattach) },
+            unsafe {
+                Header::<Root>::mismatch_at(
+                    header,
+                    &(),
+                    <Root as Layout>::storage(&()).unwrap(),
+                    revision_one,
+                    reattach,
+                )
+            },
             Some(LayoutField::Revision)
         );
         assert_eq!(
             unsafe { <Header<Root> as AdmitLayout>::admit(header, (), reattach, None) },
-            Err(AdmitError::Mismatch(LayoutField::Revision))
+            Err(RecordAdmitError::Mismatch(LayoutField::Revision))
         );
         unsafe { core::ptr::addr_of_mut!((*header).record.revision).write(2u32.to_le_bytes()) };
         assert_eq!(
@@ -1350,7 +1430,7 @@ mod admission_tests {
         }
     }
 
-    fn race_root(second_region: RegionId) -> [Result<(), AdmitError>; 2] {
+    fn race_root(second_region: RegionId) -> [Result<(), RecordAdmitError>; 2] {
         let storage = Box::into_raw(Box::new(MaybeUninit::<Header<Root>>::zeroed()));
         let pointer = storage.cast::<Header<Root>>();
         let address = pointer.addr();
@@ -1386,7 +1466,10 @@ mod admission_tests {
         assert_eq!(
             conflict
                 .iter()
-                .filter(|result| matches!(result, Err(AdmitError::Mismatch(LayoutField::Region))))
+                .filter(|result| matches!(
+                    result,
+                    Err(RecordAdmitError::Mismatch(LayoutField::Region))
+                ))
                 .count(),
             1
         );
@@ -1468,7 +1551,7 @@ mod admission_tests {
                     None,
                 )
             },
-            Err(AdmitError::Mismatch(LayoutField::HeaderSize))
+            Err(RecordAdmitError::Mismatch(LayoutField::InfoSchema))
         );
     }
 
@@ -1499,13 +1582,13 @@ mod admission_tests {
         unsafe { pointer.cast::<u8>().add(1).write(0) };
         assert_eq!(
             unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) },
-            Err(AdmitError::Mismatch(LayoutField::Format))
+            Err(RecordAdmitError::Mismatch(LayoutField::Format))
         );
         unsafe { pointer.cast::<u8>().add(1).write(RECORD_FORMAT) };
         unsafe { pointer.cast::<u8>().add(2).write(0) };
         assert_eq!(
             unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, None) },
-            Err(AdmitError::Mismatch(LayoutField::Profile))
+            Err(RecordAdmitError::Mismatch(LayoutField::Profile))
         );
     }
 
@@ -1533,19 +1616,19 @@ mod admission_tests {
         // it was written by a target of the other width, because the typed word is then unreadable.
         assert_eq!(
             unsafe { <Header<Wide> as AdmitLayout>::admit(pointer.cast(), (), join, None) },
-            Err(AdmitError::Mismatch(LayoutField::HeaderSize))
+            Err(RecordAdmitError::Mismatch(LayoutField::InfoSchema))
         );
         let native = unsafe { (*pointer).record.profile };
         unsafe { (*pointer).record.profile = [other_word, other_word, native[2]] };
         assert_eq!(
             unsafe { <Header<Wide> as AdmitLayout>::admit(pointer.cast(), (), join, None) },
-            Err(AdmitError::Mismatch(LayoutField::Profile))
+            Err(RecordAdmitError::Mismatch(LayoutField::Profile))
         );
         unsafe { (*pointer).record.profile = native };
         unsafe { (*pointer).record.profile[2] = native[2] ^ 1 };
         assert_eq!(
             unsafe { <Header<Narrow> as AdmitLayout>::admit(pointer, (), join, None) },
-            Err(AdmitError::Mismatch(LayoutField::Profile))
+            Err(RecordAdmitError::Mismatch(LayoutField::Profile))
         );
     }
 
@@ -1595,7 +1678,7 @@ mod admission_tests {
 
         assert_eq!(
             unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, Some(3)) },
-            Err(AdmitError::DuplicateMember)
+            Err(RecordAdmitError::DuplicateMember)
         );
         assert_eq!(
             unsafe { <Header<Root> as AdmitLayout>::admit(pointer, (), ctx, Some(4)) },
@@ -1628,7 +1711,7 @@ mod admission_tests {
                     unsafe {
                         <Header<Reject> as AdmitLayout>::admit(pointer, (&INITS, false), ctx, None)
                     },
-                    Err(AdmitError::Mismatch(LayoutField::$field))
+                    Err(RecordAdmitError::Mismatch(LayoutField::$field))
                 );
                 unsafe { (*pointer).record.$member[0] ^= 1 };
             }};
@@ -1642,16 +1725,13 @@ mod admission_tests {
                     unsafe {
                         <Header<Reject> as AdmitLayout>::admit(pointer, (&INITS, false), ctx, None)
                     },
-                    Err(AdmitError::Mismatch(LayoutField::$field))
+                    Err(RecordAdmitError::Mismatch(LayoutField::$field))
                 );
                 unsafe { (*pointer).$member -= 1 };
             }};
         }
-        reject_field!(header_size, HeaderSize);
-        reject_field!(header_align, HeaderAlign);
-        reject_field!(info_size, InfoSize);
-        reject_field!(info_align, InfoAlign);
-        reject_field!(body_size, Size);
-        reject_field!(body_align, Align);
+        // `Region` and `Offset` are refused from a peer's own coordinates elsewhere, and `InfoSchema`
+        // is what the `Narrow`/`Wide` pair turns on; the revision beside it had no other witness.
+        reject_field!(info_revision, InfoRevision);
     }
 }

@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::mem::{Access, Request};
 use crate::os::unix::UnixFd;
 use crate::{ChannelId as Id, Session};
-use crate::{mem::Peer, schema::RegionId};
+use crate::{mem::Peer, place::RegionId};
 
 const ROLE: &str = "EVERING_GUARD_ROLE";
 const SHM: &str = "EVERING_GUARD_SHM";

@@ -24,8 +24,12 @@ Four things stay outside that test deliberately:
   is a defect rather than a portable representation.
 - Construction-time policy — address preference, `Patience`, allocator choice, the shape of
   an OS flag. Admission erases these, so a peer never has to copy them.
-- Rust layout itself. Outside the `#[repr(C)]` items named below, no struct's layout is
-  claimed compatible across builds or targets.
+- Rust layout itself. Where a struct's bytes reach a peer, `#[repr(C)]` is the crate's own promise
+  about the order of its fields, and `queue::Header`, `talc::Meta` and `mem::AddrSpan` now carry it —
+  three items whose order nothing in the persisted record describes. None of their widths or offsets
+  is published here: a reader outside the crate cannot name them, so by the third clause above they
+  are a constraint on this crate rather than a promise out there. Outside the `#[repr(C)]` items
+  named below, no struct's layout is claimed compatible across builds or targets.
 - Names shared only between two versions of this crate, such as the `layout` vocabulary and
   `SchemaKey`. They stay in the type surface, where the whole consequence of changing one is
   a recompile, so publishing them as data would freeze a thing that never had to be frozen.

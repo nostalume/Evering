@@ -20,8 +20,8 @@ use core::ptr::NonNull;
 use core::{marker::PhantomData, ops::Deref};
 
 use crate::{
-    header::{AdmitError, AdmitLayout, Claim, Layout, Member, RcHeader, RootHeader},
-    schema::{LayoutContext, RegionAdmission, RegionId},
+    header::{AdmitLayout, Claim, Layout, Member, RecordAdmitError, RootHeader},
+    place::{LayoutContext, RegionAdmission, RegionId},
 };
 
 pub use crate::header::LayoutField;
@@ -375,6 +375,11 @@ unsafe impl<M: MemOps> MemOps for &M {
     }
 }
 
+/// A span inside one mapping: where it starts, then how long it is.
+///
+/// `talc::Meta` holds one of these and is a [`Repr`](crate::msg::Repr), so both legs reach a peer as
+/// bytes; the order between them is a promise, not a layout choice.
+#[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AddrSpan<T> {
     pub start_offset: T,
@@ -575,13 +580,13 @@ impl Map {
 }
 
 /// The one place an admission failure becomes a mapping failure.
-fn refused(error: AdmitError) -> Error {
+fn refused(error: RecordAdmitError) -> Error {
     match error {
-        AdmitError::Contention => Error::Contention,
-        AdmitError::Closed => Error::LayoutClosed,
-        AdmitError::DuplicateMember => Error::DuplicateAttachment,
-        AdmitError::InvalidHeader => Error::InvalidHeader,
-        AdmitError::Mismatch(field) => Error::LayoutMismatch(field),
+        RecordAdmitError::Contention => Error::Contention,
+        RecordAdmitError::Closed => Error::LayoutClosed,
+        RecordAdmitError::DuplicateMember => Error::DuplicateAttachment,
+        RecordAdmitError::InvalidHeader => Error::InvalidHeader,
+        RecordAdmitError::Mismatch(field) => Error::LayoutMismatch(field),
     }
 }
 
@@ -641,7 +646,7 @@ impl Observer {
     /// access declaration, and no backend type or error survives the call. Nothing past that seam is —
     /// which is the only substantive difference between this entrance and a member's.
     ///
-    /// There is deliberately no [`RegionAdmission`] parameter: one of its arms creates, and creating
+    /// There is deliberately no `RegionAdmission` parameter: one of its arms creates, and creating
     /// asserts a commit. An entrance that promises no commit must not be eligible to be asked for one.
     pub fn discover<S: Source>(
         source: S,
@@ -674,6 +679,12 @@ impl Observer {
 
     /// What the published `L` at `at` says it is, verified against the records this region wrote.
     ///
+    /// This is the reader's half of the verification the header tests aim at, and it is compiled only
+    /// for them: no entrance a caller can reach asks a standpoint that holds no slot to read a record's
+    /// own shape, so publishing it would hand out a name nobody can spell (`header::Layout` is not a
+    /// downstream implementation point) and leaving it in a release build would be code without a
+    /// producer. Giving an outside monitor that read is roadmap M4's addition, not a re-exposure.
+    ///
     /// The answer is the layout's own information value — a copy, not a reference into the mapping. That
     /// is not a convenience: `&L` would put `init`, `attach` and `recover` under a reader's fingers,
     /// which are the three writer methods this type exists to make unaskable, and it would make the rule
@@ -683,14 +694,15 @@ impl Observer {
     /// `mismatch_at` before it claims anything, so a reader and a member cannot disagree about what a
     /// record claims, and a record that lies about its region, offset or shape is refused here as it is
     /// refused there.
-    pub fn read<L: Layout>(&self, at: usize) -> Result<L::Info, Error> {
-        let (header, _) = unsafe { self.map.layout_at::<RcHeader<L>>(at) }?;
+    #[cfg(test)]
+    pub(crate) fn read<L: Layout>(&self, at: usize) -> Result<L::Info, Error> {
+        let (header, _) = unsafe { self.map.layout_at::<crate::header::RcHeader<L>>(at) }?;
         let ctx = LayoutContext {
             region: self.region,
             offset: unsafe { self.map.offset(header) } as u64,
             allow_init: false,
         };
-        unsafe { RcHeader::<L>::inspect_at(header, ctx) }.map_err(refused)
+        unsafe { crate::header::RcHeader::<L>::inspect_at(header, ctx) }.map_err(refused)
     }
 }
 
@@ -737,7 +749,6 @@ pub(crate) struct Region {
     header: NonNull<RootHeader>,
     member: Member,
     region: RegionId,
-    allow_init: bool,
     detached: bool,
 }
 
@@ -752,7 +763,7 @@ unsafe impl Sync for Region {}
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CloseError {
+pub(crate) enum UnmapCloseError {
     InUse,
     UnmapFailed,
 }
@@ -763,7 +774,7 @@ pub(crate) enum ProjectionError {
     ArithmeticOverflow,
     OutOfBounds,
     Misaligned,
-    Admission(AdmitError),
+    Admission(RecordAdmitError),
 }
 
 unsafe impl MemOps for Region {
@@ -798,20 +809,20 @@ impl Region {
     /// Admits this process as a member of the region `map` extends over.
     ///
     /// The four steps are not four reads: reserving, committing and claiming a slot write, while
-    /// finding out which region this is and whether its layout is readable is [`read_root`]. Only the
-    /// writer path is public from here; the reader's half exists so a participant that holds no slot
-    /// can still be told what a published root says.
+    /// finding out which region this is and whether its layout is readable is [`read_root`]. Nothing
+    /// here reaches that read without also writing, which is why the participant that holds no slot and
+    /// wants only what a published root says is admitted by [`Observer::discover`], not by an arm of
+    /// `admission`.
     fn new(
         map: Map,
         admission: RegionAdmission,
         promised: Option<Peer>,
     ) -> Result<(Arc<Self>, usize), Error> {
         let (ptr, offset) = unsafe { map.reserve::<RootHeader>(0) }?;
-        let region = match admission {
-            RegionAdmission::Create(id) | RegionAdmission::Expect(id) => id,
-            RegionAdmission::Discover => read_root(&map)?,
+        let (region, allow_init) = match admission {
+            RegionAdmission::Create(id) => (id, true),
+            RegionAdmission::Expect(id) => (id, false),
         };
-        let allow_init = matches!(admission, RegionAdmission::Create(_));
         let ctx = LayoutContext {
             region,
             offset: 0,
@@ -850,7 +861,6 @@ impl Region {
                 header,
                 member,
                 region,
-                allow_init,
                 detached: false,
             }),
             offset,
@@ -901,13 +911,13 @@ impl Region {
     }
 
     #[cfg(test)]
-    pub(crate) fn close(region: Arc<Self>) -> Result<(), CloseError> {
-        let mut region = Arc::try_unwrap(region).map_err(|_| CloseError::InUse)?;
+    pub(crate) fn close(region: Arc<Self>) -> Result<(), UnmapCloseError> {
+        let mut region = Arc::try_unwrap(region).map_err(|_| UnmapCloseError::InUse)?;
         region.detach();
         if region.unmap() {
             Ok(())
         } else {
-            Err(CloseError::UnmapFailed)
+            Err(UnmapCloseError::UnmapFailed)
         }
     }
 
@@ -943,10 +953,20 @@ impl Region {
     }
 }
 
+/// Which member of a shared region a sentence is about: its directory slot, under the generation that
+/// currently fills it. Which *process* a handover came from is the other question, and a host answers it
+/// through `os::Provenance` rather than here.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Peer(Member);
 
 impl Peer {
+    /// Reconstructs a peer from its wire parts without validation.
+    ///
+    /// # Safety
+    ///
+    /// This is a raw naming capability: a bare port that holds a static roster must be able to name
+    /// a peer by slot and generation. Validation of those parts (bounds, liveness) is the caller's
+    /// obligation, not this constructor's — see `Port::from_parts` for the validated counterpart.
     pub const fn from_parts(slot: u8, generation: usize) -> Self {
         Self(Member { slot, generation })
     }
@@ -1024,7 +1044,7 @@ impl Build {
         })
     }
 
-    pub fn region_id(&self) -> RegionId {
+    pub fn region(&self) -> RegionId {
         self.area.region
     }
 
@@ -1064,9 +1084,9 @@ impl Build {
             return Err(Error::InvalidHeader);
         }
         let ctx = LayoutContext {
-            region: self.region_id(),
+            region: self.region(),
             offset: offset as u64,
-            allow_init: self.area.allow_init,
+            allow_init: true,
         };
         let ptr = match unsafe { self.area.commit::<T>(ptr, conf, ctx) } {
             Ok(ptr) => ptr,
@@ -1091,7 +1111,7 @@ impl Build {
     }
 
     #[cfg(test)]
-    pub(crate) fn close(self) -> Result<(), CloseError> {
+    pub(crate) fn close(self) -> Result<(), UnmapCloseError> {
         Region::close(self.area)
     }
 }
@@ -1105,8 +1125,9 @@ pub(crate) struct Mapped<T: AdmitLayout> {
 // layout is what makes cross-thread access sound: `Mapped<T>` itself is Sync only for `T: Sync`,
 // and the only other way this type reaches memory — `ref_at` — is bounded the same way, so a
 // projection cannot hand out a shared reference to a type the promise was never made about.
-unsafe impl<T: AdmitLayout + Sync> Send for Mapped<T> {}
-unsafe impl<T: AdmitLayout + Sync> Sync for Mapped<T> {}
+// `Sync` is not restated as a bound because `AdmitLayout: Layout: Sync` already carries it.
+unsafe impl<T: AdmitLayout> Send for Mapped<T> {}
+unsafe impl<T: AdmitLayout> Sync for Mapped<T> {}
 
 impl<T: AdmitLayout + core::fmt::Debug> core::fmt::Debug for Mapped<T> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
@@ -1142,7 +1163,7 @@ impl<T: AdmitLayout> Mapped<T> {
         self.attached = false;
     }
 
-    pub fn region_id(&self) -> RegionId {
+    pub fn region(&self) -> RegionId {
         self.handle.region
     }
 
@@ -1232,8 +1253,8 @@ impl<T: AdmitLayout> Mapped<T> {
         if self.handle.permits(Access::WRITE).is_err() {
             return Err(ProjectionError::ReadOnly);
         }
-        let layout = <U as AdmitLayout>::storage(&conf).ok_or(ProjectionError::Admission(
-            crate::header::AdmitError::InvalidHeader,
+        let layout = <U as Layout>::storage(&conf).ok_or(ProjectionError::Admission(
+            crate::header::RecordAdmitError::InvalidHeader,
         ))?;
         let end = offset
             .checked_add(layout.size())

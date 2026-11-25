@@ -16,7 +16,7 @@ ownership transitions. Native resources and asynchronous waiting are adapters.
 | Concept | What you use it for |
 | --- | --- |
 | `Session` | Create or open one typed view of a shared-memory region. |
-| `Observer` | Read what a region publishes without joining it or holding a slot. |
+| `Observer` | Read the published root of a region — which region it claims, under what access — without joining it or holding a slot. |
 | `Pool` | Store transferable payloads in bounded, recoverable blocks. |
 | `Channel<H>` | Exchange fixed-representation headers through a bounded duplex queue. |
 | `Port<H>` | Hand one channel role to another process as stable bytes. |
@@ -47,6 +47,10 @@ The default feature is `std`. `map`, `notify`, and `process` are composable;
 three is also built and run at its own width on both hosts, because a layer that
 quietly needs a dependency feature some wider layer turns on composes only in
 name. The core also checks with default features disabled.
+
+`tracing` adds no capability and checks nothing. It builds the `DEBUG` events that
+say which exit a declined reap stopped at and how the shared heap mutated — the
+reasons that reach a caller as a trace rather than as a type it can match on.
 
 The crate builds on stable Rust; nothing in it needs a nightly compiler.
 [`rust-toolchain.toml`](rust-toolchain.toml) pins the version the checks below were run on

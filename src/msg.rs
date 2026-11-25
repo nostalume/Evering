@@ -8,28 +8,30 @@
 //! item. A new entry taking `T: Repr` without forcing it loses the guarantee silently, and nothing in
 //! this file's tests forces it either. The mixing constants behind `type_id_for` are wire identity,
 //! checked here only by inequality, and the revision `Encoded` carries is pinned outside this file.
-use crate::schema::{SchemaKey, compose_schema, schema_id};
+use crate::schema::{SchemaKey, SharedSchema, compose_schema, schema_id};
 
 pub type TypeId = u64;
 
 /// A value whose initialized representation may cross a process boundary.
 ///
 /// ```compile_fail
-/// # use evering::{Repr, SchemaId, SchemaKey};
+/// # use evering::layout::{Repr, SchemaId, SchemaKey, SharedSchema};
 /// # use std::rc::Rc;
 /// struct Local(Rc<()>);
-/// unsafe impl Repr for Local {
+/// impl SharedSchema for Local {
 ///     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(1), 1);
 /// }
+/// unsafe impl Repr for Local {}
 /// ```
 ///
 /// ```compile_fail
-/// # use evering::{Repr, SchemaId, SchemaKey};
+/// # use evering::layout::{Repr, SchemaId, SchemaKey, SharedSchema};
 /// struct Dropping;
 /// impl Drop for Dropping { fn drop(&mut self) {} }
-/// unsafe impl Repr for Dropping {
+/// impl SharedSchema for Dropping {
 ///     const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(1), 1);
 /// }
+/// unsafe impl Repr for Dropping {}
 /// const _: () = <Dropping as Repr>::VALID;
 /// ```
 ///
@@ -38,9 +40,7 @@ pub type TypeId = u64;
 /// `SCHEMA` must identify one stable representation across every admitted
 /// build. Every observable byte must be initialized and values must contain no
 /// process-local pointer, reference, handle, or other local authority.
-pub unsafe trait Repr: Send + 'static {
-    const SCHEMA: SchemaKey;
-
+pub unsafe trait Repr: crate::schema::SharedSchema + Send + 'static {
     #[doc(hidden)]
     const VALID: () = assert!(
         !core::mem::needs_drop::<Self>(),
@@ -51,9 +51,10 @@ pub unsafe trait Repr: Send + 'static {
 macro_rules! repr {
     ($($ty:ty => $name:literal),* $(,)?) => {
         $(
-            unsafe impl Repr for $ty {
+            impl crate::schema::SharedSchema for $ty {
                 const SCHEMA: SchemaKey = SchemaKey::new(schema_id($name), 1);
             }
+            unsafe impl Repr for $ty {}
         )*
     };
 }
@@ -70,12 +71,15 @@ repr! {
     i32 => "core.i32",
     i64 => "core.i64",
     bool => "core.bool",
-    () => "core.unit",
 }
 
-unsafe impl<T: Repr> Repr for [T] {
+unsafe impl Repr for () {}
+
+impl<T: Repr> crate::schema::SharedSchema for [T] {
     const SCHEMA: SchemaKey =
         compose_schema(SchemaKey::new(schema_id("evering.slice"), 1), T::SCHEMA);
+}
+unsafe impl<T: Repr> Repr for [T] {
     const VALID: () = T::VALID;
 }
 
@@ -99,9 +103,10 @@ impl Encoded {
     }
 }
 
-unsafe impl Repr for Encoded {
+impl crate::schema::SharedSchema for Encoded {
     const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.encoded"), 2);
 }
+unsafe impl Repr for Encoded {}
 
 #[inline(always)]
 const fn type_id_for(protocol: SchemaKey, body: SchemaKey) -> TypeId {
@@ -129,15 +134,18 @@ mod tests {
     struct Second;
     struct Member;
 
-    unsafe impl Repr for First {
+    impl crate::schema::SharedSchema for First {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x100), 1);
     }
-    unsafe impl Repr for Second {
+    unsafe impl Repr for First {}
+    impl crate::schema::SharedSchema for Second {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x200), 1);
     }
-    unsafe impl Repr for Member {
+    unsafe impl Repr for Second {}
+    impl crate::schema::SharedSchema for Member {
         const SCHEMA: SchemaKey = SchemaKey::new(SchemaId(0x300), 1);
     }
+    unsafe impl Repr for Member {}
 
     #[test]
     fn protocol_scopes_body_identity() {

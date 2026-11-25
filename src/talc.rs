@@ -7,8 +7,10 @@
 //!
 //! The three free-space arrays have to move as one unit inside the claim, and the only check that
 //! would notice otherwise, `scan_errors`, compiles to nothing in a release build — a release run can
-//! therefore pass on an availability bit that disagrees with the bin naming it. A reader also has to
-//! verify a peer-chosen tag's alignment before `deallocate` trusts it.
+//! therefore pass on an availability bit that disagrees with the bin naming it. The `tracing` feature
+//! is a separate switch and prints instead of verifying, so a release build run with it on reads the
+//! bookkeeping of each mutation while the sweep that could contradict it stays compiled out. A reader
+//! also has to verify a peer-chosen tag's alignment before `deallocate` trusts it.
 use core::alloc;
 use core::cell::UnsafeCell;
 use core::ops::Deref;
@@ -22,7 +24,8 @@ use crate::numeric::{
     bit::{WORD_ALIGN, WORD_BITS, Word},
     max_usize, min_usize,
 };
-use crate::schema::{LayoutContext, LayoutInfo, SchemaKey, SharedSchema, schema_id};
+use crate::place::LayoutContext;
+use crate::schema::{LayoutInfo, SchemaKey, SharedSchema, schema_id};
 use crate::{header, mem};
 
 type UInt = usize;
@@ -1746,8 +1749,8 @@ impl MapTalc {
         }
     }
 
-    pub(crate) fn region_id(&self) -> crate::schema::RegionId {
-        self.header.region_id()
+    pub(crate) fn region(&self) -> crate::place::RegionId {
+        self.header.region()
     }
 
     #[inline]
@@ -1853,6 +1856,11 @@ pub(crate) fn block_aligned(pointer: NonNull<u8>) -> bool {
     pointer.addr().get().is_multiple_of(BLOCK_ALIGN)
 }
 
+/// What a block is: the span it occupies in its mapping, with no process-local address in it.
+///
+/// This travels as a message payload, so its bytes are read by a build that never wrote them, and
+/// `SCHEMA` revision 1 is a claim about those bytes rather than about this struct's fields.
+#[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Meta {
     view: AddrSpan,
@@ -1864,9 +1872,7 @@ impl SharedSchema for Meta {
     const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.talc.meta"), 1);
 }
 
-unsafe impl crate::msg::Repr for Meta {
-    const SCHEMA: SchemaKey = <Self as SharedSchema>::SCHEMA;
-}
+unsafe impl crate::msg::Repr for Meta {}
 
 impl Meta {
     pub(crate) const fn null() -> Self {

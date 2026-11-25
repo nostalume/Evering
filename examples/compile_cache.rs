@@ -51,9 +51,10 @@ struct Job {
     len: u64,
 }
 
-unsafe impl Repr for Job {
+impl evering::layout::SharedSchema for Job {
     const SCHEMA: SchemaKey = compose_schema(PROTOCOL, SchemaKey::new(schema_id("job"), 1));
 }
+unsafe impl Repr for Job {}
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,9 +64,10 @@ struct Verdict {
     len: u64,
 }
 
-unsafe impl Repr for Verdict {
+impl evering::layout::SharedSchema for Verdict {
     const SCHEMA: SchemaKey = compose_schema(PROTOCOL, SchemaKey::new(schema_id("verdict"), 1));
 }
+unsafe impl Repr for Verdict {}
 
 fn access() -> Access {
     Access::READ | Access::WRITE
@@ -145,7 +147,7 @@ fn spawn_serving(
 }
 
 async fn serve(dying: bool) -> Result<(), String> {
-    let (_peer, resources, _report) = Handoff::receive().map_err(text)?;
+    let (_provenance, resources, _report) = Handoff::receive().map_err(text)?;
     let session =
         Session::open(resources.mapping, Request::new(EXTENT, access()), REGION).map_err(text)?;
     let (pool_id, jobs_port, verdicts_port) = decode_boot(&resources.bootstrap)?;
