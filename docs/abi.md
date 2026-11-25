@@ -1,10 +1,9 @@
 # Which byte facts are published
 
-This page owns two questions: which facts about shared bytes someone outside this crate has
-to reproduce, and in what shape each one is handed over. Three neighbours own what this page
-does not: [stability.md](stability.md) holds every "this was checked" claim,
-[porting.md](porting.md) holds what a base implementing the two seams has to arrange, and
-[architecture.md](architecture.md) holds the model those bytes serve.
+This page answers one question: which facts about shared bytes someone outside this crate has
+to reproduce, and in what shape each one is handed over. It names its neighbours where it needs
+them — [stability.md](stability.md), [porting.md](porting.md), [architecture.md](architecture.md) —
+and [AGENTS.md](AGENTS.md) says which kind of statement each of them owns.
 
 ## The test a fact has to pass
 
@@ -25,7 +24,7 @@ Four things stay outside that test deliberately:
 - Construction-time policy — address preference, `Patience`, allocator choice, the shape of
   an OS flag. Admission erases these, so a peer never has to copy them.
 - Rust layout itself. Where a struct's bytes reach a peer, `#[repr(C)]` is the crate's own promise
-  about the order of its fields, and `queue::Header`, `talc::Meta` and `mem::AddrSpan` now carry it —
+  about the order of its fields, and `queue::Header`, `talc::Meta` and `mem::AddrSpan` carry it —
   three items whose order nothing in the persisted record describes. None of their widths or offsets
   is published here: a reader outside the crate cannot name them, so by the third clause above they
   are a constraint on this crate rather than a promise out there. Outside the `#[repr(C)]` items
@@ -120,7 +119,7 @@ documentation change.
   drifts from what it describes; it does not make the value stop moving.
 - Adding a typed construction freezes the field order it carries. That is a decision with a
   cost, and it is taken deliberately or not at all.
-- This page states a fact's shape; [stability.md](stability.md) states what pins it, and
-  [AGENTS.md](AGENTS.md) owns the rule that moves the two together.
+- What pins a number goes on [stability.md](stability.md); the rule that moves the two pages
+  into one commit is [AGENTS.md](AGENTS.md)'s.
 - Tags, version numbers, and uploads are authorized separately, each time. Nothing on this
   page is such an authorization.

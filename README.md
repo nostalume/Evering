@@ -6,154 +6,115 @@
 
 </div>
 
-Evering is an experimental Rust substrate for bounded inter-process communication
-through shared memory. Its operating-system-independent core combines relocatable
-typed layouts, recoverable transfer storage, bounded duplex queues, and explicit
-ownership transitions. Native resources and asynchronous waiting are adapters.
+Evering is an experimental Rust substrate for bounded inter-process communication over
+shared memory. A region holds typed layouts, a pool hands out recoverable blocks, a
+channel moves one block between two members of a session, and a notification object says
+when to look again. None of that needs an operating system: mapping an extent, ringing a
+doorbell, and handing resources to a child are adapters you can supply yourself.
 
-## Model
+## What it is for
 
-| Concept | What you use it for |
-| --- | --- |
-| `Session` | Create or open one typed view of a shared-memory region. |
-| `Observer` | Read the published root of a region — which region it claims, under what access — without joining it or holding a slot. |
-| `Pool` | Store transferable payloads in bounded, recoverable blocks. |
-| `Channel<H>` | Exchange fixed-representation headers through a bounded duplex queue. |
-| `Port<H>` | Hand one channel role to another process as stable bytes. |
-| `Signals` | Wait for progress and notify a peer after shared state commits. |
-| `Deferred` | Withhold that notification across a batch of commits and spend it once. |
-| `Patience` | Decide how long a retry spins, waits for the peer, and gives up. |
+- **Transfer that survives a dead peer.** A payload occupies a Pool block with one
+  reclamation authority at a time, so a peer that dies mid-flight is reclaimed from shared
+  state instead of guessed at, and a failed send hands the same input back to its sender.
+- **Typed payloads, checked on arrival.** A block carries the schema it claims, and the
+  receiver either admits that body or keeps its claim untouched; nothing is reinterpreted.
+- **Bounded by construction.** Queue capacity, pool extent, block classes, and the framing
+  of a handover are fixed when they are created and validated at every entrance.
+- **Nothing process-local in shared bytes.** Pointers, native handles, wakers, and local
+  reference counts stay in your own process, which is what lets a second process read the
+  same region without translating anything.
 
-A creator creates a `Session`, `Pool`, and channel, then hands the mapping,
-`PoolId`, and `Port` to a peer. The peer opens the session and adopts the port.
-Each side splits its channel into `Tx` and `Rx`; sending publishes a Pool-backed
-transfer, and receiving admits its schema into a typed block. Close transmitters,
-drain peers, then remove the channels.
+## The transfer path
 
-Native resources and Tokio waiting are optional adapters. `Session::heap` and
-`PBox` are an explicit general heap, never an automatic channel fallback. The
-[architecture](docs/architecture.md) defines recovery and safety invariants.
+[`examples/index.rs`](examples/index.rs) is the full program; this is its publish and admit
+pair, with the error mapping, the per-peer slot indexing, and the run's budget timeout
+elided.
 
-## Install
+```rust
+let pool = session.create_pool(8 * 1024 * 1024, None)?;
+let (jobs, job_port) = session.create_channel(4)?;
+let (jobs_tx, jobs_rx) = jobs.split();
 
-Evering 0.1.0 is available from crates.io. Its public ABI remains experimental:
+// Publish: reserve a slot, fill a Pool block, commit it.
+let permit = signals.reserve(&jobs_tx).await?;
+let block = pool.as_ref().copy(&body)?;
+permit.send(block.encode(JOB))?;
 
-```toml
-evering = { version = "0.1.0", features = ["os", "tokio"] }
+// Admit: claim, then name the body the payload claims to carry.
+let claim = signals.claim(&jobs_rx).await?;
+let committed = signals.admit::<[u8]>(claim, pool.as_ref(), JOB)?;
 ```
 
-The default feature is `std`. `map`, `notify`, and `process` are composable;
-`os` selects all native adapters. `tokio` adds process-local waiting. Each of the
-three is also built and run at its own width on both hosts, because a layer that
-quietly needs a dependency feature some wider layer turns on composes only in
-name. The core also checks with default features disabled.
+`job_port` is a fixed number of bytes, so it reaches the peer through a handover rather
+than through the region: `os::Handoff::bind()` on the parent, `os::Handoff::receive()` in
+the child, together with the mapping and one doorbell. Each side splits its own `Tx` and
+`Rx` from the role it was admitted with, and the order to finish in is close the
+transmitters, drain the peers, then remove the channels.
 
-`tracing` adds no capability and checks nothing. It builds the `DEBUG` events that
-say which exit a declined reap stopped at and how the shared heap mutated — the
-reasons that reach a caller as a trace rather than as a type it can match on.
-
-The crate builds on stable Rust; nothing in it needs a nightly compiler.
-[`rust-toolchain.toml`](rust-toolchain.toml) pins the version the checks below were run on
-(`1.100.0`, with rustfmt and Clippy) and `rustup` installs it on first use. A
-check run through `+nightly` or another stable version compares a different
-compiler build than CI does. That pin is also the minimum supported version, and
-[`Cargo.toml`](Cargo.toml) now states it: older compilers were run rather than reasoned about,
-and `1.99.0` fails on the three standard-library faces this crate leans on —
-`allocator_api`, `unsafe_cell_access`, and a `const` `UnsafeCell::as_ref_unchecked`
-— all stable at `1.100.0`. The floor is where the library became sufficient, not
-a bound we agreed to maintain, so raising it is a one-line decision and lowering
-it is a code change.
-
-## Practical example
-
-The indexer hands shared storage and typed Channels to two workers, admits their
-runtime-classified results, then closes and removes its resources:
+## Try it
 
 ```console
 cargo run --example index --features os,tokio -- README.md Cargo.toml
 ```
 
-It prints bytes, lines, and a checksum for each file. Worker failure is reported
-and supervised, but abrupt in-flight application work is not replayed. A worker
-that dies without answering ends the run at its budget rather than leaving the
-coordinator parked on a doorbell nobody will ring.
+prints bytes, lines, and a checksum for each file. It runs two workers as real processes:
+failure is reported and supervised, abrupt in-flight work is not replayed, and a worker
+that never answers ends the run at its budget instead of leaving the coordinator parked on
+a doorbell nobody will ring.
 
-A second example sends the same three compile jobs twice — once through a
-daemon in another process, once through a matched framed-TCP server — then
-retires the peer and reclaims what it left behind.
+The second example sends the same three compile jobs twice — once to a daemon in another
+process, once to a matched framed-TCP server — then retires the peer and reclaims what it
+left behind:
 
 ```console
 cargo run --release --example compile_cache --features os,tokio
 ```
 
-Release is the intended profile; the example's own digest over a 1 MiB payload
-dominates a debug build. `--geometry` first prints the reservation each exact
-block range asks for, which is a floor set by the largest class rather than by
-traffic. The comparison favours TCP on purpose: its server is a thread inside
-the parent, while the Evering peer crosses `exec` and owns the other process.
+Release is the intended profile, because the example's own digest over a 1 MiB payload
+dominates a debug build, and the TCP arm is deliberately favourable: its server is a thread
+inside the parent, while the Evering peer crosses `exec` and owns the other process. Add
+`--geometry` to see the reservation each exact block range asks for, which is a floor set by
+the largest class rather than by traffic. Which of these programs CI executes, and on which
+host, is recorded in [stability](docs/stability.md).
 
-The workflow runs every example as a process on both arms — the same commands, in
-the profile CI already builds, asserting on the lines each leg prints and on the
-exit code — so an example that stops working fails a build instead of ageing
-quietly. The timings those lines carry are measurements and are not asserted.
+## Install
 
-## Benchmark evidence
+Version `0.1.0` is on crates.io, and its public ABI stays experimental:
 
-The registered [IPC study](benches/README.md) compares complete two-process
-request/response work against matched framed TCP and Unix-domain streams. Setup
-is outside timing; payload transformation, response validation, capacity,
-in-flight bounds, and trial admission are matched. The result measures the
-whole transport path, not an isolated ring instruction.
+```toml
+evering = { version = "0.1.0", features = ["os", "tokio"] }
+```
 
-The newest complete focused Tumbleweed delivery study compares one persistent
-Evering connection with UDS readiness. Both arms read every request byte and
-return the same fixed-size digest; all focused trials conserved and validated
-their work:
+The default feature is `std`. `map`, `notify`, and `process` are composable and `os`
+selects all three; `tokio` adds process-local waiting; `tracing` adds no capability, only
+the `DEBUG` events that name a declined reap's exit and each mutation of the shared heap.
+The core also builds with default features off, which is
+[what a `no-std` build gets](docs/stability.md#what-a-no-std-build-gets).
 
-| Payload bytes | Evering / UDS ratio | Paired 95% interval |
-| ---: | ---: | ---: |
-| 0 | 3.097 | [2.767, 3.341] |
-| 1,024 | 3.064 | [2.953, 3.197] |
-| 65,536 | 2.934 | [2.879, 3.136] |
-
-These are condition-specific throughput results, not universal IPC claims or
-causal attribution. A later Windows diagnostic excluded matched 64-KiB Pool
-allocation/copy metadata as the observed bottleneck but did not attribute the
-remaining sustained costs. The study records conditions, conservation checks,
-analysis, and extension rules; plots are generated on demand.
+The crate builds on stable Rust and needs no nightly.
+[`rust-toolchain.toml`](rust-toolchain.toml) pins the version these checks were run on,
+which is also the `rust-version` in [`Cargo.toml`](Cargo.toml), and `rustup` installs it on
+first use; a check run through `+nightly` compares a different compiler than CI does.
 
 ## Limits
 
-Evering currently assumes peers agree on build, protocol representations, and
-session composition. Peers that disagree on target width or byte order do not
-share a region: a region records the geometry it was created with, and a member
-whose own differs is refused when it is admitted rather than served translated
-field widths. A region created on one target is therefore not made readable with
-the same geometry on another, so the quantities that differ between targets are not
-published. Which byte facts are handed over, and in what shape, is
-[Which byte facts are published](docs/abi.md). It does not promise cross-build Rust
-ABI compatibility, membership that cannot write, automatic application replay, or
-recovery of ambiguous general-heap mutation. Exact participant-death evidence
-is required before shared ownership recovery. Reading a region without joining
-it is supported by `Observer`, which is a standpoint outside the roster rather
-than a kind of membership. Which surface was checked against what, and what a `no-std`
-build actually keeps, is recorded per surface in
-[What a surface can be relied on for](docs/stability.md).
+Peers are assumed to agree on build, protocol representations, and session composition.
+Recovery of shared ownership needs exact participant-death evidence; ambiguous general-heap
+mutation is stopped rather than reconstructed; application work is not replayed; and no
+cross-build Rust ABI is promised. Reading a region without joining it is offered, as a
+standpoint outside the roster rather than as a kind of membership.
 
 ## Documentation
 
-- [Architecture and invariants](docs/architecture.md)
-- [What a surface can be relied on for](docs/stability.md)
+- [Evering Architecture](docs/architecture.md)
+- [What a surface here can be relied on for](docs/stability.md)
 - [Which byte facts are published](docs/abi.md)
 - [Placing a region that is already in your image](docs/porting.md)
-- [Technology and agent guide](docs/AGENTS.md)
-- [Benchmark method and evidence](benches/README.md)
+- [Evering Agent Guide](docs/AGENTS.md)
 
-Every one of these describes what exists, and each kind of statement has one owner:
-the verdict page holds every "this was checked" claim, the architecture page holds the
-model, the ABI page holds which shared-byte facts are handed over and how, the porting
-page holds a port's obligations. Whether a design choice is settled
-is recorded in none of them.
+Each page states one kind of statement and one kind only; the rule that assigns them
+is stated in [the agent guide](docs/AGENTS.md).
 
 ## License
 

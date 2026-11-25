@@ -4,3 +4,6 @@
 .vscode/
 rustc-ice*
 /.codex/
+# Run outputs. The one artifact a test reads is a fixture under benches/ipc/testdata.
+/artifacts/
+/benches/evidence/

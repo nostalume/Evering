@@ -2,7 +2,10 @@ name: CI
 
 on:
   push:
+    branches: [main]
   pull_request:
+  workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -17,11 +20,12 @@ jobs:
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-          components: rustfmt, clippy, rust-docs
-          targets: i686-unknown-linux-gnu,riscv32imac-unknown-none-elf,aarch64-unknown-none
+      # `rust-toolchain.toml` is the only place a compiler version is written: rustup resolves the
+      # channel from it after checkout, so a row here cannot drift from the pin the docs cite. The
+      # line below records which compiler the rest of the job actually ran.
+      - run: rustc -vV
+      - run: rustup component add rustfmt clippy rust-docs
+      - run: rustup target add i686-unknown-linux-gnu riscv32imac-unknown-none-elf aarch64-unknown-none
       - run: cargo fmt --all --check
       - run: cargo clippy --all-targets --all-features -- -D warnings
       - run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
@@ -29,47 +33,9 @@ jobs:
       # The row above never compiles `benches/ipc/*` or an example, so a target gated on a feature
       # it does not ask for goes unnoticed until someone builds the whole matrix by hand.
       - run: cargo test --all-features --all-targets
-      # An example nothing executes is documentation, and documentation cannot fail a build. These are the
-      # gate's only runs of an example's own `main`, argv roles included: no test target can stand in for
-      # them, because a spawning leg names its child's role as an option on `current_exe()`, and the test
-      # harness stops at "Unrecognized option" before a role body could answer for it. So the child has to
-      # be the example, and the row that proves the handover has to exec the example.
-      # Each row asserts on the printed lines as well as the exit code, because an example whose legs all
-      # stopped reporting would otherwise still leave 0. Rows run the profile the job already builds; the
-      # durations a few lines carry are measurements, and no row asserts on one.
-      - name: the indexer hands four jobs to two worker processes
+      - name: the examples run as processes and assert on what they print
         shell: bash
-        run: |
-          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENTS.md absent)
-          test "$(grep -c $'\tok$' <<<"$out")" = 3
-          grep -q $'^3\t.*\tabsent' <<<"$out"
-      - name: the compile cache round-trips with a daemon across an exec, and reaps it
-        shell: bash
-        run: |
-          out=$(cargo run -q --features os,tokio --example compile_cache)
-          test "$(grep -c '^ROUNDTRIP' <<<"$out")" = 9
-          grep -q '^LIVENESS' <<<"$out"
-      - name: the geometry probe classifies every range it names
-        shell: bash
-        # Five rows, which is the whole claim: the refusal one of them reports is a host's class ceiling,
-        # so it is spelled on Windows and absent here, and it is asserted in `src/tests/mock/talc.rs`
-        # instead — where the ceiling is a number the test can name rather than a token the row would pin.
-        run: |
-          out=$(cargo run -q --features os,tokio --example compile_cache -- --geometry)
-          test "$(grep -c '^GEOMETRY' <<<"$out")" = 5
-      - name: the second introduction route reports where it stops
-        shell: bash
-        # 0, 3 and 4 are the three verdicts this example is built to distinguish, and which of them a host
-        # gives is what the card is about; 1 is its own word for "somewhere the roles do not name", and a
-        # signal or harness code is not a verdict at all. So the row accepts the measurement and fails on
-        # the shape nothing recorded.
-        run: |
-          status=0
-          out=$(cargo run -q --features os,tokio --example second_introduction) || status=$?
-          case "$status" in
-            0 | 3 | 4 | 6) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
-            *) exit "$status" ;;
-          esac
+        run: bash .github/scripts/ci-examples.sh linux
       # What each row says it needs, compiled at that width. `--all-features` hides this class twice over: a
       # library feature that calls a dependency feature it never declares builds because another feature turns
       # that dependency on, and a target whose `required-features` stop short of the code it holds builds for
@@ -106,15 +72,15 @@ jobs:
 
   windows:
     runs-on: windows-latest
-    # Raised from 15 for the four rows below: they ask a second feature set, so the library and the three
+    # Raised from 15 for the example rows: they ask a second feature set, so the library and the three
     # example binaries are compiled again, and the slowest of them runs three processes across an exec.
     timeout-minutes: 25
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-          components: rustfmt, clippy
+      # The same pin, and the same reason for naming it in the log. `rustfmt` and `clippy` are absent
+      # here because no row on this arm invokes either; the doc gate asks for `rust-docs`.
+      - run: rustc -vV
+      - run: rustup component add rust-docs
       - run: cargo test --features os,tokio,tracing
       # The doc surface is gated on this arm too, not only on Linux. `Death::credited` is a Linux-only
       # entrance, so an intra-doc link that resolves in the linux job's docs is a broken link on the host
@@ -122,37 +88,12 @@ jobs:
       - name: the documented surface builds without warnings
         shell: bash
         run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
-      # The four example runs, on the arm whose code they take: the rendezvous here is a pipe name rather
-      # than a descriptor number, and the death witness is written for Linux alone, so this host is the one
-      # that would otherwise carry an unexecuted example. The accepted codes of the last row are explained
-      # in the linux job's rows of the same names.
-      - name: the indexer hands four jobs to two worker processes
+      # The examples, on the arm whose code they take: the rendezvous here is a pipe name rather than a
+      # descriptor number, and the death witness is written for Linux alone, so this host is the one that
+      # would otherwise carry an unexecuted example. Both arms call the same owner of those assertions.
+      - name: the examples run as processes
         shell: bash
-        run: |
-          out=$(cargo run -q --features os,tokio --example index -- Cargo.toml README.md docs/AGENTS.md absent)
-          test "$(grep -c $'\tok$' <<<"$out")" = 3
-          grep -q $'^3\t.*\tabsent' <<<"$out"
-      - name: the compile cache round-trips with a daemon across an exec, and reaps it
-        shell: bash
-        run: |
-          out=$(cargo run -q --features os,tokio --example compile_cache)
-          test "$(grep -c '^ROUNDTRIP' <<<"$out")" = 9
-          grep -q '^LIVENESS' <<<"$out"
-      - name: the geometry probe reaches its ceiling
-        shell: bash
-        run: |
-          out=$(cargo run -q --features os,tokio --example compile_cache -- --geometry)
-          test "$(grep -c '^GEOMETRY' <<<"$out")" = 5
-          grep -q 'refused-class-too-wide-' <<<"$out"
-      - name: the second introduction route reports where it stops
-        shell: bash
-        run: |
-          status=0
-          out=$(cargo run -q --features os,tokio --example second_introduction) || status=$?
-          case "$status" in
-            0 | 3 | 4 | 6) grep -q $'^SECOND\tlauncher\tverdict:' <<<"$out" ;;
-            *) exit "$status" ;;
-          esac
+        run: bash .github/scripts/ci-examples.sh windows
       # The same narrow compile as the linux job: the legs this host owns are the ones a wide row hides.
       - run: cargo check --tests --features os,tokio
       # And the same width the linux job asks for the mapping layer. Nothing on this arm was broken by that

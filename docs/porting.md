@@ -4,8 +4,9 @@ For a port with no mapping call — bare metal, a microkernel-resident component
 firmware image where the shared extent exists because the linker put it there. The two
 seams you implement are `mapping::Source`/`Map` and `notify::Notify`/`Wait`; nothing
 else in the crate asks to be replaced. What this page adds to
-[the verdicts](stability.md) is the arrangement a base has to be in, which today lives
-only inside [`tests/portable_contracts/static_source.rs`](../tests/portable_contracts/static_source.rs).
+[the verdicts](stability.md) is the arrangement a base has to be in, which is otherwise
+written only inside
+[`tests/portable_contracts/static_source.rs`](../tests/portable_contracts/static_source.rs).
 
 ## The three numbers, and which one you cannot compute
 

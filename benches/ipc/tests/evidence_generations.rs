@@ -6,12 +6,12 @@
 
 use crate::{analysis, family, model, study, system};
 
-/// The retained `core-ipc` revision-2 artifact: one block, five cases, and no boundary
-/// or worker figure anywhere in it, because it was written before stage 0.2 counted
-/// anything.
+/// The retained `core-ipc` revision-2 artifact, kept as a fixture rather than as run output:
+/// one block, five cases, and no boundary or worker figure anywhere in it, because it was
+/// written before stage 0.2 counted anything.
 const RETIRED_SMOKE: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
-    "/benches/evidence/core-ipc-windows-smoke-20260802.jsonl"
+    "/benches/ipc/testdata/core-ipc-v2-smoke.jsonl"
 );
 
 fn cases(family: &family::Family, mode: &str) -> Vec<system::Case> {

@@ -1,5 +1,9 @@
 # Evering Architecture
 
+This page states the model and the rules a change to it must not break. Every "this
+surface was checked" sentence lives on [stability.md](stability.md), and
+[AGENTS.md](AGENTS.md) assigns the other kinds of statement their pages.
+
 ## Purpose
 
 Evering is a low-level substrate for bounded communication through a shared
@@ -11,9 +15,9 @@ model to an asynchronous runtime.
 
 The design favors concrete types, constant geometry, monomorphization, and
 inlining where they change shared interpretation or the hot path. Construction
-policy is erased once admitted. This keeps address preferences, native handles,
-and runtime choices out of persistent types and avoids the long generic chains
-that previously coupled allocator, registry, queue, and driver policy.
+policy is erased once admitted, so allocator, registry, queue, and driver policy
+stay out of the type parameters and out of persistent types along with address
+preferences and native handles.
 
 Evering is not a scheduler, process manager, discovery service, or request
 dispatcher. Application protocols own correlation, retry, idempotency, and
@@ -284,23 +288,18 @@ The essential invariants are:
 - terminal queue closure excludes later publication from the closed epoch;
 - process-local mapping and resource owners release exactly once.
 
-Current evidence covers model-level interleavings, typed admission failures,
-Directory and Pool generation reuse, queue contention and closure, malformed
-resource exchange, different-base process mappings, asynchronous notification,
-and bounded worker recovery. Two arms are exercised natively,
-`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`; the arrival receipt is
-executed only on the first, because its tests name Unix, so that leg of the
-handover seam is compiled but untested on Windows. The practical
-indexer demonstrates public construction, process handoff, runtime waiting,
-typed payload admission, close, and removal. Each example is executed as a
-process by ordinary CI on both arms and asserts on the lines its legs print, so
-what it demonstrates is gate-run rather than only compiled.
+The practical indexer demonstrates public construction, process handoff, runtime
+waiting, typed payload admission, close, and removal; what is executed rather than
+only compiled, and on which arm, is a row of
+[stability.md](stability.md). The same page records that the two arms are
+`x86_64-unknown-linux-gnu` and `x86_64-pc-windows-msvc`, and that the handover
+seam's arrival receipt is executed on the first alone.
 
-The crate defaults to standard-library support; its core also compiles with
-default features disabled. Native mapping, notification, process exchange,
-Tokio waiting, tracing, evidence capture, comparison transports, and plotting
-are additive capabilities. Bare-metal or restricted systems may supply their
-own mapping and polling environment without a fake signal implementation.
+The crate defaults to standard-library support and its core is also a `no_std +
+alloc` crate; [README.md](../README.md) names which switch turns each adapter
+capability on, and [`Cargo.toml`](../Cargo.toml) is where those switches are
+declared. Bare-metal or restricted systems may supply their own mapping and
+polling environment without a fake signal implementation.
 
 Evering remains experimental. It does not promise cross-build ABI stability,
 membership that cannot write, automatic replay of application work, universal
@@ -308,12 +307,3 @@ allocator recovery, or performance superiority outside a registered and
 matched study condition. Read-only observation is offered, and it is offered as
 a standpoint outside the roster rather than as a kind of membership. These
 limits are protocol boundaries, not hidden fallback behavior.
-
-## Where each claim is owned
-
-The published pages divide the same material by question, and the division is a rule
-rather than a habit. [AGENTS.md](AGENTS.md) states it once: which page owns which kind of
-statement, which page wins when two of them disagree, and that a change moves the pages it
-affects in one commit. A sentence about a verdict therefore belongs on the verdict page even
-when the model is what motivated it, and a sentence about the model belongs here even when a
-test is what proves it.

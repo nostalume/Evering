@@ -177,14 +177,13 @@ The first re-runs the registered schedule with the boundary counters enabled:
 and in-flight eight, one coordinator and one worker, 32 MiB, adaptive waiting.
 Every admitted row then also carries the coordinator's own run time over the
 timed window, its two context-switch counts, and the worker's separate
-accounting over its own bracket. That artifact is
-[local-ipc-unix-tumbleweed-focused-instrumented-20261122.jsonl](evidence/local-ipc-unix-tumbleweed-focused-instrumented-20261122.jsonl)
-(106,227 bytes, BLAKE3
+accounting over its own bracket. That artifact is named rather than shipped:
+106,227 bytes, BLAKE3
 `d8ec02a6d77f19eefe8d7c8d29b6a5b1505d740d91e2fd3f13fda35822ad2905`, identity
-`aacee3457609aa68cc1a626199427b365e0f6a19b389fc8ca4fa4ba294684f7f`), source
-`8463814`, rustc 1.100.0, Linux 6.18.58.1-microsoft-standard-WSL2. Its tree is
-recorded dirty only by untracked local logs under `.codex/evidence`; no tracked
-file differs from that revision.
+`aacee3457609aa68cc1a626199427b365e0f6a19b389fc8ca4fa4ba294684f7f`, source
+`8463814`, rustc 1.100.0, Linux 6.18.58.1-microsoft-standard-WSL2. The record
+names its tree dirty only through untracked local logs under `.codex/evidence`,
+with no tracked file differing from that revision.
 
 Its point estimates are 4.584, 3.896, and 3.285 — above the registered 3.097,
 3.064, and 2.934. The difference sits mostly in the baseline: its rate is 30%,
@@ -389,18 +388,19 @@ read against the family generation its header names, so a schedule written
 before a retune reproduces from the definition that recorded it, and a revision
 no retained artifact needs is refused rather than reinterpreted.
 
-Retained historical evidence is available for audit:
+Run outputs are not kept in the tree, so an earlier run is named rather than
+attached: the two 2026-07-31 screenings and the 2026-08-02 UDS screening are
+identified by family and date, and the 2026-11-22 instrumented focused run by the
+byte count and the two digests recorded above. A rerun writes a new file and never
+overwrites, so those rows are not reproducible from what ships, and they describe
+earlier implementations: none of them is pooled with the focused result or treated
+as the current performance baseline.
 
-- [Tumbleweed TCP screening, 2026-07-31](evidence/core-ipc-tumbleweed-screening-20260731.jsonl)
-- [Tumbleweed UDS screening, 2026-07-31](evidence/local-ipc-unix-tumbleweed-screening-20260731.jsonl)
-- [Tumbleweed UDS screening, 2026-08-02](evidence/local-ipc-unix-tumbleweed-screening-20260802.jsonl)
-- [Windows core smoke, 2026-08-02](evidence/core-ipc-windows-smoke-20260802.jsonl)
-
-Those artifacts describe earlier implementations and must not be pooled with
-the focused result or treated as the current performance baseline. The last one
-is what keeps the `core-ipc` v2 definition compiled: it records five rows
-against a schedule that no longer has a producer, so the checkable claim is
-that generation's own digest and heading rather than a reconstruction of it.
+One artifact is checked rather than cited. The `core-ipc` revision-2 generation has
+no producer in the schedule, and the five rows it recorded survive as a fixture,
+[`ipc/testdata/core-ipc-v2-smoke.jsonl`](ipc/testdata/core-ipc-v2-smoke.jsonl), which
+[`ipc/tests/evidence_generations.rs`](ipc/tests/evidence_generations.rs) loads to
+assert that generation's own digest and heading rather than a reconstruction of it.
 
 ## Next evidence
 

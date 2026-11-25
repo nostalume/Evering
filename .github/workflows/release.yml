@@ -12,27 +12,29 @@ permissions:
   contents: read
 
 jobs:
-  verify:
+  # Verification is the gate, not a subset of it written twice: a candidate that passes here has
+  # passed the same rows a push to `main` passes, including the bare-target arms and the examples.
+  gates:
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+
+  candidate:
+    needs: gates
     runs-on: ubuntu-latest
-    environment: publish
     timeout-minutes: 15
+    environment: publish
+    env:
+      VERSION: ${{ inputs.version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.100.0
-          components: rustfmt, clippy, rust-docs
+      - run: rustc -vV
       - name: Match candidate metadata
         shell: bash
         run: |
-          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "${{ inputs.version }}"
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(sed -n 's/^version = "\([^"]*\)"/\1/p' Cargo.toml | head -1)" = "$VERSION"
           grep -qx 'publish = true' Cargo.toml
-      - run: cargo fmt --all --check
-      - run: cargo clippy --all-targets --all-features -- -D warnings
-      - run: RUSTDOCFLAGS='-D warnings' cargo doc --all-features --no-deps
-      - run: cargo test --features os,tokio,tracing
-      - run: cargo check --all-targets --all-features
-      - run: cargo package --list
       - run: cargo package
 
 # Publishing remains intentionally absent. After crates.io trusted-publisher

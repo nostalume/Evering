@@ -161,8 +161,10 @@ than a convenience:
 - [`docs/abi.md`](abi.md) owns which shared-byte facts a reader outside this crate has to reproduce, and
   the shape each is handed over in. A fact that fails that page's test is a constraint on the
   design rather than an entry on it.
-- [`README.md`](../README.md) owns the first-run path: what to install, what to run, and what a
-  printed measurement means.
+- [`README.md`](../README.md) owns the first-run path: what the crate is for, what to install,
+  and what to run.
+- [`benches/README.md`](../benches/README.md) owns a study: how it was registered, what its
+  printed numbers mean, and which run artifacts stay checkable rather than shipped.
 - This page owns engineering rules: toolchain, gates, naming, verification, and
   delivery.
 

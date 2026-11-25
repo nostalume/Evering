@@ -29,14 +29,14 @@
 //! name. `layout` and `mapping` are re-export shims over private modules; they are public so a
 //! vocabulary has one address, not because their implementation is reachable.
 //!
-//! One noun used to answer two questions and no longer does. `Peer` is a roster's word: the admitted
-//! process reports the member it became to the process that admitted it, so `Receipt::arrived` names a
-//! `mapping::Peer` — which directory slot, under which generation — while the process that completed the
-//! handover beside it is an `os::Provenance`, whose `Attested` arm carries the id the kernel named. The
-//! two answers were never the same kind of thing, so the second is named by what it rests on instead of
-//! sharing `Peer`'s word, and the id travels with the arm that earned it: a caller no longer asks one type
-//! for an assertion and for a number it may not have. `Geometry` collides the way `Peer` did one level
-//! down and inside the crate only, between the pool's block-class layout and the heap's capacity, and the
+//! Two nouns answer two different questions, and keeping them apart is the rule. `Peer` is a
+//! roster's word: the admitted process reports the member it became to the process that admitted
+//! it, so `Receipt::arrived` names a `mapping::Peer` — which directory slot, under which
+//! generation — while the process that completed the handover beside it is an `os::Provenance`,
+//! whose `Attested` arm carries the id the kernel named. A slot assertion and a kernel-named
+//! number are different kinds of evidence, so neither type is asked for the other's, and the id
+//! travels with the arm that earned it. `Geometry` collides the same way one level down and
+//! inside the crate only, between the pool's block-class layout and the heap's capacity, and the
 //! one of them a caller can reach already says whose (`HeapGeometry`).
 //!
 //! # What a module header says
