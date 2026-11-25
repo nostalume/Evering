@@ -310,7 +310,7 @@ fn an_ungranted_process_finds_no_rendezvous_to_meet_at() {
 /// the only thing this route gives up is the announcement, which is the one thing a foreign host cannot
 /// make correctly anyway.
 #[test]
-fn a_rendezvous_the_host_placed_by_hand_is_admitted_without_an_announcement() {
+fn a_hand_placed_rendezvous_is_admitted_without_announcement() {
     let (handoff, grant) = Handoff::bind().unwrap();
     let mapping = shared("placed", SIZE, Access::READ | Access::WRITE).unwrap();
     let (_notify, child_wait) = evering::os::event().unwrap();

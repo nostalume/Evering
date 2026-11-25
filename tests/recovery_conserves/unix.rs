@@ -438,7 +438,7 @@ fn dead_process_membership_is_reaped_after_a_complete_layout_scan() {
 }
 
 #[test]
-fn wrong_region_is_rejected_at_the_root() {
+fn wrong_region_is_refused_at_the_root() {
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let _creator = creator_session(&name);
@@ -463,7 +463,7 @@ fn session_attachment_is_not_coupled_to_a_channel_count() {
 }
 
 #[test]
-fn changed_talc_geometry_is_rejected_by_talc_information() {
+fn changed_talc_geometry_is_refused_by_talc_information() {
     let name = unique_name();
     let _shm = ShmGuard(name.clone());
     let _creator = creator_session(&name);

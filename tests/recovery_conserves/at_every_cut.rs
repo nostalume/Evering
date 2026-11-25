@@ -370,7 +370,7 @@ fn clean_attach(
 }
 
 #[test]
-fn recovery_conserves_every_accepted_record() {
+fn nothing_is_lost_or_invented_at_any_cut() {
     for cut in Cut::ALL {
         let ready = env::temp_dir().join(format!(
             "evering-recovery-ready-{}-{}",

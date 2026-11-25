@@ -179,7 +179,7 @@ fn deliver(handoff: Handoff, child: &Supervisor, mapping: &Shared, bootstrap: &B
 }
 
 #[test]
-fn a_slot_announced_over_a_real_handoff_is_arrived_in_by_the_child_it_was_announced_to() {
+fn an_announced_slot_is_arrived_by_the_child_it_names() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("seat-announced", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -269,7 +269,7 @@ fn a_scribbled_member_slot_announcement_is_refused_as_the_text_it_is() {
 }
 
 #[test]
-fn a_promised_child_that_dies_between_meeting_and_arriving_leaves_nothing_to_reap() {
+fn a_promised_child_dying_before_arrival_leaves_nothing_to_reap() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("seat-vanished", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");

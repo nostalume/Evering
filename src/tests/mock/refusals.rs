@@ -35,7 +35,7 @@ fn says(error: &dyn core::fmt::Display, wanted: &str) {
 }
 
 #[test]
-fn a_refused_class_range_names_the_bounds_it_rejected() {
+fn a_refused_class_range_names_the_bounds_it_refused() {
     says(&BlockRangeError, "classes");
 }
 

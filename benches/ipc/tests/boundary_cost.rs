@@ -131,7 +131,7 @@ fn measure_round_trips_an_absent_and_a_present_boundary() {
 /// half-paired block says nothing about the boundary and a subset of blocks would be a
 /// different sample than the ratio the figures sit beside.
 #[test]
-fn paired_boundary_figures_reach_the_report_and_an_unpaired_contrast_reports_none() {
+fn paired_figures_reach_the_report_and_unpaired_contrasts_do_not() {
     let cost = |case: &system::Case| {
         let baseline = case.workload.arm == family::CORE.baseline.key;
         Some(boundary::Accounting {
@@ -266,7 +266,7 @@ fn procfs_sample_sees_a_blocking_phase() {
 /// phase that batched is still admitted by the finished Stage 0 instrument.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_batched_publish_group_costs_one_doorbell_and_the_instrument_admits_it() {
+fn a_batched_publish_costs_one_doorbell_the_instrument_admits() {
     use crate::evering_arm;
     use std::{cell::Cell, time::Instant};
 

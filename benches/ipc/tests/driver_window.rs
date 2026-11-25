@@ -137,7 +137,7 @@ fn trace_transfer_with_paths(
 }
 
 #[test]
-fn shared_driver_uses_a_sliding_window_and_shared_validation() {
+fn a_sliding_window_and_shared_validation_account_for_every_transfer() {
     let mut endpoint = TraceEndpoint::default();
     let (counts, paths) = trace_transfer_with_paths(&mut endpoint, 4, 2).unwrap();
     assert_eq!(
@@ -162,7 +162,7 @@ fn shared_driver_uses_a_sliding_window_and_shared_validation() {
 }
 
 #[test]
-fn shared_driver_aborts_and_retains_counts_after_invalid_response() {
+fn an_invalid_response_aborts_and_retains_the_committed_counts() {
     let mut endpoint = TraceEndpoint {
         corrupt: true,
         ..TraceEndpoint::default()
@@ -181,7 +181,7 @@ fn shared_driver_aborts_and_retains_counts_after_invalid_response() {
 }
 
 #[test]
-fn shared_driver_ignores_advisory_failure_after_send_commit() {
+fn an_advisory_failure_after_commit_is_ignored() {
     let mut endpoint = TraceEndpoint {
         fail_after_send: true,
         ..TraceEndpoint::default()
@@ -199,7 +199,7 @@ fn shared_driver_ignores_advisory_failure_after_send_commit() {
 }
 
 #[test]
-fn shared_driver_counts_only_committed_work_before_errors() {
+fn only_committed_work_is_counted_before_an_error() {
     let mut before = TraceEndpoint {
         fail_before_send: true,
         fail_abort: true,

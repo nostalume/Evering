@@ -128,7 +128,7 @@ fn malformed_offer_closes_attached_resources() {
 }
 
 #[test]
-fn local_bounds_reject_without_transport() {
+fn local_bounds_refuse_without_transport() {
     assert!(Bootstrap::new(vec![0; MAX_BOOTSTRAP + 1]).is_err());
     let (send, _) = Socket::pair().unwrap();
     let file = File::open("/dev/null").unwrap();

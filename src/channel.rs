@@ -29,6 +29,9 @@ use crate::schema::{LayoutInfo, SchemaKey, SharedSchema, compose_schema, schema_
 use crate::token::Token;
 
 type Item<H> = Token<H>;
+/// What a closed channel gives back instead of dropping: its mapping, then the member index, the
+/// generation it was claimed at and the owner byte — the four the removal needs in order to rebuild a
+/// closed handle if reclaiming the mapping fails.
 type ClosedMap<H> = (Mapped<RcHeader<Duplex<H>>>, usize, usize, u8);
 
 const ROLE_SLOT_BITS: usize = usize::BITS.trailing_zeros() as usize;
@@ -1041,7 +1044,7 @@ impl std::error::Error for ReceiveError {}
 
 pub enum AdoptError<'a, H: Repr> {
     Pool(Received<'a, H>),
-    Span(Received<'a, H>),
+    NoSlot(Received<'a, H>),
     Type(Received<'a, H>),
     Owned(Received<'a, H>),
 }
@@ -1050,7 +1053,7 @@ impl<H: Repr> core::fmt::Debug for AdoptError<'_, H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Pool(_) => "Pool(..)",
-            Self::Span(_) => "Span(..)",
+            Self::NoSlot(_) => "NoSlot(..)",
             Self::Type(_) => "Type(..)",
             Self::Owned(_) => "Owned(..)",
         })
@@ -1063,7 +1066,7 @@ impl<H: Repr> core::fmt::Display for AdoptError<'_, H> {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         f.write_str(match self {
             Self::Pool(_) => "the claim names a pool this one is not",
-            Self::Span(_) => "the claim names a block this pool's classes do not have",
+            Self::NoSlot(_) => "the claim names a block this pool's classes do not have",
             Self::Type(_) => "the block holds another type than the one being adopted",
             Self::Owned(_) => "the block is not detached, so another member still holds it",
         })
@@ -1077,7 +1080,7 @@ impl<'a, H: Repr> AdoptError<'a, H> {
     pub fn into_received(self) -> Received<'a, H> {
         match self {
             Self::Pool(received)
-            | Self::Span(received)
+            | Self::NoSlot(received)
             | Self::Type(received)
             | Self::Owned(received) => received,
         }
@@ -1086,7 +1089,7 @@ impl<'a, H: Repr> AdoptError<'a, H> {
     fn from_pool(error: crate::pool::AdoptError, received: Received<'a, H>) -> Self {
         match error {
             crate::pool::AdoptError::Pool => Self::Pool(received),
-            crate::pool::AdoptError::Span => Self::Span(received),
+            crate::pool::AdoptError::NoSlot => Self::NoSlot(received),
             crate::pool::AdoptError::Type => Self::Type(received),
             crate::pool::AdoptError::Owned => Self::Owned(received),
         }
@@ -1180,7 +1183,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_split_has_no_runtime_side_argument() {
+    fn a_split_needs_no_side_argument_and_its_halves_always_clone() {
         let _ = parameterless_split::<()>;
         fn cloneable<T: Clone>() {}
         cloneable::<Tx<NonClone>>();
@@ -1198,7 +1201,7 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_geometry_rejects_invalid_capacity() {
+    fn dynamic_geometry_refuses_invalid_capacity() {
         assert!(matches!(
             Duplex::<()>::geometry(0),
             Err(GeometryError::ZeroCapacity)

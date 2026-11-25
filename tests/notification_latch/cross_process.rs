@@ -50,7 +50,7 @@ pub(crate) fn leaves() -> i32 {
 // `cross_process::role_entry` and would answer to nothing.
 
 #[test]
-fn wait_cross_process() {
+fn a_child_parked_on_a_mailed_descriptor_wakes_on_notify() {
     let (ring, event) = os::event().unwrap();
 
     #[cfg(unix)]

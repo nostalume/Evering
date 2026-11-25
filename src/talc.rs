@@ -1229,18 +1229,18 @@ impl TalcMeta {
 }
 
 #[repr(C)]
-pub struct TalckMeta {
+pub struct HeapMeta {
     mutation: AtomicUsize,
     talc: UnsafeCell<TalcMeta>,
 }
 
-impl SharedSchema for TalckMeta {
+impl SharedSchema for HeapMeta {
     const SCHEMA: SchemaKey = SchemaKey::new(schema_id("evering.talc"), 2);
 }
 
-unsafe impl Sync for TalckMeta {}
+unsafe impl Sync for HeapMeta {}
 
-impl TalckMeta {
+impl HeapMeta {
     #[inline]
     const fn null() -> Self {
         Self {
@@ -1255,7 +1255,7 @@ impl TalckMeta {
     }
 }
 
-impl TalckMeta {
+impl HeapMeta {
     #[inline]
     const fn talc_ref(&self) -> &TalcMeta {
         unsafe { self.talc.as_ref_unchecked() }
@@ -1270,7 +1270,7 @@ impl TalckMeta {
     }
 }
 
-pub type Header = header::RcHeader<TalckMeta>;
+pub type Header = header::RcHeader<HeapMeta>;
 pub type MapHeader = mem::Mapped<Header>;
 
 pub struct Talc<H: Deref<Target = Header>> {
@@ -1286,29 +1286,29 @@ pub type RefTalc<'a> = Talc<&'a Header>;
 pub type MapTalc = Talc<MapHeader>;
 
 #[cfg(test)]
-pub(crate) const ALLOC_CLAIMED: usize = 1;
+pub(crate) const CUT_ALLOC_CLAIMED: usize = 1;
 #[cfg(test)]
-pub(crate) const ALLOC_MUTATED: usize = 2;
+pub(crate) const CUT_ALLOC_MUTATED: usize = 2;
 #[cfg(test)]
-pub(crate) const ALLOC_CLEAN: usize = 3;
+pub(crate) const CUT_ALLOC_CLEAN: usize = 3;
 #[cfg(test)]
-pub(crate) const FREE_CLAIMED: usize = 4;
+pub(crate) const CUT_FREE_CLAIMED: usize = 4;
 #[cfg(test)]
-pub(crate) const FREE_MUTATED: usize = 5;
+pub(crate) const CUT_FREE_MUTATED: usize = 5;
 #[cfg(test)]
-pub(crate) const FREE_CLEAN: usize = 6;
+pub(crate) const CUT_FREE_CLEAN: usize = 6;
 #[cfg(test)]
 static CRASH_AFTER: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(test, unix, feature = "map"))]
-pub(crate) fn crash_after_for_test(point: usize) {
-    CRASH_AFTER.store(point, Ordering::Relaxed);
+pub(crate) fn crash_after_for_test(cut: usize) {
+    CRASH_AFTER.store(cut, Ordering::Relaxed);
 }
 
 #[cfg(test)]
-fn crash_after(point: usize) {
-    if CRASH_AFTER.load(Ordering::Relaxed) == point {
-        std::process::exit(120 + point as i32);
+fn crash_after(cut: usize) {
+    if CRASH_AFTER.load(Ordering::Relaxed) == cut {
+        std::process::exit(120 + cut as i32);
     }
 }
 
@@ -1339,13 +1339,13 @@ impl<H: Deref<Target = Header>> Talc<H> {
     pub fn allocate(&self, layout: alloc::Layout) -> Result<Meta, DeclineCause> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
-        crash_after(ALLOC_CLAIMED);
+        crash_after(CUT_ALLOC_CLAIMED);
         let result = unsafe { self.allocate_during(&mutation, layout) };
         #[cfg(test)]
-        crash_after(ALLOC_MUTATED);
+        crash_after(CUT_ALLOC_MUTATED);
         mutation.commit();
         #[cfg(test)]
-        crash_after(ALLOC_CLEAN);
+        crash_after(CUT_ALLOC_CLEAN);
         result
     }
 
@@ -1357,13 +1357,13 @@ impl<H: Deref<Target = Header>> Talc<H> {
     ) -> Result<(), DeclineCause> {
         let mutation = self.begin_mutation()?;
         #[cfg(test)]
-        crash_after(FREE_CLAIMED);
+        crash_after(CUT_FREE_CLAIMED);
         unsafe { self.deallocate_during(&mutation, ptr, layout) };
         #[cfg(test)]
-        crash_after(FREE_MUTATED);
+        crash_after(CUT_FREE_MUTATED);
         mutation.commit();
         #[cfg(test)]
-        crash_after(FREE_CLEAN);
+        crash_after(CUT_FREE_CLEAN);
         Ok(())
     }
 
@@ -1378,7 +1378,7 @@ impl<H: Deref<Target = Header>> Talc<H> {
             Err(_) => return Err(meta),
         };
         #[cfg(test)]
-        crash_after(FREE_CLAIMED);
+        crash_after(CUT_FREE_CLAIMED);
         unsafe {
             core::ptr::drop_in_place(pointer);
             self.allocator(&mutation).deallocate(
@@ -1388,10 +1388,10 @@ impl<H: Deref<Target = Header>> Talc<H> {
             );
         }
         #[cfg(test)]
-        crash_after(FREE_MUTATED);
+        crash_after(CUT_FREE_MUTATED);
         mutation.commit();
         #[cfg(test)]
-        crash_after(FREE_CLEAN);
+        crash_after(CUT_FREE_CLEAN);
         Ok(())
     }
 
@@ -1684,7 +1684,7 @@ impl Config {
     }
 }
 
-unsafe impl header::Layout for TalckMeta {
+unsafe impl header::Layout for HeapMeta {
     type Config = Config;
     type Info = TalcInfo;
 

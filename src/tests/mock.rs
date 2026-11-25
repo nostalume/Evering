@@ -408,7 +408,7 @@ fn recovery_refuses_a_staged_span_outside_the_region() {
 }
 
 #[test]
-fn recovery_hands_both_authorities_back_when_a_staged_block_cannot_be_freed() {
+fn recovery_hands_both_authorities_back_when_a_block_cannot_free() {
     let mut page_table = [0; MAX_ADDR];
     let mut area = MockBackend(&mut page_table).shared(0, MAX_ADDR);
     let directory = area.push::<crate::dir::Header>(()).unwrap();
@@ -450,7 +450,7 @@ fn recovery_hands_both_authorities_back_when_a_staged_block_cannot_be_freed() {
 }
 
 #[test]
-fn ambiguous_dead_allocator_mutation_is_poisoned_and_its_entry_quarantined() {
+fn an_ambiguous_dead_mutation_poisons_and_quarantines_its_entry() {
     let mut page_table = [0; MAX_ADDR];
     let mut area = MockBackend(&mut page_table).shared(0, MAX_ADDR);
     let directory = area.push::<crate::dir::Header>(()).unwrap();
@@ -572,7 +572,7 @@ fn directory_resumes_a_rolled_back_create_once_when_two_threads_race_it() {
 }
 
 #[test]
-fn recovery_refuses_a_second_reaper_of_a_claimed_remove_before_it_reads_the_span() {
+fn recovery_refuses_a_second_reaper_before_the_span_is_read() {
     use crate::header::{Layout, Status};
     use crate::place::LayoutContext;
     use crate::schema::{SchemaKey, SharedSchema, schema_id};
@@ -690,7 +690,7 @@ fn recovery_refuses_a_second_reaper_of_a_claimed_remove_before_it_reads_the_span
 }
 
 #[test]
-fn directory_recovery_rejects_authority_from_another_region() {
+fn directory_recovery_refuses_authority_from_another_region() {
     let mut page_table = [0; MAX_ADDR];
     let mut area = MockBackend(&mut page_table).shared(0, MAX_ADDR);
     let directory = area.push::<crate::dir::Header>(()).unwrap();
@@ -809,7 +809,7 @@ fn directory_growth_recovery_rolls_back_unlinked_and_retains_linked_slabs() {
 }
 
 #[test]
-fn directory_growth_with_an_ambiguous_dead_heap_owner_is_leaked_and_poisoned() {
+fn an_ambiguous_dead_owner_during_growth_leaks_and_poisons() {
     let mut page_table = [0; MAX_ADDR];
     let mut area = MockBackend(&mut page_table).shared(0, MAX_ADDR);
     let directory = area.push::<crate::dir::Header>(()).unwrap();
@@ -831,7 +831,7 @@ fn directory_growth_with_an_ambiguous_dead_heap_owner_is_leaked_and_poisoned() {
 }
 
 #[test]
-fn dead_heap_owner_before_growth_evidence_poison_is_not_mistaken_for_rollback() {
+fn a_dead_owner_at_growth_poisons_rather_than_rolls_back() {
     let mut page_table = [0; MAX_ADDR];
     let mut area = MockBackend(&mut page_table).shared(0, MAX_ADDR);
     let directory = area.push::<crate::dir::Header>(()).unwrap();
@@ -934,7 +934,7 @@ fn a_read_only_view_answers_the_two_questions_the_entrance_asks_first() {
 }
 
 #[test]
-fn a_reader_with_no_slot_answers_what_a_published_record_claims_and_writes_nothing() {
+fn a_slotless_reader_answers_a_published_claim_and_writes_nothing() {
     use crate::header::{Layout, RootHeader, Status};
     use crate::mem::{MemOps, Observer};
     use crate::place::LayoutContext;

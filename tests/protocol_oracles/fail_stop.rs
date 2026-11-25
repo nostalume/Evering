@@ -243,7 +243,7 @@ impl OrderingContract {
 }
 
 #[test]
-fn queue_visibility_rejects_each_weakened_happens_before_edge() {
+fn queue_visibility_refuses_each_weakened_happens_before_edge() {
     let required = OrderingContract {
         publish_release: true,
         claim_acquire: true,
@@ -356,7 +356,7 @@ fn pool_and_queue_scan_order_have_the_same_release_result() {
 }
 
 #[test]
-fn replacement_reaper_uses_original_source_and_stale_generation_is_harmless() {
+fn a_replacement_reaper_uses_its_source_and_survives_a_stale_generation() {
     let mut interrupted = PoolAuthority::Local(7, SOURCE_OWNER.slot);
     assert!(release_transfer(&mut interrupted, 7, SOURCE_OWNER.slot));
     assert_eq!(interrupted, PoolAuthority::Free(7));

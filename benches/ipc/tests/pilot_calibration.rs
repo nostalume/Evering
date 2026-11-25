@@ -29,7 +29,7 @@ fn pilot_identity() -> pilot::Identity {
 }
 
 #[test]
-fn pilot_calibration_freezes_from_one_measurable_ramp_without_a_probe() {
+fn one_measurable_ramp_freezes_the_calibration_without_a_probe() {
     let cell = cell(&family::BUSY);
     let mut calls = 0;
     let row = pilot::calibrate(cell, 8, |_| {
@@ -41,13 +41,13 @@ fn pilot_calibration_freezes_from_one_measurable_ramp_without_a_probe() {
 }
 
 #[test]
-fn pilot_calibration_rejects_a_zero_duration_observation() {
+fn a_zero_duration_observation_is_refused() {
     let cell = cell(&family::BUSY);
     assert!(pilot::calibrate(cell, 8, |_| Ok(0)).is_err());
 }
 
 #[test]
-fn pilot_calibration_bounds_attempts_overflow_timeout_and_identity() {
+fn attempts_overflow_timeout_and_identity_are_bounded() {
     let mut attempts = 0;
     assert!(
         pilot::calibrate(cell(&family::BUSY), 8, |_| {
@@ -79,7 +79,7 @@ fn calibration_evidence(identity: pilot::Identity, rows: Vec<pilot::Row>) -> pil
 }
 
 #[test]
-fn pilot_admission_rejects_foreign_missing_duplicate_and_unverified_counts() {
+fn admission_refuses_foreign_missing_duplicate_and_unverified_counts() {
     let scheduled = model::schedule(
         &[contrast(&family::BUSY), (condition(), &family::STREAM)],
         2,

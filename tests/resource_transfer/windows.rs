@@ -178,7 +178,7 @@ fn unrelated() -> i32 {
 }
 
 #[test]
-fn control_pipe_rejects_a_different_child_instance() {
+fn control_pipe_refuses_a_different_child_instance() {
     let listener = Listener::bind().unwrap();
     let mut connecting = role::child("connecting");
     connecting.env(RENDEZVOUS, listener.name());

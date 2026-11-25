@@ -72,7 +72,7 @@ fn evidence_written_before_the_counters_still_loads_and_validates() {
 }
 
 #[test]
-fn the_retired_generation_analyzes_under_its_own_name_and_shows_no_counters() {
+fn a_retired_generation_analyzes_under_its_name_without_counters() {
     let report = analysis::command(&[RETIRED_SMOKE.to_string()]).unwrap();
     assert!(report.contains("## core-ipc/v2 — smoke"));
     assert!(report.contains("evering/notified"));

@@ -996,7 +996,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn initialized_layout_propagates_attachment_rejection_without_reinitializing() {
+    fn an_initialized_layout_propagates_refusal_without_reinitializing() {
         static INITS: AtomicUsize = AtomicUsize::new(0);
         INITS.store(0, Ordering::Relaxed);
         let mut storage = MaybeUninit::<Header<Reject>>::zeroed();
@@ -1378,7 +1378,7 @@ mod admission_tests {
     }
 
     #[test]
-    fn a_roster_of_promises_refuses_a_join_for_a_different_reason_than_capacity() {
+    fn a_full_roster_of_promises_refuses_for_a_cause_other_than_capacity() {
         let root = roster();
         for _ in 0..super::PARTICIPANT_CAPACITY {
             assert!(matches!(root.reserve(), super::Claim::Taken(_)));

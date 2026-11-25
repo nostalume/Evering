@@ -92,7 +92,7 @@ unsafe impl Source for Fixed {
 }
 
 #[test]
-fn a_region_fixed_in_the_image_composes_and_survives_every_owner_leaving_it() {
+fn a_static_region_composes_and_survives_every_owner_leaving() {
     let access = Access::READ | Access::WRITE;
     let first = Session::create(Fixed, Request::new(SIZE, access), REGION)
         .expect("compose a region over bytes that were never mapped");
@@ -125,7 +125,7 @@ fn a_region_fixed_in_the_image_composes_and_survives_every_owner_leaving_it() {
 }
 
 #[test]
-fn a_fixed_extent_claimed_read_only_refuses_the_write_every_composition_asks_for() {
+fn a_read_only_fixed_extent_refuses_the_write_composition_asks_for() {
     let refused = Session::create(Fixed, Request::new(SIZE, Access::READ), REGION);
     let Err(error) = refused else {
         panic!("a region composed over bytes that cannot be written");

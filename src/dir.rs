@@ -57,52 +57,54 @@ const _: () = assert!(
      a peer copies"
 );
 
+/// Crash cuts of the directory transaction, numbered in the order `crash_after` is reached. The numbers
+/// are ordinals in that sequence alone: `CUT_CREATE_PUBLISHED` is a step, not the `PUBLISHED` slot phase.
 #[cfg(test)]
-pub(crate) const CREATE_PENDING: usize = 1;
+pub(crate) const CUT_CREATE_PENDING: usize = 1;
 #[cfg(test)]
-pub(crate) const CREATE_ALLOCATED: usize = 2;
+pub(crate) const CUT_CREATE_ALLOCATED: usize = 2;
 #[cfg(test)]
-pub(crate) const CREATE_EVIDENCE: usize = 3;
+pub(crate) const CUT_CREATE_EVIDENCE: usize = 3;
 #[cfg(test)]
-pub(crate) const CREATE_HEAP_CLEAN: usize = 4;
+pub(crate) const CUT_CREATE_HEAP_CLEAN: usize = 4;
 #[cfg(test)]
-pub(crate) const CREATE_PUBLISHED: usize = 5;
+pub(crate) const CUT_CREATE_PUBLISHED: usize = 5;
 #[cfg(test)]
-pub(crate) const REMOVE_CLOSING: usize = 6;
+pub(crate) const CUT_REMOVE_CLOSING: usize = 6;
 #[cfg(test)]
-pub(crate) const REMOVE_CLOSED: usize = 7;
+pub(crate) const CUT_REMOVE_CLOSED: usize = 7;
 #[cfg(test)]
-pub(crate) const REMOVE_REMOVING: usize = 8;
+pub(crate) const CUT_REMOVE_REMOVING: usize = 8;
 #[cfg(test)]
-pub(crate) const REMOVE_DEALLOCATED: usize = 9;
+pub(crate) const CUT_REMOVE_DEALLOCATED: usize = 9;
 #[cfg(test)]
-pub(crate) const REMOVE_RELEASED: usize = 10;
+pub(crate) const CUT_REMOVE_RELEASED: usize = 10;
 #[cfg(test)]
-pub(crate) const REMOVE_HEAP_CLEAN: usize = 11;
+pub(crate) const CUT_REMOVE_HEAP_CLEAN: usize = 11;
 #[cfg(test)]
-pub(crate) const REMOVE_VACANT: usize = 12;
+pub(crate) const CUT_REMOVE_VACANT: usize = 12;
 #[cfg(test)]
-pub(crate) const GROW_ALLOCATED: usize = 13;
+pub(crate) const CUT_GROW_ALLOCATED: usize = 13;
 #[cfg(test)]
-pub(crate) const GROW_EVIDENCE: usize = 14;
+pub(crate) const CUT_GROW_EVIDENCE: usize = 14;
 #[cfg(test)]
-pub(crate) const GROW_HEAP_CLEAN: usize = 15;
+pub(crate) const CUT_GROW_HEAP_CLEAN: usize = 15;
 #[cfg(test)]
-pub(crate) const GROW_LINKED: usize = 16;
+pub(crate) const CUT_GROW_LINKED: usize = 16;
 #[cfg(test)]
-pub(crate) const GROW_CLEARED: usize = 17;
+pub(crate) const CUT_GROW_CLEARED: usize = 17;
 #[cfg(test)]
 static CRASH_AFTER: AtomicUsize = AtomicUsize::new(0);
 
 #[cfg(all(test, unix, feature = "map"))]
-pub(crate) fn crash_after_for_test(point: usize) {
-    CRASH_AFTER.store(point, Ordering::Relaxed);
+pub(crate) fn crash_after_for_test(cut: usize) {
+    CRASH_AFTER.store(cut, Ordering::Relaxed);
 }
 
 #[cfg(test)]
-fn crash_after(point: usize) {
-    if CRASH_AFTER.load(Ordering::Relaxed) == point {
-        std::process::exit(80 + point as i32);
+fn crash_after(cut: usize) {
+    if CRASH_AFTER.load(Ordering::Relaxed) == cut {
+        std::process::exit(80 + cut as i32);
     }
 }
 
@@ -606,7 +608,7 @@ impl MapDirectory {
             .state
             .store((slot.generation << STATE_BITS) | PENDING, Ordering::Relaxed);
         #[cfg(test)]
-        crash_after(CREATE_PENDING);
+        crash_after(CUT_CREATE_PENDING);
 
         let mutation = match heap.begin_mutation() {
             Ok(mutation) => mutation,
@@ -626,7 +628,7 @@ impl MapDirectory {
             }
         };
         #[cfg(test)]
-        crash_after(CREATE_ALLOCATED);
+        crash_after(CUT_CREATE_ALLOCATED);
         let pointer = heap.pointer(&meta);
         // Safety: `meta` is the live allocation just returned under this
         // mutation; no pointer to its not-yet-published bytes exists.
@@ -643,10 +645,10 @@ impl MapDirectory {
         };
         transaction.persist(slot.slab, slot.entry, meta, CREATE);
         #[cfg(test)]
-        crash_after(CREATE_EVIDENCE);
+        crash_after(CUT_CREATE_EVIDENCE);
         mutation.commit();
         #[cfg(test)]
-        crash_after(CREATE_HEAP_CLEAN);
+        crash_after(CUT_CREATE_HEAP_CLEAN);
 
         let mapped = match self.admit_at::<header::RcHeader<L>>(offset, conf, true) {
             Ok(mapped) => mapped,
@@ -668,7 +670,7 @@ impl MapDirectory {
             Ordering::Release,
         );
         #[cfg(test)]
-        crash_after(CREATE_PUBLISHED);
+        crash_after(CUT_CREATE_PUBLISHED);
         transaction.clear_pending();
         transaction.commit();
         Ok((
@@ -737,7 +739,7 @@ impl MapDirectory {
             .store((id.generation << STATE_BITS) | CLOSING, Ordering::Release);
         transaction.persist(id.slab, id.entry as usize, meta, REMOVE);
         #[cfg(test)]
-        crash_after(REMOVE_CLOSING);
+        crash_after(CUT_REMOVE_CLOSING);
         if let Err(error) = mapped.close_unique(self.peer().slot()) {
             entry.state.store(published, Ordering::Release);
             transaction.clear_pending();
@@ -747,28 +749,28 @@ impl MapDirectory {
         }
         mapped.disarm_detach();
         #[cfg(test)]
-        crash_after(REMOVE_CLOSED);
+        crash_after(CUT_REMOVE_CLOSED);
         entry
             .state
             .store((id.generation << STATE_BITS) | REMOVING, Ordering::Release);
         #[cfg(test)]
-        crash_after(REMOVE_REMOVING);
+        crash_after(CUT_REMOVE_REMOVING);
         unsafe { heap.deallocate_during(&mutation, pointer, layout) };
         #[cfg(test)]
-        crash_after(REMOVE_DEALLOCATED);
+        crash_after(CUT_REMOVE_DEALLOCATED);
         entry
             .state
             .store((id.generation << STATE_BITS) | RELEASED, Ordering::Release);
         #[cfg(test)]
-        crash_after(REMOVE_RELEASED);
+        crash_after(CUT_REMOVE_RELEASED);
         mutation.commit();
         #[cfg(test)]
-        crash_after(REMOVE_HEAP_CLEAN);
+        crash_after(CUT_REMOVE_HEAP_CLEAN);
         entry
             .state
             .store(id.generation << STATE_BITS, Ordering::Release);
         #[cfg(test)]
-        crash_after(REMOVE_VACANT);
+        crash_after(CUT_REMOVE_VACANT);
         transaction.clear_pending();
         transaction.commit();
         drop(mapped);
@@ -873,7 +875,7 @@ impl MapDirectory {
         let pointer = heap.pointer(&meta);
         unsafe { pointer.cast::<Slab>().as_ptr().write(Slab::new()) };
         #[cfg(test)]
-        crash_after(GROW_ALLOCATED);
+        crash_after(CUT_GROW_ALLOCATED);
         let offset = match self.offset_of(pointer, layout.size()) {
             Ok(offset) if offset != 0 => offset,
             Ok(_) => unreachable!("Talc allocation cannot overlap the region root"),
@@ -885,16 +887,16 @@ impl MapDirectory {
         };
         transaction.persist(slab_index, 0, meta, GROW);
         #[cfg(test)]
-        crash_after(GROW_EVIDENCE);
+        crash_after(CUT_GROW_EVIDENCE);
         mutation.commit();
         #[cfg(test)]
-        crash_after(GROW_HEAP_CLEAN);
+        crash_after(CUT_GROW_HEAP_CLEAN);
         tail.next().store(offset, Ordering::Release);
         #[cfg(test)]
-        crash_after(GROW_LINKED);
+        crash_after(CUT_GROW_LINKED);
         transaction.clear_pending();
         #[cfg(test)]
-        crash_after(GROW_CLEARED);
+        crash_after(CUT_GROW_CLEARED);
         Ok(())
     }
 

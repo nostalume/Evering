@@ -26,7 +26,7 @@ use crate::{
     place::LayoutContext,
     schema::{LayoutInfo, SchemaKey, SharedSchema, schema_id},
     talc::MapTalc,
-    token::{Shape, Span, Token},
+    token::{ClassSlot, Shape, Token},
 };
 
 const OWNER_BITS: u32 = 6;
@@ -189,7 +189,7 @@ impl std::error::Error for PoolCreateError {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AdoptError {
     Pool,
-    Span,
+    NoSlot,
     Type,
     Owned,
 }
@@ -782,24 +782,24 @@ impl<'p> PoolRef<'p> {
             let class = *self
                 .geometry
                 .classes
-                .get(token.span.class)
-                .ok_or(AdoptError::Span)?;
+                .get(token.at.class)
+                .ok_or(AdoptError::NoSlot)?;
             if token.generation == 0
-                || token.span.slot >= class.slots
+                || token.at.slot >= class.slots
                 || layout.size() > class.bytes
                 || layout.align() > class.bytes
             {
-                return Err(AdoptError::Span);
+                return Err(AdoptError::NoSlot);
             }
             (
                 self.takeover(transfer)?,
-                class.payload(self.base.as_ptr(), token.span.slot),
+                class.payload(self.base.as_ptr(), token.at.slot),
             )
         };
         let pointer = unsafe { metadata.as_ptr::<T>(raw) };
         Ok(Block {
             _allocation: allocation,
-            pointer: NonNull::new(pointer).ok_or(AdoptError::Span)?,
+            pointer: NonNull::new(pointer).ok_or(AdoptError::NoSlot)?,
         })
     }
 
@@ -823,12 +823,12 @@ impl<'p> PoolRef<'p> {
         let class = *self
             .geometry
             .classes
-            .get(token.span.class)
-            .ok_or(AdoptError::Span)?;
-        if token.span.slot >= class.slots {
-            return Err(AdoptError::Span);
+            .get(token.at.class)
+            .ok_or(AdoptError::NoSlot)?;
+        if token.at.slot >= class.slots {
+            return Err(AdoptError::NoSlot);
         }
-        let control = self.control(class, token.span.slot);
+        let control = self.control(class, token.at.slot);
         let detached = State::detached(token.generation);
         let local = State::local(token.generation, self.owner.slot()).unwrap();
         control
@@ -836,8 +836,8 @@ impl<'p> PoolRef<'p> {
             .map_err(|_| AdoptError::Owned)?;
         Ok(Allocation {
             pool: self,
-            class: token.span.class,
-            slot: token.span.slot,
+            class: token.at.class,
+            slot: token.at.slot,
             generation: token.generation,
             live: true,
         })
@@ -1028,7 +1028,7 @@ impl<'p, T: Repr + Shape + ?Sized> Block<'p, T> {
         let token = Token {
             token: crate::token::PoolToken::new(
                 allocation.pool.id,
-                Span {
+                ClassSlot {
                     class: allocation.class,
                     slot: allocation.slot,
                 },
@@ -1099,13 +1099,13 @@ pub(crate) fn release_token<H: Repr>(
             let Some(geometry) = Geometry::recorded(header.layout_info(), extent) else {
                 return false;
             };
-            let Some(class) = geometry.classes.get(token.span.class) else {
+            let Some(class) = geometry.classes.get(token.at.class) else {
                 return false;
             };
-            if token.span.slot >= class.slots {
+            if token.at.slot >= class.slots {
                 return false;
             }
-            let control = header.control(*class, token.span.slot);
+            let control = header.control(*class, token.at.slot);
             let mut raw = control.load(Ordering::Acquire);
             loop {
                 let state = State(raw);

@@ -24,7 +24,7 @@ fn anonymous_section_is_a_safe_session_source() {
 }
 
 #[test]
-fn section_rejects_empty_unreadable_and_escalated_mappings() {
+fn section_refuses_empty_unreadable_and_escalated_mappings() {
     assert!(Section::anonymous(0, Access::READ).is_err());
     assert!(Section::anonymous(4096, Access::WRITE).is_err());
 

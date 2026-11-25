@@ -17,9 +17,11 @@ use crate::{
     schema::{SchemaKey, SharedSchema, compose_schema, schema_id},
 };
 
+/// Which slot a locator names: the class it belongs to, then the slot inside that class. A pair of
+/// indices, never an address range: those are `mem::AddrSpan` and the spans `dir` stages.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) struct Span {
+pub(crate) struct ClassSlot {
     pub(crate) class: usize,
     pub(crate) slot: usize,
 }
@@ -30,7 +32,7 @@ pub(crate) struct Span {
 pub(crate) struct PoolToken {
     pub(crate) pool: LayoutId,
     pub(crate) id: TypeId,
-    pub(crate) span: Span,
+    pub(crate) at: ClassSlot,
     pub(crate) generation: u32,
     metadata_kind: usize,
     metadata_len: usize,
@@ -39,7 +41,7 @@ pub(crate) struct PoolToken {
 impl PoolToken {
     pub(crate) const fn new(
         pool: LayoutId,
-        span: Span,
+        at: ClassSlot,
         generation: u32,
         metadata: Metadata,
         id: TypeId,
@@ -51,7 +53,7 @@ impl PoolToken {
         Self {
             pool,
             id,
-            span,
+            at,
             generation,
             metadata_kind,
             metadata_len,
@@ -184,7 +186,7 @@ mod tests {
     use crate::msg::Repr;
 
     #[test]
-    fn token_is_a_repr_and_shape_rejects_wrong_metadata() {
+    fn a_token_is_a_repr_whose_shape_refuses_wrong_metadata() {
         fn assert_repr<T: Repr>() {}
         assert_repr::<Token<()>>();
         assert_eq!(

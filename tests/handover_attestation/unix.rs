@@ -254,7 +254,7 @@ fn admit(
 }
 
 #[test]
-fn a_member_a_child_reported_and_a_child_reaped_recover_without_an_application_byte() {
+fn a_reported_member_and_reaped_child_recover_without_application_bytes() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-reported", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -342,7 +342,7 @@ fn a_member_a_child_reported_and_a_child_reaped_recover_without_an_application_b
 }
 
 #[test]
-fn a_report_of_a_member_nobody_promised_that_child_is_refused_and_authorizes_nothing() {
+fn an_unpromised_member_report_is_refused_and_authorizes_nothing() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-diverged", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -397,7 +397,7 @@ fn a_report_of_a_member_nobody_promised_that_child_is_refused_and_authorizes_not
 }
 
 #[test]
-fn a_child_that_met_and_never_reported_is_given_up_on_at_the_bound_the_caller_named() {
+fn a_met_unreported_child_is_given_up_at_the_named_bound() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-silent", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -437,7 +437,7 @@ fn a_child_that_met_and_never_reported_is_given_up_on_at_the_bound_the_caller_na
 }
 
 #[test]
-fn a_frame_shaped_like_the_offer_is_refused_where_a_receipt_is_read() {
+fn an_offer_shaped_frame_is_refused_where_a_receipt_is_read() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-forged", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -476,7 +476,7 @@ fn a_frame_shaped_like_the_offer_is_refused_where_a_receipt_is_read() {
 /// reap of the same child.
 #[cfg(target_os = "linux")]
 #[test]
-fn a_death_the_kernel_credited_recovers_the_slot_and_equals_a_death_witnessed_from_the_reap() {
+fn a_credited_death_recovers_the_slot_as_a_reap_witnessed_one() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-introduced", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");

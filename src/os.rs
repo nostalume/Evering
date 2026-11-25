@@ -182,7 +182,7 @@ fn an_unreleased_no_answer_is_refused_by_the_thing_that_is_missing() {
 
 #[cfg(all(test, feature = "process", any(unix, windows)))]
 #[test]
-fn a_policy_releases_no_handover_whose_rendezvous_was_never_established_as_a_granted_one() {
+fn no_handover_is_released_from_a_rendezvous_never_granted() {
     let error = Provenance::unattested(Provenance::Unavailable, false, true).expect_err(
         "an unestablished rendezvous completes nothing, however trusting the introducer",
     );

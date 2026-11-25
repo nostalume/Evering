@@ -150,6 +150,10 @@ impl Handoff {
     /// coalescing is built for, because the one consumer re-examines its condition until it is drained.
     /// A caller that really does mean one condition shared by several peers duplicates the descriptor
     /// itself, through [`Event::from_owned_fd`](Event::from_owned_fd), and owns the lost wakes.
+    ///
+    /// The first two parameters stay unused on this arm: a Unix rendezvous is already connected when the
+    /// offer is made, so there is nothing to wait to accept and nothing to bound the wait by. Windows
+    /// needs both because its `send` accepts the child before it writes the descriptors.
     pub fn send<F: AsFd>(
         self,
         _child: &Supervisor,

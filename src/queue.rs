@@ -114,7 +114,7 @@ const fn holder(control: u16) -> Option<u8> {
 /// The three ways a reservation says no, in the words the whole crate declines with. A reservation is
 /// where a send still holds its value, so the answer carries a cause and the caller adds the value.
 const CLOSED: DeclineCause = DeclineCause::Closed;
-const FULL: DeclineCause = DeclineCause::NoRoom {
+const NO_ROOM: DeclineCause = DeclineCause::NoRoom {
     waits: RoomWait::Drain,
 };
 const BUSY: DeclineCause = DeclineCause::Busy { member: None };
@@ -301,7 +301,7 @@ pub trait Queue {
         ) {
             atomic::fence(Ordering::SeqCst);
             return if header.head.load(Ordering::Relaxed).wrapping_add(one_lap) == tail {
-                Err(FULL)
+                Err(NO_ROOM)
             } else {
                 Err(busy(control))
             };

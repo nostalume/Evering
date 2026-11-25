@@ -247,14 +247,15 @@ fn directory_create_crash_windows_follow_durable_evidence() {
         directory_create_child();
     }
     use crate::dir::{
-        CREATE_ALLOCATED, CREATE_EVIDENCE, CREATE_HEAP_CLEAN, CREATE_PENDING, CREATE_PUBLISHED,
+        CUT_CREATE_ALLOCATED, CUT_CREATE_EVIDENCE, CUT_CREATE_HEAP_CLEAN, CUT_CREATE_PENDING,
+        CUT_CREATE_PUBLISHED,
     };
     for cut in [
-        CREATE_PENDING,
-        CREATE_ALLOCATED,
-        CREATE_EVIDENCE,
-        CREATE_HEAP_CLEAN,
-        CREATE_PUBLISHED,
+        CUT_CREATE_PENDING,
+        CUT_CREATE_ALLOCATED,
+        CUT_CREATE_EVIDENCE,
+        CUT_CREATE_HEAP_CLEAN,
+        CUT_CREATE_PUBLISHED,
     ] {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -277,7 +278,7 @@ fn directory_create_crash_windows_follow_durable_evidence() {
         assert_eq!(status, 80 + cut as i32);
         let recovery = unsafe { session.assume_dead(peer) }.unwrap();
         let result = recovery.reap_with(&[crate::layout::recovery_handler::<()>()]);
-        if matches!(cut, CREATE_ALLOCATED | CREATE_EVIDENCE) {
+        if matches!(cut, CUT_CREATE_ALLOCATED | CUT_CREATE_EVIDENCE) {
             assert!(result.is_ok(), "poisoned heap must not block reap");
             assert!(
                 session.create_channel::<()>(4).is_err(),
@@ -289,7 +290,7 @@ fn directory_create_crash_windows_follow_durable_evidence() {
         let id = create_id(&session, 4).expect("clean heap remains usable");
         assert_eq!(
             id.entry(),
-            u32::from(cut == CREATE_PUBLISHED),
+            u32::from(cut == CUT_CREATE_PUBLISHED),
             "only a published-but-uncommitted layout is quarantined"
         );
     }
@@ -303,17 +304,17 @@ fn directory_remove_crash_windows_never_deallocate_twice() {
         directory_remove_child();
     }
     use crate::dir::{
-        REMOVE_CLOSED, REMOVE_CLOSING, REMOVE_DEALLOCATED, REMOVE_HEAP_CLEAN, REMOVE_RELEASED,
-        REMOVE_REMOVING, REMOVE_VACANT,
+        CUT_REMOVE_CLOSED, CUT_REMOVE_CLOSING, CUT_REMOVE_DEALLOCATED, CUT_REMOVE_HEAP_CLEAN,
+        CUT_REMOVE_RELEASED, CUT_REMOVE_REMOVING, CUT_REMOVE_VACANT,
     };
     for cut in [
-        REMOVE_CLOSING,
-        REMOVE_CLOSED,
-        REMOVE_REMOVING,
-        REMOVE_DEALLOCATED,
-        REMOVE_RELEASED,
-        REMOVE_HEAP_CLEAN,
-        REMOVE_VACANT,
+        CUT_REMOVE_CLOSING,
+        CUT_REMOVE_CLOSED,
+        CUT_REMOVE_REMOVING,
+        CUT_REMOVE_DEALLOCATED,
+        CUT_REMOVE_RELEASED,
+        CUT_REMOVE_HEAP_CLEAN,
+        CUT_REMOVE_VACANT,
     ] {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -336,7 +337,7 @@ fn directory_remove_crash_windows_never_deallocate_twice() {
         assert_eq!(status, 80 + cut as i32);
         let recovery = unsafe { session.assume_dead(peer) }.unwrap();
         let result = recovery.reap_with(&[crate::layout::recovery_handler::<()>()]);
-        if matches!(cut, REMOVE_REMOVING | REMOVE_DEALLOCATED) {
+        if matches!(cut, CUT_REMOVE_REMOVING | CUT_REMOVE_DEALLOCATED) {
             assert!(result.is_ok(), "poisoned heap must not block reap");
             assert!(
                 session.create_channel::<()>(4).is_err(),
@@ -345,7 +346,7 @@ fn directory_remove_crash_windows_never_deallocate_twice() {
             continue;
         }
         assert!(result.is_ok(), "recoverable removal cut {cut}");
-        if cut == REMOVE_CLOSING {
+        if cut == CUT_REMOVE_CLOSING {
             assert!(session.contains_channel(id), "pre-close layout survives");
         } else {
             assert!(!session.contains_channel(id), "closed layout stays removed");
@@ -367,13 +368,16 @@ fn directory_growth_crash_windows_preserve_the_slab_chain() {
     if std::env::var(ROLE).as_deref() == Ok("directory-grow") {
         directory_grow_child();
     }
-    use crate::dir::{GROW_ALLOCATED, GROW_CLEARED, GROW_EVIDENCE, GROW_HEAP_CLEAN, GROW_LINKED};
+    use crate::dir::{
+        CUT_GROW_ALLOCATED, CUT_GROW_CLEARED, CUT_GROW_EVIDENCE, CUT_GROW_HEAP_CLEAN,
+        CUT_GROW_LINKED,
+    };
     for cut in [
-        GROW_ALLOCATED,
-        GROW_EVIDENCE,
-        GROW_HEAP_CLEAN,
-        GROW_LINKED,
-        GROW_CLEARED,
+        CUT_GROW_ALLOCATED,
+        CUT_GROW_EVIDENCE,
+        CUT_GROW_HEAP_CLEAN,
+        CUT_GROW_LINKED,
+        CUT_GROW_CLEARED,
     ] {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -399,7 +403,7 @@ fn directory_growth_crash_windows_preserve_the_slab_chain() {
         assert_eq!(status, 80 + cut as i32);
         let recovery = unsafe { session.assume_dead(peer) }.unwrap();
         let result = recovery.reap_with(&[crate::layout::recovery_handler::<()>()]);
-        if matches!(cut, GROW_ALLOCATED | GROW_EVIDENCE) {
+        if matches!(cut, CUT_GROW_ALLOCATED | CUT_GROW_EVIDENCE) {
             assert!(result.is_ok(), "poisoned heap must not block reap");
             assert!(
                 session.create_channel::<()>(4).is_err(),
@@ -423,15 +427,16 @@ fn standalone_talc_crash_windows_poison_mutation_without_blocking_reap() {
         _ => {}
     }
     use crate::talc::{
-        ALLOC_CLAIMED, ALLOC_CLEAN, ALLOC_MUTATED, FREE_CLAIMED, FREE_CLEAN, FREE_MUTATED,
+        CUT_ALLOC_CLAIMED, CUT_ALLOC_CLEAN, CUT_ALLOC_MUTATED, CUT_FREE_CLAIMED, CUT_FREE_CLEAN,
+        CUT_FREE_MUTATED,
     };
     for (role, cut) in [
-        ("talc-allocate", ALLOC_CLAIMED),
-        ("talc-allocate", ALLOC_MUTATED),
-        ("talc-allocate", ALLOC_CLEAN),
-        ("talc-release", FREE_CLAIMED),
-        ("talc-release", FREE_MUTATED),
-        ("talc-release", FREE_CLEAN),
+        ("talc-allocate", CUT_ALLOC_CLAIMED),
+        ("talc-allocate", CUT_ALLOC_MUTATED),
+        ("talc-allocate", CUT_ALLOC_CLEAN),
+        ("talc-release", CUT_FREE_CLAIMED),
+        ("talc-release", CUT_FREE_MUTATED),
+        ("talc-release", CUT_FREE_CLEAN),
     ] {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -451,7 +456,7 @@ fn standalone_talc_crash_windows_poison_mutation_without_blocking_reap() {
         let result = recovery.reap_with(&[crate::layout::recovery_handler::<()>()]);
         if matches!(
             cut,
-            ALLOC_CLAIMED | ALLOC_MUTATED | FREE_CLAIMED | FREE_MUTATED
+            CUT_ALLOC_CLAIMED | CUT_ALLOC_MUTATED | CUT_FREE_CLAIMED | CUT_FREE_MUTATED
         ) {
             assert!(result.is_ok(), "poisoned heap must not block reap");
             let decline = match session.heap().put(8_u64) {

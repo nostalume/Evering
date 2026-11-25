@@ -80,7 +80,7 @@ fn a_pool_opens_in_a_second_mapping_of_the_same_region() {
 }
 
 #[test]
-fn layout_order_is_rejected_at_the_first_unexpected_record() {
+fn layout_order_is_refused_at_the_first_unexpected_record() {
     const SIZE: usize = 1 << 19;
     const REGION: RegionId = RegionId::new(0x004f_5244_4552, 1);
     let fd = UnixFd::memfd("layout-order", SIZE, false).expect("create shared memory");
@@ -205,7 +205,7 @@ fn a_seat_given_back_before_its_arrival_returns_its_slot_to_the_next_join() {
 }
 
 #[test]
-fn a_roster_full_of_promises_refuses_a_join_differently_than_a_roster_full_of_members() {
+fn promises_and_members_fill_a_roster_with_different_refusals() {
     const SIZE: usize = 1 << 20;
     const REGION: RegionId = RegionId::new(0x0053_E472, 1);
     let fd = UnixFd::memfd("promised-out", SIZE, false).expect("create shared memory");

@@ -289,7 +289,7 @@ fn admit(
 }
 
 #[test]
-fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
+fn a_reported_member_and_reaped_child_recover_over_the_pipe() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-reported", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -376,7 +376,7 @@ fn a_member_a_child_reported_and_a_child_reaped_recover_over_the_pipe() {
 }
 
 #[test]
-fn a_report_of_a_member_nobody_promised_that_child_is_refused_over_the_pipe() {
+fn an_unpromised_member_report_is_refused_over_the_pipe() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-diverged", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");
@@ -499,7 +499,7 @@ fn an_offer_shaped_frame_is_refused_where_the_pipe_reads_a_receipt() {
 }
 
 #[test]
-fn a_child_still_connected_and_silent_is_given_up_on_at_the_bound_the_caller_named() {
+fn a_connected_silent_child_is_given_up_at_the_named_bound() {
     let (mapping, parent, handoff, grant, bootstrap) =
         region::meeting("receipt-parked", SIZE, REGION);
     let seat = parent.reserve_seat().expect("promise a member slot");

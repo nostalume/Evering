@@ -773,7 +773,7 @@ fn session_channel_count_is_bounded_by_shared_memory_not_a_type_constant() {
 }
 
 #[test]
-fn session_rejects_zero_capacity_without_panicking_or_publishing() {
+fn session_refuses_zero_capacity_without_panicking_or_publishing() {
     let mut pt = [0; MAX_ADDR];
     let session = mock_session(&mut pt, 0, MAX_ADDR);
 
@@ -1082,7 +1082,7 @@ fn exhaustion_recovers_after_release() {
 }
 
 #[test]
-fn rejected_box_release_returns_the_live_value() {
+fn refused_box_release_returns_the_live_value() {
     use crate::boxed::PBox;
 
     let mut pt = [0; MAX_ADDR];
@@ -1098,7 +1098,7 @@ fn rejected_box_release_returns_the_live_value() {
 }
 
 #[test]
-fn rejected_box_drop_does_not_drop_the_value() {
+fn refused_box_drop_does_not_drop_the_value() {
     use crate::boxed::PBox;
     use core::sync::atomic::{AtomicUsize, Ordering};
 
