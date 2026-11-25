@@ -129,14 +129,19 @@ fn readiness_stream_progresses_with_constrained_duplex_buffers() {
 
     let listener = TcpListener::bind(("127.0.0.1", 0)).unwrap();
     let address = listener.local_addr().unwrap();
+    // Nagle is off on every other TCP leg this study runs (`stream::worker`, `stream::run`). It matters
+    // most here: a 64 KiB request across a 4 KiB duplex is tens of segments, and each one whose peer's
+    // buffer just drained waits on the delayed-ACK timer instead of on the driver being tested.
     let worker = std::thread::spawn(move || {
         let stream = listener.accept().unwrap().0;
+        stream.set_nodelay(true).unwrap();
         let socket = socket2::SockRef::from(&stream);
         socket.set_send_buffer_size(4096).unwrap();
         socket.set_recv_buffer_size(4096).unwrap();
         stream::serve(stream, boundary::ABSENT).unwrap();
     });
     let client = TcpStream::connect(address).unwrap();
+    client.set_nodelay(true).unwrap();
     let socket = socket2::SockRef::from(&client);
     socket.set_send_buffer_size(4096).unwrap();
     socket.set_recv_buffer_size(4096).unwrap();
