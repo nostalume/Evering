@@ -80,10 +80,10 @@ host, is recorded in [stability](docs/stability.md).
 
 ## Install
 
-Version `0.1.0` is on crates.io, and its public ABI stays experimental:
+Version `0.2.0` is on crates.io, and its public ABI stays experimental:
 
 ```toml
-evering = { version = "0.1.0", features = ["os", "tokio"] }
+evering = { version = "0.2.0", features = ["os", "tokio"] }
 ```
 
 The default feature is `std`. `map`, `notify`, and `process` are composable and `os`

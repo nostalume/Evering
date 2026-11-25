@@ -2,7 +2,7 @@
 
 This page names, for each public surface, a verdict and the checks in this repository
 that pin it. It is not a release, a compatibility window, or a deprecation policy;
-released boundaries are named by tags, and there is one so far (`v0.1.0`). The
+released boundaries are named by tags, and there are two so far (`v0.1.0`, `v0.2.0`). The
 argument behind a verdict is not here either — a row that moved is explained in the
 commit that moved it, and the same-commit rule in [AGENTS.md](AGENTS.md) is the whole
 notification promise here.

@@ -133,8 +133,8 @@ before any role body could answer for it.
   has no step invoking either), while the docs gate, the test arms, and the examples run as
   processes on both hosts. Timed studies
   remain isolated and emit inspectable artifacts.
-- Version `0.1.0` is published on crates.io. Do not tag or upload another version
-  without separate explicit release authorization.
+- Versions `0.1.0` and `0.2.0` are published on crates.io. Do not tag or upload
+  another version without separate explicit release authorization.
 
 ## Current goal
 
